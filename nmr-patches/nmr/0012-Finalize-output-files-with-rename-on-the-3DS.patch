@@ -1,0 +1,41 @@
+From 26dbeeea67be8705ec9ca2337c75ebdae1b927ac Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 26 Sep 2026 18:44:49 -0500
+Subject: [PATCH 12/12] Finalize output files with rename on the 3DS
+
+libstdc++'s std::filesystem::copy_file leaves empty files on
+newlib/libctru, so the save file and its backup were both truncated.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ librecomp/src/files.cpp | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/librecomp/src/files.cpp b/librecomp/src/files.cpp
+index af6f18d..ee6b598 100644
+--- a/librecomp/src/files.cpp
++++ b/librecomp/src/files.cpp
+@@ -36,6 +36,20 @@ bool recomp::finalize_output_file_with_backup(const std::filesystem::path& filep
+     temp_path += temp_suffix;
+ 
+     std::error_code ec;
++#ifdef __3DS__
++    // libstdc++'s copy_file does not work on newlib/libctru (it leaves empty
++    // files), so rotate the files with rename instead, which the SD card
++    // driver supports. Same end state: file = new data, .bak = previous.
++    if (std::filesystem::exists(filepath, ec)) {
++        std::filesystem::remove(backup_path, ec);
++        std::filesystem::rename(filepath, backup_path, ec);
++        if (ec) {
++            return false;
++        }
++    }
++    std::filesystem::rename(temp_path, filepath, ec);
++    return !ec;
++#endif
+     if (std::filesystem::exists(filepath, ec)) {
+         std::filesystem::copy_file(filepath, backup_path, std::filesystem::copy_options::overwrite_existing, ec);
+         if (ec) {
+-- 
+2.53.0
+

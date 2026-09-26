@@ -1,7 +1,7 @@
-From c8cfd02e4d9e94ce349828457f049a9c30ff358f Mon Sep 17 00:00:00 2001
+From b75cf7c895e26b8e4a67d0115ceff074eae1af98 Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 18:01:09 -0500
-Subject: [PATCH 7/9] Add RECOMP_NO_MODS to build without the mod system
+Subject: [PATCH 07/12] Add RECOMP_NO_MODS to build without the mod system
 
 The mod loader needs dynamic loading, page protection, a live recompiler
 and a 16 MB region of RDRAM, none of which a 3DS has (mods.cpp already
@@ -15,9 +15,9 @@ event, and the real one quick-exits unless load_mods sized its callback
 table, so the stub makes it a no-op.
 ---
  librecomp/CMakeLists.txt    | 22 +++++++---
- librecomp/src/mods_stub.cpp | 30 ++++++++++++++
+ librecomp/src/mods_stub.cpp | 31 ++++++++++++++
  librecomp/src/recomp.cpp    | 82 +++++++++++++++++++++++++++++++++++++
- 3 files changed, 128 insertions(+), 6 deletions(-)
+ 3 files changed, 129 insertions(+), 6 deletions(-)
  create mode 100644 librecomp/src/mods_stub.cpp
 
 diff --git a/librecomp/CMakeLists.txt b/librecomp/CMakeLists.txt
@@ -71,10 +71,10 @@ index 716d48b..5d2fdc6 100644
      "${CMAKE_CURRENT_SOURCE_DIR}/src"
 diff --git a/librecomp/src/mods_stub.cpp b/librecomp/src/mods_stub.cpp
 new file mode 100644
-index 0000000..75144a8
+index 0000000..843c0d2
 --- /dev/null
 +++ b/librecomp/src/mods_stub.cpp
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,31 @@
 +// Stand-ins for the mod system when it is compiled out (RECOMP_NO_MODS):
 +// platforms with no dynamic loading, page protection or spare memory, such
 +// as the 3DS. The recompiled patches still call recomp_trigger_event for
@@ -94,8 +94,9 @@ index 0000000..75144a8
 +    void register_config_exports() {}
 +    void register_hook_exports() {}
 +    void set_latest_game_mode_id(const std::string&) {}
-+    std::filesystem::path get_mods_directory() { return {}; }
 +    std::vector<ModDetails> get_all_mod_details(const std::string&) { return {}; }
++    bool is_mod_enabled(const std::string&) { return false; }
++    bool is_mod_auto_enabled(const std::string&) { return false; }
 +}
 +
 +extern "C" {

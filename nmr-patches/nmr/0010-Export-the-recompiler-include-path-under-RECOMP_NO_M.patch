@@ -1,0 +1,32 @@
+From ee8be1d72e2b2d294156cf22da1d7c6c0b705b62 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 26 Sep 2026 18:16:21 -0500
+Subject: [PATCH 10/12] Export the recompiler include path under RECOMP_NO_MODS
+
+game.hpp includes recomp.h, so anything that includes librecomp's public
+headers needs N64Recomp/include on its path.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ librecomp/CMakeLists.txt | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/librecomp/CMakeLists.txt b/librecomp/CMakeLists.txt
+index 511f070..2a71291 100644
+--- a/librecomp/CMakeLists.txt
++++ b/librecomp/CMakeLists.txt
+@@ -73,8 +73,9 @@ endif()
+ add_subdirectory(${PROJECT_SOURCE_DIR}/../thirdparty/miniz ${CMAKE_CURRENT_BINARY_DIR}/miniz)
+ if (RECOMP_NO_MODS)
+     # Only the recompiler's headers are needed (overlays.cpp uses a constant
+-    # from recompiler/context.h); the live recompiler is not built.
+-    target_include_directories(librecomp PRIVATE "${PROJECT_SOURCE_DIR}/../N64Recomp/include")
++    # from recompiler/context.h, and game.hpp includes recomp.h, so consumers
++    # need the path too); the live recompiler is not built.
++    target_include_directories(librecomp PUBLIC "${PROJECT_SOURCE_DIR}/../N64Recomp/include")
+     target_link_libraries(librecomp PRIVATE ultramodern)
+ else()
+     add_subdirectory(${PROJECT_SOURCE_DIR}/../N64Recomp ${CMAKE_CURRENT_BINARY_DIR}/N64Recomp EXCLUDE_FROM_ALL)
+-- 
+2.53.0
+

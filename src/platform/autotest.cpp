@@ -14,6 +14,7 @@
 #include <cstring>
 #include <strings.h>
 
+#include "recomp3ds.h"
 #include "recomp3ds_internal.h"
 
 namespace {
@@ -111,12 +112,12 @@ u32 recomp3ds::autotest_tick() {
     if (g_pending_phase >= 0) {
         g_phase = g_pending_phase;
         g_pending_phase = -1;
-        g_phase_start_ms = osGetTime();
+        g_phase_start_ms = recomp3ds::wall_ms();
         g_last_frame = -1;
         fprintf(stderr, "AUTOTEST: phase %d (%s)\n", g_phase, g_trigger[g_phase]);
     }
-    if (g_phase_start_ms == 0) g_phase_start_ms = osGetTime();
-    int f = (int)((osGetTime() - g_phase_start_ms) * 30 / 1000);
+    if (g_phase_start_ms == 0) g_phase_start_ms = recomp3ds::wall_ms();
+    int f = (int)((recomp3ds::wall_ms() - g_phase_start_ms) * 30 / 1000);
     int prev = g_last_frame;
     g_last_frame = f;
     u32 keys = 0;

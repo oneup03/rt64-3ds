@@ -17,6 +17,7 @@ public:
     void enable_instant_present() override {}
     void send_dl(const OSTask* task) override {
         (void)task;
+        if (dl_count == 0 && dl_per_sec == 0) fprintf(stderr, "rt64-3ds: first display list\n");
         dl_count++;
         u64 now = svcGetSystemTick();
         if (window_start == 0) {

@@ -19,9 +19,35 @@
 
 // libctru's default main stack is 32 KB; the runtime's start path and the
 // C++ library want more.
-extern "C" u32 __stacksize__ = 512 * 1024;
+extern "C" { u32 __stacksize__ = 512 * 1024; }
 
 namespace {
+
+// RSP task timing (audio: the graphics tasks go to the renderer instead).
+recomp::rsp::callbacks_t::get_rsp_microcode_t* g_game_get_ucode = nullptr;
+RspUcodeFunc* g_ucode_inner = nullptr;
+u64 g_ucode_ticks = 0;
+u32 g_ucode_tasks = 0;
+
+RspExitReason timed_ucode(uint8_t* rdram, uint32_t ucode_addr) {
+    u64 t0 = svcGetSystemTick();
+    RspExitReason r = g_ucode_inner(rdram, ucode_addr);
+    g_ucode_ticks += svcGetSystemTick() - t0;
+    g_ucode_tasks++;
+    return r;
+}
+
+RspUcodeFunc* timed_get_ucode(const OSTask* task) {
+    RspUcodeFunc* f = g_game_get_ucode(task);
+    if (f == nullptr) {
+        return nullptr;
+    }
+    if (g_ucode_inner != nullptr && g_ucode_inner != f) {
+        return f;   // a second microcode: leave it untimed rather than mix them
+    }
+    g_ucode_inner = f;
+    return timed_ucode;
+}
 
 char g_base_path[128] = "sdmc:/3ds";
 const recomp3ds::GameDesc* g_desc = nullptr;
@@ -46,9 +72,14 @@ void update_gfx(void*) {
         int busy0 = -1, busy2 = -1;
         recomp3ds::loadmon_sample(&busy0, &busy2);
         const rt64_3ds::FrameStats& st = rt64_3ds::stats();
-        fprintf(stderr, "stats: %d dl/s core0 %d%% core2 %d%% audio %zu frames queued\n",
-                st.dl_per_sec, busy0, busy2, recomp3ds::audio_frames_remaining());
-        printf("\x1b[2;0H%3d fps  cpu0 %3d%%  cpu2 %3d%%   \n", st.dl_per_sec, busy0, busy2);
+        // Audio microcode cost over the last second: ms of CPU and task count.
+        unsigned ucode_ms = (unsigned)(g_ucode_ticks * 1000 / SYSCLOCK_ARM11);
+        unsigned ucode_tasks = g_ucode_tasks;
+        g_ucode_ticks = 0;
+        g_ucode_tasks = 0;
+        fprintf(stderr, "stats: %d dl/s core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued\n",
+                st.dl_per_sec, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_remaining());
+        printf("\x1b[2;0H%3d fps  cpu0 %3d%%  cpu2 %3d%%  ucode %3u ms/s   \n", st.dl_per_sec, busy0, busy2, ucode_ms);
     }
     if (!aptMainLoop() || g_exit_requested) {
         static bool quitting = false;
@@ -128,6 +159,9 @@ int recomp3ds::run(const GameDesc& desc) {
     if (desc.register_patches) {
         desc.register_patches();
     }
+    // Hashes <config>/<game_id>.z64 and marks the game valid; is_rom_valid
+    // only reads that set. (A ROM with the wrong hash is deleted by this.)
+    recomp::check_all_stored_roms();
 
     ultramodern::renderer::callbacks_t renderer_callbacks{};
     renderer_callbacks.create_render_context = make_render_context;
@@ -156,6 +190,12 @@ int recomp3ds::run(const GameDesc& desc) {
 
     recomp::Configuration cfg{};
     cfg.rsp_callbacks = desc.rsp;
+    // Time the audio microcode: the game's callback hands back the ucode
+    // function and this trampoline runs it under the tick counter.
+    g_game_get_ucode = desc.rsp.get_rsp_microcode;
+    if (g_game_get_ucode != nullptr) {
+        cfg.rsp_callbacks.get_rsp_microcode = timed_get_ucode;
+    }
     cfg.renderer_callbacks = renderer_callbacks;
     cfg.audio_callbacks = audio_callbacks;
     cfg.input_callbacks = input_callbacks;

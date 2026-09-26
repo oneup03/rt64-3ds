@@ -27,7 +27,7 @@ void idle_thread(void* arg) {
         for (int i = 0; i < 64; i++) {
             __asm__ volatile("" ::: "memory");
         }
-        m->count++;
+        m->count = m->count + 1;
     }
 }
 

@@ -1,7 +1,7 @@
-From 2fd12aa6627c48777b56c35825af58c4a793bd8d Mon Sep 17 00:00:00 2001
+From a07b47662b895e35733c68736663fd707f01988a Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 17:54:40 -0500
-Subject: [PATCH 6/9] Create host threads through a HostThread wrapper
+Subject: [PATCH 06/12] Create host threads through a HostThread wrapper
 
 Every host thread was a std::thread, which offers no stack size, priority
 or core. On the 3DS those matter: libctru threads default to a small
@@ -15,13 +15,13 @@ priority changes are no-ops there.
  librecomp/src/pi.cpp                          |   4 +-
  librecomp/src/recomp.cpp                      |   4 +-
  ultramodern/CMakeLists.txt                    |   1 +
- .../include/ultramodern/host_thread.hpp       |  62 +++++++++
+ .../include/ultramodern/host_thread.hpp       |  65 +++++++++
  .../include/ultramodern/ultramodern.hpp       |   3 +-
  ultramodern/src/events.cpp                    |  18 ++-
  ultramodern/src/host_thread.cpp               | 131 ++++++++++++++++++
  ultramodern/src/threads.cpp                   |  18 ++-
  ultramodern/src/timer.cpp                     |   4 +-
- 9 files changed, 229 insertions(+), 16 deletions(-)
+ 9 files changed, 232 insertions(+), 16 deletions(-)
  create mode 100644 ultramodern/include/ultramodern/host_thread.hpp
  create mode 100644 ultramodern/src/host_thread.cpp
 
@@ -83,10 +83,10 @@ index 5593172..70036a3 100644
      "${CMAKE_CURRENT_SOURCE_DIR}/src/misc_ultra.cpp"
 diff --git a/ultramodern/include/ultramodern/host_thread.hpp b/ultramodern/include/ultramodern/host_thread.hpp
 new file mode 100644
-index 0000000..6591c87
+index 0000000..52108c5
 --- /dev/null
 +++ b/ultramodern/include/ultramodern/host_thread.hpp
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,65 @@
 +#ifndef __ULTRAMODERN_HOST_THREAD_HPP__
 +#define __ULTRAMODERN_HOST_THREAD_HPP__
 +
@@ -94,7 +94,10 @@ index 0000000..6591c87
 +#include <functional>
 +
 +#ifdef __3DS__
++extern "C" {
++#include <3ds/types.h>
 +#include <3ds/thread.h>
++}
 +#else
 +#include <thread>
 +#endif

@@ -1,7 +1,7 @@
-From 604a5a5448fd01e45d5cc653a6548680b7a1aa73 Mon Sep 17 00:00:00 2001
+From 7694f5c05a895f6a68e157b7d954119904da1d1c Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 18:12:10 -0500
-Subject: [PATCH 9/9] Leave the recompiler out of the build under
+Subject: [PATCH 09/12] Leave the recompiler out of the build under
  RECOMP_NO_MODS
 
 The option removed the mod sources but librecomp still added the

@@ -1,7 +1,7 @@
 From 2320f888ae01c0fcdb42449b1d55409254b66029 Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 17:45:06 -0500
-Subject: [PATCH 1/9] Define WindowHandle for the 3DS
+Subject: [PATCH 01/12] Define WindowHandle for the 3DS
 
 The renderer context takes a WindowHandle and recomp::start compares it
 against a default-constructed one to decide whether to ask the gfx

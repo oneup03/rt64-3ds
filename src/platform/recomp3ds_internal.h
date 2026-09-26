@@ -4,11 +4,18 @@
 
 #include <cstddef>
 #include <cstdint>
+extern "C" {
 #include <3ds/types.h>
+#include <3ds/svc.h>
+}
 
 #include "ultramodern/input.hpp"
 
 namespace recomp3ds {
+    // Milliseconds on the ARM11 system tick (268 MHz whatever the CPU clock).
+    // Not libctru's osGetTime: ultramodern's N64 osGetTime shadows that name.
+    inline uint64_t wall_ms() { return svcGetSystemTick() / 268123ull; }
+
     bool audio_init();
     void audio_shutdown();
     void audio_set_frequency(uint32_t freq);

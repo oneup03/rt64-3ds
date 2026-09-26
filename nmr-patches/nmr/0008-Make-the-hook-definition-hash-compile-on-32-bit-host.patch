@@ -1,7 +1,7 @@
-From 3c8db9178c953b9983498de2a8b3a9bd479a6d9a Mon Sep 17 00:00:00 2001
+From a6c77b2395352854255aa4cf8bfcd361e204530c Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 18:04:13 -0500
-Subject: [PATCH 8/9] Make the hook-definition hash compile on 32-bit hosts
+Subject: [PATCH 08/12] Make the hook-definition hash compile on 32-bit hosts
 
 std::hash<HookDefinition> packed its fields into a size_t behind a
 static_assert that size_t is 64 bits, which stops every file including

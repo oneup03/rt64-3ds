@@ -1,89 +1,142 @@
-From 0b97ba68f56ae1989f92c19f15a2ec6b7995e149 Mon Sep 17 00:00:00 2001
+From 1802884749c9627bad4a0308b3369cc5986bbb0e Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 17:49:01 -0500
-Subject: [PATCH 5/9] Give moodycamel's semaphore a 3DS backend
+Subject: [PATCH 05/12] Give moodycamel's semaphore a 3DS backend
 
 arm-none-eabi defines none of _WIN32, __MACH__ or __unix__, so the
 lightweight semaphore hit its #error. Back it with a kernel semaphore:
 svcWaitSynchronization already takes the timeout the timed wait needs,
 which libctru's LightSemaphore does not offer.
 ---
- .../concurrentqueue/lightweightsemaphore.h    | 60 +++++++++++++++++++
- 1 file changed, 60 insertions(+)
+ .../concurrentqueue/lightweightsemaphore.h    | 113 ++++++++++++++++++
+ 1 file changed, 113 insertions(+)
 
 diff --git a/thirdparty/concurrentqueue/lightweightsemaphore.h b/thirdparty/concurrentqueue/lightweightsemaphore.h
-index 41ba094..3be454d 100644
+index 41ba094..26a42c5 100644
 --- a/thirdparty/concurrentqueue/lightweightsemaphore.h
 +++ b/thirdparty/concurrentqueue/lightweightsemaphore.h
-@@ -24,6 +24,12 @@ extern "C" {
+@@ -24,6 +24,16 @@ extern "C" {
  }
  #elif defined(__MACH__)
  #include <mach/mach.h>
 +#elif defined(__3DS__)
++// libctru's individual headers carry no extern "C" guard; only 3ds.h does.
++extern "C" {
 +#include <3ds/types.h>
 +#include <3ds/result.h>
 +#include <3ds/svc.h>
++#include <3ds/synchronization.h>
++#include <3ds/os.h>
++}
 +#include <cassert>
-+#include <climits>
  #elif defined(__unix__)
  #include <semaphore.h>
  
-@@ -253,6 +259,60 @@ public:
+@@ -253,6 +263,109 @@ public:
  		}
  	}
  };
 +#elif defined(__3DS__)
 +//---------------------------------------------------------
-+// Semaphore (Nintendo 3DS, libctru kernel semaphore)
++// Semaphore (Nintendo 3DS, address arbiter)
 +//---------------------------------------------------------
-+// A kernel semaphore rather than libctru's LightSemaphore: the light one has
-+// no timed wait, and svcWaitSynchronization takes a timeout directly.
++// Not a kernel semaphore: the kernel lets an application own only eight of
++// those (resource limit type 5), and the runtime creates more than that. This
++// is libctru's LightSemaphore with a timed acquire added; every instance
++// shares the process's single address arbiter, so there is no limit.
 +class Semaphore
 +{
 +private:
-+	Handle m_sema;
++	s32 m_count;
++	u16 m_waiters;
++
 +	Semaphore(const Semaphore& other) = delete;
 +	Semaphore& operator=(const Semaphore& other) = delete;
 +
-+public:
-+	Semaphore(int initialCount = 0)
++	bool acquire(s64 timeout_ns)	// < 0 waits forever
 +	{
-+		assert(initialCount >= 0);
-+		Result rc = svcCreateSemaphore(&m_sema, initialCount, INT_MAX);
-+		assert(R_SUCCEEDED(rc));
-+		(void)rc;
++		// The deadline is tracked here rather than trusting the arbiter's
++		// result: hardware reports a timeout as an error, Azahar as success.
++		const u64 deadline = timeout_ns < 0 ? 0 : svcGetSystemTick() + (u64)timeout_ns * SYSCLOCK_ARM11 / 1000000000ull;
++		s32 old;
++		do
++		{
++			for (;;)
++			{
++				old = __ldrex(&m_count);
++				if (old >= 1)
++					break;
++				__clrex();
++
++				s64 remaining_ns = -1;
++				if (timeout_ns >= 0)
++				{
++					u64 now = svcGetSystemTick();
++					if (now >= deadline)
++						return try_wait();
++					remaining_ns = (s64)((deadline - now) * 1000000000ull / SYSCLOCK_ARM11);
++					if (remaining_ns <= 0)
++						return try_wait();
++				}
++
++				u16 w;
++				do w = __ldrexh(&m_waiters); while (__strexh(&m_waiters, w + 1));
++				Result rc = remaining_ns < 0
++					? syncArbitrateAddress(&m_count, ARBITRATION_WAIT_IF_LESS_THAN, 1)
++					: syncArbitrateAddressWithTimeout(&m_count, ARBITRATION_WAIT_IF_LESS_THAN_TIMEOUT, 1, remaining_ns);
++				do w = __ldrexh(&m_waiters); while (__strexh(&m_waiters, w - 1));
++				if (R_FAILED(rc) && remaining_ns >= 0)	// timed out (hardware)
++					return try_wait();
++			}
++		} while (__strex(&m_count, old - 1));
++		return true;
 +	}
 +
-+	~Semaphore()
++public:
++	Semaphore(int initialCount = 0) : m_count(initialCount), m_waiters(0)
 +	{
-+		svcCloseHandle(m_sema);
++		assert(initialCount >= 0);
 +	}
 +
 +	bool wait()
 +	{
-+		return R_SUCCEEDED(svcWaitSynchronization(m_sema, -1));
++		return acquire(-1);
 +	}
 +
 +	bool try_wait()
 +	{
-+		return R_SUCCEEDED(svcWaitSynchronization(m_sema, 0));
++		s32 old;
++		do
++		{
++			old = __ldrex(&m_count);
++			if (old < 1)
++			{
++				__clrex();
++				return false;
++			}
++		} while (__strex(&m_count, old - 1));
++		return true;
 +	}
 +
 +	bool timed_wait(std::uint64_t usecs)
 +	{
-+		return R_SUCCEEDED(svcWaitSynchronization(m_sema, (s64)usecs * 1000));
++		return acquire((s64)usecs * 1000);
 +	}
 +
-+	void signal()
++	void signal(int count = 1)
 +	{
-+		s32 count;
-+		svcReleaseSemaphore(&count, m_sema, 1);
-+	}
++		s32 old;
++		do
++			old = __ldrex(&m_count);
++		while (__strex(&m_count, old + count));
 +
-+	void signal(int count)
-+	{
-+		s32 prev;
-+		svcReleaseSemaphore(&prev, m_sema, count);
++		if (old <= 0 || __ldrexh(&m_waiters) > 0)
++		{
++			__clrex();
++			syncArbitrateAddress(&m_count, ARBITRATION_SIGNAL, count);
++		}
++		else
++			__clrex();
 +	}
 +};
  #else

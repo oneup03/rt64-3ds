@@ -1,0 +1,31 @@
+From 1eb1ab5551d6d468f3cc3b7849574d82743888d1 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 26 Sep 2026 18:21:24 -0500
+Subject: [PATCH 11/12] Link the N64 osGetTime under another symbol on the 3DS
+
+libctru defines osGetTime too, and both end up in the executable.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ultramodern/include/ultramodern/ultra64.h | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/ultramodern/include/ultramodern/ultra64.h b/ultramodern/include/ultramodern/ultra64.h
+index 31eb106..7858317 100644
+--- a/ultramodern/include/ultramodern/ultra64.h
++++ b/ultramodern/include/ultramodern/ultra64.h
+@@ -291,6 +291,11 @@ PTR(void) osViGetNextFramebuffer();
+ PTR(void) osViGetCurrentFramebuffer();
+ u32 osGetCount();
+ void osSetCount(u32 count);
++#ifdef __3DS__
++// libctru has its own osGetTime (milliseconds since 2000); the N64 one keeps
++// its declared name for the generated code but links under another symbol.
++#define osGetTime ultramodern_osGetTime
++#endif
+ OSTime osGetTime();
+ void osSetTime(OSTime t);
+ int osSetTimer(RDRAM_ARG PTR(OSTimer) timer, OSTime countdown, OSTime interval, PTR(OSMesgQueue) mq, OSMesg msg);
+-- 
+2.53.0
+
