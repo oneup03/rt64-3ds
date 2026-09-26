@@ -1,7 +1,7 @@
 From 803cc609a988b8ab6c10a6b4e6a46c15018362e6 Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 17:45:06 -0500
-Subject: [PATCH 3/8] Shrink the RDRAM model on the 3DS
+Subject: [PATCH 3/9] Shrink the RDRAM model on the 3DS
 
 mem_size covers all of kseg0 (512 MB) because mods and the recomp heap
 live above the game's 8 MB. On the 3DS the whole region is committed, so

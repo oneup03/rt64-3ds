@@ -1,7 +1,7 @@
 From c8cfd02e4d9e94ce349828457f049a9c30ff358f Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 18:01:09 -0500
-Subject: [PATCH 7/8] Add RECOMP_NO_MODS to build without the mod system
+Subject: [PATCH 7/9] Add RECOMP_NO_MODS to build without the mod system
 
 The mod loader needs dynamic loading, page protection, a live recompiler
 and a 16 MB region of RDRAM, none of which a 3DS has (mods.cpp already

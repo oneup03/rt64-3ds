@@ -1,7 +1,7 @@
 From 0b97ba68f56ae1989f92c19f15a2ec6b7995e149 Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 17:49:01 -0500
-Subject: [PATCH 5/8] Give moodycamel's semaphore a 3DS backend
+Subject: [PATCH 5/9] Give moodycamel's semaphore a 3DS backend
 
 arm-none-eabi defines none of _WIN32, __MACH__ or __unix__, so the
 lightweight semaphore hit its #error. Back it with a kernel semaphore:

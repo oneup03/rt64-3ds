@@ -1,7 +1,7 @@
 From be094dec6f20e1207d0995d6c2725060ad27beea Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 17:45:06 -0500
-Subject: [PATCH 2/8] Allocate RDRAM with calloc on the 3DS
+Subject: [PATCH 2/9] Allocate RDRAM with calloc on the 3DS
 
 The 4 GB PROT_NONE reservation with an RW window exists to turn wild
 guest accesses into faults. The 3DS has no mmap and 124 MB in total, so

@@ -1,7 +1,7 @@
 From 8d29cd9f9a2868865758eb49f611e5328d348628 Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 17:45:06 -0500
-Subject: [PATCH 4/8] Exit cleanly from quick_exit on the 3DS
+Subject: [PATCH 4/9] Exit cleanly from quick_exit on the 3DS
 
 newlib's quick_exit skips libctru's service teardown, which can hang the
 console on the way out. Flush and use exit() there instead.

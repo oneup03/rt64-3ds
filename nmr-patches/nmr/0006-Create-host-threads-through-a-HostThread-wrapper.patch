@@ -1,7 +1,7 @@
 From 2fd12aa6627c48777b56c35825af58c4a793bd8d Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 17:54:40 -0500
-Subject: [PATCH 6/8] Create host threads through a HostThread wrapper
+Subject: [PATCH 6/9] Create host threads through a HostThread wrapper
 
 Every host thread was a std::thread, which offers no stack size, priority
 or core. On the 3DS those matter: libctru threads default to a small

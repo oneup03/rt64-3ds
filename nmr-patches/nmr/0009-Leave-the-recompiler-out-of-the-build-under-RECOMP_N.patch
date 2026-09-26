@@ -1,0 +1,38 @@
+From 604a5a5448fd01e45d5cc653a6548680b7a1aa73 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 26 Sep 2026 18:12:10 -0500
+Subject: [PATCH 9/9] Leave the recompiler out of the build under
+ RECOMP_NO_MODS
+
+The option removed the mod sources but librecomp still added the
+N64Recomp subdirectory and linked it, which drags fmt, rabbitizer and the
+live recompiler into a build that cannot use them. Keep only the header
+path overlays.cpp needs.
+---
+ librecomp/CMakeLists.txt | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/librecomp/CMakeLists.txt b/librecomp/CMakeLists.txt
+index 5d2fdc6..511f070 100644
+--- a/librecomp/CMakeLists.txt
++++ b/librecomp/CMakeLists.txt
+@@ -71,7 +71,13 @@ if (WIN32)
+ endif()
+ 
+ add_subdirectory(${PROJECT_SOURCE_DIR}/../thirdparty/miniz ${CMAKE_CURRENT_BINARY_DIR}/miniz)
+-add_subdirectory(${PROJECT_SOURCE_DIR}/../N64Recomp ${CMAKE_CURRENT_BINARY_DIR}/N64Recomp EXCLUDE_FROM_ALL)
+-
+-target_link_libraries(librecomp PRIVATE ultramodern N64Recomp LiveRecomp)
++if (RECOMP_NO_MODS)
++    # Only the recompiler's headers are needed (overlays.cpp uses a constant
++    # from recompiler/context.h); the live recompiler is not built.
++    target_include_directories(librecomp PRIVATE "${PROJECT_SOURCE_DIR}/../N64Recomp/include")
++    target_link_libraries(librecomp PRIVATE ultramodern)
++else()
++    add_subdirectory(${PROJECT_SOURCE_DIR}/../N64Recomp ${CMAKE_CURRENT_BINARY_DIR}/N64Recomp EXCLUDE_FROM_ALL)
++    target_link_libraries(librecomp PRIVATE ultramodern N64Recomp LiveRecomp)
++endif()
+ target_link_libraries(librecomp PUBLIC miniz)
+-- 
+2.53.0
+
