@@ -24,6 +24,9 @@ add_library(recomp_3ds STATIC
     src/platform/recomp3ds_run.cpp
     src/platform/audio_ndsp.cpp
     src/platform/input_hid.cpp
+    src/platform/loadmon.cpp
+    src/platform/log.cpp
+    src/platform/autotest.cpp
 )
 target_include_directories(recomp_3ds PUBLIC src/platform)
 target_link_libraries(recomp_3ds PUBLIC rt64_3ds ultramodern librecomp ctru m)

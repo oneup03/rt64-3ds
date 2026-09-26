@@ -35,6 +35,21 @@ ultramodern::renderer::WindowHandle create_window(void*) {
 
 // Runs on the main thread once a millisecond while the game is up.
 void update_gfx(void*) {
+    // Once a second: frame rate and CPU load to the log and the touch screen.
+    static u64 last_report = 0;
+    u64 now = svcGetSystemTick();
+    if (last_report == 0) {
+        last_report = now;
+    }
+    else if (now - last_report >= SYSCLOCK_ARM11) {
+        last_report = now;
+        int busy0 = -1, busy2 = -1;
+        recomp3ds::loadmon_sample(&busy0, &busy2);
+        const rt64_3ds::FrameStats& st = rt64_3ds::stats();
+        fprintf(stderr, "stats: %d dl/s core0 %d%% core2 %d%% audio %zu frames queued\n",
+                st.dl_per_sec, busy0, busy2, recomp3ds::audio_frames_remaining());
+        printf("\x1b[2;0H%3d fps  cpu0 %3d%%  cpu2 %3d%%   \n", st.dl_per_sec, busy0, busy2);
+    }
     if (!aptMainLoop() || g_exit_requested) {
         static bool quitting = false;
         if (!quitting) {
@@ -82,18 +97,19 @@ int recomp3ds::run(const GameDesc& desc) {
 
     gfxInitDefault();
     consoleInit(GFX_BOTTOM, nullptr);          // stdout: status text on the touch screen
-    consoleDebugInit(debugDevice_SVC);         // stderr: the emulator / 3dslink log
     if (__3dslink_host.s_addr != 0) {
         link3dsStdio();
     }
+    snprintf(g_base_path, sizeof(g_base_path), "sdmc:/3ds/%s", desc.sd_dir);
+    mkdir(g_base_path, 0777);
+    recomp3ds::log_init(g_base_path);          // stderr: debug log + <base>/log.txt
+    recomp3ds::autotest_load(g_base_path);
+
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
     fprintf(stderr, "recomp3ds: %s starting on %s 3DS\n", desc.render.game_name, is_new_3ds ? "a New" : "an Old");
     printf("%s\n", desc.render.game_name);
     log_memory("boot");
-
-    snprintf(g_base_path, sizeof(g_base_path), "sdmc:/3ds/%s", desc.sd_dir);
-    mkdir(g_base_path, 0777);
     {
         char sub[160];
         snprintf(sub, sizeof(sub), "%s/saves", g_base_path);
@@ -163,10 +179,12 @@ int recomp3ds::run(const GameDesc& desc) {
     }
 
     recomp::start_game(desc.game_id, "");
+    recomp3ds::loadmon_start(is_new_3ds);
     log_memory("before start");
     recomp::start(cfg);        // returns when the game has quit
     log_memory("after exit");
 
+    recomp3ds::loadmon_stop();
     recomp3ds::audio_shutdown();
     gfxExit();
     return 0;

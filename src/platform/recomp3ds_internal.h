@@ -23,8 +23,17 @@ namespace recomp3ds {
     void input_set_rumble(int controller_num, bool rumble);
     ultramodern::input::connected_device_info_t input_device_info(int controller_num);
 
-    void log_init();
+    void log_init(const char* base_path);
     void log_line(const char* s);
+
+    void autotest_load(const char* base_path);
+    void autotest_scan_line(const char* line);
+    u32  autotest_tick();
+    bool autotest_touch(int* x, int* y);
+
+    void loadmon_start(bool has_core2);
+    void loadmon_sample(int* busy0, int* busy2);
+    void loadmon_stop();
 }
 
 #endif

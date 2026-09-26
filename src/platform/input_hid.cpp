@@ -7,6 +7,7 @@
 
 #include "ultramodern/input.hpp"
 #include "recomp3ds_internal.h"
+#include "recomp3ds.h"
 
 namespace {
 // N64 controller button bits (as OSContPad.button).
@@ -23,7 +24,7 @@ circlePosition g_cstick{};
 
 void recomp3ds::input_poll() {
     hidScanInput();
-    g_held = hidKeysHeld();
+    g_held = hidKeysHeld() | recomp3ds::autotest_tick();
     hidCircleRead(&g_cpad);
     hidCstickRead(&g_cstick);
 }
