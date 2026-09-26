@@ -1,0 +1,55 @@
+From 3c8db9178c953b9983498de2a8b3a9bd479a6d9a Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 26 Sep 2026 18:04:13 -0500
+Subject: [PATCH 8/8] Make the hook-definition hash compile on 32-bit hosts
+
+std::hash<HookDefinition> packed its fields into a size_t behind a
+static_assert that size_t is 64 bits, which stops every file including
+mods.hpp from compiling on the 3DS. Pack into a uint64_t and fold the
+halves when size_t is narrower; the 64-bit result is unchanged.
+---
+ librecomp/include/librecomp/mods.hpp | 11 ++++++++---
+ librecomp/src/recomp.cpp             |  2 +-
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index 37556bd..18df095 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -50,12 +50,17 @@ template <>
+ struct std::hash<recomp::mods::HookDefinition>
+ {
+     std::size_t operator()(const recomp::mods::HookDefinition& def) const {
+-        // This hash packing only works if the resulting value is 64 bits.
+-        static_assert(sizeof(std::size_t) == 8);
+         // Combine the three values into a single 64-bit value.
+         // The lower 2 bits of a function address will always be zero, so pack
+         // the value of at_return into the lowest bit.
+-        return (size_t(def.section_rom) << 32) | size_t(def.function_vram) | size_t(def.at_return ? 1 : 0);
++        uint64_t packed = (uint64_t(def.section_rom) << 32) | uint64_t(def.function_vram) | uint64_t(def.at_return ? 1 : 0);
++        if constexpr (sizeof(std::size_t) == 8) {
++            return size_t(packed);
++        }
++        else {
++            // 32-bit hosts: fold the halves together.
++            return size_t(packed) ^ size_t(packed >> 32);
++        }
+     }
+ };
+ 
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index dd71c3d..9838240 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -1099,7 +1099,7 @@ void recomp::start(const recomp::Configuration& cfg) {
+     // VirtualFree returns zero on failure.
+     free_failed = (VirtualFree(rdram, 0, MEM_RELEASE) == 0);
+ #elif defined(__3DS__)
+-    free(rdram);
++    std::free(rdram);
+     free_failed = false;
+ #else
+     // munmap returns -1 on failure.
+-- 
+2.53.0
+

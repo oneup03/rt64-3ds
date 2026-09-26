@@ -1,0 +1,100 @@
+From 803cc609a988b8ab6c10a6b4e6a46c15018362e6 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 26 Sep 2026 17:45:06 -0500
+Subject: [PATCH 3/8] Shrink the RDRAM model on the 3DS
+
+mem_size covers all of kseg0 (512 MB) because mods and the recomp heap
+live above the game's 8 MB. On the 3DS the whole region is committed, so
+it becomes 16 MB by default (RECOMP_MEM_SIZE_MB), which holds the game,
+the patches' RAM at 0x80801000 and a heap. With no mods the heap starts
+at heap_rdram_start (0x80A00000 by default, RECOMP_HEAP_START) rather
+than at the 16 MB mod region, and init_heap asserts it is inside RDRAM.
+---
+ librecomp/include/librecomp/addresses.hpp | 23 ++++++++++++++++++++++-
+ librecomp/src/heap.cpp                    |  2 ++
+ librecomp/src/recomp.cpp                  |  7 +++++++
+ 3 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/librecomp/include/librecomp/addresses.hpp b/librecomp/include/librecomp/addresses.hpp
+index b1b50cb..e7f1f3b 100644
+--- a/librecomp/include/librecomp/addresses.hpp
++++ b/librecomp/include/librecomp/addresses.hpp
+@@ -6,10 +6,21 @@
+ #include "recomp.h"
+ 
+ namespace recomp {
+-    // 512GB (kseg0 size)
++#if defined(__3DS__)
++    // The 3DS commits all of this, so it is only the game's 8 MB, the patch RAM
++    // above it (RAMBASE 0x80801000 in the patches' linker script) and the
++    // recomp heap. RECOMP_MEM_SIZE_MB overrides it per game.
++#   ifndef RECOMP_MEM_SIZE_MB
++#       define RECOMP_MEM_SIZE_MB 16
++#   endif
++    constexpr size_t mem_size = (size_t)RECOMP_MEM_SIZE_MB * 1024ULL * 1024ULL;
++    constexpr size_t allocation_size = mem_size;
++#else
++    // 512MB (kseg0 size)
+     constexpr size_t mem_size = 512ULL * 1024ULL * 1024ULL;
+     // 4GB (the full address space)
+     constexpr size_t allocation_size = 4096ULL * 1024ULL * 1024ULL;
++#endif
+     // We need a place in rdram to hold the PI handles, so pick an address in extended rdram
+     constexpr int32_t cart_handle = 0x80800000;
+     constexpr int32_t drive_handle = (int32_t)(cart_handle + sizeof(OSPiHandle));
+@@ -18,6 +29,16 @@ namespace recomp {
+     constexpr int32_t patch_rdram_start = 0x80801000;
+     static_assert(patch_rdram_start >= flash_handle_end);
+     constexpr int32_t mod_rdram_start = 0x81000000;
++#if defined(__3DS__)
++    // Where the recomp heap starts when there are no mods: just past the
++    // patches' RAM. RECOMP_HEAP_START overrides it per game (it must sit above
++    // the patches' .bss end, which their link map reports).
++#   ifndef RECOMP_HEAP_START
++#       define RECOMP_HEAP_START 0x80A00000
++#   endif
++    constexpr int32_t heap_rdram_start = (int32_t)RECOMP_HEAP_START;
++    static_assert((uint32_t)heap_rdram_start - 0x80000000u < mem_size, "heap start outside RDRAM");
++#endif
+ 
+     // Flashram occupies the same physical address as sram, but that issue is avoided because libultra exposes
+     // a high-level interface for flashram. Because that high-level interface is reimplemented, low level accesses
+diff --git a/librecomp/src/heap.cpp b/librecomp/src/heap.cpp
+index f84ac71..3c50484 100644
+--- a/librecomp/src/heap.cpp
++++ b/librecomp/src/heap.cpp
+@@ -1,3 +1,4 @@
++#include <cassert>
+ #include "o1heap/o1heap.h"
+ 
+ #include "librecomp/addresses.hpp"
+@@ -35,6 +36,7 @@ void recomp::init_heap(uint8_t* rdram, uint32_t address) {
+ 
+     // Calculate the offset of the heap from the start of rdram and the size of the heap.
+     heap_offset = address - 0x80000000U;
++    assert(heap_offset < recomp::mem_size && "recomp heap starts outside RDRAM");
+     size_t heap_size = recomp::mem_size - heap_offset;
+ 
+     printf("Initializing recomp heap at offset 0x%08X with size 0x%08X\n", heap_offset, static_cast<uint32_t>(heap_size));
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index c6e9e7d..fcb2f06 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -750,7 +750,14 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+                     }
+                 }
+ 
++#if defined(__3DS__)
++                // No mods: the heap goes straight after the patches' RAM instead
++                // of after a 16 MB mod region the console cannot afford.
++                (void)mod_ram_used;
++                recomp::init_heap(rdram, recomp::heap_rdram_start);
++#else
+                 recomp::init_heap(rdram, recomp::mod_rdram_start + mod_ram_used);
++#endif
+ 
+                 save_type = game_entry.save_type;
+                 ultramodern::init_saving(rdram);
+-- 
+2.53.0
+

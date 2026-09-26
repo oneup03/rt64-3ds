@@ -1,0 +1,33 @@
+From 8d29cd9f9a2868865758eb49f611e5328d348628 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 26 Sep 2026 17:45:06 -0500
+Subject: [PATCH 4/8] Exit cleanly from quick_exit on the 3DS
+
+newlib's quick_exit skips libctru's service teardown, which can hang the
+console on the way out. Flush and use exit() there instead.
+---
+ ultramodern/src/error_handling.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/ultramodern/src/error_handling.cpp b/ultramodern/src/error_handling.cpp
+index 8ca779e..466db95 100644
+--- a/ultramodern/src/error_handling.cpp
++++ b/ultramodern/src/error_handling.cpp
+@@ -21,8 +21,13 @@ void ultramodern::error_handling::message_box(const char* msg) {
+ void ultramodern::error_handling::quick_exit(const char* filename, int line, const char *func, int exit_status) {
+     fprintf(stderr, "Exiting with exit status '%i'. Function %s, at file %s:%i\n", exit_status, func, filename, line);
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__)
+     std::_Exit(exit_status);
++#elif defined(__3DS__)
++    // Let the stream flush so the message reaches svcOutputDebugString, then
++    // leave through exit() so libctru's service handles are released.
++    fflush(stderr);
++    std::exit(exit_status);
+ #else
+     std::quick_exit(exit_status);
+ #endif
+-- 
+2.53.0
+

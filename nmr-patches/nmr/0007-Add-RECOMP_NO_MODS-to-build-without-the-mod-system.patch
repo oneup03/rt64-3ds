@@ -1,0 +1,450 @@
+From c8cfd02e4d9e94ce349828457f049a9c30ff358f Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 26 Sep 2026 18:01:09 -0500
+Subject: [PATCH 7/8] Add RECOMP_NO_MODS to build without the mod system
+
+The mod loader needs dynamic loading, page protection, a live recompiler
+and a 16 MB region of RDRAM, none of which a 3DS has (mods.cpp already
+refuses 32-bit ARM). With the option on, the mod sources are left out,
+the recomp.cpp wrappers over ModContext and the mod-loading step in
+wait_for_game_started are compiled out, and mods_stub.cpp supplies the
+few entry points the rest of the runtime still calls.
+
+The recompiled patches call recomp_trigger_event for every declared
+event, and the real one quick-exits unless load_mods sized its callback
+table, so the stub makes it a no-op.
+---
+ librecomp/CMakeLists.txt    | 22 +++++++---
+ librecomp/src/mods_stub.cpp | 30 ++++++++++++++
+ librecomp/src/recomp.cpp    | 82 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 128 insertions(+), 6 deletions(-)
+ create mode 100644 librecomp/src/mods_stub.cpp
+
+diff --git a/librecomp/CMakeLists.txt b/librecomp/CMakeLists.txt
+index 716d48b..5d2fdc6 100644
+--- a/librecomp/CMakeLists.txt
++++ b/librecomp/CMakeLists.txt
+@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED True)
+ set(CMAKE_CXX_EXTENSIONS OFF)
+ 
++option(RECOMP_NO_MODS "Build without the mod system (no live recompiler, mod loading or hot patching)" OFF)
++
+ # Define the library
+ add_library(librecomp STATIC
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/ai.cpp"
+@@ -19,14 +21,8 @@ add_library(librecomp STATIC
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/flash.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/heap.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/math_routines.cpp"
+-    "${CMAKE_CURRENT_SOURCE_DIR}/src/mods.cpp"
+-    "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_events.cpp"
+-    "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_hooks.cpp"
+-    "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_manifest.cpp"
+-    "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_config_api.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/overlays.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/pak.cpp"
+-    "${CMAKE_CURRENT_SOURCE_DIR}/src/patcher.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/pi.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/print.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp.cpp"
+@@ -38,6 +34,20 @@ add_library(librecomp STATIC
+     "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/o1heap/o1heap/o1heap.c"
+ )
+ 
++if (RECOMP_NO_MODS)
++    target_sources(librecomp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/mods_stub.cpp")
++    target_compile_definitions(librecomp PUBLIC RECOMP_NO_MODS)
++else()
++    target_sources(librecomp PRIVATE
++        "${CMAKE_CURRENT_SOURCE_DIR}/src/mods.cpp"
++        "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_events.cpp"
++        "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_hooks.cpp"
++        "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_manifest.cpp"
++        "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_config_api.cpp"
++        "${CMAKE_CURRENT_SOURCE_DIR}/src/patcher.cpp"
++    )
++endif()
++
+ target_include_directories(librecomp PUBLIC
+     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+diff --git a/librecomp/src/mods_stub.cpp b/librecomp/src/mods_stub.cpp
+new file mode 100644
+index 0000000..75144a8
+--- /dev/null
++++ b/librecomp/src/mods_stub.cpp
+@@ -0,0 +1,30 @@
++// Stand-ins for the mod system when it is compiled out (RECOMP_NO_MODS):
++// platforms with no dynamic loading, page protection or spare memory, such
++// as the 3DS. The recompiled patches still call recomp_trigger_event for
++// every declared event, so that has to exist and do nothing.
++#include <cstdint>
++#include <filesystem>
++#include <string>
++#include <vector>
++
++#include "librecomp/mods.hpp"
++#include "recomp.h"
++
++namespace recomp::mods {
++    void initialize_mods() {}
++    void scan_mods() {}
++    void close_mods() {}
++    void register_config_exports() {}
++    void register_hook_exports() {}
++    void set_latest_game_mode_id(const std::string&) {}
++    std::filesystem::path get_mods_directory() { return {}; }
++    std::vector<ModDetails> get_all_mod_details(const std::string&) { return {}; }
++}
++
++extern "C" {
++    uint32_t builtin_base_event_index = 0;
++
++    void recomp_trigger_event(uint8_t* rdram, recomp_context* ctx, uint32_t event_index) {
++        (void)rdram; (void)ctx; (void)event_index;
++    }
++}
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 8cda251..dd71c3d 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -23,7 +23,9 @@
+ #include "ultramodern/error_handling.hpp"
+ #include "librecomp/addresses.hpp"
+ #include "librecomp/mods.hpp"
++#ifndef RECOMP_NO_MODS
+ #include "recompiler/live_recompiler.h"
++#endif
+ 
+ #ifdef _WIN32
+ #    define WIN32_LEAN_AND_MEAN
+@@ -49,14 +51,18 @@ enum GameStatus {
+ // Mutexes
+ std::mutex game_roms_mutex;
+ std::mutex current_game_mutex;
++#ifndef RECOMP_NO_MODS
+ std::mutex mod_context_mutex{};
++#endif
+ 
+ // Global variables
+ std::filesystem::path config_path;
+ // Maps game_id to the game's entry.
+ std::unordered_map<std::u8string, recomp::GameEntry> game_roms {};
+ // The global mod context.
++#ifndef RECOMP_NO_MODS
+ std::unique_ptr<recomp::mods::ModContext> mod_context = std::make_unique<recomp::mods::ModContext>();
++#endif
+ // The project's version.
+ recomp::Version project_version;
+ // The current game's save type.
+@@ -84,13 +90,16 @@ bool recomp::register_game(const recomp::GameEntry& entry) {
+         std::lock_guard<std::mutex> lock(game_roms_mutex);
+         game_roms.insert({ entry.game_id, entry });
+     }
++#ifndef RECOMP_NO_MODS
+     if (!entry.mod_game_id.empty()) {
+         std::lock_guard<std::mutex> lock(mod_context_mutex);
+         mod_context->register_game(entry.mod_game_id);
+     }
++#endif
+     return true;
+ }
+ 
++#ifndef RECOMP_NO_MODS
+ void recomp::mods::initialize_mods() {
+     N64Recomp::live_recompiler_init();
+     std::filesystem::create_directories(config_path / mods_directory);
+@@ -98,17 +107,23 @@ void recomp::mods::initialize_mods() {
+     mod_context->set_mods_config_path(config_path / "mods.json");
+     mod_context->set_mod_config_directory(config_path / mod_config_directory);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ void recomp::mods::register_embedded_mod(const std::string &mod_id, std::span<const uint8_t> mod_bytes) {
+     std::lock_guard<std::mutex> lock(mod_context_mutex);
+     mod_context->register_embedded_mod(mod_id, mod_bytes);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ void recomp::mods::register_deprecated_mod(const std::string& mod_id, recomp::mods::DeprecationStatus deprecation_status, const Version& maximum_version) {
+     std::lock_guard<std::mutex> lock(mod_context_mutex);
+     mod_context->register_deprecated_mod(mod_id, deprecation_status, maximum_version);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ void recomp::mods::scan_mods() {
+     std::vector<recomp::mods::ModOpenErrorDetails> mod_open_errors;
+     {
+@@ -121,47 +136,62 @@ void recomp::mods::scan_mods() {
+ 
+     mod_context->load_mods_config();
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ void recomp::mods::close_mods() {
+     {
+         std::lock_guard mod_lock{ mod_context_mutex };
+         mod_context->close_mods();
+     }
+ }
++#endif
+ 
+ std::filesystem::path recomp::mods::get_mods_directory() {
+     return config_path / mods_directory;
+ }
+ 
++#ifndef RECOMP_NO_MODS
+ recomp::mods::ModContentTypeId recomp::mods::register_mod_content_type(const ModContentType& type) {
+     std::lock_guard mod_lock{ mod_context_mutex };
+     return mod_context->register_content_type(type);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ bool recomp::mods::register_mod_container_type(const std::string& extension, const std::vector<ModContentTypeId>& content_types, bool requires_manifest) {
+     std::lock_guard mod_lock{ mod_context_mutex };
+     return mod_context->register_container_type(extension, content_types, requires_manifest);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ std::string recomp::mods::get_mod_display_name(size_t mod_index) {
+     std::lock_guard mod_lock{ mod_context_mutex };
+     return mod_context->get_mod_display_name(mod_index);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ std::filesystem::path recomp::mods::get_mod_path(size_t mod_index) {
+     std::lock_guard mod_lock{ mod_context_mutex };
+     return mod_context->get_mod_path(mod_index);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ std::pair<std::string, std::string> recomp::mods::get_mod_import_info(size_t mod_index, size_t import_index) {
+     std::lock_guard mod_lock{ mod_context_mutex };
+     return mod_context->get_mod_import_info(mod_index, import_index);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ recomp::mods::DependencyStatus recomp::mods::is_dependency_met(size_t mod_index, const std::string& dependency_id) {
+     std::lock_guard mod_lock{ mod_context_mutex };
+     return mod_context->is_dependency_met(mod_index, dependency_id);
+ }
++#endif
+ 
+ bool check_hash(const std::vector<uint8_t>& rom_data, uint64_t expected_hash) {
+     uint64_t calculated_hash = XXH3_64bits(rom_data.data(), rom_data.size());
+@@ -562,35 +592,47 @@ void ultramodern::quit() {
+     current_game.reset();
+ }
+ 
++#ifndef RECOMP_NO_MODS
+ void recomp::mods::enable_mod(const std::string& mod_id, bool enabled) {
+     std::lock_guard lock { mod_context_mutex };
+     return mod_context->enable_mod(mod_id, enabled, true);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ bool recomp::mods::is_mod_enabled(const std::string& mod_id) {
+     std::lock_guard lock { mod_context_mutex };
+     return mod_context->is_mod_enabled(mod_id);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ bool recomp::mods::is_mod_auto_enabled(const std::string& mod_id) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->is_mod_auto_enabled(mod_id);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ bool recomp::mods::is_mod_deprecated(const std::string& mod_id, const recomp::Version& mod_version) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->is_mod_deprecated(mod_id, mod_version);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ recomp::mods::DeprecationStatus recomp::mods::get_mod_deprecation_status(const std::string& mod_id) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->get_mod_deprecation_status(mod_id);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ recomp::Version recomp::mods::get_mod_deprecation_version(const std::string& mod_id) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->get_mod_deprecation_version(mod_id);
+ }
++#endif
+ 
+ std::string recomp::mods::deprecation_status_to_message(DeprecationStatus deprecation_status) {
+     switch (deprecation_status) {
+@@ -605,100 +647,138 @@ std::string recomp::mods::deprecation_status_to_message(DeprecationStatus deprec
+     }
+ }
+ 
++#ifndef RECOMP_NO_MODS
+ const recomp::config::ConfigSchema &recomp::mods::get_mod_config_schema(const std::string &mod_id) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->get_mod_config_schema(mod_id);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ recomp::config::Config *recomp::mods::get_mod_config(const std::string &mod_id) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->get_mod_config(mod_id);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ const std::vector<char> &recomp::mods::get_mod_thumbnail(const std::string &mod_id) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->get_mod_thumbnail(mod_id);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ void recomp::mods::set_mod_config_value(size_t mod_index, const std::string &option_id, const recomp::config::ConfigValueVariant &value) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->set_mod_config_value(mod_index, option_id, value);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ void recomp::mods::set_mod_config_value(const std::string &mod_id, const std::string &option_id, const recomp::config::ConfigValueVariant &value) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->set_mod_config_value(mod_id, option_id, value);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ recomp::config::ConfigValueVariant recomp::mods::get_mod_config_value(size_t mod_index, const std::string &option_id) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->get_mod_config_value(mod_index, option_id);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ recomp::config::ConfigValueVariant recomp::mods::get_mod_config_value(const std::string &mod_id, const std::string &option_id) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->get_mod_config_value(mod_id, option_id);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ std::string recomp::mods::get_latest_game_mode_id() {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->get_latest_game_mode_id();
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ void recomp::mods::set_latest_game_mode_id(const std::string& game_mode_id) {
+     std::lock_guard lock{ mod_context_mutex };
+     mod_context->set_latest_game_mode_id(game_mode_id);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ std::string recomp::mods::get_mod_id_from_filename(const std::filesystem::path& mod_filename) {
+     std::lock_guard lock { mod_context_mutex };
+     return mod_context->get_mod_id_from_filename(mod_filename);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ std::filesystem::path recomp::mods::get_mod_filename(const std::string& mod_id) {
+     std::lock_guard lock { mod_context_mutex };
+     return mod_context->get_mod_filename(mod_id);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ size_t recomp::mods::get_mod_order_index(const std::string& mod_id) {
+     std::lock_guard lock { mod_context_mutex };
+     return mod_context->get_mod_order_index(mod_id);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ size_t recomp::mods::get_mod_order_index(size_t mod_index) {
+     std::lock_guard lock { mod_context_mutex };
+     return mod_context->get_mod_order_index(mod_index);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ std::optional<recomp::mods::ModDetails> recomp::mods::get_details_for_mod(const std::string& mod_id) {
+     std::lock_guard lock { mod_context_mutex };
+     return mod_context->get_details_for_mod(mod_id);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ std::vector<recomp::mods::ModDetails> recomp::mods::get_all_mod_details(const std::string& mod_game_id) {
+     std::lock_guard lock { mod_context_mutex };
+     return mod_context->get_all_mod_details(mod_game_id);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ size_t recomp::mods::game_mode_count(const std::string& mod_game_id, bool include_disabled) {
+     std::lock_guard lock { mod_context_mutex };
+     return mod_context->game_mode_count(mod_game_id, include_disabled);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ recomp::Version recomp::mods::get_mod_version(size_t mod_index) {
+     std::lock_guard lock { mod_context_mutex };
+     return mod_context->get_mod_version(mod_index);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ std::string recomp::mods::get_mod_id(size_t mod_index) {
+     std::lock_guard lock { mod_context_mutex };
+     return mod_context->get_mod_id(mod_index);
+ }
++#endif
+ 
++#ifndef RECOMP_NO_MODS
+ void recomp::mods::set_mod_index(const std::string &mod_game_id, const std::string &mod_id, size_t index) {
+     std::lock_guard lock{ mod_context_mutex };
+     return mod_context->set_mod_index(mod_game_id, mod_id, index);
+ }
++#endif
+ 
+ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+     game_status.wait(GameStatus::None);
+@@ -720,6 +800,7 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+                 }
+ 
+                 uint32_t mod_ram_used = 0;
++#ifndef RECOMP_NO_MODS
+                 if (!game_entry.mod_game_id.empty()) {
+                     std::vector<recomp::mods::ModLoadErrorDetails> mod_load_errors;
+                     {
+@@ -750,6 +831,7 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+                     }
+                 }
+ 
++#endif
+ #if defined(__3DS__)
+                 // No mods: the heap goes straight after the patches' RAM instead
+                 // of after a 16 MB mod region the console cannot afford.
+-- 
+2.53.0
+

@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(toolchain_test C CXX)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/Pica.cmake)
+add_executable(fenv_test main.cpp)
+target_link_libraries(fenv_test ctru m)
+add_3dsx(fenv_test TITLE "fenv test")

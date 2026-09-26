@@ -1,0 +1,434 @@
+From 2fd12aa6627c48777b56c35825af58c4a793bd8d Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 26 Sep 2026 17:54:40 -0500
+Subject: [PATCH 6/8] Create host threads through a HostThread wrapper
+
+Every host thread was a std::thread, which offers no stack size, priority
+or core. On the 3DS those matter: libctru threads default to a small
+stack, the game threads run recompiled code, and a New 3DS has a second
+core for the renderer and the audio microcode. HostThread wraps
+std::thread everywhere else and libctru's threadCreate on the 3DS, sized
+and placed by a HostThreadSpec per thread kind that a platform layer can
+override (set_host_thread_spec_callback). Thread names and runtime
+priority changes are no-ops there.
+---
+ librecomp/src/pi.cpp                          |   4 +-
+ librecomp/src/recomp.cpp                      |   4 +-
+ ultramodern/CMakeLists.txt                    |   1 +
+ .../include/ultramodern/host_thread.hpp       |  62 +++++++++
+ .../include/ultramodern/ultramodern.hpp       |   3 +-
+ ultramodern/src/events.cpp                    |  18 ++-
+ ultramodern/src/host_thread.cpp               | 131 ++++++++++++++++++
+ ultramodern/src/threads.cpp                   |  18 ++-
+ ultramodern/src/timer.cpp                     |   4 +-
+ 9 files changed, 229 insertions(+), 16 deletions(-)
+ create mode 100644 ultramodern/include/ultramodern/host_thread.hpp
+ create mode 100644 ultramodern/src/host_thread.cpp
+
+diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
+index 43509ba..3423ce4 100644
+--- a/librecomp/src/pi.cpp
++++ b/librecomp/src/pi.cpp
+@@ -86,7 +86,7 @@ void recomp::do_rom_pio(uint8_t* rdram, gpr ram_address, uint32_t physical_addr)
+ 
+ struct {
+     std::vector<char> save_buffer;
+-    std::thread saving_thread;
++    ultramodern::HostThread saving_thread;
+     std::filesystem::path save_file_path;
+     moodycamel::LightweightSemaphore write_sempahore;
+     // Used to tell the saving thread that a file swap is pending.
+@@ -247,7 +247,7 @@ void ultramodern::init_saving(RDRAM_ARG1) {
+ 
+     read_save_file();
+ 
+-    save_context.saving_thread = std::thread{saving_thread_func, PASS_RDRAM};
++    save_context.saving_thread = ultramodern::HostThread{ultramodern::HostThreadKind::Saving, [=]() { saving_thread_func(PASS_RDRAM1); }};
+ }
+ 
+ void ultramodern::change_save_file(const std::u8string& subfolder, const std::u8string& name) {
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index fcb2f06..8cda251 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -982,7 +982,7 @@ void recomp::start(const recomp::Configuration& cfg) {
+     recomp::mods::register_config_exports();
+     recomp::mods::register_hook_exports();
+ 
+-    std::thread game_thread{[](ultramodern::renderer::WindowHandle window_handle, uint8_t* rdram) {
++    ultramodern::HostThread game_thread{ultramodern::HostThreadKind::GameStart, [window_handle, rdram]() {
+         debug_printf("[Recomp] Starting\n");
+ 
+         ultramodern::set_native_thread_name("Game Start Thread");
+@@ -993,7 +993,7 @@ void recomp::start(const recomp::Configuration& cfg) {
+ 
+         // Loop until the game starts.
+         while (!wait_for_game_started(rdram, &context)) {}
+-    }, window_handle, rdram};
++    }};
+ 
+     parse_cli(cfg.argc, cfg.argv);
+ 
+diff --git a/ultramodern/CMakeLists.txt b/ultramodern/CMakeLists.txt
+index 5593172..70036a3 100644
+--- a/ultramodern/CMakeLists.txt
++++ b/ultramodern/CMakeLists.txt
+@@ -10,6 +10,7 @@ add_library(ultramodern STATIC
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/error_handling.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/events.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/extensions.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/host_thread.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/input.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/mesgqueue.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/misc_ultra.cpp"
+diff --git a/ultramodern/include/ultramodern/host_thread.hpp b/ultramodern/include/ultramodern/host_thread.hpp
+new file mode 100644
+index 0000000..6591c87
+--- /dev/null
++++ b/ultramodern/include/ultramodern/host_thread.hpp
+@@ -0,0 +1,62 @@
++#ifndef __ULTRAMODERN_HOST_THREAD_HPP__
++#define __ULTRAMODERN_HOST_THREAD_HPP__
++
++#include <cstddef>
++#include <functional>
++
++#ifdef __3DS__
++#include <3ds/thread.h>
++#else
++#include <thread>
++#endif
++
++// The host threads ultramodern and librecomp create, behind one type so a
++// platform without std::thread attributes (the 3DS: libctru threads need an
++// explicit stack size, priority and core) can size and place each kind.
++// Everywhere else it is a thin wrapper over std::thread.
++namespace ultramodern {
++    enum class HostThreadKind {
++        GameStart,  // runs preinit and the game's entrypoint
++        Game,       // one per osCreateThread
++        Gfx,        // renderer context + display lists
++        SpTask,     // non-graphics RSP tasks (audio)
++        Vi,         // 60 Hz pacing
++        Timer,
++        Cleaner,    // joins finished game threads
++        Saving,
++    };
++
++    struct HostThreadSpec {
++        size_t stack_size;
++        int priority;   // platform units (3DS: 0x18 high .. 0x3F low)
++        int core;       // platform units (3DS: 0, 1, 2, 3, -1 all, -2 default)
++    };
++
++    using host_thread_spec_callback_t = HostThreadSpec (*)(HostThreadKind kind);
++    // Optional: a platform layer can size and place the threads. Unused on std::thread platforms.
++    void set_host_thread_spec_callback(host_thread_spec_callback_t callback);
++    HostThreadSpec get_host_thread_spec(HostThreadKind kind);
++
++    class HostThread {
++    public:
++        HostThread() = default;
++        HostThread(HostThreadKind kind, std::function<void()> func);
++        HostThread(const HostThread&) = delete;
++        HostThread& operator=(const HostThread&) = delete;
++        HostThread(HostThread&& other) noexcept;
++        HostThread& operator=(HostThread&& other) noexcept;
++        ~HostThread();
++
++        bool joinable() const;
++        void join();
++        void detach();
++    private:
++#ifdef __3DS__
++        Thread thread_ = nullptr;
++#else
++        std::thread thread_;
++#endif
++    };
++}
++
++#endif
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index 46aea61..c78e9e8 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -2,6 +2,7 @@
+ #define __ultramodern_HPP__
+ 
+ #include <thread>
++#include "ultramodern/host_thread.hpp"
+ #include <cassert>
+ #include <stdexcept>
+ #include <span>
+@@ -22,7 +23,7 @@
+ #include "ultramodern/threads.hpp"
+ 
+ struct UltraThreadContext {
+-    std::thread host_thread;
++    ultramodern::HostThread host_thread;
+     moodycamel::LightweightSemaphore running;
+     moodycamel::LightweightSemaphore initialized;
+ };
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 17d7a47..a8221ce 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -56,7 +56,7 @@ struct ViState {
+ 
+ static struct {
+     struct {
+-        std::thread thread;
++        ultramodern::HostThread thread;
+         int cur_state;
+         int field;
+         ViState states[2];
+@@ -117,8 +117,8 @@ static struct {
+         }
+     } vi;
+     struct {
+-        std::thread gfx_thread;
+-        std::thread task_thread;
++        ultramodern::HostThread gfx_thread;
++        ultramodern::HostThread task_thread;
+         PTR(OSMesgQueue) mq = NULLPTR;
+         OSMesg msg = (OSMesg)0;
+     } sp;
+@@ -583,8 +583,14 @@ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle wind
+     moodycamel::LightweightSemaphore gfx_thread_ready;
+     moodycamel::LightweightSemaphore task_thread_ready;
+     events_context.rdram = rdram;
+-    events_context.sp.gfx_thread = std::thread{ gfx_thread_func, rdram, &gfx_thread_ready, window_handle };
+-    events_context.sp.task_thread = std::thread{ task_thread_func, rdram, &task_thread_ready };
++    moodycamel::LightweightSemaphore* gfx_ready_ptr = &gfx_thread_ready;
++    moodycamel::LightweightSemaphore* task_ready_ptr = &task_thread_ready;
++    events_context.sp.gfx_thread = ultramodern::HostThread{ultramodern::HostThreadKind::Gfx, [=]() {
++        gfx_thread_func(rdram, gfx_ready_ptr, window_handle);
++    }};
++    events_context.sp.task_thread = ultramodern::HostThread{ultramodern::HostThreadKind::SpTask, [=]() {
++        task_thread_func(rdram, task_ready_ptr);
++    }};
+ 
+     // Wait for the two sp threads to be ready before continuing to prevent the game from
+     // running before we're able to handle RSP tasks.
+@@ -619,7 +625,7 @@ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle wind
+         throw std::runtime_error("Failed to initialize the renderer");
+     }
+ 
+-    events_context.vi.thread = std::thread{ vi_thread_func };
++    events_context.vi.thread = ultramodern::HostThread{ultramodern::HostThreadKind::Vi, vi_thread_func};
+ }
+ 
+ void ultramodern::join_event_threads() {
+diff --git a/ultramodern/src/host_thread.cpp b/ultramodern/src/host_thread.cpp
+new file mode 100644
+index 0000000..9af1add
+--- /dev/null
++++ b/ultramodern/src/host_thread.cpp
+@@ -0,0 +1,131 @@
++#include <cstdio>
++#include <cstdlib>
++#include <utility>
++
++#include "ultramodern/host_thread.hpp"
++
++static ultramodern::host_thread_spec_callback_t spec_callback = nullptr;
++
++void ultramodern::set_host_thread_spec_callback(host_thread_spec_callback_t callback) {
++    spec_callback = callback;
++}
++
++ultramodern::HostThreadSpec ultramodern::get_host_thread_spec(HostThreadKind kind) {
++    if (spec_callback != nullptr) {
++        return spec_callback(kind);
++    }
++#ifdef __3DS__
++    // Defaults for a New 3DS: game code on the app core, the renderer and the
++    // audio microcode on core 2 (audio above the renderer: core 2 does not
++    // timeslice), the pacing threads above the game so their sleeps wake it.
++    switch (kind) {
++        case HostThreadKind::GameStart:
++        case HostThreadKind::Game:    return { 128 * 1024, 0x30, 0 };
++        case HostThreadKind::Gfx:     return { 256 * 1024, 0x2C, 2 };
++        case HostThreadKind::SpTask:  return { 64 * 1024,  0x24, 2 };
++        case HostThreadKind::Vi:
++        case HostThreadKind::Timer:   return { 32 * 1024,  0x28, 0 };
++        case HostThreadKind::Cleaner:
++        case HostThreadKind::Saving:
++        default:                      return { 32 * 1024,  0x30, 0 };
++    }
++#else
++    (void)kind;
++    return { 0, 0, 0 };
++#endif
++}
++
++#ifdef __3DS__
++
++static void host_thread_trampoline(void* arg) {
++    auto* func = static_cast<std::function<void()>*>(arg);
++    (*func)();
++    delete func;
++}
++
++ultramodern::HostThread::HostThread(HostThreadKind kind, std::function<void()> func) {
++    HostThreadSpec spec = get_host_thread_spec(kind);
++    auto* boxed = new std::function<void()>(std::move(func));
++    thread_ = threadCreate(host_thread_trampoline, boxed, spec.stack_size, spec.priority, spec.core, false);
++    if (thread_ == nullptr && spec.core != -2) {
++        // The requested core may be unavailable (a .3dsx under the Homebrew
++        // Launcher, or an Old 3DS): fall back to the default core.
++        fprintf(stderr, "[HostThread] core %d refused for kind %d, using the default core\n", spec.core, (int)kind);
++        thread_ = threadCreate(host_thread_trampoline, boxed, spec.stack_size, spec.priority, -2, false);
++    }
++    if (thread_ == nullptr) {
++        fprintf(stderr, "[HostThread] threadCreate failed for kind %d (stack %zu)\n", (int)kind, spec.stack_size);
++        delete boxed;
++        abort();
++    }
++}
++
++ultramodern::HostThread::HostThread(HostThread&& other) noexcept : thread_(other.thread_) {
++    other.thread_ = nullptr;
++}
++
++ultramodern::HostThread& ultramodern::HostThread::operator=(HostThread&& other) noexcept {
++    if (this != &other) {
++        if (thread_ != nullptr) {
++            join();
++        }
++        thread_ = other.thread_;
++        other.thread_ = nullptr;
++    }
++    return *this;
++}
++
++ultramodern::HostThread::~HostThread() {
++    // std::thread would terminate here; joining is the safer failure mode.
++    if (thread_ != nullptr) {
++        join();
++    }
++}
++
++bool ultramodern::HostThread::joinable() const {
++    return thread_ != nullptr;
++}
++
++void ultramodern::HostThread::join() {
++    if (thread_ != nullptr) {
++        threadJoin(thread_, UINT64_MAX);
++        threadFree(thread_);
++        thread_ = nullptr;
++    }
++}
++
++void ultramodern::HostThread::detach() {
++    if (thread_ != nullptr) {
++        threadDetach(thread_);
++        thread_ = nullptr;
++    }
++}
++
++#else
++
++ultramodern::HostThread::HostThread(HostThreadKind kind, std::function<void()> func) : thread_(std::move(func)) {
++    (void)kind;
++}
++
++ultramodern::HostThread::HostThread(HostThread&& other) noexcept : thread_(std::move(other.thread_)) {}
++
++ultramodern::HostThread& ultramodern::HostThread::operator=(HostThread&& other) noexcept {
++    thread_ = std::move(other.thread_);
++    return *this;
++}
++
++ultramodern::HostThread::~HostThread() = default;
++
++bool ultramodern::HostThread::joinable() const {
++    return thread_.joinable();
++}
++
++void ultramodern::HostThread::join() {
++    thread_.join();
++}
++
++void ultramodern::HostThread::detach() {
++    thread_.detach();
++}
++
++#endif
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index 6e3ed18..36c7b5a 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -137,6 +137,16 @@ void ultramodern::set_native_thread_priority(ThreadPriority pri) {
+     //         break;
+     // }
+ }
++#elif defined(__3DS__)
++// libctru threads have no names, and their priority and core are fixed at
++// creation by the HostThreadSpec, so both are no-ops here.
++void ultramodern::set_native_thread_name(const std::string& name) {
++    (void)name;
++}
++
++void ultramodern::set_native_thread_priority(ThreadPriority pri) {
++    (void)pri;
++}
+ #elif defined(__APPLE__)
+ void ultramodern::set_native_thread_name(const std::string& name) {
+     if (name.length() > 15) {
+@@ -263,7 +273,9 @@ extern "C" void osCreateThread(RDRAM_ARG PTR(OSThread) t_, OSId id, PTR(thread_f
+     // Pass the context as an argument to the thread function to ensure that it can't get cleared before the thread captures its value.
+     UltraThreadContext* context = new UltraThreadContext{};
+     t->context = context;
+-    context->host_thread = std::thread{_thread_func, PASS_RDRAM t_, entrypoint, arg, t->context};
++    context->host_thread = ultramodern::HostThread{ultramodern::HostThreadKind::Game, [=]() {
++        _thread_func(PASS_RDRAM t_, entrypoint, arg, context);
++    }};
+ 
+     // Wait until the thread is initialized to indicate that it's ready to be started.
+     context->initialized.wait();
+@@ -341,7 +353,7 @@ PTR(OSThread) ultramodern::this_thread() {
+     return thread_self;
+ }
+ 
+-static std::thread thread_cleaner_thread;
++static ultramodern::HostThread thread_cleaner_thread;
+ static moodycamel::BlockingConcurrentQueue<UltraThreadContext*> deleted_threads{};
+ extern std::atomic_bool exited;
+ 
+@@ -359,7 +371,7 @@ void thread_cleaner_func() {
+ }
+ 
+ void ultramodern::init_thread_cleanup() {
+-    thread_cleaner_thread = std::thread{thread_cleaner_func};
++    thread_cleaner_thread = ultramodern::HostThread{ultramodern::HostThreadKind::Cleaner, thread_cleaner_func};
+ }
+ 
+ void ultramodern::cleanup_thread(UltraThreadContext *cur_context) {
+diff --git a/ultramodern/src/timer.cpp b/ultramodern/src/timer.cpp
+index ee26c45..50e4684 100644
+--- a/ultramodern/src/timer.cpp
++++ b/ultramodern/src/timer.cpp
+@@ -40,7 +40,7 @@ struct RemoveTimerAction {
+ using Action = std::variant<AddTimerAction, RemoveTimerAction>;
+ 
+ struct {
+-    std::thread thread;
++    ultramodern::HostThread thread;
+     moodycamel::BlockingConcurrentQueue<Action> action_queue{};
+ } timer_context;
+ 
+@@ -141,7 +141,7 @@ void timer_thread(RDRAM_ARG1) {
+ }
+ 
+ void ultramodern::init_timers(RDRAM_ARG1) {
+-    timer_context.thread = std::thread{ timer_thread, PASS_RDRAM1 };
++    timer_context.thread = ultramodern::HostThread{ultramodern::HostThreadKind::Timer, [=]() { timer_thread(PASS_RDRAM1); }};
+     timer_context.thread.detach();
+ }
+ 
+-- 
+2.53.0
+

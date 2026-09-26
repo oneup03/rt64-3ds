@@ -1,0 +1,42 @@
+From 2320f888ae01c0fcdb42449b1d55409254b66029 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 26 Sep 2026 17:45:06 -0500
+Subject: [PATCH 1/8] Define WindowHandle for the 3DS
+
+The renderer context takes a WindowHandle and recomp::start compares it
+against a default-constructed one to decide whether to ask the gfx
+callbacks for a window. The 3DS has no window: give it an empty struct
+with a defaulted comparison so both compile.
+---
+ N64Recomp                                            | 2 +-
+ ultramodern/include/ultramodern/renderer_context.hpp | 7 +++++++
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/N64Recomp b/N64Recomp
+index 81213c1..e4928d1 160000
+--- a/N64Recomp
++++ b/N64Recomp
+@@ -1 +1 @@
+-Subproject commit 81213c1831fab2521a6a5459c67b63437d67e253
++Subproject commit e4928d1e8c92a9f061d7841c47cbb90e331bc9c8
+diff --git a/ultramodern/include/ultramodern/renderer_context.hpp b/ultramodern/include/ultramodern/renderer_context.hpp
+index d60c4ec..0a106fa 100644
+--- a/ultramodern/include/ultramodern/renderer_context.hpp
++++ b/ultramodern/include/ultramodern/renderer_context.hpp
+@@ -62,6 +62,13 @@ namespace ultramodern {
+             void* view;
+             auto operator<=>(const WindowHandle&) const = default;
+         };
++#elif defined(__3DS__)
++        // No windows on a 3DS; the renderer owns the screens. Kept as a struct so
++        // the value-compare in recomp::start ("was a handle provided?") still works.
++        struct WindowHandle {
++            int unused = 0;
++            auto operator<=>(const WindowHandle&) const = default;
++        };
+ #endif
+ 
+         enum class SetupResult {
+-- 
+2.53.0
+

@@ -1,0 +1,94 @@
+From 0b97ba68f56ae1989f92c19f15a2ec6b7995e149 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 26 Sep 2026 17:49:01 -0500
+Subject: [PATCH 5/8] Give moodycamel's semaphore a 3DS backend
+
+arm-none-eabi defines none of _WIN32, __MACH__ or __unix__, so the
+lightweight semaphore hit its #error. Back it with a kernel semaphore:
+svcWaitSynchronization already takes the timeout the timed wait needs,
+which libctru's LightSemaphore does not offer.
+---
+ .../concurrentqueue/lightweightsemaphore.h    | 60 +++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/thirdparty/concurrentqueue/lightweightsemaphore.h b/thirdparty/concurrentqueue/lightweightsemaphore.h
+index 41ba094..3be454d 100644
+--- a/thirdparty/concurrentqueue/lightweightsemaphore.h
++++ b/thirdparty/concurrentqueue/lightweightsemaphore.h
+@@ -24,6 +24,12 @@ extern "C" {
+ }
+ #elif defined(__MACH__)
+ #include <mach/mach.h>
++#elif defined(__3DS__)
++#include <3ds/types.h>
++#include <3ds/result.h>
++#include <3ds/svc.h>
++#include <cassert>
++#include <climits>
+ #elif defined(__unix__)
+ #include <semaphore.h>
+ 
+@@ -253,6 +259,60 @@ public:
+ 		}
+ 	}
+ };
++#elif defined(__3DS__)
++//---------------------------------------------------------
++// Semaphore (Nintendo 3DS, libctru kernel semaphore)
++//---------------------------------------------------------
++// A kernel semaphore rather than libctru's LightSemaphore: the light one has
++// no timed wait, and svcWaitSynchronization takes a timeout directly.
++class Semaphore
++{
++private:
++	Handle m_sema;
++	Semaphore(const Semaphore& other) = delete;
++	Semaphore& operator=(const Semaphore& other) = delete;
++
++public:
++	Semaphore(int initialCount = 0)
++	{
++		assert(initialCount >= 0);
++		Result rc = svcCreateSemaphore(&m_sema, initialCount, INT_MAX);
++		assert(R_SUCCEEDED(rc));
++		(void)rc;
++	}
++
++	~Semaphore()
++	{
++		svcCloseHandle(m_sema);
++	}
++
++	bool wait()
++	{
++		return R_SUCCEEDED(svcWaitSynchronization(m_sema, -1));
++	}
++
++	bool try_wait()
++	{
++		return R_SUCCEEDED(svcWaitSynchronization(m_sema, 0));
++	}
++
++	bool timed_wait(std::uint64_t usecs)
++	{
++		return R_SUCCEEDED(svcWaitSynchronization(m_sema, (s64)usecs * 1000));
++	}
++
++	void signal()
++	{
++		s32 count;
++		svcReleaseSemaphore(&count, m_sema, 1);
++	}
++
++	void signal(int count)
++	{
++		s32 prev;
++		svcReleaseSemaphore(&prev, m_sema, count);
++	}
++};
+ #else
+ #error Unsupported platform! (No semaphore wrapper available)
+ #endif
+-- 
+2.53.0
+

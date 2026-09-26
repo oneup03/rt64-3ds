@@ -1,0 +1,52 @@
+From be094dec6f20e1207d0995d6c2725060ad27beea Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 26 Sep 2026 17:45:06 -0500
+Subject: [PATCH 2/8] Allocate RDRAM with calloc on the 3DS
+
+The 4 GB PROT_NONE reservation with an RW window exists to turn wild
+guest accesses into faults. The 3DS has no mmap and 124 MB in total, so
+commit one zero-filled block of mem_size instead (zero-filled matters:
+the patches' .bss is NOLOAD and is never written by read_patch_data).
+---
+ librecomp/src/recomp.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 850689d..c6e9e7d 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -28,6 +28,8 @@
+ #ifdef _WIN32
+ #    define WIN32_LEAN_AND_MEAN
+ #    include <Windows.h>
++#elif defined(__3DS__)
++#    include <cstdlib>
+ #else
+ #    include <sys/mman.h>
+ #endif
+@@ -946,6 +948,12 @@ void recomp::start(const recomp::Configuration& cfg) {
+             VirtualFree(rdram, 0, MEM_RELEASE);
+         }
+     }
++#elif defined(__3DS__)
++    // No virtual memory tricks on the 3DS: one zero-filled block the size of
++    // the (reduced) RDRAM region. Wild accesses corrupt instead of faulting.
++    static_assert(allocation_size == mem_size, "the 3DS commits the whole RDRAM region");
++    rdram = reinterpret_cast<uint8_t*>(calloc(mem_size, 1));
++    alloc_failed = (rdram == nullptr);
+ #else
+     rdram = (uint8_t*)mmap(NULL, allocation_size, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+     alloc_failed = rdram == reinterpret_cast<uint8_t*>(MAP_FAILED);
+@@ -1001,6 +1009,9 @@ void recomp::start(const recomp::Configuration& cfg) {
+ #ifdef _WIN32
+     // VirtualFree returns zero on failure.
+     free_failed = (VirtualFree(rdram, 0, MEM_RELEASE) == 0);
++#elif defined(__3DS__)
++    free(rdram);
++    free_failed = false;
+ #else
+     // munmap returns -1 on failure.
+     free_failed = (munmap(rdram, allocation_size) == -1);
+-- 
+2.53.0
+
