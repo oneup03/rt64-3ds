@@ -1,4 +1,4 @@
-From ee8be1d72e2b2d294156cf22da1d7c6c0b705b62 Mon Sep 17 00:00:00 2001
+From 34cb7c908766c34c33ae05705f02a18110272e51 Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 18:16:21 -0500
 Subject: [PATCH 10/12] Export the recompiler include path under RECOMP_NO_MODS

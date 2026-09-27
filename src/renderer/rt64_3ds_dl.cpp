@@ -382,8 +382,9 @@ struct Interpreter::Impl {
             float cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
             float sign = (a.w * b.w * c.w) < 0.0f ? -1.0f : 1.0f;
             cross *= sign * vp.scale[0] * vp.scale[1];   // the viewport can mirror an axis
-            if ((geometry_mode & G_CULL_BACK) && cross > 0.0f) return;
-            if ((geometry_mode & G_CULL_FRONT) && cross < 0.0f) return;
+            // With y down, front faces wind clockwise on screen (cross > 0).
+            if ((geometry_mode & G_CULL_BACK) && cross < 0.0f) return;
+            if ((geometry_mode & G_CULL_FRONT) && cross > 0.0f) return;
         }
         const Tile& tl = tiles[texture.tile & 7];
         float uls = (float)(tl.uls >> 2), ult = (float)(tl.ult >> 2);

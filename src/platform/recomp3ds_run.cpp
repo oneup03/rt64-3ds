@@ -140,6 +140,14 @@ void update_gfx(void*) {
             quitting = true;
             fprintf(stderr, "recomp3ds: quitting\n");
             ultramodern::quit();
+            // The runtime joins its threads; a game thread stuck in a wait
+            // would keep the HOME Menu on "closing", so leave regardless.
+            threadCreate([](void*) {
+                svcSleepThread(1500000000ll);
+                fprintf(stderr, "recomp3ds: exit forced after 1.5 s\n");
+                fflush(stderr);
+                exit(0);
+            }, nullptr, 16 * 1024, 0x20, -2, true);
         }
     }
 }

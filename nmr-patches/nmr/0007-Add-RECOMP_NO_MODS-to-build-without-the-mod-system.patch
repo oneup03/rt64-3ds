@@ -1,4 +1,4 @@
-From b75cf7c895e26b8e4a67d0115ceff074eae1af98 Mon Sep 17 00:00:00 2001
+From bda8cc6b50bde7b111c77f77dbac7be7a384a887 Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 18:01:09 -0500
 Subject: [PATCH 07/12] Add RECOMP_NO_MODS to build without the mod system

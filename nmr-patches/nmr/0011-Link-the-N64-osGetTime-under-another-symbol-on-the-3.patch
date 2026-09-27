@@ -1,4 +1,4 @@
-From 1eb1ab5551d6d468f3cc3b7849574d82743888d1 Mon Sep 17 00:00:00 2001
+From b6537d4053d955b3d4ae685fff84f3a13f12df95 Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 18:21:24 -0500
 Subject: [PATCH 11/12] Link the N64 osGetTime under another symbol on the 3DS

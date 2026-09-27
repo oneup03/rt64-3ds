@@ -1,4 +1,4 @@
-From a6c77b2395352854255aa4cf8bfcd361e204530c Mon Sep 17 00:00:00 2001
+From c8c0dc237609f68d568ba902612de36a67cdda8d Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 18:04:13 -0500
 Subject: [PATCH 08/12] Make the hook-definition hash compile on 32-bit hosts

@@ -1,4 +1,4 @@
-From 1802884749c9627bad4a0308b3369cc5986bbb0e Mon Sep 17 00:00:00 2001
+From b981df562079460dacc13aafed0976c8859964c2 Mon Sep 17 00:00:00 2001
 From: oneup03 <oneup03@gmail.com>
 Date: Sat, 26 Sep 2026 17:49:01 -0500
 Subject: [PATCH 05/12] Give moodycamel's semaphore a 3DS backend
@@ -8,11 +8,11 @@ lightweight semaphore hit its #error. Back it with a kernel semaphore:
 svcWaitSynchronization already takes the timeout the timed wait needs,
 which libctru's LightSemaphore does not offer.
 ---
- .../concurrentqueue/lightweightsemaphore.h    | 113 ++++++++++++++++++
- 1 file changed, 113 insertions(+)
+ .../concurrentqueue/lightweightsemaphore.h    | 117 ++++++++++++++++++
+ 1 file changed, 117 insertions(+)
 
 diff --git a/thirdparty/concurrentqueue/lightweightsemaphore.h b/thirdparty/concurrentqueue/lightweightsemaphore.h
-index 41ba094..26a42c5 100644
+index 41ba094..98defab 100644
 --- a/thirdparty/concurrentqueue/lightweightsemaphore.h
 +++ b/thirdparty/concurrentqueue/lightweightsemaphore.h
 @@ -24,6 +24,16 @@ extern "C" {
@@ -32,7 +32,7 @@ index 41ba094..26a42c5 100644
  #elif defined(__unix__)
  #include <semaphore.h>
  
-@@ -253,6 +263,109 @@ public:
+@@ -253,6 +263,113 @@ public:
  		}
  	}
  };
@@ -81,6 +81,9 @@ index 41ba094..26a42c5 100644
 +
 +				u16 w;
 +				do w = __ldrexh(&m_waiters); while (__strexh(&m_waiters, w + 1));
++				// The MPCore reorders this store past the kernel's read of the
++				// count without a barrier (a lost wake-up on hardware).
++				__dmb();
 +				Result rc = remaining_ns < 0
 +					? syncArbitrateAddress(&m_count, ARBITRATION_WAIT_IF_LESS_THAN, 1)
 +					: syncArbitrateAddressWithTimeout(&m_count, ARBITRATION_WAIT_IF_LESS_THAN_TIMEOUT, 1, remaining_ns);
@@ -129,6 +132,7 @@ index 41ba094..26a42c5 100644
 +		do
 +			old = __ldrex(&m_count);
 +		while (__strex(&m_count, old + count));
++		__dmb();   // publish the count before looking for waiters
 +
 +		if (old <= 0 || __ldrexh(&m_waiters) > 0)
 +		{
