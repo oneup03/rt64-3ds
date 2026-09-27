@@ -19,7 +19,8 @@ constexpr uint32_t kMaxBytes = 8u * 1024 * 1024;
 struct Entry {
     C3D_Tex tex{};
     uint32_t potw = 0, poth = 0, bytes = 0;
-    uint32_t last_frame = 0;
+    uint32_t last_frame = 0, checked_frame = 0;
+    uint32_t content = 0;
 };
 
 inline uint8_t rb(const uint8_t* rdram, uint32_t a) { return rdram[(a & 0xFFFFFF) ^ 3]; }
@@ -81,25 +82,48 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
     uint32_t bpp_shift = d.siz;                          // bytes per row = width << siz >> 1
     uint32_t row_bytes = ((uint32_t)d.width << bpp_shift) >> 1;
     if (row_bytes == 0) row_bytes = 1;
-    // Content hash over the texel rows plus the description.
-    uint32_t h = 2166136261u;
-    for (uint32_t y = 0; y < d.height; y++) {
-        uint32_t a = d.addr + y * d.pitch;
-        uint32_t end = a + row_bytes;
-        for (uint32_t p = a & ~3u; p < end; p += 4) { h ^= rw(rdram_, p); h *= 16777619u; }
-    }
-    uint64_t key = ((uint64_t)h << 32) ^ ((uint64_t)d.addr * 2654435761u) ^ ((uint64_t)d.fmt << 3) ^ ((uint64_t)d.siz << 6) ^
+    // Key on where and how the texels are read; the content hash is checked
+    // once per frame per key so a texture the game rewrites in place is
+    // picked up without hashing every draw.
+    uint64_t key = ((uint64_t)d.addr * 2654435761u) ^ ((uint64_t)d.fmt << 3) ^ ((uint64_t)d.siz << 6) ^
                    ((uint64_t)d.width << 10) ^ ((uint64_t)d.height << 21) ^ ((uint64_t)d.tlut_hash << 40) ^ ((uint64_t)d.palette << 56) ^
                    ((uint64_t)d.pitch << 44) ^ ((uint64_t)d.nibble << 63);
+    auto content_hash = [&]() {
+        uint32_t h = 2166136261u;
+        for (uint32_t y = 0; y < d.height; y++) {
+            uint32_t a = d.addr + y * d.pitch;
+            uint32_t end = a + row_bytes;
+            // Every fourth word: enough to catch a rewritten texture cheaply.
+            for (uint32_t p = a & ~3u; p < end; p += 16) { h ^= rw(rdram_, p); h *= 16777619u; }
+            h ^= rw(rdram_, (end - 4) & ~3u); h *= 16777619u;
+        }
+        return h;
+    };
 
     auto it = impl_->map.find(key);
     if (it != impl_->map.end()) {
-        it->second.last_frame = impl_->frame;
-        b.tex = &it->second.tex;
-        b.uscale = 1.0f / (float)it->second.potw;
-        b.vscale = 1.0f / (float)it->second.poth;
-        return b;
+        Entry& e = it->second;
+        if (e.checked_frame != impl_->frame) {
+            e.checked_frame = impl_->frame;
+            uint32_t h = content_hash();
+            if (h != e.content) {
+                // Rewritten in place: retire the old texture and decode again.
+                impl_->retired[impl_->frame % 3].push_back(e.tex);
+                bytes_ -= e.bytes;
+                live_--;
+                impl_->map.erase(it);
+                it = impl_->map.end();
+            }
+        }
+        if (it != impl_->map.end()) {
+            e.last_frame = impl_->frame;
+            b.tex = &e.tex;
+            b.uscale = 1.0f / (float)e.potw;
+            b.vscale = 1.0f / (float)e.poth;
+            return b;
+        }
     }
+    uint32_t h = content_hash();
 
     // Decode.
     uint32_t potw = pot(d.width), poth = pot(d.height);
@@ -223,7 +247,7 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
     if (wide) swizzle32((uint32_t*)e.tex.data, impl_->stage32.data(), (int)potw, (int)poth);
     else swizzle16((uint16_t*)e.tex.data, impl_->stage16.data(), (int)potw, (int)poth);
     GSPGPU_FlushDataCache(e.tex.data, bytes);
-    e.potw = potw; e.poth = poth; e.bytes = bytes; e.last_frame = impl_->frame;
+    e.potw = potw; e.poth = poth; e.bytes = bytes; e.last_frame = impl_->frame; e.checked_frame = impl_->frame; e.content = h;
     uploads_++;
     live_++;
     bytes_ += bytes;

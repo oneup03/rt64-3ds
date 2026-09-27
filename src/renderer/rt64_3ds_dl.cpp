@@ -129,6 +129,8 @@ struct Interpreter::Impl {
     uint16_t tlut[256]{};
     uint32_t tlut_hash = 1;
     uint32_t tlut_frame_hash = 0, tlut_frame_index = 0;
+    uint32_t state_seq = 1;    // bumped by every command that changes draw state
+    uint32_t last_draw_seq = 0;
     int16_t rect_align[4]{};   // left/top/right/bottom offsets (extended)
     uint16_t rect_lorigin = 0x800, rect_rorigin = 0x800;
     uint8_t rect_aspect = 0;
@@ -291,7 +293,9 @@ struct Interpreter::Impl {
         if (w <= 0 || h <= 0 || w > 1024 || h > 1024) return;
         // A block load is one contiguous run whose rows are the tile's line;
         // a tile load copies rows out of a wider image in RDRAM.
-        uint32_t pitch = best->block ? tl.line * 8 : best->pitch;
+        // 32-bit texels are split across TMEM's two halves, so their line
+        // counts half the row.
+        uint32_t pitch = best->block ? tl.line * (tl.siz == 3 ? 16 : 8) : best->pitch;
         if (pitch == 0) pitch = best->pitch;
         d.valid = true;
         d.addr = best->addr + (tl.tmem - best->tmem) * 8;
@@ -354,9 +358,10 @@ struct Interpreter::Impl {
         DrawRecord* r = nullptr;
         if (!out->draws.empty()) {
             DrawRecord& last = out->draws.back();
-            if (last.kind == DrawRecord::Tris && last.first + last.count == out->verts.size() && same_state(last)) r = &last;
+            if (last.kind == DrawRecord::Tris && last.first + last.count == out->verts.size() && last_draw_seq == state_seq) r = &last;
         }
         if (r == nullptr) {
+            last_draw_seq = state_seq;
             out->draws.emplace_back();
             r = &out->draws.back();
             r->kind = DrawRecord::Tris;
@@ -405,27 +410,12 @@ struct Interpreter::Impl {
         return (float)(1 << (16 - s));
     }
 
-    bool same_state(const DrawRecord& r) const {
-        return r.cc_w0 == cc_w0 && r.cc_w1 == cc_w1 && r.othermode_h == othermode_h && r.othermode_l == othermode_l &&
-               r.geometry_mode == geometry_mode && memcmp(r.prim, prim, 4) == 0 && memcmp(r.env, env, 4) == 0 &&
-               memcmp(r.blend, blend, 4) == 0 && memcmp(r.fog, fog, 4) == 0 && r.prim_lod_frac == prim_lod_frac &&
-               memcmp(r.scissor, scissor, sizeof(scissor)) == 0 && r.proj_id == proj_id &&
-               tex_matches(r.tex[0], texture.tile & 7) && r.tex[1].valid == false;
-    }
-    bool tex_matches(const TexDesc& d, int t) const {
-        if (!d.valid) return !uses_texel(0);
-        TexDesc cur;
-        const_cast<Impl*>(this)->describe_tile(t, cur);
-        return cur.valid && cur.addr == d.addr && cur.fmt == d.fmt && cur.siz == d.siz && cur.width == d.width &&
-               cur.height == d.height && cur.pitch == d.pitch && cur.masks == d.masks && cur.maskt == d.maskt &&
-               cur.cms == d.cms && cur.cmt == d.cmt && cur.palette == d.palette && cur.tlut_hash == d.tlut_hash;
-    }
-
     // Rectangles are emitted in N64 pixels with w = 1.
     void emit_rect(float ulx, float uly, float lrx, float lry, bool textured, int tile, float s, float t, float dsdx, float dtdy, bool flip) {
         if (offscreen_target()) return;
         uint32_t cyc = (othermode_h >> 20) & 3;
         if (!textured && zimg != 0 && cimg == zimg) return;   // depth clear: the target is cleared per frame
+        state_seq++;
         out->draws.emplace_back();
         DrawRecord& r = out->draws.back();
         r.kind = textured ? DrawRecord::TexRect : DrawRecord::FillRect;
@@ -576,6 +566,13 @@ struct Interpreter::Impl {
             uint8_t op = w0 >> 24;
             stats->commands++;
             uint32_t next = pc + 8;
+            // Anything but drawing, vertex loads and list flow may change the
+            // state a draw snapshots (rects bump it themselves).
+            if (!(op == G_TRI1 || op == G_TRI2 || op == G_QUAD || op == G_VTX || op == G_MODIFYVTX || op == G_DL || op == G_ENDDL ||
+                  op == G_CULLDL || op == G_BRANCH_Z || op == G_NOOP || op == G_RDPPIPESYNC || op == G_RDPLOADSYNC || op == G_RDPTILESYNC ||
+                  op == G_MTX || op == G_POPMTX || op == G_MOVEMEM || op == G_RDPHALF_1 || op == G_RDPHALF_2)) {
+                state_seq++;
+            }
             switch (op) {
                 case G_NOOP: break;
                 case G_SPNOOP:
