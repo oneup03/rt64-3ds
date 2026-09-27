@@ -529,22 +529,86 @@ struct Interpreter::Impl {
             if ((geometry_mode & G_CULL_BACK) && cross > 0.0f) return;
             if ((geometry_mode & G_CULL_FRONT) && cross < 0.0f) return;
         }
-        Vtx3ds* o = out->verts.append(3);
-        if (o == nullptr) return;
         const Tile& tl = tiles[texture.tile & 7];
         const float uls = (float)(tl.uls >> 2), ult = (float)(tl.ult >> 2);
         const float ss = shift_scale(tl.shifts), st = shift_scale(tl.shiftt);
         const bool snap = r->tex[0].snapshot;
+        Vtx3ds tri[3];
         for (int k = 0; k < 3; k++) {
             const auto& v = k == 0 ? a : (k == 1 ? b : c);
-            o[k].x = v.x; o[k].y = v.y; o[k].z = v.z; o[k].w = v.w;
-            o[k].u = v.u * ss - uls;
-            o[k].v = v.v * st - ult;
-            if (snap) snapshot_uv(r->tex[0], o[k].u, o[k].v, o[k].u, o[k].v);
-            o[k].r = v.r; o[k].g = v.g; o[k].b = v.b; o[k].a = v.a;
+            Vtx3ds& t = tri[k];
+            t.x = v.x; t.y = v.y; t.z = v.z; t.w = v.w;
+            t.u = v.u * ss - uls;
+            t.v = v.v * st - ult;
+            if (snap) snapshot_uv(r->tex[0], t.u, t.v, t.u, t.v);
+            t.r = v.r; t.g = v.g; t.b = v.b; t.a = v.a;
         }
-        r->count += 3;
         stats->tris++;
+        if (!inside_guard_band(tri[0]) || !inside_guard_band(tri[1]) || !inside_guard_band(tri[2])) {
+            emit_clipped(*r, tri);
+            return;
+        }
+        Vtx3ds* o = out->verts.append(3);
+        if (o == nullptr) return;
+        o[0] = tri[0]; o[1] = tri[1]; o[2] = tri[2];
+        r->count += 3;
+    }
+
+    // The PICA rasterises in fixed point over a limited range: a triangle
+    // with a corner far off screen (or behind the eye) is dropped on the
+    // console, where emulators draw it. Such triangles are clipped here to a
+    // guard band around the screen and to the near plane (z' >= 0), in
+    // homogeneous screen space, then drawn as a fan.
+    static constexpr float kGuard = 1024.0f;   // pixels beyond the screen centre, each axis
+    static bool inside_guard_band(const Vtx3ds& v) {
+        if (!(v.w > 0.0f) || v.z < 0.0f) return false;
+        const float gx = kGuard * v.w;
+        const float dx = v.x - 160.0f * v.w, dy = v.y - 120.0f * v.w;
+        return dx <= gx && dx >= -gx && dy <= gx && dy >= -gx;
+    }
+    static Vtx3ds lerp_vtx(const Vtx3ds& p, const Vtx3ds& q, float t) {
+        Vtx3ds o;
+        o.x = p.x + (q.x - p.x) * t; o.y = p.y + (q.y - p.y) * t; o.z = p.z + (q.z - p.z) * t; o.w = p.w + (q.w - p.w) * t;
+        o.u = p.u + (q.u - p.u) * t; o.v = p.v + (q.v - p.v) * t;
+        auto mix = [t](uint8_t a, uint8_t b) { float f = (float)a + ((float)b - (float)a) * t; return (uint8_t)(f < 0.0f ? 0.0f : (f > 255.0f ? 255.0f : f + 0.5f)); };
+        o.r = mix(p.r, q.r); o.g = mix(p.g, q.g); o.b = mix(p.b, q.b); o.a = mix(p.a, q.a);
+        return o;
+    }
+    void emit_clipped(DrawRecord& r, const Vtx3ds* tri) {
+        Vtx3ds buf_a[12], buf_b[12];
+        int n = 3;
+        for (int i = 0; i < 3; i++) buf_a[i] = tri[i];
+        Vtx3ds* in = buf_a;
+        Vtx3ds* outp = buf_b;
+        // Planes as f(v) >= 0: near (z' >= 0), then the four guard band edges.
+        for (int plane = 0; plane < 5 && n >= 3; plane++) {
+            auto f = [plane](const Vtx3ds& v) {
+                const float g = kGuard * v.w;
+                switch (plane) {
+                    case 0: return v.z - 1e-5f * v.w;
+                    case 1: return g - (v.x - 160.0f * v.w);
+                    case 2: return g + (v.x - 160.0f * v.w);
+                    case 3: return g - (v.y - 120.0f * v.w);
+                    default: return g + (v.y - 120.0f * v.w);
+                }
+            };
+            int m = 0;
+            for (int i = 0; i < n && m < 11; i++) {
+                const Vtx3ds& p = in[i];
+                const Vtx3ds& q = in[(i + 1) % n];
+                const float fp = f(p), fq = f(q);
+                if (fp >= 0.0f) outp[m++] = p;
+                if ((fp >= 0.0f) != (fq >= 0.0f) && m < 11) outp[m++] = lerp_vtx(p, q, fp / (fp - fq));
+            }
+            n = m;
+            Vtx3ds* t = in; in = outp; outp = t;
+        }
+        if (n < 3) return;
+        stats->clipped++;
+        Vtx3ds* o = out->verts.append((uint32_t)(n - 2) * 3);
+        if (o == nullptr) return;
+        for (int i = 1; i + 1 < n; i++) { *o++ = in[0]; *o++ = in[i]; *o++ = in[i + 1]; }
+        r.count += (uint32_t)(n - 2) * 3;
     }
 
     // Texel coordinates relative to a tile that reads the stored frame ->

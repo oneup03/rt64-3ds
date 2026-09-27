@@ -212,8 +212,12 @@ void update_gfx_inner() {
                 svcSleepThread(300000000ll);      // the renderer finishes its frame and goes idle
                 recomp3ds::audio_shutdown();
                 gfxExit();                        // give the GPU and screens back to the system
-                __appExit();                      // libctru's service teardown (hid, fs, apt, srv)
-                svcExitProcess();
+                // libctru's service teardown; its aptExit asks NS to close the
+                // application, and NS then ends the process itself. Exiting
+                // on our own before that completes raced the HOME Menu.
+                __appExit();
+                svcSleepThread(3000000000ll);
+                svcExitProcess();                 // fallback if nothing ended us
             }, nullptr, 16 * 1024, 0x20, -2, true);
         }
     }

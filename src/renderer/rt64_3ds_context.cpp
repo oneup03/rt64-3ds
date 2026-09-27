@@ -90,8 +90,9 @@ public:
             g_stats.replay_ms = (float)acc_replay_ * 1000.0f / (float)SYSCLOCK_ARM11 / (float)(dl_count_ ? dl_count_ : 1);
             wait_ms_ = (float)acc_wait_ * 1000.0f / (float)SYSCLOCK_ARM11 / (float)(dl_count_ ? dl_count_ : 1);
             end_ms_ = (float)acc_end_ * 1000.0f / (float)SYSCLOCK_ARM11 / (float)(dl_count_ ? dl_count_ : 1);
+            depth_ms_ = (float)acc_depth_ * 1000.0f / (float)SYSCLOCK_ARM11 / (float)(dl_count_ ? dl_count_ : 1);
             dl_count_ = 0;
-            acc_gfx_ = acc_replay_ = acc_wait_ = acc_end_ = 0;
+            acc_gfx_ = acc_replay_ = acc_wait_ = acc_end_ = acc_depth_ = 0;
             window_start_ = t2;
             const rt64_3ds::InterpreterStats& is = interp_.stats();
             frames_in_window_ = (float)(frames_ - frames_at_window_ > 0 ? frames_ - frames_at_window_ : 1);
@@ -103,8 +104,8 @@ public:
                         (float)prof_[0] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[1] * 1000.0f / SYSCLOCK_ARM11 / fpw,
                         (float)prof_[2] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[4] * 1000.0f / SYSCLOCK_ARM11 / fpw,
                         (float)prof_[3] * 1000.0f / SYSCLOCK_ARM11 / fpw);
-                fprintf(stderr, "rt64-3ds: frame %u: %u draws %u verts, interp %.1f ms replay %.1f ms (gpu wait %.1f, end %.1f), tex live %u (%u KB) %u uploads/frame, linear free %u KB, unknown ops %u ex %u, tev fallbacks %d, cimg %06x w%u, snapshots %u\n",
-                        frames_, (unsigned)last_draws_, (unsigned)last_verts_, g_stats.gfx_ms, g_stats.replay_ms, wait_ms_, end_ms_, textures_.live(), textures_.bytes() / 1024, last_uploads_,
+                fprintf(stderr, "rt64-3ds: frame %u: %u draws %u verts, interp %.1f ms replay %.1f ms (gpu wait %.1f, end %.1f, depth %.1f), tex live %u (%u KB) %u uploads/frame, linear free %u KB, unknown ops %u ex %u, tev fallbacks %d, cimg %06x w%u, snapshots %u\n",
+                        frames_, (unsigned)last_draws_, (unsigned)last_verts_, g_stats.gfx_ms, g_stats.replay_ms, wait_ms_, end_ms_, depth_ms_, textures_.live(), textures_.bytes() / 1024, last_uploads_,
                         (unsigned)(linearSpaceFree() / 1024), is.unknown, is.ex_unknown, g_stats.combiner_fallbacks, frame_.color_image, frame_.color_width, snapshots_);
                 // Where the geometry lands: screen-space bounds of the last frame.
                 float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f, minz = 1e9f, maxz = -1e9f;
@@ -235,7 +236,11 @@ private:
         C3D_FrameBegin(0);
         acc_wait_ += svcGetSystemTick() - tb0;
         maybe_capture_framebuffer();
-        if (rt64_3ds::render_desc().depth_to_rdram && prev_depth_image_ != 0) depth_to_rdram(prev_depth_image_);
+        if (rt64_3ds::render_desc().depth_to_rdram && prev_depth_image_ != 0) {
+            u64 td = svcGetSystemTick();
+            depth_to_rdram(prev_depth_image_);
+            acc_depth_ += svcGetSystemTick() - td;
+        }
         g_progress.phase = 3;
         for (const rt64_3ds::DrawRecord& d : frame_.draws) {
             if (d.tex[0].valid && d.tex[0].snapshot) {
@@ -616,17 +621,18 @@ public:
         const uint32_t* db = (const uint32_t*)top_->frameBuf.depthBuf;
         if (db == nullptr || (zimg & 0xFFFFFF) + 320 * 240 * 2 > 16u * 1024 * 1024) return;
         uint8_t* z = rdram_ + (zimg & 0xFFFFFF);
-        for (int by = 0; by < 240; by += 4) {
-            for (int bx = 0; bx < 320; bx += 4) {
-                int sx = bx + 2 + 40, sy = by + 2;       // block centre on the 400-wide screen
+        constexpr int B = 8;   // block size: VRAM reads by the CPU are slow on the console
+        for (int by = 0; by < 240; by += B) {
+            for (int bx = 0; bx < 320; bx += B) {
+                int sx = bx + B / 2 + 40, sy = by + B / 2;   // block centre on the 400-wide screen
                 int r = sx, c = 239 - sy;
                 uint32_t tile = (uint32_t)(r >> 3) * 30 + (uint32_t)(c >> 3);
                 uint32_t mo = (c & 1) | ((r & 1) << 1) | ((c & 2) << 1) | ((r & 2) << 2) | ((c & 4) << 2) | ((r & 4) << 3);
                 uint32_t d = db[tile * 64 + mo] & 0xFFFFFF;
                 uint16_t v = n64_depth(1.0f - (float)d * (1.0f / 16777215.0f));
-                for (int y = by; y < by + 4; y++) {
+                for (int y = by; y < by + B; y++) {
                     uint8_t* row = z + (uint32_t)y * 640;
-                    for (int x = bx; x < bx + 4; x++) *(uint16_t*)(row + ((x * 2) ^ 2)) = v;
+                    for (int x = bx; x < bx + B; x++) *(uint16_t*)(row + ((x * 2) ^ 2)) = v;
                 }
             }
         }
@@ -653,8 +659,8 @@ public:
     size_t last_draws_ = 0, last_verts_ = 0;
     uint32_t last_uploads_ = 0;
     uint32_t dl_count_ = 0;
-    u64 window_start_ = 0, acc_gfx_ = 0, acc_replay_ = 0, acc_wait_ = 0, acc_end_ = 0;
-    float wait_ms_ = 0, end_ms_ = 0;
+    u64 window_start_ = 0, acc_gfx_ = 0, acc_replay_ = 0, acc_wait_ = 0, acc_end_ = 0, acc_depth_ = 0;
+    float wait_ms_ = 0, end_ms_ = 0, depth_ms_ = 0;
     u64 prof_[5] = {};
     bool prof_on_ = false;   // PROFILE.TXT: time the replay's sections (a syscall per sample)
     u64 tick() const { return prof_on_ ? svcGetSystemTick() : 0; }

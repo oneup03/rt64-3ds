@@ -1,0 +1,66 @@
+From 2f9405564b8080e96eedb236a9bfea89ef7d38d3 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sun, 27 Sep 2026 16:34:22 -0500
+Subject: [PATCH] Optional volatile RDRAM accesses (RECOMP_VOLATILE_RDRAM)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/recomp.h | 25 ++++++++++++++++++-------
+ 1 file changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/include/recomp.h b/include/recomp.h
+index 3f14575..fb05ac5 100644
+--- a/include/recomp.h
++++ b/include/recomp.h
+@@ -109,6 +109,17 @@ static inline void DDIVU(uint64_t a, uint64_t b, uint64_t* quot, uint64_t* rem)
+ 
+ typedef uint64_t gpr;
+ 
++// RDRAM is shared with host threads (DMA, the RSP task, the VI and the
++// renderer). With RECOMP_VOLATILE_RDRAM every access is a real memory
++// access, as each MIPS load and store is, so the rdram/ctx parameters can be
++// declared restrict (context registers kept in host registers) without the
++// compiler caching RDRAM across polling loops.
++#ifdef RECOMP_VOLATILE_RDRAM
++#define RECOMP_RDRAM_V volatile
++#else
++#define RECOMP_RDRAM_V
++#endif
++
+ #define SIGNED(val) \
+     ((int64_t)(val))
+ 
+@@ -119,23 +130,23 @@ typedef uint64_t gpr;
+     ((gpr)(int32_t)((a) - (b)))
+ 
+ #define MEM_W(offset, reg) \
+-    (*(int32_t*)(rdram + ((((reg) + (offset))) - 0xFFFFFFFF80000000)))
++    (*(RECOMP_RDRAM_V int32_t*)(rdram + ((((reg) + (offset))) - 0xFFFFFFFF80000000)))
+ 
+ #define MEM_H(offset, reg) \
+-    (*(int16_t*)(rdram + ((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000)))
++    (*(RECOMP_RDRAM_V int16_t*)(rdram + ((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000)))
+ 
+ #define MEM_B(offset, reg) \
+-    (*(int8_t*)(rdram + ((((reg) + (offset)) ^ 3) - 0xFFFFFFFF80000000)))
++    (*(RECOMP_RDRAM_V int8_t*)(rdram + ((((reg) + (offset)) ^ 3) - 0xFFFFFFFF80000000)))
+ 
+ #define MEM_HU(offset, reg) \
+-    (*(uint16_t*)(rdram + ((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000)))
++    (*(RECOMP_RDRAM_V uint16_t*)(rdram + ((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000)))
+ 
+ #define MEM_BU(offset, reg) \
+-    (*(uint8_t*)(rdram + ((((reg) + (offset)) ^ 3) - 0xFFFFFFFF80000000)))
++    (*(RECOMP_RDRAM_V uint8_t*)(rdram + ((((reg) + (offset)) ^ 3) - 0xFFFFFFFF80000000)))
+ 
+ #define SD(val, offset, reg) { \
+-    *(uint32_t*)(rdram + ((((reg) + (offset) + 4)) - 0xFFFFFFFF80000000)) = (uint32_t)((gpr)(val) >> 0); \
+-    *(uint32_t*)(rdram + ((((reg) + (offset) + 0)) - 0xFFFFFFFF80000000)) = (uint32_t)((gpr)(val) >> 32); \
++    *(RECOMP_RDRAM_V uint32_t*)(rdram + ((((reg) + (offset) + 4)) - 0xFFFFFFFF80000000)) = (uint32_t)((gpr)(val) >> 0); \
++    *(RECOMP_RDRAM_V uint32_t*)(rdram + ((((reg) + (offset) + 0)) - 0xFFFFFFFF80000000)) = (uint32_t)((gpr)(val) >> 32); \
+ }
+ 
+ static inline uint64_t load_doubleword(uint8_t* rdram, gpr reg, gpr offset) {
+-- 
+2.53.0
+

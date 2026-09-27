@@ -16,7 +16,7 @@ struct InterpreterStats {
     uint32_t tex_unresolved = 0;   // draws that wanted a texture no load covered
     uint32_t snapshots = 0;        // frames that copied the screen
     uint32_t op_hist[256] = {};    // commands run per opcode
-    uint32_t mtx_loads = 0, vtx_loaded = 0, draws_merged = 0, probes = 0;
+    uint32_t mtx_loads = 0, vtx_loaded = 0, draws_merged = 0, probes = 0, clipped = 0;
 };
 
 class Interpreter {
