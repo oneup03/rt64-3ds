@@ -167,8 +167,9 @@ void plan_tev(const DrawRecord& d, TevPlan& plan) {
     k.primlod = pl | (pl << 8) | (pl << 16) | (pl << 24);
 
     uint32_t cyc = (d.othermode_h >> 20) & 3;
-    if (d.kind == DrawRecord::FillRect || cyc == 3) {
-        // Fill: the fill colour (parked in prim).
+    if (cyc == 3) {
+        // Fill mode: the fill colour (parked in prim). Rectangles in 1- and
+        // 2-cycle mode go through the combiner like triangles.
         TevStage& st = plan.stage[plan.stages++];
         Op rgb = { GPU_REPLACE, { S_PRIM, S_PRIM, S_PRIM }, 1 }, a = { GPU_REPLACE, { S_PRIM_A, S_PRIM_A, S_PRIM_A }, 1 };
         build_stage(st, &rgb, &a, k, plan.fallbacks);
@@ -223,6 +224,39 @@ void plan_tev(const DrawRecord& d, TevPlan& plan) {
         TevStage& st = plan.stage[plan.stages++];
         Op rgb = { GPU_REPLACE, { S_SHADE, S_SHADE, S_SHADE }, 1 }, a = { GPU_REPLACE, { S_SHADE_A, S_SHADE_A, S_SHADE_A }, 1 };
         build_stage(st, &rgb, &a, k, plan.fallbacks);
+    }
+
+    // Blend factor: the PICA blends by the fragment's alpha, the blender
+    // may use the fog colour's alpha (DK64's water and glass) or the shade
+    // alpha instead. Put that factor in the output alpha when nothing
+    // compares the combiner's alpha.
+    const uint32_t l = d.othermode_l;
+    const bool alpha_compared = (l & 3) != 0 || (l & 0x2000) != 0;
+    if ((l & 0x4000) && !alpha_compared && plan.stages < 6) {
+        auto sel = [&](int cy, int shift) { return (l >> (cy == 0 ? shift + 2 : shift)) & 3; };   // cycle 0 fields sit 2 bits higher
+        auto is_blend_in_mem = [&](int cy) { return sel(cy, 28) == 0 && sel(cy, 20) == 1 && sel(cy, 16) == 0; };   // IN*A + MEM*(1-A)
+        auto is_pass = [&](int cy) { return sel(cy, 28) == 0 && sel(cy, 24) == 3 && sel(cy, 20) == 0 && sel(cy, 16) == 2; };  // IN*0 + IN*1
+        int src = -1;              // 0 fog alpha, 1 combiner alpha * fog alpha, 2 shade alpha
+        int last = (cyc == 1) ? 1 : 0;
+        if (is_blend_in_mem(last)) {
+            uint32_t a = sel(last, 24);
+            bool first_pass = (cyc != 1) || is_pass(0);
+            bool first_in_a = (cyc == 1) && is_blend_in_mem(0) && sel(0, 24) == 0;
+            if (a == 1 && first_pass) src = 0;
+            else if (a == 1 && first_in_a) src = 1;
+            else if (a == 2 && first_pass) src = 2;
+        }
+        if (src >= 0) {
+            TevStage& st = plan.stage[plan.stages++];
+            Op rgb = { GPU_REPLACE, { S_COMBINED, S_COMBINED, S_COMBINED }, 1 };
+            Op a;
+            if (src == 0) a = { GPU_REPLACE, { S_PRIM_A, S_PRIM_A, S_PRIM_A }, 1 };
+            else if (src == 1) a = { GPU_MODULATE, { S_COMBINED_A, S_PRIM_A, S_PRIM_A }, 2 };
+            else a = { GPU_REPLACE, { S_SHADE_A, S_SHADE_A, S_SHADE_A }, 1 };
+            Consts kf = k;   // the fog colour rides in the stage constant
+            kf.prim = (uint32_t)d.fog[0] | ((uint32_t)d.fog[1] << 8) | ((uint32_t)d.fog[2] << 16) | ((uint32_t)d.fog[3] << 24);
+            build_stage(st, &rgb, &a, kf, plan.fallbacks);
+        }
     }
 }
 

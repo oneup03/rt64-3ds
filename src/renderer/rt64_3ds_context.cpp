@@ -136,6 +136,7 @@ private:
         u_xform_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "xform");
         u_stereo_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "stereo");
         u_uvscale_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "uvscale");
+        u_uv1_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "uv1");
 
         C3D_AttrInfo* ai = C3D_GetAttrInfo();
         AttrInfo_Init(ai);
@@ -214,6 +215,7 @@ private:
         u64 tb0 = svcGetSystemTick();
         C3D_FrameBegin(0);
         acc_wait_ += svcGetSystemTick() - tb0;
+        maybe_capture_framebuffer();
         g_progress.phase = 3;
         for (const rt64_3ds::DrawRecord& d : frame_.draws) {
             if (d.tex[0].valid && d.tex[0].snapshot) {
@@ -247,6 +249,7 @@ private:
         last_cc_[0] = last_cc_[1] = 0xFFFFFFFFu;
         last_misc_ = ~0ull;
         last_us_ = last_vs_ = -1.0f;
+        last_uv1_[0] = -1.0f;
         last_plan_.stages = -1;
 
         // The interpreter wrote the frame's vertices straight into this
@@ -285,6 +288,7 @@ private:
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &proj_);
                 C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, 0.0f, 0.0f, 0.0f, 0.0f);
                 C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uvscale_, last_us_, last_vs_, 0.0f, 0.0f);
+                C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uv1_, last_uv1_[0], last_uv1_[1], last_uv1_[2], last_uv1_[3]);
                 bi = C3D_GetBufInfo();
                 BufInfo_Init(bi);
                 BufInfo_Add(bi, vb, sizeof(GpuVertex), 3, 0x210);
@@ -305,7 +309,7 @@ private:
     void apply_state(const rt64_3ds::DrawRecord& d, int& fallbacks) {
         u64 tp0 = tick();
         // Textures.
-        float us = 1.0f, vs = 1.0f;
+        float us = 1.0f, vs = 1.0f, us1 = 1.0f, vs1 = 1.0f;
         for (int t = 0; t < 2; t++) {
             bool bound = false;
             if (d.tex[t].valid && d.tex[t].snapshot && snapshot_.data != nullptr) {
@@ -314,6 +318,7 @@ private:
                     last_tex_[t] = &snapshot_; last_tex_param_[t] = 0xFFFFFFFFu;
                 }
                 if (t == 0) { us = 1.0f / 256.0f; vs = 1.0f / 512.0f; }
+                else { us1 = 1.0f / 256.0f; vs1 = 1.0f / 512.0f; }
                 bound = true;
             }
             else if (d.tex[t].valid) {
@@ -331,6 +336,7 @@ private:
                         last_tex_[t] = b.tex; last_tex_param_[t] = param;
                     }
                     if (t == 0) { us = b.uscale; vs = b.vscale; }
+                    else { us1 = b.uscale; vs1 = b.vscale; }
                     bound = true;
                 }
             }
@@ -343,6 +349,16 @@ private:
             C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uvscale_, us, vs, 0.0f, 0.0f);
             last_us_ = us; last_vs_ = vs;
         }
+        {
+            // TEXEL1: its own tile's shift and origin, its own texture size.
+            float uv1[4];
+            if (d.tex[1].valid && !d.tex[1].snapshot) { uv1[0] = d.uv1[0] * us1; uv1[1] = d.uv1[1] * vs1; uv1[2] = d.uv1[2] * us1; uv1[3] = d.uv1[3] * vs1; }
+            else { uv1[0] = us; uv1[1] = vs; uv1[2] = 0.0f; uv1[3] = 0.0f; }
+            if (memcmp(uv1, last_uv1_, sizeof(uv1)) != 0) {
+                C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uv1_, uv1[0], uv1[1], uv1[2], uv1[3]);
+                memcpy(last_uv1_, uv1, sizeof(uv1));
+            }
+        }
         u64 tp1 = tick();
         prof_[0] += tp1 - tp0;
 
@@ -353,12 +369,16 @@ private:
             d.prim_lod_frac != last_plf_ || d.kind != last_kind_ || d.geometry_mode != last_gm_) {
             // Plans are cached: the same combiner/mode/colour set recurs across
             // draws and frames.
-            uint64_t pk = ((uint64_t)d.cc_w0 << 40) ^ ((uint64_t)d.cc_w1 << 8) ^ ((uint64_t)d.othermode_h << 20) ^ (uint64_t)d.othermode_l ^
-                          ((uint64_t)(*(const uint32_t*)d.prim) << 32) ^ ((uint64_t)(*(const uint32_t*)d.env) << 16) ^ ((uint64_t)(*(const uint32_t*)d.fog) << 48) ^
-                          ((uint64_t)d.prim_lod_frac << 56) ^ ((uint64_t)d.kind << 60) ^ ((uint64_t)(d.geometry_mode & 0x10000) << 30);
-            uint32_t slot = (uint32_t)((pk ^ (pk >> 29) ^ (pk >> 47)) & (kPlanCache - 1));
+            // Exact key: every input plan_tev reads.
+            PlanKey pk{};
+            pk.w[0] = d.cc_w0; pk.w[1] = d.cc_w1; pk.w[2] = d.othermode_h; pk.w[3] = d.othermode_l;
+            memcpy(&pk.w[4], d.prim, 4); memcpy(&pk.w[5], d.env, 4); memcpy(&pk.w[6], d.fog, 4);
+            pk.w[7] = (uint32_t)d.prim_lod_frac | ((uint32_t)d.kind << 8) | (d.geometry_mode & 0x10000);
+            uint32_t h = 2166136261u;
+            for (uint32_t v : pk.w) { h ^= v; h *= 16777619u; h ^= h >> 15; }
+            uint32_t slot = h & (kPlanCache - 1);
             const rt64_3ds::TevPlan* plan;
-            if (plan_keys_[slot] == pk && plan_valid_[slot]) {
+            if (plan_valid_[slot] && memcmp(&plan_keys_[slot], &pk, sizeof(pk)) == 0) {
                 plan = &plan_cache_[slot];
             }
             else {
@@ -389,7 +409,9 @@ private:
         bool zupd = (l & 0x20) != 0 && d.kind == rt64_3ds::DrawRecord::Tris;
         uint32_t zmode = (l >> 10) & 3;
         C3D_DepthTest(zcmp, zcmp ? GPU_GEQUAL : GPU_ALWAYS, zupd ? GPU_WRITE_ALL : GPU_WRITE_COLOR);
-        C3D_DepthMap(true, -1.0f, zmode == 3 ? -0.0004f : 0.0f);
+        // Decals sit on coplanar surfaces: nudge them toward the viewer
+        // (reversed depth: nearer is larger).
+        C3D_DepthMap(true, -1.0f, zmode == 3 ? 0.0004f : 0.0f);
 
         // Blending: force-blend with memory colour by source alpha.
         uint32_t cyc = (d.othermode_h >> 20) & 3;
@@ -441,12 +463,50 @@ public:
         }
         if (want < 0 || (int)frames_ != want) return;
         want = -1;
-        FILE* f = fopen("sdmc:/3ds/DK64/gfx_task.bin", "wb");
-        if (!f) return;
-        fwrite(task, 1, sizeof(OSTask), f);
-        for (uint32_t off = 0; off < 16u * 1024 * 1024; off += 65536) fwrite(rdram_ + off, 1, 65536, f);
-        fclose(f);
+        // Snapshot RDRAM and the task now; the slow SD write happens after
+        // this frame is drawn (the game thread keeps changing RDRAM).
+        capture_copy_ = (uint8_t*)malloc(16u * 1024 * 1024);
+        if (capture_copy_ == nullptr) { fprintf(stderr, "rt64-3ds: no memory for an RDRAM snapshot\n"); return; }
+        memcpy(capture_copy_, rdram_, 16u * 1024 * 1024);
+        capture_task_ = *task;
         fprintf(stderr, "rt64-3ds: captured gfx task of frame %u\n", frames_);
+        fb_capture_pending_ = true;   // the next frame begin saves what this task rendered
+    }
+
+    // After C3D_FrameBegin the top target still holds the previous frame:
+    // untile it into linear memory and save it as gfx_frame.ppm (400x240),
+    // to compare with the host reference render of gfx_task.bin.
+    void maybe_capture_framebuffer() {
+        if (!fb_capture_pending_) return;
+        fb_capture_pending_ = false;
+        if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_task.bin", "wb")) {
+            fwrite(&capture_task_, 1, sizeof(OSTask), f);
+            for (uint32_t off = 0; off < 16u * 1024 * 1024; off += 65536) fwrite(capture_copy_ + off, 1, 65536, f);
+            fclose(f);
+        }
+        free(capture_copy_);
+        capture_copy_ = nullptr;
+        // Read the tiled target straight from VRAM (the CPU can read it; the
+        // emulator flushes its cached copy on such reads): 8x8 tiles, 30 per
+        // tile row, Morton order inside a tile.
+        const uint32_t* lin = (const uint32_t*)top_->frameBuf.colorBuf;
+        if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_frame.ppm", "wb")) {
+            // The target is 240 wide and 400 tall (rotated): written as is;
+            // the host rotates it to the 400x240 screen.
+            fprintf(f, "P6\n240 400\n255\n");
+            static uint8_t row[240 * 3];
+            for (int r = 0; r < 400; r++) {
+                for (int c = 0; c < 240; c++) {
+                    uint32_t tile = (uint32_t)(r >> 3) * 30 + (uint32_t)(c >> 3);
+                    uint32_t m = (c & 1) | ((r & 1) << 1) | ((c & 2) << 1) | ((r & 2) << 2) | ((c & 4) << 2) | ((r & 4) << 3);
+                    uint32_t p = lin[tile * 64 + m];
+                    row[c * 3 + 0] = (uint8_t)(p >> 24); row[c * 3 + 1] = (uint8_t)(p >> 16); row[c * 3 + 2] = (uint8_t)(p >> 8);
+                }
+                fwrite(row, 1, sizeof(row), f);
+            }
+            fclose(f);
+        }
+        fprintf(stderr, "rt64-3ds: captured gfx frame\n");
     }
 
     static void describe_draw(uint32_t i, const rt64_3ds::DrawRecord& d) {
@@ -476,6 +536,9 @@ public:
     rt64_3ds::FrameRecord frame_;
     bool ok_ = false;
     C3D_RenderTarget* top_ = nullptr;
+    bool fb_capture_pending_ = false;
+    uint8_t* capture_copy_ = nullptr;
+    OSTask capture_task_{};
     C3D_Tex white_{};
     C3D_Tex snapshot_{};
     uint32_t snapshots_ = 0;
@@ -483,7 +546,8 @@ public:
     uint32_t debug_from_ = 0, debug_count_ = 0, debug_step_ = 1;
     DVLB_s* dvlb_ = nullptr;
     shaderProgram_s prog_{};
-    int u_xform_ = -1, u_stereo_ = -1, u_uvscale_ = -1;
+    int u_xform_ = -1, u_stereo_ = -1, u_uvscale_ = -1, u_uv1_ = -1;
+    float last_uv1_[4] = { -1.0f, -1.0f, -1.0f, -1.0f };
     C3D_Mtx proj_{};
     GpuVertex* vbo_[2] = { nullptr, nullptr };
     int vbo_idx_ = 0;
@@ -504,7 +568,8 @@ public:
     rt64_3ds::TevPlan last_plan_{};
     static constexpr uint32_t kPlanCache = 256;
     rt64_3ds::TevPlan plan_cache_[kPlanCache]{};
-    uint64_t plan_keys_[kPlanCache]{};
+    struct PlanKey { uint32_t w[8]; };
+    PlanKey plan_keys_[kPlanCache]{};
     bool plan_valid_[kPlanCache]{};
     uint64_t last_misc_ = ~0ull;
     float last_us_ = -1.0f, last_vs_ = -1.0f;

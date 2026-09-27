@@ -5,6 +5,7 @@
 #include "rt64_3ds_dl.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 
@@ -71,6 +72,7 @@ struct TmemLoad {
     bool block = false;      // LOADBLOCK: texels contiguous, rows are the tile's line
     uint32_t seq = 0;        // load order: a later load overwrites the TMEM range
     uint8_t nibble = 0;      // 4-bit tile loads that start on an odd texel
+    uint16_t dxt = 0;        // LOADBLOCK row step (1.11 per 64-bit word)
 };
 
 struct Light { float dir[3]; uint8_t col[3]; };
@@ -233,7 +235,9 @@ struct Interpreter::Impl {
         ldir_dirty = false;
     }
 
+    uint32_t last_vtx_addr = 0;
     void load_vertices(uint32_t addr, int n, int v0) {
+        last_vtx_addr = addr;
         update_mvp();
         const bool lit = (geometry_mode & G_LIGHTING) != 0;
         const bool texgen = (geometry_mode & G_TEXTURE_GEN) != 0;
@@ -340,10 +344,14 @@ struct Interpreter::Impl {
             }
             return;
         }
-        int w = ((tl.lrs >> 2) - (tl.uls >> 2)) + 1;
-        int h = ((tl.lrt >> 2) - (tl.ult >> 2)) + 1;
-        if (tl.masks != 0 && w > (1 << tl.masks)) w = 1 << tl.masks;
-        if (tl.maskt != 0 && h > (1 << tl.maskt)) h = 1 << tl.maskt;
+        // A masked axis repeats with the mask's period whatever the tile
+        // size (scrolling tiles set an upper bound below the lower one);
+        // with clamping on, a smaller tile clamps inside that period.
+        int tw = ((tl.lrs >> 2) - (tl.uls >> 2)) + 1;
+        int th = ((tl.lrt >> 2) - (tl.ult >> 2)) + 1;
+        int w = tw, h = th;
+        if (tl.masks != 0) { int m = 1 << tl.masks; w = ((tl.cms & 2) && tw > 0 && tw < m) ? tw : m; }
+        if (tl.maskt != 0) { int m = 1 << tl.maskt; h = ((tl.cmt & 2) && th > 0 && th < m) ? th : m; }
         if (w <= 0 || h <= 0 || w > 1024 || h > 1024) return;
         // A block load is one contiguous run whose rows are the tile's line;
         // a tile load copies rows out of a wider image in RDRAM.
@@ -362,6 +370,9 @@ struct Interpreter::Impl {
         d.masks = tl.masks; d.maskt = tl.maskt; d.cms = tl.cms; d.cmt = tl.cmt;
         d.palette = tl.palette;
         d.nibble = (tl.siz == 0) ? best->nibble : 0;
+        d.block = best->block;
+        d.dxt = best->dxt;
+        d.load_word = (uint16_t)(tl.tmem - best->tmem);
         d.tlut_mode = (othermode_h >> 14) & 3;
         d.tlut_hash = (tl.fmt == 2) ? tlut_hash : 0;
         d.tlut_index = 0;
@@ -377,6 +388,16 @@ struct Interpreter::Impl {
         d.bilerp = ((othermode_h >> 12) & 3) != 0;
     }
 
+    // TEXEL1's coordinates relative to TEXEL0's (tile t0 and the next one).
+    void set_uv1(DrawRecord& r, int t0) const {
+        const Tile& a = tiles[t0 & 7];
+        const Tile& b = tiles[(t0 + 1) & 7];
+        float k_u = shift_scale(b.shifts) / shift_scale(a.shifts), k_v = shift_scale(b.shiftt) / shift_scale(a.shiftt);
+        r.uv1[0] = k_u; r.uv1[1] = k_v;
+        r.uv1[2] = (float)(a.uls >> 2) * k_u - (float)(b.uls >> 2);
+        r.uv1[3] = (float)(a.ult >> 2) * k_v - (float)(b.ult >> 2);
+    }
+
     void snapshot(DrawRecord& r) {
         r.cc_w0 = cc_w0; r.cc_w1 = cc_w1;
         r.othermode_h = othermode_h; r.othermode_l = othermode_l;
@@ -386,6 +407,8 @@ struct Interpreter::Impl {
         memcpy(r.scissor, scissor, sizeof(scissor));
         r.proj_id = proj_id;
         r.perspective = proj.m[2][3] != 0.0f || proj.m[3][3] == 0.0f;
+        r.dbg_vtx = last_vtx_addr;
+        set_uv1(r, texture.tile);
         r.dbg_vp[0] = vp.scale[0]; r.dbg_vp[1] = vp.scale[1]; r.dbg_vp[2] = vp.trans[0]; r.dbg_vp[3] = vp.trans[1];
         r.dbg_proj[0] = proj.m[1][1]; r.dbg_proj[1] = proj.m[3][1]; r.dbg_proj[2] = proj.m[2][3]; r.dbg_proj[3] = proj.m[3][3];
     }
@@ -500,13 +523,15 @@ struct Interpreter::Impl {
         if (!a.valid) return true;
         return a.addr == b.addr && a.pitch == b.pitch && a.fmt == b.fmt && a.siz == b.siz && a.width == b.width && a.height == b.height &&
                a.masks == b.masks && a.maskt == b.maskt && a.cms == b.cms && a.cmt == b.cmt && a.palette == b.palette &&
-               a.nibble == b.nibble && a.tlut_hash == b.tlut_hash && a.tlut_mode == b.tlut_mode && a.bilerp == b.bilerp && a.snapshot == b.snapshot;
+               a.nibble == b.nibble && a.tlut_hash == b.tlut_hash && a.tlut_mode == b.tlut_mode && a.bilerp == b.bilerp && a.snapshot == b.snapshot &&
+               a.block == b.block && a.dxt == b.dxt && a.load_word == b.load_word;
     }
     static bool same_draw_state(const DrawRecord& a, const DrawRecord& b) {
         return a.cc_w0 == b.cc_w0 && a.cc_w1 == b.cc_w1 && a.othermode_h == b.othermode_h && a.othermode_l == b.othermode_l &&
                a.geometry_mode == b.geometry_mode && memcmp(a.prim, b.prim, 4) == 0 && memcmp(a.env, b.env, 4) == 0 &&
                memcmp(a.blend, b.blend, 4) == 0 && memcmp(a.fog, b.fog, 4) == 0 && a.prim_lod_frac == b.prim_lod_frac &&
                memcmp(a.scissor, b.scissor, sizeof(a.scissor)) == 0 && a.proj_id == b.proj_id && a.perspective == b.perspective &&
+               memcmp(a.uv1, b.uv1, sizeof(a.uv1)) == 0 &&
                same_tex(a.tex[0], b.tex[0]) && same_tex(a.tex[1], b.tex[1]);
     }
 
@@ -550,9 +575,10 @@ struct Interpreter::Impl {
         if (textured) {
             describe_tile(tile, r.tex[0]);
             if (cyc == 2 && uses_texel(1)) describe_tile((tile + 1) & 7, r.tex[1]);
+            set_uv1(r, tile);
         }
-        else {
-            memcpy(r.prim, fill, 4);   // the fill colour rides in prim for the backend
+        else if (cyc == 3) {
+            memcpy(r.prim, fill, 4);   // fill mode: the fill colour rides in prim for the backend
         }
         // Fill and copy modes cover the lower-right pixel too.
         if (cyc == 2 || cyc == 3) { lrx += 1.0f; lry += 1.0f; }
@@ -570,7 +596,7 @@ struct Interpreter::Impl {
             q[i].x = xs[i]; q[i].y = ys[i]; q[i].z = 0.0f; q[i].w = 1.0f;
             q[i].u = us[i]; q[i].v = vs[i];
             if (r.tex[0].snapshot) snapshot_uv(r.tex[0], q[i].u, q[i].v, q[i].u, q[i].v);
-            q[i].r = q[i].g = q[i].b = q[i].a = 255;
+            q[i].r = q[i].g = q[i].b = q[i].a = 0;   // rectangles have no shade: SHADE reads as 0 (as RT64)
         }
         Vtx3ds* o = out->verts.append(6);
         if (o == nullptr) { out->draws.pop_back(); return; }
@@ -723,6 +749,14 @@ struct Interpreter::Impl {
             uint8_t op = w0 >> 24;
             stats->commands++;
             stats->op_hist[op]++;
+#ifndef __3DS__
+            // Host tools: DL_TRACE=<first draw>,<last draw> prints the commands
+            // that run while the frame has that many draws.
+            static int trace_lo = -2, trace_hi = -1;
+            if (trace_lo == -2) { trace_lo = -1; if (const char* e = getenv("DL_TRACE")) sscanf(e, "%d,%d", &trace_lo, &trace_hi); }
+            if (trace_lo >= 0 && (int)out->draws.size() >= trace_lo && (int)out->draws.size() <= trace_hi)
+                fprintf(stderr, "  [%zu] %08x: %02x %08x %08x\n", out->draws.size(), pc, op, w0, w1);
+#endif
             uint32_t next = pc + 8;
             // Anything but drawing, vertex loads and list flow may change the
             // state a draw snapshots (rects bump it themselves).
@@ -922,6 +956,7 @@ struct Interpreter::Impl {
                     L.block = true;
                     L.seq = load_count;
                     L.nibble = 0;
+                    L.dxt = (uint16_t)(w1 & 0xFFF);
                     tl.uls = uls; tl.ult = ult; tl.lrs = lrs;
                     break;
                 }
@@ -941,6 +976,7 @@ struct Interpreter::Impl {
                     L.pitch = row_bytes;
                     L.siz = timg.siz;
                     L.block = false;
+                    L.dxt = 0;
                     L.seq = load_count;
                     L.nibble = (timg.siz == 0) ? ((uls >> 2) & 1) : 0;
                     tl.uls = uls; tl.ult = ult; tl.lrs = lrs; tl.lrt = lrt;

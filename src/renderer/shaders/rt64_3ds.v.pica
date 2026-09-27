@@ -5,11 +5,13 @@
 ; `xform` is the Mtx_OrthoTilt over the N64 screen for the render target
 ; being drawn. `stereo` = (a, b): x' = x + a*w + b, the per-draw eye shift
 ; (zero for mono). `uvscale` turns texel coordinates into normalized ones
-; for the PICA texture actually bound (power-of-two padded).
+; for the PICA texture actually bound (power-of-two padded). `uv1` maps
+; them to the second texture's normalized coordinates: itc * uv1.xy + uv1.zw.
 
 .fvec xform[4]
 .fvec stereo
 .fvec uvscale
+.fvec uv1
 
 .constf consts(0.00392156862745, 0.0, 1.0, 0.0)
 
@@ -36,7 +38,10 @@
 	mul r2.xy, uvscale.xy, itc.xy
 	mov r2.zw, consts.yyyy
 	mov otc0, r2
-	mov otc1, r2
+	mul r3.xy, uv1.xy, itc.xy
+	add r3.xy, uv1.zw, r3.xy
+	mov r3.zw, consts.yyyy
+	mov otc1, r3
 	mul oclr, consts.xxxx, iclr
 	end
 .end

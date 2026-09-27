@@ -3,6 +3,7 @@
 // format, tiled (8x8 Morton, rows flipped so v = 0 is the top texel row) and
 // kept in linear memory keyed by their source and content.
 #include "rt64_3ds_texture.h"
+#include "rt64_3ds_texdecode.h"
 
 #include <cstdio>
 #include <cstring>
@@ -87,7 +88,8 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
     // picked up without hashing every draw.
     uint64_t key = ((uint64_t)d.addr * 2654435761u) ^ ((uint64_t)d.fmt << 3) ^ ((uint64_t)d.siz << 6) ^
                    ((uint64_t)d.width << 10) ^ ((uint64_t)d.height << 21) ^ ((uint64_t)d.tlut_hash << 40) ^ ((uint64_t)d.palette << 56) ^
-                   ((uint64_t)d.pitch << 44) ^ ((uint64_t)d.nibble << 63);
+                   ((uint64_t)d.pitch << 44) ^ ((uint64_t)d.nibble << 63) ^
+                   (d.block ? (((uint64_t)d.dxt << 27) ^ ((uint64_t)d.load_word << 50) ^ (1ull << 62)) : 0);
     auto content_hash = [&]() {
         uint32_t h = 2166136261u;
         for (uint32_t y = 0; y < d.height; y++) {
@@ -135,73 +137,11 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
     uint32_t bytes = potw * poth * texel_bytes;
     if (wide) impl_->stage32.assign(potw * poth, 0); else impl_->stage16.assign(potw * poth, 0);
 
-    const uint16_t* pal = tlut;
+    decode_texels(rdram_, d, tlut, [&](uint32_t xt, uint32_t y, bool have16, uint16_t p16, uint32_t r, uint32_t g, uint32_t bl, uint32_t a) {
+        if (wide) impl_->stage32[y * potw + xt] = have16 ? rgba5551_to_rgba8(p16) : ((r << 24) | (g << 16) | (bl << 8) | a);
+        else impl_->stage16[y * potw + xt] = have16 ? p16 : ia_to_rgba5551((uint8_t)r, (uint8_t)a);
+    });
     for (uint32_t y = 0; y < d.height; y++) {
-        uint32_t row = d.addr + y * d.pitch;
-        for (uint32_t xt = 0; xt < d.width; xt++) {
-            uint32_t x = xt + d.nibble;   // 4-bit formats may start mid-byte
-            uint32_t r = 0, g = 0, bl = 0, a = 255;
-            uint16_t p16 = 0;
-            bool have16 = false;
-            switch ((d.fmt << 2) | d.siz) {
-                case (0 << 2) | 2: p16 = rh(rdram_, row + x * 2); have16 = true; break;          // RGBA16
-                case (0 << 2) | 3: { uint32_t v = rw(rdram_, row + x * 4); r = v >> 24; g = v >> 16; bl = v >> 8; a = v; break; }  // RGBA32
-                case (2 << 2) | 0: {                                                              // CI4
-                    uint8_t byte = rb(rdram_, row + x / 2);
-                    uint8_t idx = (x & 1) ? (byte & 0xF) : (byte >> 4);
-                    idx |= (d.palette & 0xF) << 4;
-                    p16 = pal ? pal[idx] : 0; have16 = true;
-                    if (d.tlut_mode == 3) { have16 = false; r = g = bl = p16 >> 8; a = p16 & 0xFF; }
-                    break;
-                }
-                case (2 << 2) | 1: {                                                              // CI8
-                    uint8_t idx = rb(rdram_, row + x);
-                    p16 = pal ? pal[idx] : 0; have16 = true;
-                    if (d.tlut_mode == 3) { have16 = false; r = g = bl = p16 >> 8; a = p16 & 0xFF; }
-                    break;
-                }
-                case (3 << 2) | 0: {                                                              // IA4
-                    uint8_t byte = rb(rdram_, row + x / 2);
-                    uint8_t v = (x & 1) ? (byte & 0xF) : (byte >> 4);
-                    uint8_t i = (v >> 1) * 255 / 7;
-                    r = g = bl = i; a = (v & 1) ? 255 : 0;
-                    break;
-                }
-                case (3 << 2) | 1: {                                                              // IA8
-                    uint8_t v = rb(rdram_, row + x);
-                    r = g = bl = (v >> 4) * 17; a = (v & 0xF) * 17;
-                    break;
-                }
-                case (3 << 2) | 2: {                                                              // IA16
-                    uint16_t v = rh(rdram_, row + x * 2);
-                    r = g = bl = v >> 8; a = v & 0xFF;
-                    break;
-                }
-                case (4 << 2) | 0: {                                                              // I4
-                    uint8_t byte = rb(rdram_, row + x / 2);
-                    uint8_t v = (x & 1) ? (byte & 0xF) : (byte >> 4);
-                    r = g = bl = a = v * 17;
-                    break;
-                }
-                case (4 << 2) | 1: {                                                              // I8
-                    uint8_t v = rb(rdram_, row + x);
-                    r = g = bl = a = v;
-                    break;
-                }
-                default:
-                    p16 = 0xFFFF; have16 = true;
-                    break;
-            }
-            if (wide) {
-                if (have16) {
-                    r = ((p16 >> 11) & 31) * 255 / 31; g = ((p16 >> 6) & 31) * 255 / 31; bl = ((p16 >> 1) & 31) * 255 / 31; a = (p16 & 1) ? 255 : 0;
-                }
-                impl_->stage32[y * potw + xt] = (r << 24) | (g << 16) | (bl << 8) | a;
-            }
-            else {
-                impl_->stage16[y * potw + xt] = have16 ? p16 : ia_to_rgba5551((uint8_t)r, (uint8_t)a);
-            }
-        }
         // Pad the row to the POT width with the last texel (clamping looks right).
         for (uint32_t x = d.width; x < potw; x++) {
             if (wide) impl_->stage32[y * potw + x] = impl_->stage32[y * potw + d.width - 1];

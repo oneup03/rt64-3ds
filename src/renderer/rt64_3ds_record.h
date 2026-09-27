@@ -69,6 +69,14 @@ struct TexDesc {
     uint16_t tlut_mode = 0; // G_TT_* (0 none, 2 RGBA16, 3 IA16)
     bool bilerp = false;
     bool snapshot = false;  // samples the stored copy of a previous frame instead of RDRAM
+    // LOADBLOCK row step: the RDP swaps the 32-bit halves of each 64-bit
+    // TMEM word on rows its dxt counter calls odd, and the sampler swaps
+    // them back on odd tile rows. Where the two disagree (dxt 0: data
+    // pre-interleaved in RDRAM, as Rare's games store it) the decoder must
+    // swap too. load_word = the tile's first 64-bit word within the load.
+    bool block = false;
+    uint16_t dxt = 0;
+    uint16_t load_word = 0;
 };
 
 // One draw of triangles or a rectangle with a snapshot of the RDP state that
@@ -83,8 +91,12 @@ struct DrawRecord {
     uint8_t prim_lod_frac = 0;
     int16_t scissor[4] = { 0, 0, 320, 240 };  // ulx uly lrx lry in N64 pixels
     TexDesc tex[2];
+    // TEXEL1's texel coordinates from TEXEL0's: u1 = u0 * uv1[0] + uv1[2],
+    // v1 = v0 * uv1[1] + uv1[3] (the two tiles' shifts and origins differ).
+    float uv1[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
     uint32_t proj_id = 0;               // gEXMatrixGroup id in force (stereo later)
     bool perspective = true;
+    uint32_t dbg_vtx = 0;               // RDRAM address of the last vertex load (debug)
     float dbg_vp[4] = {};               // viewport scale x/y, translate x/y (debug logging)
     float dbg_proj[4] = {};             // projection m[1][1], m[3][1], m[2][3], m[3][3]
 };

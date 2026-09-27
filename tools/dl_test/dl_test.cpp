@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "rt64_3ds_dl.h"
+#include "refrender.h"
 #include "ultramodern/ultra64.h"
 
 int main(int argc, char** argv) {
@@ -45,16 +46,67 @@ int main(int argc, char** argv) {
         FILE* o = fopen(dump, "w");
         for (size_t i = 0; i < frame.draws.size(); i++) {
             const auto& d = frame.draws[i];
-            fprintf(o, "draw %zu kind %d first %u count %u cc %08x %08x om %08x %08x gm %08x prim %02x%02x%02x%02x env %02x%02x%02x%02x tex0 %d %x %u %ux%u tex1 %d\n",
+            float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
+            for (uint32_t k = d.first; k < d.first + d.count; k++) {
+                const auto& v = frame.verts[k];
+                if (v.w <= 0) continue;
+                float x = v.x / v.w, y = v.y / v.w;
+                if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y;
+            }
+            fprintf(o, "draw %zu kind %d first %u count %u cc %06x %08x om %06x %08x gm %06x prim %02x%02x%02x%02x env %02x%02x%02x%02x blend %02x%02x%02x%02x fog %02x%02x%02x%02x plf %u proj %x persp %d tex0 %d %x fmt %u/%u %ux%u tlut %u tex1 %d %x fmt %u/%u %ux%u vtx %06x | x %.0f..%.0f y %.0f..%.0f\n",
                     i, (int)d.kind, d.first, d.count, d.cc_w0, d.cc_w1, d.othermode_h, d.othermode_l, d.geometry_mode,
                     d.prim[0], d.prim[1], d.prim[2], d.prim[3], d.env[0], d.env[1], d.env[2], d.env[3],
-                    (int)d.tex[0].valid, d.tex[0].addr, d.tex[0].pitch, d.tex[0].width, d.tex[0].height, (int)d.tex[1].valid);
+                    d.blend[0], d.blend[1], d.blend[2], d.blend[3], d.fog[0], d.fog[1], d.fog[2], d.fog[3], d.prim_lod_frac, d.proj_id, (int)d.perspective,
+                    (int)d.tex[0].valid, d.tex[0].addr, d.tex[0].fmt, d.tex[0].siz, d.tex[0].width, d.tex[0].height, d.tex[0].tlut_mode,
+                    (int)d.tex[1].valid, d.tex[1].addr, d.tex[1].fmt, d.tex[1].siz, d.tex[1].width, d.tex[1].height, d.dbg_vtx, minx, maxx, miny, maxy);
         }
         for (size_t i = 0; i < frame.verts.size(); i++) {
             const auto& v = frame.verts[i];
             fprintf(o, "v %zu %.3f %.3f %.4f %.4f %.3f %.3f %u %u %u %u\n", i, v.x, v.y, v.z, v.w, v.u, v.v, v.r, v.g, v.b, v.a);
         }
         fclose(o);
+    }
+
+    {
+        // Block loads whose row step disagrees with the sampler's odd rows.
+        size_t block = 0, swapped = 0;
+        for (const auto& d : frame.draws) {
+            const auto& t = d.tex[0];
+            if (!t.valid || !t.block) continue;
+            block++;
+            uint32_t rw = t.pitch / 8, bad = 0;
+            for (uint32_t y = 0; y < t.height; y++) if (((((uint32_t)t.load_word + y * rw + rw / 2) * t.dxt >> 11) & 1) != (y & 1)) bad++;
+            if (bad) {
+                swapped++;
+                if (swapped <= 12) printf("  swap: tex %06x fmt %u siz %u %ux%u pitch %u dxt %u word %u: %u rows\n", t.addr, t.fmt, t.siz, t.width, t.height, t.pitch, t.dxt, t.load_word, bad);
+            }
+        }
+        printf("%zu block-loaded draws, %zu need odd-row swaps\n", block, swapped);
+    }
+
+    if (const char* out = getenv("DL_RENDER")) {
+        // Reference render; DL_MAX / DL_ONLY limit the draws, DL_LOD sets LOD_FRACTION.
+        RefOptions o;
+        if (const char* e = getenv("DL_MAX")) o.max_draw = atoi(e);
+        if (const char* e = getenv("DL_ONLY")) o.only_draw = atoi(e);
+        if (const char* e = getenv("DL_LOD")) o.lod_fraction = atoi(e);
+        printf("reference render -> %s: %s\n", out, ref_render(rdram.data(), frame, o, out) ? "ok" : "failed");
+    }
+    if (const char* list = getenv("DL_TEXDUMP")) {
+        // "draw[,draw...]": write both textures of those draws as PPM.
+        const char* dir = getenv("DL_TEXDIR") ? getenv("DL_TEXDIR") : ".";
+        for (const char* p = list; *p;) {
+            int i = atoi(p);
+            if (i >= 0 && (size_t)i < frame.draws.size()) {
+                for (int t = 0; t < 2; t++) {
+                    char path[512];
+                    snprintf(path, sizeof(path), "%s/draw%03d_tex%d.ppm", dir, i, t);
+                    if (dump_texture(rdram.data(), frame, frame.draws[i].tex[t], path)) printf("wrote %s\n", path);
+                }
+            }
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
     }
 
     auto t0 = std::chrono::steady_clock::now();
