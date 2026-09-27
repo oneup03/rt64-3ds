@@ -411,8 +411,10 @@ private:
         // screen: the patched projection already fills it.
         if (d.scissor[0] <= 0 && d.scissor[2] >= 320) { x0 = 0; x1 = 400; }
         if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > 400) x1 = 400; if (y1 > 240) y1 = 240;
+        // Mtx_OrthoTilt maps screen y = 0 to framebuffer x = 240 and the
+        // screen's left edge to framebuffer y = 400: both axes run backwards.
         if (x1 <= x0 || y1 <= y0) C3D_SetScissor(GPU_SCISSOR_NORMAL, 0, 0, 0, 0);
-        else C3D_SetScissor(GPU_SCISSOR_NORMAL, (u32)(240 - y1), (u32)x0, (u32)(240 - y0), (u32)x1);
+        else C3D_SetScissor(GPU_SCISSOR_NORMAL, (u32)(240 - y1), (u32)(400 - x1), (u32)(240 - y0), (u32)(400 - x0));
         prof_[2] += svcGetSystemTick() - tp2;
     }
 
