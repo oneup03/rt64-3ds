@@ -11,6 +11,7 @@ function(add_cia target)
     endif()
     set(out "${CMAKE_CURRENT_BINARY_DIR}/${target}")
     set(rsf "${out}.rsf")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${A_RSF}")   # re-generate on template edits
     file(READ "${A_RSF}" rsf_text)
     string(REPLACE "@TITLE@" "${A_TITLE}" rsf_text "${rsf_text}")
     string(REPLACE "@PRODUCT@" "${A_PRODUCT}" rsf_text "${rsf_text}")

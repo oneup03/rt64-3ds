@@ -92,6 +92,13 @@ struct FrameStats {
 const FrameStats& stats();
 FrameStats& mutable_stats();   // for the renderer implementations
 
+// Debugging: sleep this long after every display list (emulating console
+// timing in the emulator).
+void set_debug_gfx_delay_ms(int ms);
+
+// The process is about to end: stop submitting GPU work.
+void set_quitting();
+
 }   // namespace rt64_3ds
 
 #endif

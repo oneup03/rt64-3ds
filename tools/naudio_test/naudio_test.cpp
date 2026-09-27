@@ -2,6 +2,7 @@
 // AUDIO_CAPTURE.TXT in naudio_hle.cpp) through the recompiled microcode
 // and through the interpreter, and compares every RDRAM range the task
 // writes. Build with tools/naudio_test/build.sh <game repo>.
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -62,6 +63,30 @@ int main(int argc, char** argv) {
     recomp::rsp::constants_init();
 
     printf("task: data_ptr %08x size %u (%u cmds) ucode_data %08x\n", task.t.data_ptr, task.t.data_size, task.t.data_size / 8, task.t.ucode_data);
+    if (argc > 3 && strcmp(argv[2], "--bench") == 0) {
+        // --bench N: time N interpreter runs (fresh RDRAM each time) and the
+        // command mix, for profiling.
+        int n = atoi(argv[3]);
+        std::vector<uint8_t> work(mem);
+        auto t0 = std::chrono::steady_clock::now();
+        memcpy(work.data(), base.data(), mem);
+        for (int i = 0; i < n; i++) {
+            if (getenv("BENCH_RESET")) memcpy(work.data(), base.data(), mem);
+            run_hle(work.data(), task);
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        auto t2 = std::chrono::steady_clock::now();
+        if (getenv("BENCH_RESET")) for (int i = 0; i < n; i++) memcpy(work.data(), base.data(), mem);
+        auto t3 = std::chrono::steady_clock::now();
+        double ms = (std::chrono::duration<double, std::milli>(t1 - t0).count() - std::chrono::duration<double, std::milli>(t3 - t2).count()) / n;
+        uint32_t hist[32] = {};
+        uint32_t list = task.t.data_ptr & 0xFFFFFF;
+        for (uint32_t i = 0; i < task.t.data_size / 8; i++) hist[(rw(base.data(), list + i * 8) >> 24) & 31]++;
+        printf("%.3f ms per task on this host; commands:", ms);
+        for (int op = 0; op < 32; op++) if (hist[op]) printf(" %d:%u", op, hist[op]);
+        printf("\n");
+        return 0;
+    }
     std::vector<Range> ranges;
     ranges_of(base.data(), task, ranges);
 

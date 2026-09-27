@@ -102,11 +102,11 @@ size_t recomp3ds::audio_frames_remaining() {
 
 void recomp3ds::audio_shutdown() {
     if (g_ready) {
+        g_ready = false;     // the audio task thread may still queue samples
         ndspChnWaveBufClear(kChannel);
         ndspExit();
         for (int i = 0; i < kNumBufs; i++) {
             linearFree(g_storage[i]);
         }
-        g_ready = false;
     }
 }

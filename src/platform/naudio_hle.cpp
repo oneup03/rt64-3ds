@@ -37,19 +37,47 @@ constexpr uint32_t kMainL = 0x9D0, kMainR = 0xB40, kAuxL = 0xCB0, kAuxR = 0xE20;
 
 // DMEM, kept in the same byte-swapped layout as RDRAM (byte a at [a ^ 3]) so
 // aligned DMA is a plain copy.
-uint8_t g_dm[0x1000];
+alignas(8) uint8_t g_dm[0x1000];
+typedef int16_t __attribute__((may_alias)) dm_i16;
+typedef uint32_t __attribute__((may_alias)) dm_u32;
 
 inline uint8_t db(uint32_t a) { return g_dm[(a & 0xFFF) ^ 3]; }
 inline void dbw(uint32_t a, uint8_t v) { g_dm[(a & 0xFFF) ^ 3] = v; }
-inline int16_t dh(uint32_t a) { return (int16_t)((db(a) << 8) | db(a + 1)); }
-inline void dhw(uint32_t a, int32_t v) { dbw(a, (uint8_t)(v >> 8)); dbw(a + 1, (uint8_t)v); }
-inline uint32_t dw(uint32_t a) { return ((uint32_t)db(a) << 24) | ((uint32_t)db(a + 1) << 16) | ((uint32_t)db(a + 2) << 8) | db(a + 3); }
-inline void dww(uint32_t a, uint32_t v) { dbw(a, v >> 24); dbw(a + 1, v >> 16); dbw(a + 2, v >> 8); dbw(a + 3, v); }
+// Halfwords and words: one native access when aligned (a halfword at even
+// address a sits at a ^ 2, a word at an aligned address as is), bytes
+// otherwise (the RSP allows unaligned vector loads).
+inline int16_t dh(uint32_t a) {
+    if (__builtin_expect((a & 1) == 0, 1)) return *(const dm_i16*)(g_dm + ((a & 0xFFE) ^ 2));
+    return (int16_t)((db(a) << 8) | db(a + 1));
+}
+inline void dhw(uint32_t a, int32_t v) {
+    if (__builtin_expect((a & 1) == 0, 1)) { *(dm_i16*)(g_dm + ((a & 0xFFE) ^ 2)) = (int16_t)v; return; }
+    dbw(a, (uint8_t)(v >> 8)); dbw(a + 1, (uint8_t)v);
+}
+inline uint32_t dw(uint32_t a) {
+    if (__builtin_expect((a & 3) == 0, 1)) return *(const dm_u32*)(g_dm + (a & 0xFFC));
+    return ((uint32_t)db(a) << 24) | ((uint32_t)db(a + 1) << 16) | ((uint32_t)db(a + 2) << 8) | db(a + 3);
+}
+inline void dww(uint32_t a, uint32_t v) {
+    if (__builtin_expect((a & 3) == 0, 1)) { *(dm_u32*)(g_dm + (a & 0xFFC)) = v; return; }
+    dbw(a, v >> 24); dbw(a + 1, v >> 16); dbw(a + 2, v >> 8); dbw(a + 3, v);
+}
 
 inline uint8_t rb(const uint8_t* rdram, uint32_t p) { return rdram[(p & 0xFFFFFF) ^ 3]; }
 inline void rbw(uint8_t* rdram, uint32_t p, uint8_t v) { rdram[(p & 0xFFFFFF) ^ 3] = v; }
 
-inline int16_t clamp16(int32_t v) { return v > 32767 ? 32767 : (v < -32768 ? -32768 : (int16_t)v); }
+#if defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
+inline int32_t sat16(int32_t v) { int32_t r; __asm__("ssat %0, #16, %1" : "=r"(r) : "r"(v)); return r; }
+#else
+inline int32_t sat16(int32_t v) { return v > 32767 ? 32767 : (v < -32768 ? -32768 : v); }
+#endif
+inline int16_t clamp16(int32_t v) { return (int16_t)sat16(v); }
+
+// Buffers as native halfword arrays. With both ends 4-byte aligned the
+// XOR-2 halfword layout permutes every buffer the same way (raw index j is
+// sample j ^ 1), so element-wise operations can run on the raw arrays.
+inline dm_i16* dmraw(uint32_t a) { return (dm_i16*)(g_dm + (a & 0xFFF)); }
+inline bool raw_ok(uint32_t a, uint32_t bytes) { return (a & 3) == 0 && (a & 0xFFF) + bytes <= 0x1000; }
 
 // (2ab + 0x8000) >> 16, saturated: VMULF.
 inline int16_t vmulf(int32_t a, int32_t b) { return clamp16((a * b + 0x4000) >> 15); }
@@ -86,6 +114,11 @@ RspUcodeFunc* g_reference = nullptr;
 void cmd_clearbuff(uint32_t w0, uint32_t w1) {
     uint32_t a = (w0 & 0xFFFF) + kBufBase;
     int32_t n = w1 & 0xFFFF;
+    uint32_t bytes = n <= 0 ? 16 : ((uint32_t)(n + 15) & ~15u);
+    if (raw_ok(a, bytes)) {
+        memset(g_dm + (a & 0xFFF), 0, bytes);
+        return;
+    }
     do {
         for (int i = 0; i < 16; i++) dbw(a + i, 0);
         a += 16;
@@ -167,6 +200,12 @@ void cmd_mixer(uint32_t w0, uint32_t w1) {
     int32_t gain = (int16_t)(w0 & 0xFFFF);
     uint32_t out = (w1 & 0xFFFF) + kBufBase;
     uint32_t in = (w1 >> 16) + kBufBase;
+    if (raw_ok(out, kCount) && raw_ok(in, kCount) && (in == out || in + kCount <= out || out + kCount <= in)) {
+        dm_i16* o = dmraw(out);
+        const dm_i16* x = dmraw(in);
+        for (uint32_t j = 0; j < kCount / 2; j++) o[j] = (int16_t)sat16((o[j] * 0x7FFF + x[j] * gain + 0x4000) >> 15);
+        return;
+    }
     for (uint32_t i = 0; i < kCount; i += 2) {
         int32_t acc = dh(out + i) * 0x7FFF + dh(in + i) * gain;
         dhw(out + i, clamp16((acc + 0x4000) >> 15));
@@ -271,13 +310,74 @@ void cmd_resample(uint8_t* rdram, uint32_t w0, uint32_t w1) {
             dhw(kState + 0x20 + 2 * k, (int32_t)(kLut + (frac[k] >> 10) * 8));
         }
     };
-    store_tables();
+    // The microcode keeps the per-lane sample and table addresses in DMEM
+    // (kState + 0x10 / 0x20) and reloads them each block; they are computed
+    // here as it would read them (16-bit truncated) and stored once at the end.
+    // Fast path: the input span and the coefficient table copied into plain
+    // arrays, when the output does not overlap the input (the microcode
+    // would otherwise read samples it has just written).
+    const uint32_t last = (uint32_t)(accum + 2u * (uint32_t)pitch * 184u) >> 16;   // furthest start sample
+    const uint32_t span = (last + 8) * 2;                                         // bytes from base
+    const uint32_t out0 = out;
+    // Exact check: block b reads samples [ipos(b, 0), ipos(b, 7) + 3] after
+    // blocks 0..b-1 wrote [out0, out0 + 16 b). A read below that frontier
+    // would see new output, which the copied input would not.
+    bool overlap = false;
+    {
+        int32_t ip0 = ipos[0], ip7 = ipos[7];
+        uint32_t f7 = frac[7];
+        for (int b = 0; b < 23 && !overlap; b++) {
+            uint32_t lo = base + 2 * (uint32_t)ip0, hi = base + 2 * ((uint32_t)ip7 + 4);
+            uint32_t wlo = out0, whi = out0 + 16 * (uint32_t)b;
+            if (lo < whi && hi > wlo) overlap = true;
+            uint32_t pos7 = ((uint32_t)ip7 << 16) | f7;
+            uint32_t a0 = pos7 + 2u * (uint32_t)pitch, a7 = pos7 + 16u * (uint32_t)pitch;
+            ip0 = (int16_t)(a0 >> 16); ip7 = (int16_t)(a7 >> 16); f7 = a7 & 0xFFFF;
+        }
+    }
+#ifdef NAUDIO_DEBUG_PATHS
+    fprintf(stderr, "resample: base %03x span %u out %03x pitch %04x overlap %d\n", base, span, out0, pitch, (int)overlap);
+#endif
+    if (!overlap && span <= 0x1000 && ((base + span) & 0xFFFF) > base && base + span <= 0x1000 && pitch >= 0) {
+        int16_t x[0x800];
+        int16_t lut[64][4];
+        for (uint32_t i = 0; i < span / 2; i++) x[i] = dh(base + 2 * i);
+        for (int r = 0; r < 64; r++) for (int t = 0; t < 4; t++) lut[r][t] = dh(kLut + r * 8 + t * 2);
+        for (int block = 0; block < 23; block++) {
+            int16_t o[8];
+            for (int k = 0; k < 8; k++) {
+                // Lane k reads samples ipos[k] .. +3 (the table stores base +
+                // 2 * ipos truncated to 16 bits; ipos stays small here).
+                const int16_t* xs = &x[(uint16_t)ipos[k]];
+                const int16_t* l = lut[frac[k] >> 10];
+                int32_t t0 = vmulf(xs[0], l[0]);
+                int32_t t1 = vmulf(xs[1], l[1]);
+                int32_t t2 = vmulf(xs[2], l[2]);
+                int32_t t3 = vmulf(xs[3], l[3]);
+                o[k] = clamp16(clamp16(t0 + t1) + clamp16(t2 + t3));
+            }
+            uint32_t pos7 = ((uint32_t)ipos[7] << 16) | frac[7];
+            for (int k = 0; k < 8; k++) {
+                uint32_t acc = pos7 + (uint32_t)(2 * (k + 1)) * (uint32_t)pitch;
+                ipos[k] = (int16_t)(acc >> 16);
+                frac[k] = acc & 0xFFFF;
+            }
+            for (int k = 0; k < 8; k++) dhw(out + 2 * k, o[k]);
+            out += 16;
+        }
+        store_tables();
+        uint32_t sa = (uint16_t)dh(kState + 0x10);
+        for (int i = 0; i < 8; i++) dbw(kState + i, db(sa + i));
+        dhw(kState + 8, (int32_t)frac[0]);
+        dma_write(rdram, kState, state, 16);
+        return;
+    }
 
     for (int block = 0; block < 23; block++) {
         int16_t o[8];
         for (int k = 0; k < 8; k++) {
-            uint32_t sa = (uint16_t)dh(kState + 0x10 + 2 * k);
-            uint32_t la = (uint16_t)dh(kState + 0x20 + 2 * k);
+            uint32_t sa = (base + 2 * (uint32_t)ipos[k]) & 0xFFFF;
+            uint32_t la = (kLut + (frac[k] >> 10) * 8) & 0xFFFF;
             int32_t t0 = vmulf(dh(sa), dh(la));
             int32_t t1 = vmulf(dh(sa + 2), dh(la + 2));
             int32_t t2 = vmulf(dh(sa + 4), dh(la + 4));
@@ -291,10 +391,10 @@ void cmd_resample(uint8_t* rdram, uint32_t w0, uint32_t w1) {
             ipos[k] = (int16_t)(acc >> 16);
             frac[k] = acc & 0xFFFF;
         }
-        store_tables();
         for (int k = 0; k < 8; k++) dhw(out + 2 * k, o[k]);
         out += 16;
     }
+    store_tables();
 
     // State: the 4 samples at the next position, then its fraction.
     uint32_t sa = (uint16_t)dh(kState + 0x10);
@@ -345,7 +445,30 @@ void cmd_envmixer(uint8_t* rdram, uint32_t w0, uint32_t w1) {
         rlo[k] = lo & 0xFFFF;
         rhi[k] = clamp16(rhi[k] + rratm + carry);
     };
+    const bool raw = raw_ok(in, 16 * 23) && raw_ok(mainL, 16 * 23) && raw_ok(mainR, 16 * 23) && raw_ok(auxL, 16 * 23) && raw_ok(auxR, 16 * 23);
     auto apply = [&]() {
+        if (raw) {
+            // Raw halfword r of a block is lane r ^ 1.
+            int32_t gld[8], glw[8], grd[8], grw[8];
+            for (int r = 0; r < 8; r++) {
+                int k = r ^ 1;
+                gld[r] = vmulf(lhi[k], dry); glw[r] = vmulf(lhi[k], wet);
+                grd[r] = vmulf(rhi[k], dry); grw[r] = vmulf(rhi[k], wet);
+            }
+            const dm_i16* xi = dmraw(in);
+            dm_i16* ml = dmraw(mainL); dm_i16* al = dmraw(auxL); dm_i16* mr = dmraw(mainR); dm_i16* ar = dmraw(auxR);
+            for (int r = 0; r < 8; r++) {
+                int32_t x = xi[r];
+                int32_t xl = x ^ maskL, xr = x ^ maskR;
+                ml[r] = (int16_t)sat16((ml[r] * 0x7FFF + xl * gld[r] + 0x4000) >> 15);
+                al[r] = (int16_t)sat16((al[r] * 0x7FFF + xl * glw[r] + 0x4000) >> 15);
+                mr[r] = (int16_t)sat16((mr[r] * 0x7FFF + xr * grd[r] + 0x4000) >> 15);
+                ar[r] = (int16_t)sat16((ar[r] * 0x7FFF + xr * grw[r] + 0x4000) >> 15);
+            }
+            in += 16; mainL += 16; mainR += 16; auxL += 16; auxR += 16;
+            blocks_done++;
+            return;
+        }
         for (int k = 0; k < 8; k++) {
             int32_t x = dh(in + 2 * k);
             int32_t xl = x ^ maskL, xr = x ^ maskR;
@@ -393,11 +516,13 @@ void cmd_envmixer(uint8_t* rdram, uint32_t w0, uint32_t w1) {
             rlo[k] = (uint16_t)dh(kState + 0x30 + 2 * k);
         }
     }
+    // The left ramp state goes to DMEM after every block in the microcode;
+    // nothing reads it back within the command, so once at the end.
     while (blocks_done < 23) {
         for (int k = 0; k < 8; k++) { addL(k); clampL(k); addR(k); clampR(k); }
-        save_left();
         apply();
     }
+    save_left();
     for (int k = 0; k < 8; k++) {
         dhw(kState + 0x20 + 2 * k, rhi[k]);
         dhw(kState + 0x30 + 2 * k, (int32_t)rlo[k]);

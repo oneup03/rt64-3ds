@@ -75,7 +75,7 @@ AccessControlInfo:
   MemoryType                    : Application # Application/System/Base
   SystemMode                    : 64MB # 64MB(Default)/96MB/80MB/72MB/32MB
   IdealProcessor                : 0
-  AffinityMask                  : 1
+  AffinityMask                  : 3 # cores 0 and 1 (the audio task may run on core 1)
   Priority                      : 16
   MaxCpu                        : 0x9E # Default
   HandleTableSize               : 0x200

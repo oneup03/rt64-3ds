@@ -34,9 +34,16 @@ u32 g_ucode_tasks = 0;
 
 bool g_audio_hle = false;
 
+uint8_t* g_rdram = nullptr;
+// SLOW.TXT "<gfx ms> <audio ms>": pad every display list and audio task by
+// that much, to reproduce console timing in the emulator.
+int g_slow_audio_ms = -1;
+
 RspExitReason timed_ucode(uint8_t* rdram, uint32_t ucode_addr) {
+    g_rdram = rdram;
     u64 t0 = svcGetSystemTick();
     RspExitReason r = g_ucode_inner(rdram, ucode_addr);
+    if (g_slow_audio_ms > 0) svcSleepThread((s64)g_slow_audio_ms * 1000000);
     g_ucode_ticks += svcGetSystemTick() - t0;
     g_ucode_tasks++;
     return r;
@@ -90,6 +97,23 @@ RspUcodeFunc* timed_get_ucode(const OSTask* task) {
 }
 
 const recomp3ds::GameDesc* g_desc = nullptr;
+int g_sp_core = 2;
+
+// Thread placement: game code on core 0, renderer on core 2, the audio task
+// on g_sp_core (core 1 when the system grants time there), pacing threads
+// above the game so their sleeps wake it.
+ultramodern::HostThreadSpec host_thread_spec(ultramodern::HostThreadKind kind) {
+    using K = ultramodern::HostThreadKind;
+    switch (kind) {
+        case K::GameStart:
+        case K::Game:    return { 128 * 1024, 0x30, 0 };
+        case K::Gfx:     return { 256 * 1024, 0x2C, 2 };
+        case K::SpTask:  return { 64 * 1024, 0x24, g_sp_core };
+        case K::Vi:
+        case K::Timer:   return { 32 * 1024, 0x28, 0 };
+        default:         return { 32 * 1024, 0x30, 0 };
+    }
+}
 volatile bool g_exit_requested = false;
 
 void* create_gfx() { return nullptr; }
@@ -117,6 +141,18 @@ void update_gfx(void*) {
         g_ucode_ticks = 0;
         g_ucode_tasks = 0;
         const recomp3ds::NaudioHleStats& hs = recomp3ds::naudio_hle_stats();
+        // Audio stall watchdog: tasks ran, then none for 2 s.
+        {
+            static bool seen = false, reported = false;
+            static int idle = 0;
+            if (ucode_tasks > 0) { seen = true; idle = 0; }
+            else if (seen && !reported && ++idle >= 2) {
+                reported = true;
+                fprintf(stderr, "recomp3ds: AUDIO STALL: no audio task for 2 s\n");
+                if (g_desc != nullptr && g_desc->on_audio_stall != nullptr && g_rdram != nullptr) g_desc->on_audio_stall(g_rdram);
+                fflush(stderr);
+            }
+        }
         fprintf(stderr, "stats: %d dl/s core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued hle %u/%u diff-mismatch %u/%u unknown %u\n",
                 st.dl_per_sec, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_remaining(),
                 hs.tasks, hs.commands, hs.diff_mismatches, hs.diff_tasks, hs.unknown_opcodes);
@@ -146,7 +182,15 @@ void update_gfx(void*) {
                 svcSleepThread(1500000000ll);
                 fprintf(stderr, "recomp3ds: exit forced after 1.5 s\n");
                 fflush(stderr);
-                exit(0);
+                // exit() would run C++ destructors and unmap the heaps while
+                // the renderer, audio and game threads still run (a data
+                // abort on the way out). Quiesce the GPU and DSP users, then
+                // end the process; the kernel reclaims the rest.
+                rt64_3ds::set_quitting();
+                svcSleepThread(200000000ll);
+                recomp3ds::audio_shutdown();
+                aptExit();
+                svcExitProcess();
             }, nullptr, 16 * 1024, 0x20, -2, true);
         }
     }
@@ -196,6 +240,19 @@ int recomp3ds::run(const GameDesc& desc) {
     mkdir(g_base_path, 0777);
     recomp3ds::log_init(g_base_path);          // stderr: debug log + <base>/log.txt
     recomp3ds::autotest_load(g_base_path);
+    {
+        char path[192];
+        snprintf(path, sizeof(path), "%s/SLOW.TXT", g_base_path);
+        if (FILE* f = fopen(path, "r")) {
+            int gfx_ms = 0, audio_ms = 0;
+            if (fscanf(f, "%d %d", &gfx_ms, &audio_ms) >= 1) {
+                g_slow_audio_ms = audio_ms;
+                rt64_3ds::set_debug_gfx_delay_ms(gfx_ms);
+                fprintf(stderr, "recomp3ds: SLOW.TXT: +%d ms per display list, +%d ms per audio task\n", gfx_ms, audio_ms);
+            }
+            fclose(f);
+        }
+    }
 
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
@@ -280,6 +337,30 @@ int recomp3ds::run(const GameDesc& desc) {
         return 1;
     }
 
+    // The audio microcode interpreter shares core 2 with the renderer and
+    // outranks it there, so every audio task stalls a frame. Core 1 (the
+    // system core, time-limited for applications) takes it when available.
+    // AUDIO_CORE.TXT holds 1 or 2 to force a core.
+    {
+        int want = 1;
+        char path[192];
+        snprintf(path, sizeof(path), "%s/AUDIO_CORE.TXT", g_base_path);
+        if (FILE* f = fopen(path, "r")) { if (fscanf(f, "%d", &want) != 1) want = 1; fclose(f); }
+        g_sp_core = 2;
+        if (want == 1) {
+            u32 limit = 0;
+            Result rc = APT_SetAppCpuTimeLimit(80);
+            APT_GetAppCpuTimeLimit(&limit);
+            Thread probe = R_SUCCEEDED(rc) ? threadCreate([](void*) {}, nullptr, 4096, 0x30, 1, false) : nullptr;
+            if (probe != nullptr) {
+                threadJoin(probe, UINT64_MAX);
+                threadFree(probe);
+                g_sp_core = 1;
+            }
+            fprintf(stderr, "recomp3ds: core 1 time limit %lu%% (rc %08lx), audio task on core %d\n", (unsigned long)limit, (unsigned long)rc, g_sp_core);
+        }
+        ultramodern::set_host_thread_spec_callback(host_thread_spec);
+    }
     recomp::start_game(desc.game_id, "");
     recomp3ds::loadmon_start(is_new_3ds);
     log_memory("before start");

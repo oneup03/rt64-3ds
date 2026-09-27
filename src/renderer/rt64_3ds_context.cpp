@@ -5,6 +5,7 @@
 #include <citro3d.h>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "rt64_3ds.h"
@@ -28,6 +29,8 @@ constexpr uint32_t kVboVerts = 65536;
 using GpuVertex = rt64_3ds::Vtx3ds;   // the record's vertex is the PICA's attribute layout
 
 #define g_stats rt64_3ds::mutable_stats()
+int g_debug_gfx_delay_ms = 0;
+volatile bool g_quitting = false;
 rt64_3ds::Progress g_progress{};
 const rt64_3ds::DrawRecord* g_progress_draw = nullptr;
 
@@ -49,7 +52,7 @@ public:
     float get_resolution_scale() const override { return 1.0f; }
 
     void send_dl(const OSTask* task) override {
-        if (!ok_) return;
+        if (!ok_ || g_quitting) return;
         u64 t0 = svcGetSystemTick();
         frame_.clear();
         vbo_idx_ ^= 1;
@@ -60,6 +63,7 @@ public:
         u64 t1 = svcGetSystemTick();
         dl_count_++;
         if (present) replay_and_present();
+        if (g_debug_gfx_delay_ms > 0) svcSleepThread((s64)g_debug_gfx_delay_ms * 1000000);
         g_progress.phase = 0;
         u64 t2 = svcGetSystemTick();
         acc_gfx_ += t1 - t0;
@@ -219,6 +223,7 @@ private:
         g_progress.phase = 3;
         for (const rt64_3ds::DrawRecord& d : frame_.draws) {
             if (d.tex[0].valid && d.tex[0].snapshot) {
+                if (capture_snapshot_frames_ > 0 && !fb_capture_pending_) { capture_snapshot_frames_--; fb_capture_pending_ = true; }
                 // Ask the emulator harness for a screenshot of this frame
                 // (rate-limited: one per second).
                 static u64 last = 0;
@@ -231,9 +236,10 @@ private:
             // The target still holds the last presented frame: copy it, one
             // 8x8-tile row at a time, into the wider texture. Sizes are in
             // bytes; a tile row of the 240-wide buffer is 30 tiles.
+            // TextureCopy line widths and gaps are in 16-byte units.
             const u32 row = 240 * 8 * 4, gap = (256 - 240) * 8 * 4;
-            C3D_SyncTextureCopy((u32*)top_->frameBuf.colorBuf, GX_BUFFER_DIM(row, 0),
-                                (u32*)snapshot_.data, GX_BUFFER_DIM(row, gap), 240 * 400 * 4, 0);
+            C3D_SyncTextureCopy((u32*)top_->frameBuf.colorBuf, GX_BUFFER_DIM(row / 16, 0),
+                                (u32*)snapshot_.data, GX_BUFFER_DIM(row / 16, gap / 16), 240 * 400 * 4, 0);
             snapshots_++;
         }
         C3D_RenderTargetClear(top_, C3D_CLEAR_ALL, 0x000000FF, 0);
@@ -459,7 +465,14 @@ public:
         static int want = -2;
         if (want == -2) {
             want = -1;
-            if (FILE* f = fopen("sdmc:/3ds/DK64/GFX_CAPTURE.TXT", "r")) { if (fscanf(f, "%d", &want) != 1) want = -1; fclose(f); }
+            if (FILE* f = fopen("sdmc:/3ds/DK64/GFX_CAPTURE.TXT", "r")) {
+                char word[16] = {};
+                if (fscanf(f, "%15s", word) == 1) {
+                    if (strcmp(word, "snap") == 0) capture_snapshot_frames_ = 3;   // the first three frames drawing from a snapshot
+                    else want = atoi(word);
+                }
+                fclose(f);
+            }
         }
         if (want < 0 || (int)frames_ != want) return;
         want = -1;
@@ -479,18 +492,28 @@ public:
     void maybe_capture_framebuffer() {
         if (!fb_capture_pending_) return;
         fb_capture_pending_ = false;
-        if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_task.bin", "wb")) {
-            fwrite(&capture_task_, 1, sizeof(OSTask), f);
-            for (uint32_t off = 0; off < 16u * 1024 * 1024; off += 65536) fwrite(capture_copy_ + off, 1, 65536, f);
-            fclose(f);
+        if (capture_copy_ != nullptr) {
+            if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_task.bin", "wb")) {
+                fwrite(&capture_task_, 1, sizeof(OSTask), f);
+                for (uint32_t off = 0; off < 16u * 1024 * 1024; off += 65536) fwrite(capture_copy_ + off, 1, 65536, f);
+                fclose(f);
+            }
+            free(capture_copy_);
+            capture_copy_ = nullptr;
         }
-        free(capture_copy_);
-        capture_copy_ = nullptr;
+        if (snapshot_.data != nullptr) {
+            // The snapshot texture as stored (256x512 RGBA8, tiled), raw.
+            if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_snapshot.raw", "wb")) { fwrite(snapshot_.data, 1, 256 * 512 * 4, f); fclose(f); }
+        }
+        static int frame_captures = 0;
+        char fname[64];
+        snprintf(fname, sizeof(fname), frame_captures == 0 ? "sdmc:/3ds/DK64/gfx_frame.ppm" : "sdmc:/3ds/DK64/gfx_frame%d.ppm", frame_captures);
+        frame_captures++;
         // Read the tiled target straight from VRAM (the CPU can read it; the
         // emulator flushes its cached copy on such reads): 8x8 tiles, 30 per
         // tile row, Morton order inside a tile.
         const uint32_t* lin = (const uint32_t*)top_->frameBuf.colorBuf;
-        if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_frame.ppm", "wb")) {
+        if (FILE* f = fopen(fname, "wb")) {
             // The target is 240 wide and 400 tall (rotated): written as is;
             // the host rotates it to the 400x240 screen.
             fprintf(f, "P6\n240 400\n255\n");
@@ -537,6 +560,7 @@ public:
     bool ok_ = false;
     C3D_RenderTarget* top_ = nullptr;
     bool fb_capture_pending_ = false;
+    int capture_snapshot_frames_ = 0;
     uint8_t* capture_copy_ = nullptr;
     OSTask capture_task_{};
     C3D_Tex white_{};
@@ -592,3 +616,6 @@ void rt64_3ds::dump_progress() {
     fprintf(stderr, "rt64-3ds: progress: frame %u phase %u draw %u of %u\n", g_progress.frames, g_progress.phase, g_progress.draw_index, g_progress.draw_count);
     if (g_progress.phase == 3 && g_progress_draw != nullptr) C3dRenderContext::describe_draw(g_progress.draw_index, *g_progress_draw);
 }
+
+void rt64_3ds::set_debug_gfx_delay_ms(int ms) { g_debug_gfx_delay_ms = ms; }
+void rt64_3ds::set_quitting() { g_quitting = true; }

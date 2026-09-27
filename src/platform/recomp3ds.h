@@ -22,6 +22,9 @@ struct GameDesc {
     rt64_3ds::RenderDesc render;
     bool null_renderer = false;         // bring-up: accept display lists, draw nothing
     bool audio_hle = false;             // run the naudio audio task on the CPU (naudio_hle.cpp) instead of the recompiled RSP code
+    // Called once when audio tasks stop arriving for 2 s after having run:
+    // the game can log its scheduler/audio state (debugging lost wake-ups).
+    void (*on_audio_stall)(uint8_t* rdram) = nullptr;
 };
 
 // Brings up the console, registers the game and runs the runtime. Returns the
