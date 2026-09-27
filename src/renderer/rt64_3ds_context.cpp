@@ -25,7 +25,7 @@ namespace {
 
 constexpr uint32_t kVboVerts = 65536;
 
-struct GpuVertex { float x, y, z, w; float u, v; uint8_t r, g, b, a; };
+using GpuVertex = rt64_3ds::Vtx3ds;   // the record's vertex is the PICA's attribute layout
 
 #define g_stats rt64_3ds::mutable_stats()
 rt64_3ds::Progress g_progress{};
@@ -52,7 +52,10 @@ public:
         if (!ok_) return;
         u64 t0 = svcGetSystemTick();
         frame_.clear();
+        vbo_idx_ ^= 1;
+        frame_.verts.set_storage((rt64_3ds::Vtx3ds*)vbo_[vbo_idx_], kVboVerts);
         g_progress.phase = 1;
+        maybe_capture(task);
         bool present = interp_.run(task->t.data_ptr, frame_);
         u64 t1 = svcGetSystemTick();
         dl_count_++;
@@ -77,7 +80,7 @@ public:
             if (++report_ % 5 == 1) {
                 float fpw = (float)(frames_ - frames_at_profile_ > 0 ? frames_ - frames_at_profile_ : 1);
                 frames_at_profile_ = frames_;
-                fprintf(stderr, "rt64-3ds:   replay profile per frame: textures %.1f tev %.1f state %.1f flush %.1f draw %.1f ms\n",
+                if (prof_on_) fprintf(stderr, "rt64-3ds:   replay profile per frame: textures %.1f tev %.1f state %.1f flush %.1f draw %.1f ms\n",
                         (float)prof_[0] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[1] * 1000.0f / SYSCLOCK_ARM11 / fpw,
                         (float)prof_[2] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[4] * 1000.0f / SYSCLOCK_ARM11 / fpw,
                         (float)prof_[3] * 1000.0f / SYSCLOCK_ARM11 / fpw);
@@ -181,6 +184,7 @@ private:
             debug_from_ = (uint32_t)a; debug_count_ = (uint32_t)b; debug_sync_ = c != 0; debug_step_ = d > 0 ? (uint32_t)d : 1;
             fprintf(stderr, "rt64-3ds: GPU debug mode from frame %u for %u frames, sync %d, every %u\n", debug_from_, debug_count_, (int)debug_sync_, debug_step_);
         }
+        if (FILE* f = fopen("sdmc:/3ds/DK64/PROFILE.TXT", "r")) { prof_on_ = true; fclose(f); }
         fprintf(stderr, "rt64-3ds: citro3d renderer up (linear free %u KB)\n", (unsigned)(linearSpaceFree() / 1024));
     }
 
@@ -245,15 +249,10 @@ private:
         last_us_ = last_vs_ = -1.0f;
         last_plan_.stages = -1;
 
-        // Vertices for the whole frame in one buffer.
-        vbo_idx_ ^= 1;
+        // The interpreter wrote the frame's vertices straight into this
+        // frame's linear buffer (the other one may still be read by the GPU).
         GpuVertex* vb = vbo_[vbo_idx_];
         size_t n = frame_.verts.size();
-        if (n > kVboVerts) n = kVboVerts;
-        for (size_t i = 0; i < n; i++) {
-            const rt64_3ds::Vtx3ds& s = frame_.verts[i];
-            vb[i] = { s.x, s.y, s.z, s.w, s.u, s.v, s.r, s.g, s.b, s.a };
-        }
         GSPGPU_FlushDataCache(vb, n * sizeof(GpuVertex));
         C3D_BufInfo* bi = C3D_GetBufInfo();
         BufInfo_Init(bi);
@@ -266,12 +265,12 @@ private:
             g_progress_draw = &d;
             if (d.count < 3 || d.first + d.count > n) continue;
             apply_state(d, fallbacks);
-            u64 td = svcGetSystemTick();
+            u64 td = tick();
             C3Di_UpdateContext();          // the state flush, timed apart from the draw itself
-            u64 tf = svcGetSystemTick();
+            u64 tf = tick();
             prof_[4] += tf - td;
             C3D_DrawArrays(GPU_TRIANGLES, d.first, d.count);
-            prof_[3] += svcGetSystemTick() - tf;
+            prof_[3] += tick() - tf;
             if (debug_frame && debug_sync_) {
                 // Finish the frame here and start it again: FrameBegin waits
                 // for the GPU, so a hang stops with draw_index naming the
@@ -304,7 +303,7 @@ private:
     }
 
     void apply_state(const rt64_3ds::DrawRecord& d, int& fallbacks) {
-        u64 tp0 = svcGetSystemTick();
+        u64 tp0 = tick();
         // Textures.
         float us = 1.0f, vs = 1.0f;
         for (int t = 0; t < 2; t++) {
@@ -344,7 +343,7 @@ private:
             C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uvscale_, us, vs, 0.0f, 0.0f);
             last_us_ = us; last_vs_ = vs;
         }
-        u64 tp1 = svcGetSystemTick();
+        u64 tp1 = tick();
         prof_[0] += tp1 - tp0;
 
         // Combiner: only re-sent when the plan changes (every C3D_TexEnv call
@@ -352,18 +351,31 @@ private:
         if (d.cc_w0 != last_cc_[0] || d.cc_w1 != last_cc_[1] || d.othermode_h != last_omh_ || d.othermode_l != last_oml_ ||
             memcmp(d.prim, last_prim_, 4) != 0 || memcmp(d.env, last_env_, 4) != 0 || memcmp(d.fog, last_fog_, 4) != 0 ||
             d.prim_lod_frac != last_plf_ || d.kind != last_kind_ || d.geometry_mode != last_gm_) {
-            rt64_3ds::TevPlan plan;
-            rt64_3ds::plan_tev(d, plan);
-            fallbacks += plan.fallbacks;
-            if (plan.stages != last_plan_.stages || memcmp(plan.stage, last_plan_.stage, sizeof(rt64_3ds::TevStage) * plan.stages) != 0) {
-                rt64_3ds::apply_tev(plan);
-                last_plan_ = plan;
+            // Plans are cached: the same combiner/mode/colour set recurs across
+            // draws and frames.
+            uint64_t pk = ((uint64_t)d.cc_w0 << 40) ^ ((uint64_t)d.cc_w1 << 8) ^ ((uint64_t)d.othermode_h << 20) ^ (uint64_t)d.othermode_l ^
+                          ((uint64_t)(*(const uint32_t*)d.prim) << 32) ^ ((uint64_t)(*(const uint32_t*)d.env) << 16) ^ ((uint64_t)(*(const uint32_t*)d.fog) << 48) ^
+                          ((uint64_t)d.prim_lod_frac << 56) ^ ((uint64_t)d.kind << 60) ^ ((uint64_t)(d.geometry_mode & 0x10000) << 30);
+            uint32_t slot = (uint32_t)((pk ^ (pk >> 29) ^ (pk >> 47)) & (kPlanCache - 1));
+            const rt64_3ds::TevPlan* plan;
+            if (plan_keys_[slot] == pk && plan_valid_[slot]) {
+                plan = &plan_cache_[slot];
+            }
+            else {
+                rt64_3ds::plan_tev(d, plan_cache_[slot]);
+                plan_keys_[slot] = pk; plan_valid_[slot] = true;
+                plan = &plan_cache_[slot];
+                fallbacks += plan->fallbacks;
+            }
+            if (plan->stages != last_plan_.stages || memcmp(plan->stage, last_plan_.stage, sizeof(rt64_3ds::TevStage) * plan->stages) != 0) {
+                rt64_3ds::apply_tev(*plan);
+                last_plan_ = *plan;
             }
             last_cc_[0] = d.cc_w0; last_cc_[1] = d.cc_w1; last_omh_ = d.othermode_h; last_oml_ = d.othermode_l;
             memcpy(last_prim_, d.prim, 4); memcpy(last_env_, d.env, 4); memcpy(last_fog_, d.fog, 4);
             last_plf_ = d.prim_lod_frac; last_kind_ = d.kind; last_gm_ = d.geometry_mode;
         }
-        u64 tp2 = svcGetSystemTick();
+        u64 tp2 = tick();
         prof_[1] += tp2 - tp1;
 
         // Depth: reversed map, so "less" becomes GEQUAL. Rects ignore depth
@@ -371,7 +383,7 @@ private:
         uint32_t l = d.othermode_l;
         uint64_t misc_key = ((uint64_t)l << 32) | ((uint64_t)(d.othermode_h & 0x300000) << 8) | ((uint64_t)d.kind << 28) | (uint64_t)d.blend[3] |
                             ((uint64_t)(uint16_t)d.scissor[0] << 8) ^ ((uint64_t)(uint16_t)d.scissor[1] << 16) ^ ((uint64_t)(uint16_t)d.scissor[2] << 12) ^ ((uint64_t)(uint16_t)d.scissor[3] << 20);
-        if (misc_key == last_misc_) { prof_[2] += svcGetSystemTick() - tp2; return; }
+        if (misc_key == last_misc_) { prof_[2] += tick() - tp2; return; }
         last_misc_ = misc_key;
         bool zcmp = (l & 0x10) != 0 && d.kind == rt64_3ds::DrawRecord::Tris;
         bool zupd = (l & 0x20) != 0 && d.kind == rt64_3ds::DrawRecord::Tris;
@@ -415,10 +427,28 @@ private:
         // screen's left edge to framebuffer y = 400: both axes run backwards.
         if (x1 <= x0 || y1 <= y0) C3D_SetScissor(GPU_SCISSOR_NORMAL, 0, 0, 0, 0);
         else C3D_SetScissor(GPU_SCISSOR_NORMAL, (u32)(240 - y1), (u32)(400 - x1), (u32)(240 - y0), (u32)(400 - x0));
-        prof_[2] += svcGetSystemTick() - tp2;
+        prof_[2] += tick() - tp2;
     }
 
 public:
+    // GFX_CAPTURE.TXT holds a frame number: that frame's RDRAM and OSTask go
+    // to gfx_task.bin for tools/dl_test (host-side interpreter profiling).
+    void maybe_capture(const OSTask* task) {
+        static int want = -2;
+        if (want == -2) {
+            want = -1;
+            if (FILE* f = fopen("sdmc:/3ds/DK64/GFX_CAPTURE.TXT", "r")) { if (fscanf(f, "%d", &want) != 1) want = -1; fclose(f); }
+        }
+        if (want < 0 || (int)frames_ != want) return;
+        want = -1;
+        FILE* f = fopen("sdmc:/3ds/DK64/gfx_task.bin", "wb");
+        if (!f) return;
+        fwrite(task, 1, sizeof(OSTask), f);
+        for (uint32_t off = 0; off < 16u * 1024 * 1024; off += 65536) fwrite(rdram_ + off, 1, 65536, f);
+        fclose(f);
+        fprintf(stderr, "rt64-3ds: captured gfx task of frame %u\n", frames_);
+    }
+
     static void describe_draw(uint32_t i, const rt64_3ds::DrawRecord& d) {
         fprintf(stderr, "rt64-3ds: draw %u: kind %d first %u count %u cc %06x %08x omh %06x oml %08x gm %06x prim %02x%02x%02x%02x env %02x%02x%02x%02x sc %d,%d-%d,%d",
                 i, (int)d.kind, d.first, d.count, d.cc_w0, d.cc_w1, d.othermode_h, d.othermode_l, d.geometry_mode,
@@ -464,12 +494,18 @@ public:
     u64 window_start_ = 0, acc_gfx_ = 0, acc_replay_ = 0, acc_wait_ = 0, acc_end_ = 0;
     float wait_ms_ = 0, end_ms_ = 0;
     u64 prof_[5] = {};
+    bool prof_on_ = false;   // PROFILE.TXT: time the replay's sections (a syscall per sample)
+    u64 tick() const { return prof_on_ ? svcGetSystemTick() : 0; }
     uint32_t frames_at_profile_ = 0;
     C3D_Tex* last_tex_[2] = { nullptr, nullptr };
     uint32_t last_tex_param_[2] = { 0, 0 };
     uint32_t last_cc_[2] = { 0, 0 }, last_omh_ = 0, last_oml_ = 0, last_gm_ = 0;
     uint8_t last_prim_[4] = {}, last_env_[4] = {}, last_fog_[4] = {}, last_plf_ = 0, last_kind_ = 0;
     rt64_3ds::TevPlan last_plan_{};
+    static constexpr uint32_t kPlanCache = 256;
+    rt64_3ds::TevPlan plan_cache_[kPlanCache]{};
+    uint64_t plan_keys_[kPlanCache]{};
+    bool plan_valid_[kPlanCache]{};
     uint64_t last_misc_ = ~0ull;
     float last_us_ = -1.0f, last_vs_ = -1.0f;
     float frames_in_window_ = 1.0f;

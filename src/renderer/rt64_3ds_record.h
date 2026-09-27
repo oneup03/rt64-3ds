@@ -4,6 +4,7 @@
 #define RT64_3DS_RECORD_H
 
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 namespace rt64_3ds {
@@ -16,6 +17,40 @@ struct Vtx3ds {
     float x, y, z, w;
     float u, v;
     uint8_t r, g, b, a;
+};
+
+// The frame's vertices. The backend hands it the linear-memory vertex buffer
+// the GPU reads, so the interpreter writes the triangles it emits straight
+// into place; without storage it allocates its own (host tools).
+class VtxArray {
+public:
+    ~VtxArray() { if (owned_) free(data_); }
+    void set_storage(Vtx3ds* p, uint32_t cap) { if (owned_) free(data_); owned_ = false; data_ = p; cap_ = cap; size_ = 0; }
+    void clear() { size_ = 0; }
+    uint32_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    Vtx3ds* data() { return data_; }
+    const Vtx3ds* data() const { return data_; }
+    Vtx3ds& operator[](uint32_t i) { return data_[i]; }
+    const Vtx3ds& operator[](uint32_t i) const { return data_[i]; }
+    // Room for n more vertices; returns where to write them or nullptr when
+    // the buffer is full (fixed storage) and the triangle must be dropped.
+    Vtx3ds* append(uint32_t n) {
+        if (size_ + n > cap_) {
+            if (!owned_ && data_ != nullptr) return nullptr;
+            uint32_t nc = cap_ ? cap_ * 2 : 4096;
+            while (nc < size_ + n) nc *= 2;
+            data_ = (Vtx3ds*)realloc(data_, nc * sizeof(Vtx3ds));
+            cap_ = nc; owned_ = true;
+        }
+        Vtx3ds* p = data_ + size_;
+        size_ += n;
+        return p;
+    }
+private:
+    Vtx3ds* data_ = nullptr;
+    uint32_t size_ = 0, cap_ = 0;
+    bool owned_ = false;
 };
 
 // A texture as the RDP would sample it: where the texels come from and the
@@ -55,7 +90,7 @@ struct DrawRecord {
 };
 
 struct FrameRecord {
-    std::vector<Vtx3ds> verts;
+    VtxArray verts;
     std::vector<DrawRecord> draws;
     std::vector<uint16_t> tlut;         // palettes referenced by draws, 256 entries each
     bool has_fullsync = false;

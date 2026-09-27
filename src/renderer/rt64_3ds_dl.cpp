@@ -78,6 +78,19 @@ struct Light { float dir[3]; uint8_t col[3]; };
 struct Mtx { float m[4][4]; };
 
 constexpr int kMaxDlDepth = 18;
+
+// 1 for opcodes that may change the state a draw snapshots.
+struct StateOpTable {
+    uint8_t v[256];
+    constexpr StateOpTable() : v{} {
+        for (int i = 0; i < 256; i++) v[i] = 1;
+        for (int op : { G_TRI1, G_TRI2, G_QUAD, G_VTX, G_MODIFYVTX, G_DL, G_ENDDL, G_CULLDL, G_BRANCH_Z, G_NOOP,
+                        G_RDPPIPESYNC, G_RDPLOADSYNC, G_RDPTILESYNC, G_MTX, G_POPMTX, G_MOVEMEM, G_RDPHALF_1, G_RDPHALF_2 })
+            v[op] = 0;
+    }
+};
+constexpr StateOpTable kStateOpTable{};
+#define kStateOp kStateOpTable.v
 constexpr int kMaxMtxStack = 32;
 constexpr int kMaxVerts = 64;
 
@@ -112,7 +125,11 @@ struct Interpreter::Impl {
     bool ldir_dirty = true;
     int16_t fog_mul = 0, fog_off = 0;
     uint32_t proj_id = 0;
+    // Loaded vertices, already in N64 screen homogeneous space (the RSP
+    // applies the viewport at load time): x/w, y/w are pixels (y down),
+    // z/w in [0, 1]; u/v are texel coordinates after the G_TEXTURE scale.
     struct { float x, y, z, w; float u, v; uint8_t r, g, b, a; } vtx[kMaxVerts]{};
+    int32_t ldir_i[8][3]{}, lk_i[2][3]{};   // light directions in 16.16 for the integer lighting loop
     uint32_t rdphalf1 = 0, rdphalf2 = 0;
 
     // RDP
@@ -204,6 +221,7 @@ struct Interpreter::Impl {
             float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
             float inv = len > 0.0f ? 1.0f / (len * 127.0f) : 0.0f;
             ldir[i][0] = d[0] * inv; ldir[i][1] = d[1] * inv; ldir[i][2] = d[2] * inv;
+            for (int k = 0; k < 3; k++) ldir_i[i][k] = (int32_t)(ldir[i][k] * 65536.0f);
         }
         for (int i = 0; i < 2; i++) {
             float d[3];
@@ -217,43 +235,58 @@ struct Interpreter::Impl {
 
     void load_vertices(uint32_t addr, int n, int v0) {
         update_mvp();
-        bool lit = (geometry_mode & G_LIGHTING) != 0;
-        bool texgen = (geometry_mode & G_TEXTURE_GEN) != 0;
+        const bool lit = (geometry_mode & G_LIGHTING) != 0;
+        const bool texgen = (geometry_mode & G_TEXTURE_GEN) != 0;
+        const bool fogged = (geometry_mode & G_FOG) != 0;
         if ((lit || texgen) && ldir_dirty) update_light_dirs();
         const float uscale = (float)texture.scaleS / (65536.0f * 32.0f), vscale = (float)texture.scaleT / (65536.0f * 32.0f);
-        const float m00 = mvp.m[0][0], m01 = mvp.m[0][1], m02 = mvp.m[0][2], m03 = mvp.m[0][3];
-        const float m10 = mvp.m[1][0], m11 = mvp.m[1][1], m12 = mvp.m[1][2], m13 = mvp.m[1][3];
-        const float m20 = mvp.m[2][0], m21 = mvp.m[2][1], m22 = mvp.m[2][2], m23 = mvp.m[2][3];
-        const float m30 = mvp.m[3][0], m31 = mvp.m[3][1], m32 = mvp.m[3][2], m33 = mvp.m[3][3];
-        for (int i = 0; i < n; i++) {
-            int dst = v0 + i;
-            if (dst < 0 || dst >= kMaxVerts) continue;
-            uint32_t a = addr + i * 16;
-            float ob[3] = { (float)r16(a), (float)r16(a + 2), (float)r16(a + 4) };
-            int16_t tc0 = r16(a + 8), tc1 = r16(a + 10);
-            uint8_t cn[4] = { r8(a + 12), r8(a + 13), r8(a + 14), r8(a + 15) };
-            auto& v = vtx[dst];
-            v.x = ob[0] * m00 + ob[1] * m10 + ob[2] * m20 + m30;
-            v.y = ob[0] * m01 + ob[1] * m11 + ob[2] * m21 + m31;
-            v.z = ob[0] * m02 + ob[1] * m12 + ob[2] * m22 + m32;
-            v.w = ob[0] * m03 + ob[1] * m13 + ob[2] * m23 + m33;
-            // Texture coordinates in texels (10.5 * 0.16 scale / 32).
+        // Model -> clip -> screen in one matrix: the viewport is a scale and
+        // translate of x/w and y/w (y negated: screen y grows downward) and
+        // z' = (z + w) / 2, all linear in homogeneous coordinates.
+        const float sx = vp.scale[0], sy = -vp.scale[1], tx = vp.trans[0], ty = vp.trans[1];
+        float m[4][4];
+        for (int i = 0; i < 4; i++) {
+            const float cx = mvp.m[i][0], cy = mvp.m[i][1], cz = mvp.m[i][2], cw = mvp.m[i][3];
+            m[i][0] = cx * sx + cw * tx;
+            m[i][1] = cy * sy + cw * ty;
+            m[i][2] = 0.5f * (cz + cw);
+            m[i][3] = cw;
+        }
+        const float fm = (float)fog_mul, fo = (float)fog_off;
+        const int32_t amb0 = ambient[0] << 16, amb1 = ambient[1] << 16, amb2 = ambient[2] << 16;
+        int lo = v0 < 0 ? -v0 : 0, hi = n;
+        if (v0 + hi > kMaxVerts) hi = kMaxVerts - v0;
+        for (int i = lo; i < hi; i++) {
+            const uint8_t* src = rdram + ((addr + i * 16) & 0xFFFFFC);
+            // RDRAM is stored in 32-bit little-endian words: halves are at ^2, bytes at ^3.
+            const float ob0 = (float)*(const int16_t*)(src + 2), ob1 = (float)*(const int16_t*)(src + 0), ob2 = (float)*(const int16_t*)(src + 6);
+            const int16_t tc0 = *(const int16_t*)(src + 10), tc1 = *(const int16_t*)(src + 8);
+            const uint8_t c0 = src[15], c1 = src[14], c2 = src[13], c3 = src[12];
+            auto& v = vtx[v0 + i];
+            v.x = ob0 * m[0][0] + ob1 * m[1][0] + ob2 * m[2][0] + m[3][0];
+            v.y = ob0 * m[0][1] + ob1 * m[1][1] + ob2 * m[2][1] + m[3][1];
+            v.z = ob0 * m[0][2] + ob1 * m[1][2] + ob2 * m[2][2] + m[3][2];
+            v.w = ob0 * m[0][3] + ob1 * m[1][3] + ob2 * m[2][3] + m[3][3];
             v.u = (float)tc0 * uscale;
             v.v = (float)tc1 * vscale;
             if (lit) {
-                float nx = (int8_t)cn[0], ny = (int8_t)cn[1], nz = (int8_t)cn[2];
-                float c[3] = { (float)ambient[0], (float)ambient[1], (float)ambient[2] };
+                // Integer lighting, as the RSP does it: the unnormalised
+                // signed normal dotted with 16.16 unit directions.
+                const int32_t nx = (int8_t)c0, ny = (int8_t)c1, nz = (int8_t)c2;
+                int32_t r = amb0, g = amb1, b = amb2;
                 for (int l = 0; l < num_lights; l++) {
-                    float d = nx * ldir[l][0] + ny * ldir[l][1] + nz * ldir[l][2];
-                    if (d > 0.0f) { c[0] += d * lights[l].col[0]; c[1] += d * lights[l].col[1]; c[2] += d * lights[l].col[2]; }
+                    int32_t d = nx * ldir_i[l][0] + ny * ldir_i[l][1] + nz * ldir_i[l][2];
+                    if (d > 0) { r += d * lights[l].col[0]; g += d * lights[l].col[1]; b += d * lights[l].col[2]; }
                 }
-                v.r = (uint8_t)(c[0] > 255.0f ? 255 : c[0]);
-                v.g = (uint8_t)(c[1] > 255.0f ? 255 : c[1]);
-                v.b = (uint8_t)(c[2] > 255.0f ? 255 : c[2]);
-                v.a = cn[3];
+                r >>= 16; g >>= 16; b >>= 16;
+                v.r = (uint8_t)(r > 255 ? 255 : r);
+                v.g = (uint8_t)(g > 255 ? 255 : g);
+                v.b = (uint8_t)(b > 255 ? 255 : b);
+                v.a = c3;
                 if (texgen) {
-                    float dx = nx * lk[0][0] + ny * lk[0][1] + nz * lk[0][2];
-                    float dy = nx * lk[1][0] + ny * lk[1][1] + nz * lk[1][2];
+                    float fx = (float)nx, fy = (float)ny, fz = (float)nz;
+                    float dx = fx * lk[0][0] + fy * lk[0][1] + fz * lk[0][2];
+                    float dy = fx * lk[1][0] + fy * lk[1][1] + fz * lk[1][2];
                     if (dx < -1) dx = -1; if (dx > 1) dx = 1;
                     if (dy < -1) dy = -1; if (dy > 1) dy = 1;
                     if (geometry_mode & G_TEXTURE_GEN_LINEAR) {
@@ -269,13 +302,14 @@ struct Interpreter::Impl {
                 }
             }
             else {
-                v.r = cn[0]; v.g = cn[1]; v.b = cn[2]; v.a = cn[3];
+                v.r = c0; v.g = c1; v.b = c2; v.a = c3;
             }
-            if (geometry_mode & G_FOG) {
-                // Fog factor into alpha: (z/w * mul + off) / 255, as the RSP does.
-                float zw = v.w != 0.0f ? v.z / v.w : 0.0f;
+            if (fogged) {
+                // Fog factor into alpha: (z/w * mul + off) / 255, as the RSP
+                // does, with z/w the clip-space depth = 2 z' / w - 1.
+                float zw = v.w != 0.0f ? 2.0f * v.z / v.w - 1.0f : 0.0f;
                 if (zw < -1) zw = -1; if (zw > 1) zw = 1;
-                float f = zw * fog_mul + fog_off;
+                float f = zw * fm + fo;
                 if (f < 0) f = 0; if (f > 255) f = 255;
                 v.a = (uint8_t)f;
             }
@@ -398,6 +432,7 @@ struct Interpreter::Impl {
                     if (same_draw_state(probe, last)) {
                         last_draw_seq = state_seq;
                         r = &last;
+                        stats->draws_merged++;
                     }
                 }
             }
@@ -414,35 +449,34 @@ struct Interpreter::Impl {
             if (uses_texel(0)) describe_tile(t0, r->tex[0]);
             if (uses_texel(1)) describe_tile((t0 + 1) & 7, r->tex[1]);
         }
-        int idx[3] = { i0, i1, i2 };
+        const auto& a = vtx[i0]; const auto& b = vtx[i1]; const auto& c = vtx[i2];
         if (geometry_mode & (G_CULL_FRONT | G_CULL_BACK)) {
-            // Screen-space winding (y down); a vertex behind the eye flips it.
-            const auto& a = vtx[i0]; const auto& b = vtx[i1]; const auto& c = vtx[i2];
-            float ax = a.x * b.w * c.w, ay = a.y * b.w * c.w;
-            float bx = b.x * a.w * c.w, by = b.y * a.w * c.w;
-            float cx = c.x * a.w * b.w, cy = c.y * a.w * b.w;
+            // Winding in screen space (y down), each vertex scaled by the
+            // other two w's so the comparison holds without dividing; a
+            // vertex behind the eye flips it, hence the sign of the product.
+            const float ab = a.w * b.w, bc = b.w * c.w, ac = a.w * c.w;
+            const float ax = a.x * bc, ay = a.y * bc;
+            const float bx = b.x * ac, by = b.y * ac;
+            const float cx = c.x * ab, cy = c.y * ab;
             float cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-            float sign = (a.w * b.w * c.w) < 0.0f ? -1.0f : 1.0f;
-            cross *= sign * vp.scale[0] * vp.scale[1];   // the viewport can mirror an axis
-            // With y down, front faces wind clockwise on screen (cross > 0).
-            if ((geometry_mode & G_CULL_BACK) && cross < 0.0f) return;
-            if ((geometry_mode & G_CULL_FRONT) && cross > 0.0f) return;
+            if (ab * c.w < 0.0f) cross = -cross;
+            // Front faces wind counter-clockwise on the y-down screen (cross < 0).
+            if ((geometry_mode & G_CULL_BACK) && cross > 0.0f) return;
+            if ((geometry_mode & G_CULL_FRONT) && cross < 0.0f) return;
         }
+        Vtx3ds* o = out->verts.append(3);
+        if (o == nullptr) return;
         const Tile& tl = tiles[texture.tile & 7];
-        float uls = (float)(tl.uls >> 2), ult = (float)(tl.ult >> 2);
-        float ss = shift_scale(tl.shifts), st = shift_scale(tl.shiftt);
+        const float uls = (float)(tl.uls >> 2), ult = (float)(tl.ult >> 2);
+        const float ss = shift_scale(tl.shifts), st = shift_scale(tl.shiftt);
+        const bool snap = r->tex[0].snapshot;
         for (int k = 0; k < 3; k++) {
-            const auto& v = vtx[idx[k]];
-            Vtx3ds o;
-            o.x = vp.trans[0] * v.w + vp.scale[0] * v.x;
-            o.y = vp.trans[1] * v.w - vp.scale[1] * v.y;   // the RSP negates y: screen y grows downward
-            o.z = 0.5f * v.z + 0.5f * v.w;
-            o.w = v.w;
-            o.u = v.u * ss - uls;
-            o.v = v.v * st - ult;
-            if (r->tex[0].snapshot) snapshot_uv(r->tex[0], o.u, o.v, o.u, o.v);
-            o.r = v.r; o.g = v.g; o.b = v.b; o.a = v.a;
-            out->verts.push_back(o);
+            const auto& v = k == 0 ? a : (k == 1 ? b : c);
+            o[k].x = v.x; o[k].y = v.y; o[k].z = v.z; o[k].w = v.w;
+            o[k].u = v.u * ss - uls;
+            o[k].v = v.v * st - ult;
+            if (snap) snapshot_uv(r->tex[0], o[k].u, o[k].v, o[k].u, o[k].v);
+            o[k].r = v.r; o[k].g = v.g; o[k].b = v.b; o[k].a = v.a;
         }
         r->count += 3;
         stats->tris++;
@@ -538,8 +572,10 @@ struct Interpreter::Impl {
             if (r.tex[0].snapshot) snapshot_uv(r.tex[0], q[i].u, q[i].v, q[i].u, q[i].v);
             q[i].r = q[i].g = q[i].b = q[i].a = 255;
         }
-        out->verts.push_back(q[0]); out->verts.push_back(q[1]); out->verts.push_back(q[2]);
-        out->verts.push_back(q[0]); out->verts.push_back(q[2]); out->verts.push_back(q[3]);
+        Vtx3ds* o = out->verts.append(6);
+        if (o == nullptr) { out->draws.pop_back(); return; }
+        o[0] = q[0]; o[1] = q[1]; o[2] = q[2];
+        o[3] = q[0]; o[4] = q[2]; o[5] = q[3];
         stats->rects++;
     }
 
@@ -686,14 +722,11 @@ struct Interpreter::Impl {
             uint32_t w0 = r32(pc), w1 = r32(pc + 4);
             uint8_t op = w0 >> 24;
             stats->commands++;
+            stats->op_hist[op]++;
             uint32_t next = pc + 8;
             // Anything but drawing, vertex loads and list flow may change the
             // state a draw snapshots (rects bump it themselves).
-            if (!(op == G_TRI1 || op == G_TRI2 || op == G_QUAD || op == G_VTX || op == G_MODIFYVTX || op == G_DL || op == G_ENDDL ||
-                  op == G_CULLDL || op == G_BRANCH_Z || op == G_NOOP || op == G_RDPPIPESYNC || op == G_RDPLOADSYNC || op == G_RDPTILESYNC ||
-                  op == G_MTX || op == G_POPMTX || op == G_MOVEMEM || op == G_RDPHALF_1 || op == G_RDPHALF_2)) {
-                state_seq++;
-            }
+            state_seq += kStateOp[op];
             switch (op) {
                 case G_NOOP: break;
                 case G_SPNOOP:

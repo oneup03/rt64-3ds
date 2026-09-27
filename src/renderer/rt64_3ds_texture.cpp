@@ -103,7 +103,9 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
     auto it = impl_->map.find(key);
     if (it != impl_->map.end()) {
         Entry& e = it->second;
-        if (e.checked_frame != impl_->frame) {
+        // Re-hash every fourth frame, staggered by key, so a texture the game
+        // rewrites in place is noticed within ~130 ms at a quarter of the cost.
+        if (e.checked_frame != impl_->frame && ((impl_->frame + (uint32_t)(key >> 12)) & 3) == 0) {
             e.checked_frame = impl_->frame;
             uint32_t h = content_hash();
             if (h != e.content) {
