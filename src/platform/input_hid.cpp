@@ -24,9 +24,15 @@ circlePosition g_cstick{};
 
 void recomp3ds::input_poll() {
     hidScanInput();
-    g_held = hidKeysHeld() | recomp3ds::autotest_tick();
+    u32 scripted = recomp3ds::autotest_tick();
+    g_held = hidKeysHeld() | scripted;
     hidCircleRead(&g_cpad);
     hidCstickRead(&g_cstick);
+    // Scripted stick directions (AUTOTEST STICK_*): full deflection.
+    if (scripted & (KEY_CPAD_UP | KEY_CPAD_DOWN | KEY_CPAD_LEFT | KEY_CPAD_RIGHT)) {
+        g_cpad.dx = (scripted & KEY_CPAD_RIGHT) ? CPAD_MAX : ((scripted & KEY_CPAD_LEFT) ? -CPAD_MAX : 0);
+        g_cpad.dy = (scripted & KEY_CPAD_UP) ? CPAD_MAX : ((scripted & KEY_CPAD_DOWN) ? -CPAD_MAX : 0);
+    }
 }
 
 bool recomp3ds::input_get(int controller_num, uint16_t* buttons, float* x, float* y) {

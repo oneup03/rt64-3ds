@@ -62,6 +62,21 @@ public:
         bool present = interp_.run(task->t.data_ptr, frame_);
         u64 t1 = svcGetSystemTick();
         dl_count_++;
+        if (cam_log_now_) {
+            cam_log_now_ = false;
+            const float* c = frame_.cam;
+            u64 now = svcGetSystemTick();
+            static u64 last = 0;
+            // DK64 (debug only): the camera eye/target from character_change_array (0x807FC924) + 0x210 / 0x228.
+            auto rf = [&](uint32_t va) { float f; uint32_t w = *(const uint32_t*)(rdram_ + ((va - 0x80000000u) & 0xFFFFFC)); memcpy(&f, &w, 4); return f; };
+            uint32_t cc = *(const uint32_t*)(rdram_ + (0x807FC924u - 0x80000000u));
+            float ex = 0, ey = 0, ez = 0, ax = 0, ay = 0, az = 0;
+            if (cc >= 0x80000000u && cc < 0x80800000u) { ex = rf(cc + 0x210); ey = rf(cc + 0x214); ez = rf(cc + 0x218); ax = rf(cc + 0x228); ay = rf(cc + 0x22C); az = rf(cc + 0x230); }
+            (void)c;
+            fprintf(stderr, "cam %u: dt %.1f ms eye %.2f %.2f %.2f at %.2f %.2f %.2f\n", frames_,
+                    last ? (double)(now - last) * 1000.0 / SYSCLOCK_ARM11 : 0.0, ex, ey, ez, ax, ay, az);
+            last = now;
+        }
         if (present) replay_and_present();
         if (g_debug_gfx_delay_ms > 0) svcSleepThread((s64)g_debug_gfx_delay_ms * 1000000);
         g_progress.phase = 0;
@@ -220,6 +235,7 @@ private:
         C3D_FrameBegin(0);
         acc_wait_ += svcGetSystemTick() - tb0;
         maybe_capture_framebuffer();
+        if (rt64_3ds::render_desc().depth_to_rdram && prev_depth_image_ != 0) depth_to_rdram(prev_depth_image_);
         g_progress.phase = 3;
         for (const rt64_3ds::DrawRecord& d : frame_.draws) {
             if (d.tex[0].valid && d.tex[0].snapshot) {
@@ -308,6 +324,7 @@ private:
         C3D_FrameEnd(0);
         acc_end_ += svcGetSystemTick() - te0;
         interp_.note_presented_framebuffer(frame_.color_image);
+        prev_depth_image_ = (frame_.color_width == 320) ? frame_.depth_image : 0;
         last_uploads_ = textures_.uploads_this_frame();
         textures_.end_frame();
     }
@@ -469,6 +486,10 @@ public:
                 char word[16] = {};
                 if (fscanf(f, "%15s", word) == 1) {
                     if (strcmp(word, "snap") == 0) capture_snapshot_frames_ = 3;   // the first three frames drawing from a snapshot
+                    else if (strcmp(word, "cam") == 0) {
+                        // "cam <first frame> <count>": log the camera projection per frame
+                        if (fscanf(f, "%d %d", &cam_log_first_, &cam_log_count_) != 2) cam_log_count_ = 0;
+                    }
                     else if (strcmp(word, "seq") == 0) {
                         // "seq <first frame> <count>": the rendered frames only, one file each
                         if (fscanf(f, "%d %d", &seq_first_, &seq_count_) != 2) seq_count_ = 0;
@@ -479,6 +500,7 @@ public:
             }
         }
         if (seq_count_ > 0 && (int)frames_ >= seq_first_ && (int)frames_ < seq_first_ + seq_count_) fb_capture_pending_ = true;
+        if (cam_log_count_ > 0 && (int)frames_ >= cam_log_first_ && (int)frames_ < cam_log_first_ + cam_log_count_) cam_log_now_ = true;
         if (want < 0 || (int)frames_ != want) return;
         want = -1;
         // Snapshot RDRAM and the task now; the slow SD write happens after
@@ -565,8 +587,54 @@ public:
     bool ok_ = false;
     C3D_RenderTarget* top_ = nullptr;
     bool fb_capture_pending_ = false;
+    uint32_t prev_depth_image_ = 0;
+
+    // The finished frame's depth (the GPU is idle after C3D_FrameBegin) into
+    // the game's 320x240 RDRAM depth buffer in the RDP's format: one sample
+    // per 4x4 block, read straight from VRAM (8x8 Morton tiles, the target
+    // rotated: row = screen x, column = 239 - screen y). Stored depth is
+    // 1 - z' with z' = (clip z / w + 1) / 2; the RDP's 18-bit z is
+    // z' * 0x3FE00 (viewport z scale and offset 0x1FF, x32, 15.3), stored
+    // as 3-bit exponent (leading ones) and 11-bit mantissa, dz 0.
+    static uint16_t n64_depth(float zp) {
+        if (zp < 0.0f) zp = 0.0f;
+        if (zp > 1.0f) zp = 1.0f;
+        uint32_t z = (uint32_t)(zp * 261632.0f);
+        if (z > 0x3FFFF) z = 0x3FFFF;
+        uint32_t e, m;
+        if (z < 0x20000) { e = 0; m = z >> 6; }
+        else if (z < 0x30000) { e = 1; m = z >> 5; }
+        else if (z < 0x38000) { e = 2; m = z >> 4; }
+        else if (z < 0x3C000) { e = 3; m = z >> 3; }
+        else if (z < 0x3E000) { e = 4; m = z >> 2; }
+        else if (z < 0x3F000) { e = 5; m = z >> 1; }
+        else if (z < 0x3F800) { e = 6; m = z; }
+        else { e = 7; m = z; }
+        return (uint16_t)((e << 13) | ((m & 0x7FF) << 2));
+    }
+    void depth_to_rdram(uint32_t zimg) {
+        const uint32_t* db = (const uint32_t*)top_->frameBuf.depthBuf;
+        if (db == nullptr || (zimg & 0xFFFFFF) + 320 * 240 * 2 > 16u * 1024 * 1024) return;
+        uint8_t* z = rdram_ + (zimg & 0xFFFFFF);
+        for (int by = 0; by < 240; by += 4) {
+            for (int bx = 0; bx < 320; bx += 4) {
+                int sx = bx + 2 + 40, sy = by + 2;       // block centre on the 400-wide screen
+                int r = sx, c = 239 - sy;
+                uint32_t tile = (uint32_t)(r >> 3) * 30 + (uint32_t)(c >> 3);
+                uint32_t mo = (c & 1) | ((r & 1) << 1) | ((c & 2) << 1) | ((r & 2) << 2) | ((c & 4) << 2) | ((r & 4) << 3);
+                uint32_t d = db[tile * 64 + mo] & 0xFFFFFF;
+                uint16_t v = n64_depth(1.0f - (float)d * (1.0f / 16777215.0f));
+                for (int y = by; y < by + 4; y++) {
+                    uint8_t* row = z + (uint32_t)y * 640;
+                    for (int x = bx; x < bx + 4; x++) *(uint16_t*)(row + ((x * 2) ^ 2)) = v;
+                }
+            }
+        }
+    }
     int capture_snapshot_frames_ = 0;
     int seq_first_ = 0, seq_count_ = 0;
+    int cam_log_first_ = 0, cam_log_count_ = 0;
+    bool cam_log_now_ = false;
     uint8_t* capture_copy_ = nullptr;
     OSTask capture_task_{};
     C3D_Tex white_{};

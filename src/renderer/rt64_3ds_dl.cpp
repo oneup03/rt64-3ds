@@ -891,6 +891,7 @@ struct Interpreter::Impl {
                     load_mtx(m, seg(w1));
                     if (p & 4) {
                         if (p & 2) proj = m; else mul(proj, m, proj);
+                        if (!out->has_cam && proj.m[2][3] != 0.0f) { out->has_cam = true; memcpy(out->cam, &proj, sizeof(out->cam)); }
                     }
                     else {
                         if (p & 1) {

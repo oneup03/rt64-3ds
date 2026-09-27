@@ -41,6 +41,8 @@ u32 key_bit(const char* name) {
         {"A",KEY_A},{"B",KEY_B},{"X",KEY_X},{"Y",KEY_Y},{"L",KEY_L},{"R",KEY_R},
         {"ZL",KEY_ZL},{"ZR",KEY_ZR},{"START",KEY_START},{"SELECT",KEY_SELECT},
         {"UP",KEY_DUP},{"DOWN",KEY_DDOWN},{"LEFT",KEY_DLEFT},{"RIGHT",KEY_DRIGHT},
+        // Circle Pad pushed fully that way (the input layer turns these into stick values).
+        {"STICK_UP",KEY_CPAD_UP},{"STICK_DOWN",KEY_CPAD_DOWN},{"STICK_LEFT",KEY_CPAD_LEFT},{"STICK_RIGHT",KEY_CPAD_RIGHT},
     };
     for (auto& e : tab) {
         if (strcasecmp(e.n, name) == 0) return e.k;

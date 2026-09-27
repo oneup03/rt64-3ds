@@ -108,6 +108,8 @@ struct FrameRecord {
     bool has_fullsync = false;
     bool snapshot_request = false;      // copy the last presented frame before drawing this one
     uint32_t color_image = 0, color_width = 0, depth_image = 0;
+    bool has_cam = false;               // the first camera projection (group 5) loaded this frame (debug)
+    float cam[16] = {};
 
     void clear() {
         verts.clear();
@@ -115,6 +117,7 @@ struct FrameRecord {
         tlut.clear();
         has_fullsync = false;
         snapshot_request = false;
+        has_cam = false;
     }
 };
 

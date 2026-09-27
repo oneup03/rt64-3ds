@@ -39,6 +39,10 @@ struct RenderDesc {
     bool hud_on_bottom_supported = false;
     const uint32_t* snapshot_buffers = nullptr;   // RDRAM addresses the game copies frames into
     size_t snapshot_count = 0;
+    // Write the rendered depth back into the game's RDRAM depth buffer each
+    // frame (N64 compressed format, sampled on a 4x4 grid): for games that
+    // read depth on the CPU (DK64's camera wall avoidance).
+    bool depth_to_rdram = false;
 };
 
 void set_render_desc(const RenderDesc& desc);

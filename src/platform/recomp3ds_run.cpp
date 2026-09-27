@@ -391,6 +391,15 @@ int recomp3ds::run(const GameDesc& desc) {
         }
         ultramodern::set_host_thread_spec_callback(host_thread_spec);
     }
+    {
+        // Debug: the FPU control state threads start with (rounding mode in
+        // bits 22-23, flush-to-zero in bit 24, default NaN in bit 25).
+        u32 main_fpscr; __asm__ volatile("vmrs %0, fpscr" : "=r"(main_fpscr));
+        static volatile u32 thread_fpscr = 0;
+        Thread t = threadCreate([](void*) { u32 v; __asm__ volatile("vmrs %0, fpscr" : "=r"(v)); thread_fpscr = v; }, nullptr, 4096, 0x30, 0, false);
+        if (t) { threadJoin(t, UINT64_MAX); threadFree(t); }
+        fprintf(stderr, "recomp3ds: FPSCR main %08lx, new thread %08lx\n", (unsigned long)main_fpscr, (unsigned long)thread_fpscr);
+    }
     recomp::start_game(desc.game_id, "");
     recomp3ds::loadmon_start(is_new_3ds);
     log_memory("before start");
