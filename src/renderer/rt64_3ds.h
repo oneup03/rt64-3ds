@@ -79,6 +79,7 @@ struct FrameStats {
     int dl_per_sec = 0;               // display lists received per second
 };
 const FrameStats& stats();
+FrameStats& mutable_stats();   // for the renderer implementations
 
 }   // namespace rt64_3ds
 

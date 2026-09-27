@@ -15,7 +15,12 @@ include("${CMAKE_CURRENT_LIST_DIR}/cmake/Pica.cmake")
 add_library(rt64_3ds STATIC
     src/renderer/rt64_3ds_common.cpp
     src/renderer/rt64_3ds_null_context.cpp
+    src/renderer/rt64_3ds_context.cpp
+    src/renderer/rt64_3ds_dl.cpp
+    src/renderer/rt64_3ds_texture.cpp
+    src/renderer/rt64_3ds_tev.cpp
 )
+add_pica_shader(rt64_3ds "${CMAKE_CURRENT_LIST_DIR}/src/renderer/shaders/rt64_3ds.v.pica")
 target_include_directories(rt64_3ds PUBLIC src/renderer)
 target_link_libraries(rt64_3ds PUBLIC ultramodern librecomp citro3d ctru m)
 target_compile_features(rt64_3ds PUBLIC cxx_std_20)

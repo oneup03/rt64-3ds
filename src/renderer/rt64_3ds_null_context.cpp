@@ -25,6 +25,7 @@ public:
         }
         else if (now - window_start >= SYSCLOCK_ARM11) {
             dl_per_sec = dl_count;
+            rt64_3ds::mutable_stats().dl_per_sec = dl_count;
             dl_count = 0;
             window_start = now;
         }
@@ -43,7 +44,6 @@ private:
 };
 
 NullRenderContext* g_null = nullptr;
-rt64_3ds::FrameStats g_stats{};
 
 }   // namespace
 
@@ -56,9 +56,3 @@ rt64_3ds::create_null_render_context(uint8_t* rdram, ultramodern::renderer::Wind
     return ctx;
 }
 
-const rt64_3ds::FrameStats& rt64_3ds::stats() {
-    if (g_null != nullptr) {
-        g_stats.dl_per_sec = g_null->dl_per_sec;
-    }
-    return g_stats;
-}

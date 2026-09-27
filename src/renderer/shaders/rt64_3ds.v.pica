@@ -1,0 +1,42 @@
+; rt64-3ds vertex shader.
+;
+; Vertices arrive in N64 screen homogeneous space: (x, y) / w are N64 pixels
+; (the viewport already applied on the CPU), z / w in [0, 1] near to far.
+; `xform` is the Mtx_OrthoTilt over the N64 screen for the render target
+; being drawn. `stereo` = (a, b): x' = x + a*w + b, the per-draw eye shift
+; (zero for mono). `uvscale` turns texel coordinates into normalized ones
+; for the PICA texture actually bound (power-of-two padded).
+
+.fvec xform[4]
+.fvec stereo
+.fvec uvscale
+
+.constf consts(0.00392156862745, 0.0, 1.0, 0.0)
+
+.out opos position
+.out otc0 texcoord0
+.out otc1 texcoord1
+.out oclr color
+
+.alias ipos v0   ; float4 (x, y, z, w)
+.alias itc  v1   ; float2 texels
+.alias iclr v2   ; ubyte4 RGBA
+
+.proc main
+	mov r0, ipos
+	mul r1.x, stereo.x, ipos.w
+	add r0.x, r0.x, r1.x
+	add r0.x, stereo.y, r0.x
+
+	dp4 opos.x, xform[0], r0
+	dp4 opos.y, xform[1], r0
+	dp4 opos.z, xform[2], r0
+	dp4 opos.w, xform[3], r0
+
+	mul r2.xy, uvscale.xy, itc.xy
+	mov r2.zw, consts.yyyy
+	mov otc0, r2
+	mov otc1, r2
+	mul oclr, consts.xxxx, iclr
+	end
+.end
