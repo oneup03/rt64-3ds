@@ -26,6 +26,8 @@ constexpr uint32_t kVboVerts = 65536;
 struct GpuVertex { float x, y, z, w; float u, v; uint8_t r, g, b, a; };
 
 #define g_stats rt64_3ds::mutable_stats()
+rt64_3ds::Progress g_progress{};
+const rt64_3ds::DrawRecord* g_progress_draw = nullptr;
 
 class C3dRenderContext final : public ultramodern::renderer::RendererContext {
 public:
@@ -48,10 +50,12 @@ public:
         if (!ok_) return;
         u64 t0 = svcGetSystemTick();
         frame_.clear();
+        g_progress.phase = 1;
         bool present = interp_.run(task->t.data_ptr, frame_);
         u64 t1 = svcGetSystemTick();
         dl_count_++;
         if (present) replay_and_present();
+        g_progress.phase = 0;
         u64 t2 = svcGetSystemTick();
         acc_gfx_ += t1 - t0;
         acc_replay_ += t2 - t1;
@@ -152,6 +156,11 @@ private:
         C3D_DepthMap(true, -1.0f, 0.0f);
         C3D_CullFace(GPU_CULL_NONE);
         ok_ = true;
+        if (FILE* f = fopen("sdmc:/3ds/DK64/GPU_DEBUG.TXT", "r")) {
+            fclose(f);
+            gpu_debug_ = true;
+            fprintf(stderr, "rt64-3ds: GPU debug mode: every draw is logged and synced\n");
+        }
         fprintf(stderr, "rt64-3ds: citro3d renderer up (linear free %u KB)\n", (unsigned)(linearSpaceFree() / 1024));
     }
 
@@ -159,9 +168,18 @@ private:
         last_draws_ = frame_.draws.size();
         last_verts_ = frame_.verts.size();
         frames_++;
+        g_progress.frames = frames_;
+        g_progress.draw_count = (uint32_t)frame_.draws.size();
+        g_progress.draw_index = 0;
+        g_progress.phase = 2;
+        if (gpu_debug_) {
+            // Every draw of the frame goes to the log before the GPU sees it.
+            for (size_t i = 0; i < frame_.draws.size(); i++) describe_draw((uint32_t)i, frame_.draws[i]);
+        }
         u64 tb0 = svcGetSystemTick();
         C3D_FrameBegin(0);
         acc_wait_ += svcGetSystemTick() - tb0;
+        g_progress.phase = 3;
         C3D_RenderTargetClear(top_, C3D_CLEAR_ALL, 0x000000FF, 0);
         C3D_FrameDrawOn(top_);
         C3D_BindProgram(&prog_);
@@ -192,13 +210,23 @@ private:
         BufInfo_Add(bi, vb, sizeof(GpuVertex), 3, 0x210);
 
         int fallbacks = 0;
-        for (const rt64_3ds::DrawRecord& d : frame_.draws) {
+        for (size_t i = 0; i < frame_.draws.size(); i++) {
+            const rt64_3ds::DrawRecord& d = frame_.draws[i];
+            g_progress.draw_index = (uint32_t)i;
+            g_progress_draw = &d;
             if (d.count < 3 || d.first + d.count > n) continue;
             apply_state(d, fallbacks);
             u64 td = svcGetSystemTick();
             C3D_DrawArrays(GPU_TRIANGLES, d.first, d.count);
             prof_[3] += svcGetSystemTick() - td;
+            if (gpu_debug_) {
+                // Run the GPU up to this draw before queueing the next, so a
+                // hang stops here with draw_index naming the culprit.
+                C3D_FrameSplit(0);
+                gspWaitForP3D();
+            }
         }
+        g_progress.phase = 4;
         g_stats.combiner_fallbacks = fallbacks;
         g_stats.draws = (int)frame_.draws.size();
         g_stats.tris = (int)(frame_.verts.size() / 3);
@@ -307,6 +335,21 @@ private:
         prof_[2] += svcGetSystemTick() - tp2;
     }
 
+public:
+    static void describe_draw(uint32_t i, const rt64_3ds::DrawRecord& d) {
+        fprintf(stderr, "rt64-3ds: draw %u: kind %d first %u count %u cc %06x %08x omh %06x oml %08x gm %06x prim %02x%02x%02x%02x env %02x%02x%02x%02x sc %d,%d-%d,%d",
+                i, (int)d.kind, d.first, d.count, d.cc_w0, d.cc_w1, d.othermode_h, d.othermode_l, d.geometry_mode,
+                d.prim[0], d.prim[1], d.prim[2], d.prim[3], d.env[0], d.env[1], d.env[2], d.env[3],
+                d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
+        for (int t = 0; t < 2; t++) {
+            if (d.tex[t].valid) {
+                fprintf(stderr, " tex%d %06x/%u fmt %u siz %u %ux%u m%u/%u c%u/%u", t, d.tex[t].addr, d.tex[t].pitch, d.tex[t].fmt, d.tex[t].siz,
+                        d.tex[t].width, d.tex[t].height, d.tex[t].masks, d.tex[t].maskt, d.tex[t].cms, d.tex[t].cmt);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+
     static GPU_TEXTURE_WRAP_PARAM wrap_mode(uint8_t cm, uint8_t mask, uint16_t size) {
         if (mask == 0 || (cm & 1)) return GPU_CLAMP_TO_EDGE;
         if ((1u << mask) != size) return GPU_CLAMP_TO_EDGE;
@@ -320,6 +363,7 @@ private:
     bool ok_ = false;
     C3D_RenderTarget* top_ = nullptr;
     C3D_Tex white_{};
+    bool gpu_debug_ = false;
     DVLB_s* dvlb_ = nullptr;
     shaderProgram_s prog_{};
     int u_xform_ = -1, u_stereo_ = -1, u_uvscale_ = -1;
@@ -352,3 +396,10 @@ rt64_3ds::create_render_context(uint8_t* rdram, ultramodern::renderer::WindowHan
     return std::make_unique<C3dRenderContext>(rdram);
 }
 
+
+const rt64_3ds::Progress& rt64_3ds::progress() { return g_progress; }
+
+void rt64_3ds::dump_progress() {
+    fprintf(stderr, "rt64-3ds: progress: frame %u phase %u draw %u of %u\n", g_progress.frames, g_progress.phase, g_progress.draw_index, g_progress.draw_count);
+    if (g_progress.phase == 3 && g_progress_draw != nullptr) C3dRenderContext::describe_draw(g_progress.draw_index, *g_progress_draw);
+}

@@ -73,6 +73,17 @@ void set_low_convergence_scene(bool on);
 // in RDRAM (for effects whose CPU code reads pixels). Synchronous.
 void request_fb_readback(uint32_t fb_addr, int x, int y, int w, int h);
 
+// Live progress of the gfx thread, for a watchdog on another thread: which
+// frame and draw it is on. `dump_progress` writes the current draw's state
+// to stderr (read racily; only meant for a hung GPU).
+struct Progress {
+    volatile uint32_t frames = 0;
+    volatile uint32_t draw_index = 0, draw_count = 0;
+    volatile uint32_t phase = 0;      // 0 idle, 1 interpreting, 2 frame begin, 3 replaying, 4 frame end
+};
+const Progress& progress();
+void dump_progress();
+
 struct FrameStats {
     float game_ms = 0, gfx_ms = 0, replay_ms = 0, audio_ms = 0;
     int draws = 0, tris = 0, tex_uploads = 0, combiner_fallbacks = 0;

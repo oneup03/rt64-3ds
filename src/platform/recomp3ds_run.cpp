@@ -122,6 +122,18 @@ void update_gfx(void*) {
                 hs.tasks, hs.commands, hs.diff_mismatches, hs.diff_tasks, hs.unknown_opcodes);
         printf("\x1b[2;0H%3d fps  cpu0 %3d%%  cpu2 %3d%%  ucode %3u ms/s   \n", st.dl_per_sec, busy0, busy2, ucode_ms);
     }
+    // Watchdog: a frame that stays in the replay or the GPU wait for 4 s is
+    // a hung GPU; say which draw it was on, once.
+    {
+        static u32 last_frames = 0; static u64 since = 0; static bool reported = false;
+        const rt64_3ds::Progress& pg = rt64_3ds::progress();
+        if (pg.frames != last_frames || pg.phase == 0 || pg.phase == 1) { last_frames = pg.frames; since = now; }
+        else if (!reported && since != 0 && now - since > 4ull * SYSCLOCK_ARM11) {
+            reported = true;
+            fprintf(stderr, "recomp3ds: WATCHDOG: no frame for 4 s\n");
+            rt64_3ds::dump_progress();
+        }
+    }
     if (!aptMainLoop() || g_exit_requested) {
         static bool quitting = false;
         if (!quitting) {
