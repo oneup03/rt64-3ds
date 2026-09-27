@@ -14,6 +14,8 @@
 #include "rt64_3ds_tev.h"
 #include "rt64_3ds_shbin.h"
 
+extern "C" void C3Di_UpdateContext(void);
+
 namespace {
 
 #define DISPLAY_TRANSFER_FLAGS \
@@ -73,9 +75,12 @@ public:
             frames_in_window_ = (float)(frames_ - frames_at_window_ > 0 ? frames_ - frames_at_window_ : 1);
             frames_at_window_ = frames_;
             if (++report_ % 5 == 1) {
-                fprintf(stderr, "rt64-3ds:   replay profile per frame: textures %.1f tev %.1f state %.1f draw %.1f ms\n",
-                        (float)prof_[0] * 1000.0f / SYSCLOCK_ARM11 / frames_in_window_, (float)prof_[1] * 1000.0f / SYSCLOCK_ARM11 / frames_in_window_,
-                        (float)prof_[2] * 1000.0f / SYSCLOCK_ARM11 / frames_in_window_, (float)prof_[3] * 1000.0f / SYSCLOCK_ARM11 / frames_in_window_);
+                float fpw = (float)(frames_ - frames_at_profile_ > 0 ? frames_ - frames_at_profile_ : 1);
+                frames_at_profile_ = frames_;
+                fprintf(stderr, "rt64-3ds:   replay profile per frame: textures %.1f tev %.1f state %.1f flush %.1f draw %.1f ms\n",
+                        (float)prof_[0] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[1] * 1000.0f / SYSCLOCK_ARM11 / fpw,
+                        (float)prof_[2] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[4] * 1000.0f / SYSCLOCK_ARM11 / fpw,
+                        (float)prof_[3] * 1000.0f / SYSCLOCK_ARM11 / fpw);
                 fprintf(stderr, "rt64-3ds: frame %u: %u draws %u verts, interp %.1f ms replay %.1f ms (gpu wait %.1f, end %.1f), tex live %u (%u KB) %u uploads/frame, linear free %u KB, unknown ops %u ex %u, tev fallbacks %d, cimg %06x w%u\n",
                         frames_, (unsigned)last_draws_, (unsigned)last_verts_, g_stats.gfx_ms, g_stats.replay_ms, wait_ms_, end_ms_, textures_.live(), textures_.bytes() / 1024, last_uploads_,
                         (unsigned)(linearSpaceFree() / 1024), is.unknown, is.ex_unknown, g_stats.combiner_fallbacks, frame_.color_image, frame_.color_width);
@@ -98,7 +103,7 @@ public:
                         tris, rects, textured, untextured, is.tex_unresolved, minx, maxx, miny, maxy, minz, maxz, behind);
                 if (!frame_.draws.empty()) {
                     const rt64_3ds::DrawRecord& d = frame_.draws[frame_.draws.size() / 2];
-                    prof_[0] = prof_[1] = prof_[2] = prof_[3] = 0;
+                    prof_[0] = prof_[1] = prof_[2] = prof_[3] = prof_[4] = 0;
                 fprintf(stderr, "rt64-3ds:   mid draw: kind %d cc %06x %08x omh %06x oml %08x gm %06x tex0 %d %ux%u fmt %u/%u sc %d,%d-%d,%d\n",
                             (int)d.kind, d.cc_w0, d.cc_w1, d.othermode_h, d.othermode_l, d.geometry_mode, d.tex[0].valid,
                             d.tex[0].width, d.tex[0].height, d.tex[0].fmt, d.tex[0].siz, d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
@@ -151,8 +156,9 @@ private:
         }
 
         // The N64's 320x240 sits centred on the 400 px wide screen for now.
-        // N64 y grows downward; this ordering puts row 0 at the top.
-        Mtx_OrthoTilt(&proj_, -40.0f, 360.0f, 0.0f, 240.0f, 0.0f, 1.0f, true);
+        // Everything arrives in N64 screen pixels with y growing downward:
+        // bottom edge = 240, top edge = 0.
+        Mtx_OrthoTilt(&proj_, -40.0f, 360.0f, 240.0f, 0.0f, 0.0f, 1.0f, true);
         C3D_DepthMap(true, -1.0f, 0.0f);
         C3D_CullFace(GPU_CULL_NONE);
         ok_ = true;
@@ -173,8 +179,17 @@ private:
         g_progress.draw_index = 0;
         g_progress.phase = 2;
         if (gpu_debug_) {
-            // Every draw of the frame goes to the log before the GPU sees it.
-            for (size_t i = 0; i < frame_.draws.size(); i++) describe_draw((uint32_t)i, frame_.draws[i]);
+            // Every draw of the frame goes to the log before the GPU sees it,
+            // with its first three vertices.
+            for (size_t i = 0; i < frame_.draws.size(); i++) {
+                const rt64_3ds::DrawRecord& d = frame_.draws[i];
+                describe_draw((uint32_t)i, d);
+                for (uint32_t k = d.first; k < d.first + 4 && k < d.first + d.count && k < frame_.verts.size(); k++) {
+                    const rt64_3ds::Vtx3ds& v = frame_.verts[k];
+                    fprintf(stderr, "rt64-3ds:    v%u x %.1f y %.1f z %.3f w %.3f u %.2f v %.2f rgba %02x%02x%02x%02x\n", k - d.first,
+                            v.x / v.w, v.y / v.w, v.z / v.w, v.w, v.u, v.v, v.r, v.g, v.b, v.a);
+                }
+            }
         }
         u64 tb0 = svcGetSystemTick();
         C3D_FrameBegin(0);
@@ -217,8 +232,11 @@ private:
             if (d.count < 3 || d.first + d.count > n) continue;
             apply_state(d, fallbacks);
             u64 td = svcGetSystemTick();
+            C3Di_UpdateContext();          // the state flush, timed apart from the draw itself
+            u64 tf = svcGetSystemTick();
+            prof_[4] += tf - td;
             C3D_DrawArrays(GPU_TRIANGLES, d.first, d.count);
-            prof_[3] += svcGetSystemTick() - td;
+            prof_[3] += svcGetSystemTick() - tf;
             if (gpu_debug_) {
                 // Finish the frame here and start it again: FrameBegin waits
                 // for the GPU, so a hang stops with draw_index naming the
@@ -388,7 +406,8 @@ public:
     uint32_t dl_count_ = 0;
     u64 window_start_ = 0, acc_gfx_ = 0, acc_replay_ = 0, acc_wait_ = 0, acc_end_ = 0;
     float wait_ms_ = 0, end_ms_ = 0;
-    u64 prof_[4] = {};
+    u64 prof_[5] = {};
+    uint32_t frames_at_profile_ = 0;
     C3D_Tex* last_tex_[2] = { nullptr, nullptr };
     uint32_t last_tex_param_[2] = { 0, 0 };
     uint32_t last_cc_[2] = { 0, 0 }, last_omh_ = 0, last_oml_ = 0, last_gm_ = 0;

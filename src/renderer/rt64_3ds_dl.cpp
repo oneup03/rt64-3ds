@@ -108,6 +108,8 @@ struct Interpreter::Impl {
     uint8_t ambient[3]{};
     int num_lights = 0;
     float lookat[2][3]{};
+    float ldir[8][3]{}, lk[2][3]{};   // light/lookat directions rotated by the current modelview
+    bool ldir_dirty = true;
     int16_t fog_mul = 0, fog_off = 0;
     uint32_t proj_id = 0;
     struct { float x, y, z, w; float u, v; uint8_t r, g, b, a; } vtx[kMaxVerts]{};
@@ -175,34 +177,39 @@ struct Interpreter::Impl {
     }
 
     // ---- vertices
+    void update_light_dirs() {
+        // Light and look-at directions rotated by the modelview (transposed
+        // product, as the RSP effectively does) so they can be dotted with
+        // model-space normals; the vertex normals themselves are used as the
+        // RSP uses them, unnormalised, scaled by 1/127.
+        const Mtx& mv = mv_stack[mv_depth];
+        for (int i = 0; i < num_lights; i++) {
+            float d[3];
+            for (int k = 0; k < 3; k++) d[k] = lights[i].dir[0] * mv.m[k][0] + lights[i].dir[1] * mv.m[k][1] + lights[i].dir[2] * mv.m[k][2];
+            float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            float inv = len > 0.0f ? 1.0f / (len * 127.0f) : 0.0f;
+            ldir[i][0] = d[0] * inv; ldir[i][1] = d[1] * inv; ldir[i][2] = d[2] * inv;
+        }
+        for (int i = 0; i < 2; i++) {
+            float d[3];
+            for (int k = 0; k < 3; k++) d[k] = lookat[i][0] * mv.m[k][0] + lookat[i][1] * mv.m[k][1] + lookat[i][2] * mv.m[k][2];
+            float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            float inv = len > 0.0f ? 1.0f / (len * 127.0f) : 0.0f;
+            lk[i][0] = d[0] * inv; lk[i][1] = d[1] * inv; lk[i][2] = d[2] * inv;
+        }
+        ldir_dirty = false;
+    }
+
     void load_vertices(uint32_t addr, int n, int v0) {
         update_mvp();
-        const Mtx& mv = mv_stack[mv_depth];
-        float ldir[8][3];
         bool lit = (geometry_mode & G_LIGHTING) != 0;
-        if (lit) {
-            for (int i = 0; i < num_lights; i++) {
-                // Light directions are rotated by the modelview (transposed
-                // product, as the RSP effectively does) so they can be dotted
-                // with model-space normals.
-                float d[3];
-                for (int k = 0; k < 3; k++) d[k] = lights[i].dir[0] * mv.m[k][0] + lights[i].dir[1] * mv.m[k][1] + lights[i].dir[2] * mv.m[k][2];
-                float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-                if (len > 0.0f) { d[0] /= len; d[1] /= len; d[2] /= len; }
-                ldir[i][0] = d[0]; ldir[i][1] = d[1]; ldir[i][2] = d[2];
-            }
-        }
-        float lk[2][3];
         bool texgen = (geometry_mode & G_TEXTURE_GEN) != 0;
-        if (texgen) {
-            for (int i = 0; i < 2; i++) {
-                float d[3];
-                for (int k = 0; k < 3; k++) d[k] = lookat[i][0] * mv.m[k][0] + lookat[i][1] * mv.m[k][1] + lookat[i][2] * mv.m[k][2];
-                float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-                if (len > 0.0f) { d[0] /= len; d[1] /= len; d[2] /= len; }
-                lk[i][0] = d[0]; lk[i][1] = d[1]; lk[i][2] = d[2];
-            }
-        }
+        if ((lit || texgen) && ldir_dirty) update_light_dirs();
+        const float uscale = (float)texture.scaleS / (65536.0f * 32.0f), vscale = (float)texture.scaleT / (65536.0f * 32.0f);
+        const float m00 = mvp.m[0][0], m01 = mvp.m[0][1], m02 = mvp.m[0][2], m03 = mvp.m[0][3];
+        const float m10 = mvp.m[1][0], m11 = mvp.m[1][1], m12 = mvp.m[1][2], m13 = mvp.m[1][3];
+        const float m20 = mvp.m[2][0], m21 = mvp.m[2][1], m22 = mvp.m[2][2], m23 = mvp.m[2][3];
+        const float m30 = mvp.m[3][0], m31 = mvp.m[3][1], m32 = mvp.m[3][2], m33 = mvp.m[3][3];
         for (int i = 0; i < n; i++) {
             int dst = v0 + i;
             if (dst < 0 || dst >= kMaxVerts) continue;
@@ -211,17 +218,15 @@ struct Interpreter::Impl {
             int16_t tc0 = r16(a + 8), tc1 = r16(a + 10);
             uint8_t cn[4] = { r8(a + 12), r8(a + 13), r8(a + 14), r8(a + 15) };
             auto& v = vtx[dst];
-            v.x = ob[0] * mvp.m[0][0] + ob[1] * mvp.m[1][0] + ob[2] * mvp.m[2][0] + mvp.m[3][0];
-            v.y = ob[0] * mvp.m[0][1] + ob[1] * mvp.m[1][1] + ob[2] * mvp.m[2][1] + mvp.m[3][1];
-            v.z = ob[0] * mvp.m[0][2] + ob[1] * mvp.m[1][2] + ob[2] * mvp.m[2][2] + mvp.m[3][2];
-            v.w = ob[0] * mvp.m[0][3] + ob[1] * mvp.m[1][3] + ob[2] * mvp.m[2][3] + mvp.m[3][3];
+            v.x = ob[0] * m00 + ob[1] * m10 + ob[2] * m20 + m30;
+            v.y = ob[0] * m01 + ob[1] * m11 + ob[2] * m21 + m31;
+            v.z = ob[0] * m02 + ob[1] * m12 + ob[2] * m22 + m32;
+            v.w = ob[0] * m03 + ob[1] * m13 + ob[2] * m23 + m33;
             // Texture coordinates in texels (10.5 * 0.16 scale / 32).
-            v.u = (float)tc0 * (float)texture.scaleS / 65536.0f / 32.0f;
-            v.v = (float)tc1 * (float)texture.scaleT / 65536.0f / 32.0f;
+            v.u = (float)tc0 * uscale;
+            v.v = (float)tc1 * vscale;
             if (lit) {
                 float nx = (int8_t)cn[0], ny = (int8_t)cn[1], nz = (int8_t)cn[2];
-                float len = sqrtf(nx * nx + ny * ny + nz * nz);
-                if (len > 0.0f) { nx /= len; ny /= len; nz /= len; }
                 float c[3] = { (float)ambient[0], (float)ambient[1], (float)ambient[2] };
                 for (int l = 0; l < num_lights; l++) {
                     float d = nx * ldir[l][0] + ny * ldir[l][1] + nz * ldir[l][2];
@@ -393,7 +398,7 @@ struct Interpreter::Impl {
             const auto& v = vtx[idx[k]];
             Vtx3ds o;
             o.x = vp.trans[0] * v.w + vp.scale[0] * v.x;
-            o.y = vp.trans[1] * v.w + vp.scale[1] * v.y;
+            o.y = vp.trans[1] * v.w - vp.scale[1] * v.y;   // the RSP negates y: screen y grows downward
             o.z = 0.5f * v.z + 0.5f * v.w;
             o.w = v.w;
             o.u = v.u * ss - uls;
@@ -633,6 +638,7 @@ struct Interpreter::Impl {
                     mv_depth -= n;
                     if (mv_depth < 0) mv_depth = 0;
                     mvp_dirty = true;
+                    ldir_dirty = true;
                     break;
                 }
                 case G_GEOMETRYMODE:
@@ -650,6 +656,7 @@ struct Interpreter::Impl {
                             if (mv_depth + 1 < kMaxMtxStack) { mv_stack[mv_depth + 1] = mv_stack[mv_depth]; mv_depth++; }
                         }
                         if (p & 2) mv_stack[mv_depth] = m; else mul(mv_stack[mv_depth], m, mv_stack[mv_depth]);
+                        ldir_dirty = true;
                     }
                     mvp_dirty = true;
                     break;
@@ -660,7 +667,7 @@ struct Interpreter::Impl {
                     switch (index) {
                         case 0x06: segments[(offset / 4) & 0xF] = w1 & 0xFFFFFF; break;
                         case 0x08: fog_mul = (int16_t)(w1 >> 16); fog_off = (int16_t)(w1 & 0xFFFF); break;
-                        case 0x02: num_lights = (int)(w1 / 24); if (num_lights > 7) num_lights = 7; break;
+                        case 0x02: num_lights = (int)(w1 / 24); if (num_lights > 7) num_lights = 7; ldir_dirty = true; break;
                         case 0x0A: {
                             int li = offset / 24;
                             if (li < 8) { lights[li].col[0] = w1 >> 24; lights[li].col[1] = w1 >> 16; lights[li].col[2] = w1 >> 8; }
@@ -678,6 +685,7 @@ struct Interpreter::Impl {
                         load_viewport(addr);
                     }
                     else if (index == 10) {      // G_MV_LIGHT
+                        ldir_dirty = true;
                         if (offset < 0x30) {
                             int k = offset / 0x18;
                             lookat[k][0] = (int8_t)r8(addr + 8); lookat[k][1] = (int8_t)r8(addr + 9); lookat[k][2] = (int8_t)r8(addr + 10);
