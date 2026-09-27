@@ -77,7 +77,7 @@ AccessControlInfo:
   IdealProcessor                : 0
   AffinityMask                  : 3 # cores 0 and 1 (the audio task may run on core 1)
   Priority                      : 16
-  MaxCpu                        : 0x9E # Default
+  MaxCpu                        : 0xD0 # bit 7 kept from the default 0x9E; low bits = the most core 1 time APT may grant (80%)
   HandleTableSize               : 0x200
   DisableDebug                  : false
   EnableForceDebug              : false

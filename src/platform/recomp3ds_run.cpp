@@ -368,8 +368,15 @@ int recomp3ds::run(const GameDesc& desc) {
         if (FILE* f = fopen(path, "r")) { if (fscanf(f, "%d", &want) != 1) want = 1; fclose(f); }
         g_sp_core = 2;
         if (want == 1) {
+            // PM refuses a limit above the exheader's MaxCpu (low 7 bits):
+            // take the highest it accepts.
             u32 limit = 0;
-            Result rc = APT_SetAppCpuTimeLimit(80);
+            Result rc = -1;
+            static const u32 kTry[] = { 80, 70, 60, 50, 40, 30, 25, 20 };
+            for (u32 pct : kTry) {
+                rc = APT_SetAppCpuTimeLimit(pct);
+                if (R_SUCCEEDED(rc)) break;
+            }
             APT_GetAppCpuTimeLimit(&limit);
             Thread probe = R_SUCCEEDED(rc) ? threadCreate([](void*) {}, nullptr, 4096, 0x30, 1, false) : nullptr;
             if (probe != nullptr) {
