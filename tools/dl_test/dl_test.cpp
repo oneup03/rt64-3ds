@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
            task.t.data_ptr, (int)present, frame.draws.size(), frame.verts.size(), st.commands, st.tris, st.rects, st.unknown, st.ex_unknown, st.tex_unresolved);
     size_t textured = 0;
     for (const auto& d : frame.draws) if (d.tex[0].valid) textured++;
-    printf("%zu textured draws, %u merged\n", textured, st.draws_merged);
+    printf("%zu textured draws, %u merged, %u probes\n", textured, st.draws_merged, st.probes);
     static const char* names[256] = {};
     names[0x00] = "NOOP"; names[0x01] = "VTX"; names[0x02] = "MODIFYVTX"; names[0x03] = "CULLDL"; names[0x04] = "BRANCH_Z"; names[0x05] = "TRI1"; names[0x06] = "TRI2"; names[0x07] = "QUAD";
     names[0xD7] = "TEXTURE"; names[0xD8] = "POPMTX"; names[0xD9] = "GEOMETRYMODE"; names[0xDA] = "MTX"; names[0xDB] = "MOVEWORD"; names[0xDC] = "MOVEMEM"; names[0xDE] = "DL"; names[0xDF] = "ENDDL";

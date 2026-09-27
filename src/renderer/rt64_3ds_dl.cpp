@@ -93,6 +93,19 @@ struct StateOpTable {
 };
 constexpr StateOpTable kStateOpTable{};
 #define kStateOp kStateOpTable.v
+
+// 1 for opcodes that may change what describe_tile returns (tiles, loads,
+// palettes, the texture tile index, texture filter/TLUT modes, and the
+// combiner inputs that decide which texels are used).
+struct TexOpTable {
+    uint8_t v[256];
+    constexpr TexOpTable() : v{} {
+        for (int op : { G_SETTILE, G_SETTILESIZE, G_LOADBLOCK, G_LOADTILE, G_LOADTLUT, G_SETOTHERMODE_H, G_RDPSETOTHERMODE,
+                        G_TEXTURE, G_SETCOMBINE })
+            v[op] = 1;
+    }
+};
+constexpr TexOpTable kTexOpTable{};
 constexpr int kMaxMtxStack = 32;
 constexpr int kMaxVerts = 64;
 
@@ -151,6 +164,23 @@ struct Interpreter::Impl {
     uint32_t tlut_hash = 1;
     uint32_t tlut_frame_hash = 0, tlut_frame_index = 0;
     uint32_t state_seq = 1;    // bumped by every command that changes draw state
+    // TexDescs of the current texture tile pair, recomputed only when a
+    // texture-affecting command ran (tex_seq) or the tile index changed.
+    uint32_t tex_seq = 1, cached_tex_seq = 0;
+    int cached_tile = -1;
+    TexDesc cached_tex[2];
+    const TexDesc* current_textures() {
+        int t0 = texture.tile & 7;
+        if (cached_tex_seq != tex_seq || cached_tile != t0) {
+            cached_tex[0] = TexDesc{};
+            cached_tex[1] = TexDesc{};
+            if (uses_texel(0)) describe_tile(t0, cached_tex[0]);
+            if (uses_texel(1)) describe_tile((t0 + 1) & 7, cached_tex[1]);
+            cached_tex_seq = tex_seq;
+            cached_tile = t0;
+        }
+        return cached_tex;
+    }
     uint32_t last_draw_seq = 0;
     int16_t rect_align[4]{};   // left/top/right/bottom offsets (extended)
     uint32_t rect_lorigin = 0x800, rect_rorigin = 0x800;
@@ -237,6 +267,9 @@ struct Interpreter::Impl {
 
     uint32_t last_vtx_addr = 0;
     void load_vertices(uint32_t addr, int n, int v0) {
+#ifdef DL_BENCH_SKIP_VTX
+        return;
+#endif
         last_vtx_addr = addr;
         update_mvp();
         const bool lit = (geometry_mode & G_LIGHTING) != 0;
@@ -389,14 +422,15 @@ struct Interpreter::Impl {
     }
 
     // TEXEL1's coordinates relative to TEXEL0's (tile t0 and the next one).
-    void set_uv1(DrawRecord& r, int t0) const {
+    void compute_uv1(float* uv1, int t0) const {
         const Tile& a = tiles[t0 & 7];
         const Tile& b = tiles[(t0 + 1) & 7];
         float k_u = shift_scale(b.shifts) / shift_scale(a.shifts), k_v = shift_scale(b.shiftt) / shift_scale(a.shiftt);
-        r.uv1[0] = k_u; r.uv1[1] = k_v;
-        r.uv1[2] = (float)(a.uls >> 2) * k_u - (float)(b.uls >> 2);
-        r.uv1[3] = (float)(a.ult >> 2) * k_v - (float)(b.ult >> 2);
+        uv1[0] = k_u; uv1[1] = k_v;
+        uv1[2] = (float)(a.uls >> 2) * k_u - (float)(b.uls >> 2);
+        uv1[3] = (float)(a.ult >> 2) * k_v - (float)(b.ult >> 2);
     }
+    void set_uv1(DrawRecord& r, int t0) const { compute_uv1(r.uv1, t0); }
 
     void snapshot(DrawRecord& r) {
         r.cc_w0 = cc_w0; r.cc_w1 = cc_w1;
@@ -433,6 +467,9 @@ struct Interpreter::Impl {
     }
 
     void emit_tri(int i0, int i1, int i2) {
+#ifdef DL_BENCH_SKIP_TRI
+        return;
+#endif
         if (offscreen_target()) return;
         if (i0 >= kMaxVerts || i1 >= kMaxVerts || i2 >= kMaxVerts) return;
         DrawRecord* r = nullptr;
@@ -446,13 +483,11 @@ struct Interpreter::Impl {
                     // State commands ran since the last triangle; if they left
                     // the same state (re-sent textures and modes are common)
                     // the record continues, sparing a draw call.
-                    DrawRecord probe;
-                    probe.kind = DrawRecord::Tris;
-                    snapshot(probe);
-                    int t0 = texture.tile & 7;
-                    if (uses_texel(0)) describe_tile(t0, probe.tex[0]);
-                    if (uses_texel(1)) describe_tile((t0 + 1) & 7, probe.tex[1]);
-                    if (same_draw_state(probe, last)) {
+                    stats->probes++;
+#ifdef DL_BENCH_NO_PROBE
+                    if (false)
+#endif
+                    if (same_as_last(last, current_textures())) {
                         last_draw_seq = state_seq;
                         r = &last;
                         stats->draws_merged++;
@@ -462,16 +497,19 @@ struct Interpreter::Impl {
         }
         if (r == nullptr) {
             last_draw_seq = state_seq;
+            const TexDesc* tex = current_textures();
             out->draws.emplace_back();
             r = &out->draws.back();
             r->kind = DrawRecord::Tris;
             r->first = (uint32_t)out->verts.size();
             r->count = 0;
             snapshot(*r);
-            int t0 = texture.tile & 7;
-            if (uses_texel(0)) describe_tile(t0, r->tex[0]);
-            if (uses_texel(1)) describe_tile((t0 + 1) & 7, r->tex[1]);
+            r->tex[0] = tex[0];
+            r->tex[1] = tex[1];
         }
+#ifdef DL_BENCH_NO_EMIT
+        return;
+#endif
         const auto& a = vtx[i0]; const auto& b = vtx[i1]; const auto& c = vtx[i2];
         if (geometry_mode & (G_CULL_FRONT | G_CULL_BACK)) {
             // Winding in screen space (y down), each vertex scaled by the
@@ -535,6 +573,20 @@ struct Interpreter::Impl {
                same_tex(a.tex[0], b.tex[0]) && same_tex(a.tex[1], b.tex[1]);
     }
 
+    // The current state against a recorded draw (what same_draw_state
+    // compares, without building a probe record).
+    bool same_as_last(const DrawRecord& a, const TexDesc* tex) const {
+        if (a.cc_w0 != cc_w0 || a.cc_w1 != cc_w1 || a.othermode_h != othermode_h || a.othermode_l != othermode_l ||
+            a.geometry_mode != geometry_mode || a.prim_lod_frac != prim_lod_frac || a.proj_id != proj_id) return false;
+        if (memcmp(a.prim, prim, 4) != 0 || memcmp(a.env, env, 4) != 0 || memcmp(a.blend, blend, 4) != 0 || memcmp(a.fog, fog, 4) != 0) return false;
+        if (memcmp(a.scissor, scissor, sizeof(a.scissor)) != 0) return false;
+        if (a.perspective != (proj.m[2][3] != 0.0f || proj.m[3][3] == 0.0f)) return false;
+        float uv1[4];
+        compute_uv1(uv1, texture.tile);
+        if (memcmp(a.uv1, uv1, sizeof(uv1)) != 0) return false;
+        return same_tex(a.tex[0], tex[0]) && same_tex(a.tex[1], tex[1]);
+    }
+
     static float shift_scale(int s) {
         if (s == 0) return 1.0f;
         if (s <= 10) return 1.0f / (float)(1 << s);
@@ -559,6 +611,7 @@ struct Interpreter::Impl {
                     out->snapshot_request = true;
                     snapshot_base = cimg;
                     snapshot_valid = true;
+                    tex_seq++;
                 }
             }
             return;
@@ -740,6 +793,7 @@ struct Interpreter::Impl {
 
     // ---- main loop
     bool run(uint32_t data_ptr) {
+        tex_seq++;   // FrameRecord::tlut restarts: cached palette indices are stale
         uint32_t stack[kMaxDlDepth];
         int depth = 0;
         uint32_t pc = seg(data_ptr);
@@ -761,6 +815,7 @@ struct Interpreter::Impl {
             // Anything but drawing, vertex loads and list flow may change the
             // state a draw snapshots (rects bump it themselves).
             state_seq += kStateOp[op];
+            tex_seq += kTexOpTable.v[op];
             switch (op) {
                 case G_NOOP: break;
                 case G_SPNOOP:

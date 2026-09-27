@@ -122,8 +122,16 @@ ultramodern::renderer::WindowHandle create_window(void*) {
     return ultramodern::renderer::WindowHandle{};
 }
 
-// Runs on the main thread once a millisecond while the game is up.
+// Called by the runtime's main loop (which sleeps 1 ms between calls) on
+// core 0, the game's core: it sleeps most of a VI itself so the main thread
+// wakes ~60 times a second instead of 1000.
+void update_gfx_inner();
 void update_gfx(void*) {
+    update_gfx_inner();
+    if (!g_exit_requested) svcSleepThread(15 * 1000000ll);
+}
+
+void update_gfx_inner() {
     // Once a second: frame rate and CPU load to the log and the touch screen.
     static u64 last_report = 0;
     u64 now = svcGetSystemTick();
@@ -145,6 +153,18 @@ void update_gfx(void*) {
         {
             static bool seen = false, reported = false;
             static int idle = 0;
+            static int test_countdown = -2;   // STALL_DUMP_TEST.TXT: run the dump once after 30 s (checks the dumper)
+            if (test_countdown == -2) {
+                char path[192];
+                snprintf(path, sizeof(path), "%s/STALL_DUMP_TEST.TXT", g_base_path);
+                FILE* f = fopen(path, "r");
+                test_countdown = f ? 30 : -1;
+                if (f) fclose(f);
+            }
+            if (test_countdown > 0 && --test_countdown == 0 && g_desc != nullptr && g_desc->on_audio_stall != nullptr && g_rdram != nullptr) {
+                fprintf(stderr, "recomp3ds: stall dump test\n");
+                g_desc->on_audio_stall(g_rdram);
+            }
             if (ucode_tasks > 0) { seen = true; idle = 0; }
             else if (seen && !reported && ++idle >= 2) {
                 reported = true;
