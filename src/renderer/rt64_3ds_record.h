@@ -33,6 +33,7 @@ struct TexDesc {
     uint32_t tlut_index = 0;// offset of that palette's 256 entries in FrameRecord::tlut
     uint16_t tlut_mode = 0; // G_TT_* (0 none, 2 RGBA16, 3 IA16)
     bool bilerp = false;
+    bool snapshot = false;  // samples the stored copy of a previous frame instead of RDRAM
 };
 
 // One draw of triangles or a rectangle with a snapshot of the RDP state that
@@ -49,6 +50,8 @@ struct DrawRecord {
     TexDesc tex[2];
     uint32_t proj_id = 0;               // gEXMatrixGroup id in force (stereo later)
     bool perspective = true;
+    float dbg_vp[4] = {};               // viewport scale x/y, translate x/y (debug logging)
+    float dbg_proj[4] = {};             // projection m[1][1], m[3][1], m[2][3], m[3][3]
 };
 
 struct FrameRecord {
@@ -56,6 +59,7 @@ struct FrameRecord {
     std::vector<DrawRecord> draws;
     std::vector<uint16_t> tlut;         // palettes referenced by draws, 256 entries each
     bool has_fullsync = false;
+    bool snapshot_request = false;      // copy the last presented frame before drawing this one
     uint32_t color_image = 0, color_width = 0, depth_image = 0;
 
     void clear() {
@@ -63,6 +67,7 @@ struct FrameRecord {
         draws.clear();
         tlut.clear();
         has_fullsync = false;
+        snapshot_request = false;
     }
 };
 

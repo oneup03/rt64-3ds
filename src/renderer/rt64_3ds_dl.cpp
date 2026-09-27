@@ -102,7 +102,7 @@ struct Interpreter::Impl {
     Viewport vp_stack[8]{};
     int vp_depth = 0;
     int16_t vp_align_x = 0, vp_align_y = 0;
-    uint16_t vp_origin = 0;
+    uint16_t vp_origin = 0x800;
     struct { uint16_t scaleS, scaleT; uint8_t tile, level; bool on; } texture{ 0xFFFF, 0xFFFF, 0, 0, false };
     Light lights[8]{};
     uint8_t ambient[3]{};
@@ -134,8 +134,23 @@ struct Interpreter::Impl {
     uint32_t state_seq = 1;    // bumped by every command that changes draw state
     uint32_t last_draw_seq = 0;
     int16_t rect_align[4]{};   // left/top/right/bottom offsets (extended)
-    uint16_t rect_lorigin = 0x800, rect_rorigin = 0x800;
+    uint32_t rect_lorigin = 0x800, rect_rorigin = 0x800;
     uint8_t rect_aspect = 0;
+
+    // Framebuffer effects: the game copies the front buffer into a storage
+    // buffer in RDRAM with texture rectangles, then draws with it. Draws
+    // into the storage are dropped; the first one requests a GPU snapshot of
+    // the last presented frame, and loads from the storage sample it.
+    uint32_t vi_fbs[4] = {};
+    int vi_fb_next = 0;
+    uint32_t snapshot_base = 0;         // storage buffer that holds the snapshot
+    bool snapshot_valid = false;
+    int snapshot_x_offset = 40;         // where N64 x = 0 sits on the 400 px screen
+
+    bool is_vi_framebuffer(uint32_t a) const {
+        for (uint32_t fb : vi_fbs) if (fb != 0 && a >= fb && a < fb + 320 * 240 * 2) return true;
+        return false;
+    }
 
     // ---- memory
     uint8_t r8(uint32_t a) const { return rdram[(a & 0xFFFFFF) ^ 3]; }
@@ -305,6 +320,7 @@ struct Interpreter::Impl {
         d.valid = true;
         d.addr = best->addr + (tl.tmem - best->tmem) * 8;
         d.pitch = pitch;
+        d.snapshot = snapshot_valid && d.addr >= snapshot_base && d.addr < snapshot_base + 320 * 240 * 2;
         d.fmt = tl.fmt;
         d.siz = tl.siz;
         d.width = (uint16_t)w;
@@ -336,6 +352,8 @@ struct Interpreter::Impl {
         memcpy(r.scissor, scissor, sizeof(scissor));
         r.proj_id = proj_id;
         r.perspective = proj.m[2][3] != 0.0f || proj.m[3][3] == 0.0f;
+        r.dbg_vp[0] = vp.scale[0]; r.dbg_vp[1] = vp.scale[1]; r.dbg_vp[2] = vp.trans[0]; r.dbg_vp[3] = vp.trans[1];
+        r.dbg_proj[0] = proj.m[1][1]; r.dbg_proj[1] = proj.m[3][1]; r.dbg_proj[2] = proj.m[2][3]; r.dbg_proj[3] = proj.m[3][3];
     }
 
     bool uses_texel(int which) const {
@@ -363,7 +381,26 @@ struct Interpreter::Impl {
         DrawRecord* r = nullptr;
         if (!out->draws.empty()) {
             DrawRecord& last = out->draws.back();
-            if (last.kind == DrawRecord::Tris && last.first + last.count == out->verts.size() && last_draw_seq == state_seq) r = &last;
+            if (last.kind == DrawRecord::Tris && last.first + last.count == out->verts.size()) {
+                if (last_draw_seq == state_seq) {
+                    r = &last;
+                }
+                else {
+                    // State commands ran since the last triangle; if they left
+                    // the same state (re-sent textures and modes are common)
+                    // the record continues, sparing a draw call.
+                    DrawRecord probe;
+                    probe.kind = DrawRecord::Tris;
+                    snapshot(probe);
+                    int t0 = texture.tile & 7;
+                    if (uses_texel(0)) describe_tile(t0, probe.tex[0]);
+                    if (uses_texel(1)) describe_tile((t0 + 1) & 7, probe.tex[1]);
+                    if (same_draw_state(probe, last)) {
+                        last_draw_seq = state_seq;
+                        r = &last;
+                    }
+                }
+            }
         }
         if (r == nullptr) {
             last_draw_seq = state_seq;
@@ -403,11 +440,40 @@ struct Interpreter::Impl {
             o.w = v.w;
             o.u = v.u * ss - uls;
             o.v = v.v * st - ult;
+            if (r->tex[0].snapshot) snapshot_uv(r->tex[0], o.u, o.v, o.u, o.v);
             o.r = v.r; o.g = v.g; o.b = v.b; o.a = v.a;
             out->verts.push_back(o);
         }
         r->count += 3;
         stats->tris++;
+    }
+
+    // Texel coordinates relative to a tile that reads the stored frame ->
+    // snapshot texture texels. The snapshot is the rotated 240x400 colour
+    // buffer copied into a 256x512 texture: its u axis runs along screen y
+    // (bottom row first), its v axis along screen x.
+    void snapshot_uv(const TexDesc& d, float u, float v, float& su, float& sv) const {
+        uint32_t texel = (d.addr - snapshot_base) / 2;
+        float x0 = (float)(texel % 320), y0 = (float)(texel / 320);
+        float sx = x0 + u + (float)snapshot_x_offset;     // screen pixel
+        float sy = y0 + v;
+        su = 240.0f - sy;
+        sv = sx;
+    }
+
+    static bool same_tex(const TexDesc& a, const TexDesc& b) {
+        if (a.valid != b.valid) return false;
+        if (!a.valid) return true;
+        return a.addr == b.addr && a.pitch == b.pitch && a.fmt == b.fmt && a.siz == b.siz && a.width == b.width && a.height == b.height &&
+               a.masks == b.masks && a.maskt == b.maskt && a.cms == b.cms && a.cmt == b.cmt && a.palette == b.palette &&
+               a.nibble == b.nibble && a.tlut_hash == b.tlut_hash && a.tlut_mode == b.tlut_mode && a.bilerp == b.bilerp && a.snapshot == b.snapshot;
+    }
+    static bool same_draw_state(const DrawRecord& a, const DrawRecord& b) {
+        return a.cc_w0 == b.cc_w0 && a.cc_w1 == b.cc_w1 && a.othermode_h == b.othermode_h && a.othermode_l == b.othermode_l &&
+               a.geometry_mode == b.geometry_mode && memcmp(a.prim, b.prim, 4) == 0 && memcmp(a.env, b.env, 4) == 0 &&
+               memcmp(a.blend, b.blend, 4) == 0 && memcmp(a.fog, b.fog, 4) == 0 && a.prim_lod_frac == b.prim_lod_frac &&
+               memcmp(a.scissor, b.scissor, sizeof(a.scissor)) == 0 && a.proj_id == b.proj_id && a.perspective == b.perspective &&
+               same_tex(a.tex[0], b.tex[0]) && same_tex(a.tex[1], b.tex[1]);
     }
 
     static float shift_scale(int s) {
@@ -418,7 +484,26 @@ struct Interpreter::Impl {
 
     // Rectangles are emitted in N64 pixels with w = 1.
     void emit_rect(float ulx, float uly, float lrx, float lry, bool textured, int tile, float s, float t, float dsdx, float dtdy, bool flip) {
-        if (offscreen_target()) return;
+        emit_rect_aligned(ulx, uly, lrx, lry, textured, tile, s, t, dsdx, dtdy, flip, rect_lorigin, rect_rorigin, rect_align);
+    }
+    void emit_rect_aligned(float ulx, float uly, float lrx, float lry, bool textured, int tile, float s, float t, float dsdx, float dtdy, bool flip,
+                           uint32_t lorigin, uint32_t rorigin, const int16_t* align) {
+        ulx += align[0] + origin_shift(lorigin); uly += align[1];
+        lrx += align[2] + origin_shift(rorigin); lry += align[3];
+        if (offscreen_target()) {
+            // A copy of the front buffer into the storage: snapshot instead.
+            if (textured) {
+                TexDesc src;
+                describe_tile(tile, src);
+                if (src.valid && is_vi_framebuffer(src.addr)) {
+                    if (!out->snapshot_request) stats->snapshots++;
+                    out->snapshot_request = true;
+                    snapshot_base = cimg;
+                    snapshot_valid = true;
+                }
+            }
+            return;
+        }
         uint32_t cyc = (othermode_h >> 20) & 3;
         if (!textured && zimg != 0 && cimg == zimg) return;   // depth clear: the target is cleared per frame
         state_seq++;
@@ -450,6 +535,7 @@ struct Interpreter::Impl {
         for (int i = 0; i < 4; i++) {
             q[i].x = xs[i]; q[i].y = ys[i]; q[i].z = 0.0f; q[i].w = 1.0f;
             q[i].u = us[i]; q[i].v = vs[i];
+            if (r.tex[0].snapshot) snapshot_uv(r.tex[0], q[i].u, q[i].v, q[i].u, q[i].v);
             q[i].r = q[i].g = q[i].b = q[i].a = 255;
         }
         out->verts.push_back(q[0]); out->verts.push_back(q[1]); out->verts.push_back(q[2]);
@@ -494,12 +580,16 @@ struct Interpreter::Impl {
                 vp_origin = w1 & 0xFFF;
                 uint32_t a = r32(pc + 8);
                 vp_align_x = (int16_t)(a >> 16); vp_align_y = (int16_t)(a & 0xFFFF);
+                apply_viewport_align();
                 return 1;
             }
             case EX_SETSCISSOR: {
+                // x edges are relative to an origin each (left/centre/right
+                // of the N64 screen, or absolute).
+                uint32_t lorigin = (w1 >> 2) & 0xFFF, rorigin = (w1 >> 14) & 0xFFF;
                 uint32_t a = r32(pc + 8), b = r32(pc + 12);
-                scissor[0] = (int16_t)(a >> 16) / 4; scissor[1] = (int16_t)(a & 0xFFFF) / 4;
-                scissor[2] = (int16_t)(b >> 16) / 4; scissor[3] = (int16_t)(b & 0xFFFF) / 4;
+                scissor[0] = (int16_t)(a >> 16) / 4 + origin_x(lorigin); scissor[1] = (int16_t)(a & 0xFFFF) / 4;
+                scissor[2] = (int16_t)(b >> 16) / 4 + origin_x(rorigin); scissor[3] = (int16_t)(b & 0xFFFF) / 4;
                 return 1;
             }
             case EX_SETSCISSORALIGN: return 2;
@@ -523,19 +613,23 @@ struct Interpreter::Impl {
             case EX_TEXRECT: {
                 int tile = w1 & 7;
                 bool flip = (w1 >> 7) & 1;
+                uint32_t lorigin = (w1 >> 3) & 0xFFF, rorigin = (w1 >> 15) & 0xFFF;
                 uint32_t a = r32(pc + 8), b = r32(pc + 12), c = r32(pc + 16), d = r32(pc + 20);
-                float ulx = (int16_t)(a >> 16) / 4.0f, uly = (int16_t)(a & 0xFFFF) / 4.0f;
-                float lrx = (int16_t)(b >> 16) / 4.0f, lry = (int16_t)(b & 0xFFFF) / 4.0f;
+                float ulx = (int16_t)(a >> 16) / 4.0f + origin_x(lorigin), uly = (int16_t)(a & 0xFFFF) / 4.0f;
+                float lrx = (int16_t)(b >> 16) / 4.0f + origin_x(rorigin), lry = (int16_t)(b & 0xFFFF) / 4.0f;
                 float s = (int16_t)(c >> 16) / 32.0f, t = (int16_t)(c & 0xFFFF) / 32.0f;
                 float dsdx = (int16_t)(d >> 16) / 1024.0f, dtdy = (int16_t)(d & 0xFFFF) / 1024.0f;
-                emit_rect(ulx, uly, lrx, lry, true, tile, s, t, dsdx, dtdy, flip);
+                static const int16_t none[4] = { 0, 0, 0, 0 };
+                emit_rect_aligned(ulx, uly, lrx, lry, true, tile, s, t, dsdx, dtdy, flip, 0x800, 0x800, none);
                 return 2;
             }
             case EX_FILLRECT: {
+                uint32_t lorigin = w1 & 0xFFF, rorigin = (w1 >> 12) & 0xFFF;
                 uint32_t a = r32(pc + 8), b = r32(pc + 12);
-                float ulx = (int16_t)(a >> 16) / 4.0f, uly = (int16_t)(a & 0xFFFF) / 4.0f;
-                float lrx = (int16_t)(b >> 16) / 4.0f, lry = (int16_t)(b & 0xFFFF) / 4.0f;
-                emit_rect(ulx, uly, lrx, lry, false, 0, 0, 0, 0, 0, false);
+                float ulx = (int16_t)(a >> 16) / 4.0f + origin_x(lorigin), uly = (int16_t)(a & 0xFFFF) / 4.0f;
+                float lrx = (int16_t)(b >> 16) / 4.0f + origin_x(rorigin), lry = (int16_t)(b & 0xFFFF) / 4.0f;
+                static const int16_t none[4] = { 0, 0, 0, 0 };
+                emit_rect_aligned(ulx, uly, lrx, lry, false, 0, 0, 0, 0, 0, false, 0x800, 0x800, none);
                 return 1;
             }
             case EX_VERTEX: return 1;
@@ -552,13 +646,34 @@ struct Interpreter::Impl {
         }
     }
 
+    // gEX origins: 0 left, 0x200 centre, 0x400 right, 0x800 none. A
+    // coordinate is relative to the origin's N64 position (0/160/320), and
+    // the origin itself sits on the matching edge of the wide screen, whose
+    // N64 x range is -40..360 here; "none" keeps the 4:3 placement.
+    static int origin_x(uint32_t origin) {
+        switch (origin) { case 0x000: return -40; case 0x200: return 160; case 0x400: return 360; default: return 0; }
+    }
+    static int origin_shift(uint32_t origin) {
+        switch (origin) { case 0x000: return -40; case 0x400: return 40; default: return 0; }
+    }
+
+    float raw_vtrans_x = 640.0f;   // quarter pixels, as loaded
     void load_viewport(uint32_t addr) {
         vp.scale[0] = r16(addr + 0) / 4.0f;
         vp.scale[1] = r16(addr + 2) / 4.0f;
         vp.scale[2] = r16(addr + 4);
-        vp.trans[0] = r16(addr + 8) / 4.0f;
+        raw_vtrans_x = (float)r16(addr + 8);
         vp.trans[1] = r16(addr + 10) / 4.0f;
         vp.trans[2] = r16(addr + 12);
+        apply_viewport_align();
+    }
+    void apply_viewport_align() {
+        // gEXSetViewportAlign: the translate is re-based on an origin and
+        // shifted by an offset (quarter pixels); the origin then sits on the
+        // wide screen's edge.
+        float x = raw_vtrans_x;
+        if (vp_origin < 0x800) x += (float)vp_origin * 320.0f * 4.0f / 1024.0f;
+        vp.trans[0] = (x + (float)vp_align_x) / 4.0f + (float)origin_shift(vp_origin);
     }
 
     // ---- main loop
@@ -848,6 +963,15 @@ Interpreter::Interpreter(uint8_t* rdram) : impl_(new Impl()) {
     impl_->stats = &stats_;
     Impl::identity(impl_->proj);
     Impl::identity(impl_->mv_stack[0]);
+}
+
+void Interpreter::note_presented_framebuffer(uint32_t addr) {
+    for (uint32_t fb : impl_->vi_fbs) if (fb == addr) return;
+    impl_->vi_fbs[impl_->vi_fb_next++ & 3] = addr;
+}
+
+void Interpreter::set_snapshot_layout(int screen_x_offset) {
+    impl_->snapshot_x_offset = screen_x_offset;
 }
 
 bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {

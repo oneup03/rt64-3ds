@@ -81,9 +81,9 @@ public:
                         (float)prof_[0] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[1] * 1000.0f / SYSCLOCK_ARM11 / fpw,
                         (float)prof_[2] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[4] * 1000.0f / SYSCLOCK_ARM11 / fpw,
                         (float)prof_[3] * 1000.0f / SYSCLOCK_ARM11 / fpw);
-                fprintf(stderr, "rt64-3ds: frame %u: %u draws %u verts, interp %.1f ms replay %.1f ms (gpu wait %.1f, end %.1f), tex live %u (%u KB) %u uploads/frame, linear free %u KB, unknown ops %u ex %u, tev fallbacks %d, cimg %06x w%u\n",
+                fprintf(stderr, "rt64-3ds: frame %u: %u draws %u verts, interp %.1f ms replay %.1f ms (gpu wait %.1f, end %.1f), tex live %u (%u KB) %u uploads/frame, linear free %u KB, unknown ops %u ex %u, tev fallbacks %d, cimg %06x w%u, snapshots %u\n",
                         frames_, (unsigned)last_draws_, (unsigned)last_verts_, g_stats.gfx_ms, g_stats.replay_ms, wait_ms_, end_ms_, textures_.live(), textures_.bytes() / 1024, last_uploads_,
-                        (unsigned)(linearSpaceFree() / 1024), is.unknown, is.ex_unknown, g_stats.combiner_fallbacks, frame_.color_image, frame_.color_width);
+                        (unsigned)(linearSpaceFree() / 1024), is.unknown, is.ex_unknown, g_stats.combiner_fallbacks, frame_.color_image, frame_.color_width, snapshots_);
                 // Where the geometry lands: screen-space bounds of the last frame.
                 float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f, minz = 1e9f, maxz = -1e9f;
                 int behind = 0, tris = 0, rects = 0;
@@ -155,6 +155,16 @@ private:
             C3D_TexSetFilter(&white_, GPU_NEAREST, GPU_NEAREST);
         }
 
+        // The snapshot texture: the 240x400 colour buffer copied whole into
+        // a 256x512 RGBA8 texture (same tiling, rows padded), for the game's
+        // framebuffer effects.
+        if (!C3D_TexInitVRAM(&snapshot_, 256, 512, GPU_RGBA8)) {
+            if (!C3D_TexInit(&snapshot_, 256, 512, GPU_RGBA8)) fprintf(stderr, "rt64-3ds: snapshot texture allocation failed\n");
+        }
+        C3D_TexSetFilter(&snapshot_, GPU_LINEAR, GPU_LINEAR);
+        C3D_TexSetWrap(&snapshot_, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+        interp_.set_snapshot_layout(40);
+
         // The N64's 320x240 sits centred on the 400 px wide screen for now.
         // Everything arrives in N64 screen pixels with y growing downward:
         // bottom edge = 240, top edge = 0.
@@ -162,10 +172,14 @@ private:
         C3D_DepthMap(true, -1.0f, 0.0f);
         C3D_CullFace(GPU_CULL_NONE);
         ok_ = true;
+        // GPU_DEBUG.TXT: "<start frame> <frame count> <sync 0/1> <every N frames>" (defaults 0, all, 1, 1).
         if (FILE* f = fopen("sdmc:/3ds/DK64/GPU_DEBUG.TXT", "r")) {
+            int a = 0, b = 1000000000, c = 1, d = 1;
+            if (fscanf(f, "%d %d %d %d", &a, &b, &c, &d) < 1) { a = 0; }
             fclose(f);
             gpu_debug_ = true;
-            fprintf(stderr, "rt64-3ds: GPU debug mode: every draw is logged and synced\n");
+            debug_from_ = (uint32_t)a; debug_count_ = (uint32_t)b; debug_sync_ = c != 0; debug_step_ = d > 0 ? (uint32_t)d : 1;
+            fprintf(stderr, "rt64-3ds: GPU debug mode from frame %u for %u frames, sync %d, every %u\n", debug_from_, debug_count_, (int)debug_sync_, debug_step_);
         }
         fprintf(stderr, "rt64-3ds: citro3d renderer up (linear free %u KB)\n", (unsigned)(linearSpaceFree() / 1024));
     }
@@ -178,9 +192,11 @@ private:
         g_progress.draw_count = (uint32_t)frame_.draws.size();
         g_progress.draw_index = 0;
         g_progress.phase = 2;
-        if (gpu_debug_) {
+        bool debug_frame = gpu_debug_ && frames_ >= debug_from_ && frames_ < debug_from_ + debug_count_ && ((frames_ - debug_from_) % debug_step_) == 0;
+        if (debug_frame) {
+            fprintf(stderr, "rt64-3ds: === frame %u: %u draws, cimg %06x\n", frames_, (unsigned)frame_.draws.size(), frame_.color_image);
             // Every draw of the frame goes to the log before the GPU sees it,
-            // with its first three vertices.
+            // with its first vertices.
             for (size_t i = 0; i < frame_.draws.size(); i++) {
                 const rt64_3ds::DrawRecord& d = frame_.draws[i];
                 describe_draw((uint32_t)i, d);
@@ -195,6 +211,25 @@ private:
         C3D_FrameBegin(0);
         acc_wait_ += svcGetSystemTick() - tb0;
         g_progress.phase = 3;
+        for (const rt64_3ds::DrawRecord& d : frame_.draws) {
+            if (d.tex[0].valid && d.tex[0].snapshot) {
+                // Ask the emulator harness for a screenshot of this frame
+                // (rate-limited: one per second).
+                static u64 last = 0;
+                u64 now = svcGetSystemTick();
+                if (now - last > SYSCLOCK_ARM11) { last = now; fprintf(stderr, "AUTOTEST shot snapshot-draw\n"); }
+                break;
+            }
+        }
+        if (frame_.snapshot_request && snapshot_.data != nullptr) {
+            // The target still holds the last presented frame: copy it, one
+            // 8x8-tile row at a time, into the wider texture. Sizes are in
+            // bytes; a tile row of the 240-wide buffer is 30 tiles.
+            const u32 row = 240 * 8 * 4, gap = (256 - 240) * 8 * 4;
+            C3D_SyncTextureCopy((u32*)top_->frameBuf.colorBuf, GX_BUFFER_DIM(row, 0),
+                                (u32*)snapshot_.data, GX_BUFFER_DIM(row, gap), 240 * 400 * 4, 0);
+            snapshots_++;
+        }
         C3D_RenderTargetClear(top_, C3D_CLEAR_ALL, 0x000000FF, 0);
         C3D_FrameDrawOn(top_);
         C3D_BindProgram(&prog_);
@@ -237,7 +272,7 @@ private:
             prof_[4] += tf - td;
             C3D_DrawArrays(GPU_TRIANGLES, d.first, d.count);
             prof_[3] += svcGetSystemTick() - tf;
-            if (gpu_debug_) {
+            if (debug_frame && debug_sync_) {
                 // Finish the frame here and start it again: FrameBegin waits
                 // for the GPU, so a hang stops with draw_index naming the
                 // draw that caused it (phase 2 = waiting after that draw).
@@ -263,6 +298,7 @@ private:
         u64 te0 = svcGetSystemTick();
         C3D_FrameEnd(0);
         acc_end_ += svcGetSystemTick() - te0;
+        interp_.note_presented_framebuffer(frame_.color_image);
         last_uploads_ = textures_.uploads_this_frame();
         textures_.end_frame();
     }
@@ -273,7 +309,15 @@ private:
         float us = 1.0f, vs = 1.0f;
         for (int t = 0; t < 2; t++) {
             bool bound = false;
-            if (d.tex[t].valid) {
+            if (d.tex[t].valid && d.tex[t].snapshot && snapshot_.data != nullptr) {
+                if (last_tex_[t] != &snapshot_) {
+                    C3D_TexBind(t, &snapshot_);
+                    last_tex_[t] = &snapshot_; last_tex_param_[t] = 0xFFFFFFFFu;
+                }
+                if (t == 0) { us = 1.0f / 256.0f; vs = 1.0f / 512.0f; }
+                bound = true;
+            }
+            else if (d.tex[t].valid) {
                 const uint16_t* pal = (d.tex[t].fmt == 2 && d.tex[t].tlut_index + 256 <= frame_.tlut.size()) ? &frame_.tlut[d.tex[t].tlut_index] : nullptr;
                 rt64_3ds::BoundTex b = textures_.get(d.tex[t], pal);
                 if (b.tex != nullptr) {
@@ -358,7 +402,14 @@ private:
         C3D_CullFace(GPU_CULL_NONE);
 
         // Scissor in N64 pixels -> target pixels (rotated framebuffer).
+        // NO_SCISSOR.TXT disables it (to see draws a wrong clip would hide).
+        static int no_scissor = -1;
+        if (no_scissor < 0) { FILE* f = fopen("sdmc:/3ds/DK64/NO_SCISSOR.TXT", "r"); no_scissor = f ? 1 : 0; if (f) fclose(f); }
         int x0 = d.scissor[0] + 40, y0 = d.scissor[1], x1 = d.scissor[2] + 40, y1 = d.scissor[3];
+        if (no_scissor) { x0 = 0; y0 = 0; x1 = 400; y1 = 240; }
+        // The original game's own 320-wide scissor is stretched to the wide
+        // screen: the patched projection already fills it.
+        if (d.scissor[0] <= 0 && d.scissor[2] >= 320) { x0 = 0; x1 = 400; }
         if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > 400) x1 = 400; if (y1 > 240) y1 = 240;
         if (x1 <= x0 || y1 <= y0) C3D_SetScissor(GPU_SCISSOR_NORMAL, 0, 0, 0, 0);
         else C3D_SetScissor(GPU_SCISSOR_NORMAL, (u32)(240 - y1), (u32)x0, (u32)(240 - y0), (u32)x1);
@@ -373,11 +424,12 @@ public:
                 d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
         for (int t = 0; t < 2; t++) {
             if (d.tex[t].valid) {
-                fprintf(stderr, " tex%d %06x/%u fmt %u siz %u %ux%u m%u/%u c%u/%u", t, d.tex[t].addr, d.tex[t].pitch, d.tex[t].fmt, d.tex[t].siz,
-                        d.tex[t].width, d.tex[t].height, d.tex[t].masks, d.tex[t].maskt, d.tex[t].cms, d.tex[t].cmt);
+                fprintf(stderr, " tex%d %06x/%u fmt %u siz %u %ux%u m%u/%u c%u/%u%s", t, d.tex[t].addr, d.tex[t].pitch, d.tex[t].fmt, d.tex[t].siz,
+                        d.tex[t].width, d.tex[t].height, d.tex[t].masks, d.tex[t].maskt, d.tex[t].cms, d.tex[t].cmt, d.tex[t].snapshot ? " SNAP" : "");
             }
         }
-        fprintf(stderr, "\n");
+        fprintf(stderr, " vp %.1f %.1f %.1f %.1f proj %.3f %.3f %.3f %.3f%s\n", d.dbg_vp[0], d.dbg_vp[1], d.dbg_vp[2], d.dbg_vp[3],
+                d.dbg_proj[0], d.dbg_proj[1], d.dbg_proj[2], d.dbg_proj[3], d.perspective ? "" : " ortho");
     }
 
     static GPU_TEXTURE_WRAP_PARAM wrap_mode(uint8_t cm, uint8_t mask, uint16_t size) {
@@ -393,7 +445,10 @@ public:
     bool ok_ = false;
     C3D_RenderTarget* top_ = nullptr;
     C3D_Tex white_{};
-    bool gpu_debug_ = false;
+    C3D_Tex snapshot_{};
+    uint32_t snapshots_ = 0;
+    bool gpu_debug_ = false, debug_sync_ = true;
+    uint32_t debug_from_ = 0, debug_count_ = 0, debug_step_ = 1;
     DVLB_s* dvlb_ = nullptr;
     shaderProgram_s prog_{};
     int u_xform_ = -1, u_stereo_ = -1, u_uvscale_ = -1;
