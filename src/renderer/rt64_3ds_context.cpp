@@ -220,10 +220,22 @@ private:
             C3D_DrawArrays(GPU_TRIANGLES, d.first, d.count);
             prof_[3] += svcGetSystemTick() - td;
             if (gpu_debug_) {
-                // Run the GPU up to this draw before queueing the next, so a
-                // hang stops here with draw_index naming the culprit.
-                C3D_FrameSplit(0);
-                gspWaitForP3D();
+                // Finish the frame here and start it again: FrameBegin waits
+                // for the GPU, so a hang stops with draw_index naming the
+                // draw that caused it (phase 2 = waiting after that draw).
+                g_progress.phase = 4;
+                C3D_FrameEnd(0);
+                g_progress.phase = 2;
+                C3D_FrameBegin(0);
+                C3D_FrameDrawOn(top_);
+                g_progress.phase = 3;
+                C3D_BindProgram(&prog_);
+                C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &proj_);
+                C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, 0.0f, 0.0f, 0.0f, 0.0f);
+                C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uvscale_, last_us_, last_vs_, 0.0f, 0.0f);
+                bi = C3D_GetBufInfo();
+                BufInfo_Init(bi);
+                BufInfo_Add(bi, vb, sizeof(GpuVertex), 3, 0x210);
             }
         }
         g_progress.phase = 4;
