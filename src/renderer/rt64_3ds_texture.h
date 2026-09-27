@@ -13,6 +13,9 @@ namespace rt64_3ds {
 struct BoundTex {
     C3D_Tex* tex = nullptr;
     float uscale = 1.0f, vscale = 1.0f;   // texels -> normalized
+    // Created by this call: the C3D_Tex may sit at the address of one freed
+    // earlier this frame, so a pointer comparison cannot skip its bind.
+    bool fresh = false;
 };
 
 class TextureCache {

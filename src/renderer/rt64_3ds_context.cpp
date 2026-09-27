@@ -335,7 +335,7 @@ private:
                     GPU_TEXTURE_WRAP_PARAM ws = wrap_mode(d.tex[t].cms, d.tex[t].masks, d.tex[t].width);
                     GPU_TEXTURE_WRAP_PARAM wt = wrap_mode(d.tex[t].cmt, d.tex[t].maskt, d.tex[t].height);
                     uint32_t param = (uint32_t)f | ((uint32_t)ws << 4) | ((uint32_t)wt << 8);
-                    if (b.tex != last_tex_[t] || param != last_tex_param_[t]) {
+                    if (b.tex != last_tex_[t] || param != last_tex_param_[t] || b.fresh) {
                         C3D_TexSetFilter(b.tex, f, f);
                         C3D_TexSetWrap(b.tex, ws, wt);
                         C3D_TexBind(t, b.tex);
@@ -469,11 +469,16 @@ public:
                 char word[16] = {};
                 if (fscanf(f, "%15s", word) == 1) {
                     if (strcmp(word, "snap") == 0) capture_snapshot_frames_ = 3;   // the first three frames drawing from a snapshot
+                    else if (strcmp(word, "seq") == 0) {
+                        // "seq <first frame> <count>": the rendered frames only, one file each
+                        if (fscanf(f, "%d %d", &seq_first_, &seq_count_) != 2) seq_count_ = 0;
+                    }
                     else want = atoi(word);
                 }
                 fclose(f);
             }
         }
+        if (seq_count_ > 0 && (int)frames_ >= seq_first_ && (int)frames_ < seq_first_ + seq_count_) fb_capture_pending_ = true;
         if (want < 0 || (int)frames_ != want) return;
         want = -1;
         // Snapshot RDRAM and the task now; the slow SD write happens after
@@ -501,7 +506,7 @@ public:
             free(capture_copy_);
             capture_copy_ = nullptr;
         }
-        if (snapshot_.data != nullptr) {
+        if (snapshot_.data != nullptr && seq_count_ == 0) {
             // The snapshot texture as stored (256x512 RGBA8, tiled), raw.
             if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_snapshot.raw", "wb")) { fwrite(snapshot_.data, 1, 256 * 512 * 4, f); fclose(f); }
         }
@@ -561,6 +566,7 @@ public:
     C3D_RenderTarget* top_ = nullptr;
     bool fb_capture_pending_ = false;
     int capture_snapshot_frames_ = 0;
+    int seq_first_ = 0, seq_count_ = 0;
     uint8_t* capture_copy_ = nullptr;
     OSTask capture_task_{};
     C3D_Tex white_{};

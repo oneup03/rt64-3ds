@@ -96,6 +96,8 @@ RspUcodeFunc* timed_get_ucode(const OSTask* task) {
     return timed_ucode;
 }
 
+extern "C" void __appExit(void);   // libctru: closes the services __appInit opened
+
 const recomp3ds::GameDesc* g_desc = nullptr;
 int g_sp_core = 2;
 
@@ -207,9 +209,10 @@ void update_gfx_inner() {
                 // abort on the way out). Quiesce the GPU and DSP users, then
                 // end the process; the kernel reclaims the rest.
                 rt64_3ds::set_quitting();
-                svcSleepThread(200000000ll);
+                svcSleepThread(300000000ll);      // the renderer finishes its frame and goes idle
                 recomp3ds::audio_shutdown();
-                aptExit();
+                gfxExit();                        // give the GPU and screens back to the system
+                __appExit();                      // libctru's service teardown (hid, fs, apt, srv)
                 svcExitProcess();
             }, nullptr, 16 * 1024, 0x20, -2, true);
         }

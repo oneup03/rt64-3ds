@@ -195,6 +195,7 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
     bytes_ += bytes;
     auto ins = impl_->map.emplace(key, e);
     b.tex = &ins.first->second.tex;
+    b.fresh = true;
     b.uscale = 1.0f / (float)potw;
     b.vscale = 1.0f / (float)poth;
     return b;

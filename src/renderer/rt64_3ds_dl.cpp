@@ -395,7 +395,11 @@ struct Interpreter::Impl {
         d.valid = true;
         d.addr = best->addr + (tl.tmem - best->tmem) * 8;
         d.pitch = pitch;
-        d.snapshot = snapshot_valid && d.addr >= snapshot_base && d.addr < snapshot_base + 320 * 240 * 2;
+        // Reads of the stored frame are 16-bit tile loads out of a 320-wide
+        // image; anything else at that address is ordinary texture data
+        // (the storage may be heap memory the game reuses later).
+        d.snapshot = snapshot_valid && d.addr >= snapshot_base && d.addr < snapshot_base + 320 * 240 * 2 &&
+                     !best->block && best->pitch == 320 * 2 && tl.siz == 2;
         d.fmt = tl.fmt;
         d.siz = tl.siz;
         d.width = (uint16_t)w;
