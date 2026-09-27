@@ -16,6 +16,7 @@
 #include "ultramodern/host_thread.hpp"
 #include "recomp3ds.h"
 #include "recomp3ds_internal.h"
+#include "naudio_hle.h"
 
 // libctru's default main stack is 32 KB; the runtime's start path and the
 // C++ library want more.
@@ -23,11 +24,15 @@ extern "C" { u32 __stacksize__ = 512 * 1024; }
 
 namespace {
 
+char g_base_path[128] = "sdmc:/3ds";
+
 // RSP task timing (audio: the graphics tasks go to the renderer instead).
 recomp::rsp::callbacks_t::get_rsp_microcode_t* g_game_get_ucode = nullptr;
 RspUcodeFunc* g_ucode_inner = nullptr;
 u64 g_ucode_ticks = 0;
 u32 g_ucode_tasks = 0;
+
+bool g_audio_hle = false;
 
 RspExitReason timed_ucode(uint8_t* rdram, uint32_t ucode_addr) {
     u64 t0 = svcGetSystemTick();
@@ -42,6 +47,33 @@ RspUcodeFunc* timed_get_ucode(const OSTask* task) {
     if (f == nullptr) {
         return nullptr;
     }
+    if (g_audio_hle) {
+        // The CPU interpreter replaces the game's (recompiled) microcode. In
+        // differential mode it still runs the original to check itself.
+        static RspUcodeFunc* game_ucode = nullptr;
+        if (game_ucode == nullptr) {
+            game_ucode = f;
+            char path[192];
+            snprintf(path, sizeof(path), "%s/AUDIO_DIFF.TXT", g_base_path);
+            snprintf(path, sizeof(path), "%s/AUDIO_CAPTURE.TXT", g_base_path);
+            if (FILE* c = fopen(path, "r")) {
+                fclose(c);
+                recomp3ds_naudio_capture_dir(g_base_path);
+            }
+            snprintf(path, sizeof(path), "%s/AUDIO_DIFF.TXT", g_base_path);
+            if (FILE* d = fopen(path, "r")) {
+                fclose(d);
+                recomp3ds::naudio_hle_set_reference(f);
+                fprintf(stderr, "recomp3ds: audio HLE in differential mode (AUDIO_DIFF.TXT present)\n");
+            }
+            else {
+                fprintf(stderr, "recomp3ds: audio HLE replaces the RSP microcode\n");
+            }
+        }
+        if (f == game_ucode) {
+            f = recomp3ds::naudio_hle_run;
+        }
+    }
     if (g_ucode_inner != nullptr && g_ucode_inner != f) {
         return f;   // a second microcode: leave it untimed rather than mix them
     }
@@ -49,7 +81,6 @@ RspUcodeFunc* timed_get_ucode(const OSTask* task) {
     return timed_ucode;
 }
 
-char g_base_path[128] = "sdmc:/3ds";
 const recomp3ds::GameDesc* g_desc = nullptr;
 volatile bool g_exit_requested = false;
 
@@ -77,8 +108,10 @@ void update_gfx(void*) {
         unsigned ucode_tasks = g_ucode_tasks;
         g_ucode_ticks = 0;
         g_ucode_tasks = 0;
-        fprintf(stderr, "stats: %d dl/s core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued\n",
-                st.dl_per_sec, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_remaining());
+        const recomp3ds::NaudioHleStats& hs = recomp3ds::naudio_hle_stats();
+        fprintf(stderr, "stats: %d dl/s core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued hle %u/%u diff-mismatch %u/%u unknown %u\n",
+                st.dl_per_sec, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_remaining(),
+                hs.tasks, hs.commands, hs.diff_mismatches, hs.diff_tasks, hs.unknown_opcodes);
         printf("\x1b[2;0H%3d fps  cpu0 %3d%%  cpu2 %3d%%  ucode %3u ms/s   \n", st.dl_per_sec, busy0, busy2, ucode_ms);
     }
     if (!aptMainLoop() || g_exit_requested) {
@@ -193,6 +226,7 @@ int recomp3ds::run(const GameDesc& desc) {
     // Time the audio microcode: the game's callback hands back the ucode
     // function and this trampoline runs it under the tick counter.
     g_game_get_ucode = desc.rsp.get_rsp_microcode;
+    g_audio_hle = desc.audio_hle;
     if (g_game_get_ucode != nullptr) {
         cfg.rsp_callbacks.get_rsp_microcode = timed_get_ucode;
     }

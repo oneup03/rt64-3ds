@@ -28,3 +28,29 @@ What a game repository needs, in the order it is set up. Donkey Kong 64
 5. **ROM placement.** The runtime looks for `sdmc:/3ds/<sd_dir>/<game_id>.z64`.
 6. **Stereo rules.** Port the game's classification from its `rt64-3D`
    branch (`render/rt64_projection_processor.cpp`) into `StereoRule`s.
+
+## Audio
+
+The RSP audio microcode recompiled by RSPRecomp runs scalar on the ARM11 and
+costs most of a core. Set `GameDesc.audio_hle = true` for games whose audio
+task is the naudio family (n_aspMain and relatives: F3DEX2-era games such as
+DK64 and Banjo); `src/platform/naudio_hle.cpp` then interprets the command
+list on the CPU, bit for bit, and the recompiled microcode stays as the
+reference for testing only. Keep the game's `get_rsp_microcode` callback as
+it is: the platform wraps it.
+
+Verifying a new game's command stream:
+
+- `AUDIO_DIFF.TXT` next to the executable: every command also runs through
+  the recompiled microcode and mismatches are logged (`naudio-hle:` lines).
+  Rare one-LSB reports in envelope-init cases are the ARM build of the
+  microcode disagreeing with the x86 one, not the interpreter.
+- `AUDIO_CAPTURE.TXT`: tasks 200-207 are written to `audio_task_N.bin`
+  (RDRAM + OSTask, 16 MB each). `tools/naudio_test/build.sh <game repo>`
+  builds a host harness that replays them against the x86 microcode.
+- The stats line reports `ucode N ms/s in N tasks` and the interpreter's
+  command count; `unknown` must stay 0.
+
+Whatever the game's toolchain does, compile the recompiled functions,
+patches and microcode with `-fno-strict-aliasing`: the desktop builds do,
+and without it the scalar vector unit miscompiles.

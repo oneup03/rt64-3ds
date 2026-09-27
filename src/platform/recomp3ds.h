@@ -21,6 +21,7 @@ struct GameDesc {
     std::string (*get_game_thread_name)(const OSThread* t) = nullptr;   // optional
     rt64_3ds::RenderDesc render;
     bool null_renderer = false;         // bring-up: accept display lists, draw nothing
+    bool audio_hle = false;             // run the naudio audio task on the CPU (naudio_hle.cpp) instead of the recompiled RSP code
 };
 
 // Brings up the console, registers the game and runs the runtime. Returns the
