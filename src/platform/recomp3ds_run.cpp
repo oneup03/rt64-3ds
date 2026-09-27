@@ -60,17 +60,25 @@ RspUcodeFunc* timed_get_ucode(const OSTask* task) {
                 fclose(c);
                 recomp3ds_naudio_capture_dir(g_base_path);
             }
-            snprintf(path, sizeof(path), "%s/AUDIO_DIFF.TXT", g_base_path);
-            if (FILE* d = fopen(path, "r")) {
-                fclose(d);
-                recomp3ds::naudio_hle_set_reference(f);
-                fprintf(stderr, "recomp3ds: audio HLE in differential mode (AUDIO_DIFF.TXT present)\n");
+            snprintf(path, sizeof(path), "%s/AUDIO_RSP.TXT", g_base_path);
+            if (FILE* r = fopen(path, "r")) {
+                fclose(r);
+                g_audio_hle = false;   // the recompiled microcode itself, for comparison
+                fprintf(stderr, "recomp3ds: audio runs the recompiled RSP microcode (AUDIO_RSP.TXT present)\n");
             }
-            else {
-                fprintf(stderr, "recomp3ds: audio HLE replaces the RSP microcode\n");
+            snprintf(path, sizeof(path), "%s/AUDIO_DIFF.TXT", g_base_path);
+            if (g_audio_hle) {
+                if (FILE* d = fopen(path, "r")) {
+                    fclose(d);
+                    recomp3ds::naudio_hle_set_reference(f);
+                    fprintf(stderr, "recomp3ds: audio HLE in differential mode (AUDIO_DIFF.TXT present)\n");
+                }
+                else {
+                    fprintf(stderr, "recomp3ds: audio task interpreted on the CPU (AUDIO_RSP.TXT selects the recompiled microcode)\n");
+                }
             }
         }
-        if (f == game_ucode) {
+        if (g_audio_hle && f == game_ucode) {
             f = recomp3ds::naudio_hle_run;
         }
     }

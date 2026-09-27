@@ -137,6 +137,15 @@ private:
             return;
         }
 
+        // A white 8x8 texture for any unit a combiner samples without a
+        // resolved texture: the PICA hangs on an unconfigured texture unit
+        // (the emulator does not).
+        if (C3D_TexInit(&white_, 8, 8, GPU_RGBA5551)) {
+            memset(white_.data, 0xFF, 8 * 8 * 2);
+            GSPGPU_FlushDataCache(white_.data, 8 * 8 * 2);
+            C3D_TexSetFilter(&white_, GPU_NEAREST, GPU_NEAREST);
+        }
+
         // The N64's 320x240 sits centred on the 400 px wide screen for now.
         // N64 y grows downward; this ordering puts row 0 at the top.
         Mtx_OrthoTilt(&proj_, -40.0f, 360.0f, 0.0f, 240.0f, 0.0f, 1.0f, true);
@@ -158,7 +167,11 @@ private:
         C3D_BindProgram(&prog_);
         C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &proj_);
         C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, 0.0f, 0.0f, 0.0f, 0.0f);
-        last_tex_[0] = last_tex_[1] = nullptr;
+        C3D_TexBind(0, &white_);
+        C3D_TexBind(1, &white_);
+        C3D_TexBind(2, &white_);
+        last_tex_[0] = last_tex_[1] = &white_;
+        last_tex_param_[0] = last_tex_param_[1] = 0xFFFFFFFFu;
         last_cc_[0] = last_cc_[1] = 0xFFFFFFFFu;
         last_misc_ = ~0ull;
         last_us_ = last_vs_ = -1.0f;
@@ -180,7 +193,7 @@ private:
 
         int fallbacks = 0;
         for (const rt64_3ds::DrawRecord& d : frame_.draws) {
-            if (d.first + d.count > n) continue;
+            if (d.count < 3 || d.first + d.count > n) continue;
             apply_state(d, fallbacks);
             u64 td = svcGetSystemTick();
             C3D_DrawArrays(GPU_TRIANGLES, d.first, d.count);
@@ -201,6 +214,7 @@ private:
         // Textures.
         float us = 1.0f, vs = 1.0f;
         for (int t = 0; t < 2; t++) {
+            bool bound = false;
             if (d.tex[t].valid) {
                 const uint16_t* pal = (d.tex[t].fmt == 2 && d.tex[t].tlut_index + 256 <= frame_.tlut.size()) ? &frame_.tlut[d.tex[t].tlut_index] : nullptr;
                 rt64_3ds::BoundTex b = textures_.get(d.tex[t], pal);
@@ -216,7 +230,12 @@ private:
                         last_tex_[t] = b.tex; last_tex_param_[t] = param;
                     }
                     if (t == 0) { us = b.uscale; vs = b.vscale; }
+                    bound = true;
                 }
+            }
+            if (!bound && last_tex_[t] != &white_) {
+                C3D_TexBind(t, &white_);
+                last_tex_[t] = &white_; last_tex_param_[t] = 0xFFFFFFFFu;
             }
         }
         if (us != last_us_ || vs != last_vs_) {
@@ -300,6 +319,7 @@ private:
     rt64_3ds::FrameRecord frame_;
     bool ok_ = false;
     C3D_RenderTarget* top_ = nullptr;
+    C3D_Tex white_{};
     DVLB_s* dvlb_ = nullptr;
     shaderProgram_s prog_{};
     int u_xform_ = -1, u_stereo_ = -1, u_uvscale_ = -1;
