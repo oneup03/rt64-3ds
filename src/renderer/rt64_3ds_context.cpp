@@ -852,10 +852,11 @@ public:
                 d.dbg_proj[0], d.dbg_proj[1], d.dbg_proj[2], d.dbg_proj[3], d.perspective ? "" : " ortho");
     }
 
+    // cm is the tile's cms/cmt: bit 0 G_TX_MIRROR, bit 1 G_TX_CLAMP.
     static GPU_TEXTURE_WRAP_PARAM wrap_mode(uint8_t cm, uint8_t mask, uint16_t size) {
-        if (mask == 0 || (cm & 1)) return GPU_CLAMP_TO_EDGE;
+        if (mask == 0 || (cm & 2)) return GPU_CLAMP_TO_EDGE;
         if ((1u << mask) != size) return GPU_CLAMP_TO_EDGE;
-        return (cm & 2) ? GPU_MIRRORED_REPEAT : GPU_REPEAT;
+        return (cm & 1) ? GPU_MIRRORED_REPEAT : GPU_REPEAT;
     }
 
     uint8_t* rdram_;
