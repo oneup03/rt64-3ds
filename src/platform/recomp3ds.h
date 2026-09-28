@@ -25,6 +25,9 @@ struct GameDesc {
     // Called once when audio tasks stop arriving for 2 s after having run:
     // the game can log its scheduler/audio state (debugging lost wake-ups).
     void (*on_audio_stall)(uint8_t* rdram) = nullptr;
+    // Optional: game-specific numbers appended to the once-a-second stats
+    // line (e.g. the game's own VI counter and frame pacing).
+    void (*append_stats)(const uint8_t* rdram, char* buf, size_t size) = nullptr;
 };
 
 // Brings up the console, registers the game and runs the runtime. Returns the

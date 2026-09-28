@@ -173,7 +173,6 @@ void update_gfx_inner() {
         unsigned ucode_tasks = g_ucode_tasks;
         g_ucode_ticks = 0;
         g_ucode_tasks = 0;
-        const recomp3ds::NaudioHleStats& hs = recomp3ds::naudio_hle_stats();
         // Audio stall watchdog: tasks ran, then none for 2 s.
         {
             static bool seen = false, reported = false;
@@ -199,10 +198,13 @@ void update_gfx_inner() {
             }
         }
         const recomp3ds::AudioCounters ac = recomp3ds::audio_take_counters();
-        fprintf(stderr, "stats: %d dl/s core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu, hle %u/%u unknown %u\n",
-                st.dl_per_sec, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_remaining(),
-                (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped,
-                hs.tasks, hs.commands, hs.unknown_opcodes);
+        char game_stats[96] = "";
+        if (g_desc != nullptr && g_desc->append_stats != nullptr && g_rdram != nullptr) {
+            g_desc->append_stats(g_rdram, game_stats, sizeof(game_stats));
+        }
+        fprintf(stderr, "stats: %d dl/s (late %d, max gap %.0f ms) core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu%s\n",
+                st.dl_per_sec, st.late_frames, st.max_gap_ms, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_remaining(),
+                (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped, game_stats);
         printf("\x1b[2;0H%3d fps  cpu0 %3d%%  cpu2 %3d%%  ucode %3u ms/s   \n", st.dl_per_sec, busy0, busy2, ucode_ms);
     }
     // Watchdog: a frame that stays in the replay or the GPU wait for 4 s is
@@ -315,10 +317,11 @@ u32 measure_load_ns() {
     return (u32)(ticks * 1000000000ull / SYSCLOCK_ARM11 / kHops);
 }
 
-void log_cpu(const char* when) {
+u32 log_cpu(const char* when) {
     u32 mhz = measure_cpu_mhz();
     fprintf(stderr, "recomp3ds: %s: CPU ~%lu MHz, 1 MB load walk %lu ns/load\n", when,
             (unsigned long)mhz, (unsigned long)measure_load_ns());
+    return mhz;
 }
 
 }   // namespace
@@ -358,14 +361,14 @@ int recomp3ds::run(const GameDesc& desc) {
     fprintf(stderr, "recomp3ds: %s starting on %s 3DS\n", desc.render.game_name, is_new_3ds ? "a New" : "an Old");
     printf("%s\n", desc.render.game_name);
     log_memory("boot");
-    log_cpu("boot");
+    u32 cpu_mhz = log_cpu("boot");
     if (is_new_3ds) {
         // The exheader asks for 804 MHz and the L2 cache, but on hardware the
         // CIA still starts at 268 MHz without L2 (measured: 271 MHz, 230 ns
         // loads; 816 MHz, 33 ns after this). libctru re-applies it after
         // every HOME Menu visit.
         osSetSpeedupEnable(true);
-        log_cpu("after speedup request");
+        cpu_mhz = log_cpu("after speedup request");
     }
     {
         char sub[160];
@@ -445,12 +448,15 @@ int recomp3ds::run(const GameDesc& desc) {
         return 1;
     }
 
-    // The audio microcode interpreter shares core 2 with the renderer and
-    // outranks it there, so every audio task stalls a frame. Core 1 (the
-    // system core, time-limited for applications) takes it when available.
-    // AUDIO_CORE.TXT holds 1 or 2 to force a core.
+    // The audio task goes on core 2 with the renderer (and outranks it
+    // there). At 804 MHz that core has plenty of room, while on core 1 the
+    // system's share of the core delays audio tasks now and then, and DK64
+    // starts a frame's graphics only after the audio task: late frames the
+    // intro's pacing never makes up (Azahar does not model the share). At
+    // 268 MHz core 2 is too busy, so core 1 takes it when the system grants
+    // time there. AUDIO_CORE.TXT holds 1 or 2 to force a core.
     {
-        int want = 1;
+        int want = cpu_mhz >= 600 ? 2 : 1;
         char path[192];
         snprintf(path, sizeof(path), "%s/AUDIO_CORE.TXT", g_base_path);
         if (FILE* f = fopen(path, "r")) { if (fscanf(f, "%d", &want) != 1) want = 1; fclose(f); }
@@ -473,6 +479,9 @@ int recomp3ds::run(const GameDesc& desc) {
                 g_sp_core = 1;
             }
             fprintf(stderr, "recomp3ds: core 1 time limit %lu%% (rc %08lx), audio task on core %d\n", (unsigned long)limit, (unsigned long)rc, g_sp_core);
+        }
+        else {
+            fprintf(stderr, "recomp3ds: audio task on core 2\n");
         }
         ultramodern::set_host_thread_spec_callback(host_thread_spec);
     }

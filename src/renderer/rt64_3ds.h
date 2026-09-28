@@ -92,6 +92,8 @@ struct FrameStats {
     float game_ms = 0, gfx_ms = 0, replay_ms = 0, audio_ms = 0;
     int draws = 0, tris = 0, tex_uploads = 0, combiner_fallbacks = 0;
     int dl_per_sec = 0;               // display lists received per second
+    int late_frames = 0;              // gaps of more than 50 ms between display lists, last second
+    float max_gap_ms = 0;             // the longest such gap, last second
 };
 const FrameStats& stats();
 FrameStats& mutable_stats();   // for the renderer implementations

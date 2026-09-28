@@ -93,6 +93,21 @@ public:
         while (gpu_away() && !g_quitting) svcSleepThread(10 * 1000000ll);
         if (g_quitting) return;
         u64 t0 = svcGetSystemTick();
+        // Frame pacing: a gap well past two VIs is a frame the game delivered
+        // late (its pacing loses that time, e.g. against the intro music).
+        if (last_dl_tick_ != 0) {
+            float gap = (float)(t0 - last_dl_tick_) * 1000.0f / (float)SYSCLOCK_ARM11;
+            if (gap > 50.0f) {
+                late_++;
+                if (gap > max_gap_) max_gap_ = gap;
+                if (late_logged_ < 200) {
+                    late_logged_++;
+                    fprintf(stderr, "rt64-3ds: late frame %u: %.1f ms since the previous list (that one: interp %.1f replay %.1f ms)\n",
+                            frames_, gap, last_interp_ms_, last_replay_ms_);
+                }
+            }
+        }
+        last_dl_tick_ = t0;
         frame_.clear();
         vbo_idx_ ^= 1;
         frame_.verts.set_storage((rt64_3ds::Vtx3ds*)vbo_[vbo_idx_], kVboVerts);
@@ -126,9 +141,15 @@ public:
         u64 t2 = svcGetSystemTick();
         acc_gfx_ += t1 - t0;
         acc_replay_ += t2 - t1;
+        last_interp_ms_ = (float)(t1 - t0) * 1000.0f / (float)SYSCLOCK_ARM11;
+        last_replay_ms_ = (float)(t2 - t1) * 1000.0f / (float)SYSCLOCK_ARM11;
         if (window_start_ == 0) window_start_ = t0;
         else if (t2 - window_start_ >= SYSCLOCK_ARM11) {
             g_stats.dl_per_sec = (int)dl_count_;
+            g_stats.late_frames = (int)late_;
+            g_stats.max_gap_ms = max_gap_;
+            late_ = 0;
+            max_gap_ = 0;
             g_stats.gfx_ms = (float)acc_gfx_ * 1000.0f / (float)SYSCLOCK_ARM11 / (float)(dl_count_ ? dl_count_ : 1);
             g_stats.replay_ms = (float)acc_replay_ * 1000.0f / (float)SYSCLOCK_ARM11 / (float)(dl_count_ ? dl_count_ : 1);
             wait_ms_ = (float)acc_wait_ * 1000.0f / (float)SYSCLOCK_ARM11 / (float)(dl_count_ ? dl_count_ : 1);
@@ -702,6 +723,9 @@ public:
     GpuVertex* vbo_[2] = { nullptr, nullptr };
     int vbo_idx_ = 0;
     uint32_t frames_ = 0, report_ = 0;
+    u64 last_dl_tick_ = 0;
+    uint32_t late_ = 0, late_logged_ = 0;
+    float max_gap_ = 0, last_interp_ms_ = 0, last_replay_ms_ = 0;
     size_t last_draws_ = 0, last_verts_ = 0;
     uint32_t last_uploads_ = 0;
     uint32_t dl_count_ = 0;
