@@ -35,6 +35,10 @@ namespace recomp3ds {
     ultramodern::input::connected_device_info_t input_device_info(int controller_num);
 
     void log_init(const char* base_path);
+
+    void log_start_writer();
+
+    void log_flush();
     void log_line(const char* s);
 
     void autotest_load(const char* base_path);

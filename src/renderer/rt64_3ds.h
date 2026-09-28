@@ -43,6 +43,10 @@ struct RenderDesc {
     // frame (N64 compressed format, sampled on a 4x4 grid): for games that
     // read depth on the CPU (DK64's camera wall avoidance).
     bool depth_to_rdram = false;
+    // Always take gSPBranchLessZ's branch, i.e. always the near model of a
+    // level-of-detail pair: what the recomp frontends set (RT64's
+    // enhancementConfig.f3dex.forceBranch).
+    bool force_lod_branch = true;
 };
 
 void set_render_desc(const RenderDesc& desc);

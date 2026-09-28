@@ -39,6 +39,8 @@ public:
     // load, so a reticle made of quads stays one quad per record.
     void set_world_proj_ids(const uint32_t* ids, int count);   // up to 4
     void set_split_untagged_ortho(bool on);
+    // Always take G_BRANCH_Z (the near model), as the recomp frontends do.
+    void set_force_branch_z(bool on);
 
 private:
     struct Impl;

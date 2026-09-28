@@ -157,6 +157,7 @@ struct Interpreter::Impl {
         return id == world_proj_ids[0] || id == world_proj_ids[1] || id == world_proj_ids[2] || id == world_proj_ids[3];
     }
     bool split_untagged_ortho = false;
+    bool force_branch_z = true;        // RenderDesc::force_lod_branch, or gEXForceBranch
     // Loaded vertices, already in N64 screen homogeneous space (the RSP
     // applies the viewport at load time): x/w, y/w are pixels (y down),
     // z/w in [0, 1]; u/v are texel coordinates after the G_TEXTURE scale.
@@ -1007,12 +1008,14 @@ struct Interpreter::Impl {
                     // list in RDPHALF_1 when the vertex's screen depth (the
                     // RSP's z/w * vscale + vtrans, 0..1023) is below w1/65536.
                     // The near model sits behind the branch; what follows is
-                    // the far one, or nothing for objects that vanish.
+                    // the far one, or nothing for objects that vanish. The
+                    // recomp frontends force the branch (RT64's forceBranch,
+                    // or gEXForceBranch): always the near model.
                     int vi = (w0 >> 1) & 0x7FF;
                     if (vi < kMaxVerts) {
                         const auto& v = vtx[vi];
                         float zw = 2.0f * v.z / (v.w != 0.0f ? v.w : 1e-6f) - 1.0f;
-                        if (zw * vp.scale[2] + vp.trans[2] < (float)w1 / 65536.0f) {
+                        if (force_branch_z || zw * vp.scale[2] + vp.trans[2] < (float)w1 / 65536.0f) {
                             next = seg(rdphalf1);
                             stats->branch_z_taken++;
                         }
@@ -1294,5 +1297,6 @@ void Interpreter::set_world_proj_ids(const uint32_t* ids, int count) {
     for (int i = 0; i < 4; i++) impl_->world_proj_ids[i] = count > 0 ? ids[i < count ? i : count - 1] : 5;
 }
 void Interpreter::set_split_untagged_ortho(bool on) { impl_->split_untagged_ortho = on; }
+void Interpreter::set_force_branch_z(bool on) { impl_->force_branch_z = on; }
 
 }   // namespace rt64_3ds

@@ -301,6 +301,7 @@ private:
             }
             if (n == 0) ids[n++] = desc.frame_head_proj_id;
             interp_.set_world_proj_ids(ids, n);
+            interp_.set_force_branch_z(desc.force_lod_branch);
         }
 
         // The N64's 320x240 sits centred on the 400 px wide screen for now.
@@ -397,10 +398,29 @@ private:
                 for (u32 tr = 0; tr < 400 / 8; tr++) memcpy(dst + tr * (row + gap), src + tr * row, row);
             }
             else {
-                C3D_SyncTextureCopy((u32*)top_->frameBuf.colorBuf, GX_BUFFER_DIM(row / 16, 0),
-                                    (u32*)snapshot_.data, GX_BUFFER_DIM(row / 16, gap / 16), 240 * 400 * 4, 0);
+                // One gap-free copy per tile row: a single copy with an output
+                // gap came out scrambled on the console.
+                const u8* src = (const u8*)top_->frameBuf.colorBuf;
+                u8* dst = (u8*)snapshot_.data;
+                for (u32 tr = 0; tr < 400 / 8; tr++) {
+                    C3D_SyncTextureCopy((u32*)(src + tr * row), GX_BUFFER_DIM(row / 16, 0),
+                                        (u32*)(dst + tr * (row + gap)), GX_BUFFER_DIM(row / 16, 0), row, 0);
+                }
             }
             snapshots_++;
+            if (snapshots_ <= 3) {
+                // Self-check (CPU reads of VRAM are fine): the copy must hold
+                // the colour buffer tile row for tile row.
+                const u32* src = (const u32*)top_->frameBuf.colorBuf;
+                const u32* dst = (const u32*)snapshot_.data;
+                u32 bad = 0, seed = 0x1234567u;
+                for (int i = 0; i < 512; i++) {
+                    seed = seed * 1103515245u + 12345u;
+                    const u32 tr = (seed >> 8) % 50, off = (seed >> 3) % (row / 4);
+                    if (src[tr * (row / 4) + off] != dst[tr * ((row + gap) / 4) + off]) bad++;
+                }
+                fprintf(stderr, "rt64-3ds: snapshot copy %u: %u/512 words differ from the frame\n", snapshots_, bad);
+            }
         }
         C3D_RenderTargetClear(top_, C3D_CLEAR_ALL, 0x000000FF, 0);
         C3D_FrameDrawOn(top_);
@@ -820,7 +840,12 @@ public:
         uint8_t* z = rdram_ + (zimg & 0xFFFFFF);
         for (int gy = 0; gy < kGridRows; gy++) {
             for (int gx = 0; gx < kGridCols; gx++) {
-                const uint16_t v = n64_depth(depth_grid_[gy * kGridCols + gx]);
+                // Nothing drawn there: the RDP's clear value (0xFFFC), which
+                // the game reads as "nothing here" (its camera and the sun's
+                // visibility test compare against it); the far plane itself
+                // encodes lower (0xF800).
+                const float zp = depth_grid_[gy * kGridCols + gx];
+                const uint16_t v = zp >= 1.0f ? 0xFFFC : n64_depth(zp);
                 for (int y = gy * 8; y < gy * 8 + 8; y++) {
                     uint8_t* row = z + (uint32_t)y * 640;
                     for (int x = gx * 8; x < gx * 8 + 8; x++) *(uint16_t*)(row + ((x * 2) ^ 2)) = v;

@@ -138,6 +138,7 @@ ultramodern::renderer::WindowHandle create_window(void*) {
         for (;;) svcSleepThread(1000000000ll);    // the other path is already leaving
     }
     fflush(stderr);
+    recomp3ds::log_flush();
     recomp3ds::loadmon_stop();
     recomp3ds::audio_shutdown();
     gfxExit();
@@ -497,6 +498,7 @@ int recomp3ds::run(const GameDesc& desc) {
     recomp::start_game(desc.game_id, "");
     recomp3ds::loadmon_start(is_new_3ds);
     log_memory("before start");
+    recomp3ds::log_start_writer();
     recomp::start(cfg);        // returns when the game has quit
     log_memory("after exit");
     finish_exit();
