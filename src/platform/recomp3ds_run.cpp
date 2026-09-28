@@ -233,6 +233,26 @@ void update_gfx_inner() {
     if (!g_exit_requested && (aptCheckHomePressRejected() || recomp3ds::autotest_take_home())) {
         if (home_prompt()) g_exit_requested = true;
     }
+    {
+        // SELECT held for a second (the game has no use for it): capture the
+        // next frame for the host tools, and say so on the touch screen.
+        static u64 select_since = 0;
+        static bool fired = false;
+        if (hidKeysHeld() & KEY_SELECT) {
+            const u64 now = svcGetSystemTick();
+            if (select_since == 0) select_since = now;
+            else if (!fired && now - select_since > SYSCLOCK_ARM11) {
+                fired = true;
+                rt64_3ds::request_capture();
+                printf("\x1b[28;0HFrame captured to gfx_task.bin       ");
+                gfxFlushBuffers();
+            }
+        }
+        else {
+            select_since = 0;
+            fired = false;
+        }
+    }
     // Once a second: frame rate and CPU load to the log and the touch screen.
     static u64 last_report = 0;
     u64 now = svcGetSystemTick();

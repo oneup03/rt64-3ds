@@ -62,6 +62,7 @@ void apt_hook(APT_HookType type, void*) {
 
 bool gpu_away() { return g_suspended || g_sleeping; }
 volatile bool g_paused = false;
+volatile bool g_capture_request = false;
 rt64_3ds::Progress g_progress{};
 const rt64_3ds::DrawRecord* g_progress_draw = nullptr;
 
@@ -697,6 +698,11 @@ public:
     // to gfx_task.bin for tools/dl_test (host-side interpreter profiling).
     void maybe_capture(const OSTask* task) {
         int& want = capture_want_;
+        if (g_capture_request) {       // SELECT held on the console: this frame
+            g_capture_request = false;
+            if (want == -2) want = -1;
+            if (want < 0) want = (int)frames_;
+        }
         if (want == -2) {
             want = -1;
             if (FILE* f = fopen("sdmc:/3ds/DK64/GFX_CAPTURE.TXT", "r")) {
@@ -727,7 +733,18 @@ public:
         // Snapshot RDRAM and the task now; the slow SD write happens after
         // this frame is drawn (the game thread keeps changing RDRAM).
         capture_copy_ = (uint8_t*)malloc(16u * 1024 * 1024);
-        if (capture_copy_ == nullptr) { fprintf(stderr, "rt64-3ds: no memory for an RDRAM snapshot\n"); return; }
+        if (capture_copy_ == nullptr) {
+            // No room for a copy: write RDRAM straight away (the game waits
+            // on this display list meanwhile, so it holds still).
+            if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_task.bin", "wb")) {
+                fwrite(task, 1, sizeof(OSTask), f);
+                for (uint32_t off = 0; off < 16u * 1024 * 1024; off += 65536) fwrite(rdram_ + off, 1, 65536, f);
+                fclose(f);
+            }
+            fprintf(stderr, "rt64-3ds: captured gfx task of frame %u (written directly)\n", frames_);
+            fb_capture_pending_ = true;
+            return;
+        }
         memcpy(capture_copy_, rdram_, 16u * 1024 * 1024);
         capture_task_ = *task;
         fprintf(stderr, "rt64-3ds: captured gfx task of frame %u\n", frames_);
@@ -1095,3 +1112,4 @@ void rt64_3ds::dump_progress() {
 void rt64_3ds::set_debug_gfx_delay_ms(int ms) { g_debug_gfx_delay_ms = ms; }
 void rt64_3ds::set_quitting() { g_quitting = true; }
 void rt64_3ds::set_paused(bool paused) { g_paused = paused; }
+void rt64_3ds::request_capture() { g_capture_request = true; }
