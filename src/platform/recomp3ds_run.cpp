@@ -157,6 +157,7 @@ void update_gfx(void*) {
 }
 
 void update_gfx_inner() {
+    recomp3ds::stereo_panel_update();
     // Once a second: frame rate and CPU load to the log and the touch screen.
     static u64 last_report = 0;
     u64 now = svcGetSystemTick();
@@ -361,6 +362,7 @@ int recomp3ds::run(const GameDesc& desc) {
     fprintf(stderr, "recomp3ds: %s starting on %s 3DS\n", desc.render.game_name, is_new_3ds ? "a New" : "an Old");
     printf("%s\n", desc.render.game_name);
     log_memory("boot");
+    recomp3ds::stereo_panel_init(g_base_path);
     u32 cpu_mhz = log_cpu("boot");
     if (is_new_3ds) {
         // The exheader asks for 804 MHz and the L2 cache, but on hardware the

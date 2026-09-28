@@ -19,6 +19,7 @@ add_library(rt64_3ds STATIC
     src/renderer/rt64_3ds_dl.cpp
     src/renderer/rt64_3ds_texture.cpp
     src/renderer/rt64_3ds_tev.cpp
+    src/renderer/rt64_3ds_stereo.cpp
 )
 add_pica_shader(rt64_3ds "${CMAKE_CURRENT_LIST_DIR}/src/renderer/shaders/rt64_3ds.v.pica")
 target_include_directories(rt64_3ds PUBLIC src/renderer)
@@ -27,6 +28,7 @@ target_compile_features(rt64_3ds PUBLIC cxx_std_20)
 
 add_library(recomp_3ds STATIC
     src/platform/recomp3ds_run.cpp
+    src/platform/stereo_panel.cpp
     src/platform/audio_ndsp.cpp
     src/platform/naudio_hle.cpp
     src/platform/input_hid.cpp

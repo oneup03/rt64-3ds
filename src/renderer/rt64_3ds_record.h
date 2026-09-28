@@ -94,8 +94,10 @@ struct DrawRecord {
     // TEXEL1's texel coordinates from TEXEL0's: u1 = u0 * uv1[0] + uv1[2],
     // v1 = v0 * uv1[1] + uv1[3] (the two tiles' shifts and origins differ).
     float uv1[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
-    uint32_t proj_id = 0;               // gEXMatrixGroup id in force (stereo later)
+    uint32_t proj_id = 0;               // projection group id in force (gEXMatrixGroup), for stereo
     bool perspective = true;
+    bool mv_auto = false;               // the modelview group is untagged (G_EX_ID_AUTO): reticle candidates
+    uint32_t mv_seq = 0;                // modelview loads so far this list (reticle quads are split on it)
     uint32_t dbg_vtx = 0;               // RDRAM address of the last vertex load (debug)
     float dbg_vp[4] = {};               // viewport scale x/y, translate x/y (debug logging)
     float dbg_proj[4] = {};             // projection m[1][1], m[3][1], m[2][3], m[3][3]
@@ -108,7 +110,8 @@ struct FrameRecord {
     bool has_fullsync = false;
     bool snapshot_request = false;      // copy the last presented frame before drawing this one
     uint32_t color_image = 0, color_width = 0, depth_image = 0;
-    bool has_cam = false;               // the first camera projection (group 5) loaded this frame (debug)
+    bool has_cam = false;               // a perspective projection was loaded this frame
+    bool cam_is_world = false;          // ... under the world projection group (stereo depth terms)
     float cam[16] = {};
 
     void clear() {
@@ -118,6 +121,7 @@ struct FrameRecord {
         has_fullsync = false;
         snapshot_request = false;
         has_cam = false;
+        cam_is_world = false;
     }
 };
 

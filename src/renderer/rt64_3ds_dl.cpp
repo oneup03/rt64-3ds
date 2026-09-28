@@ -140,6 +140,20 @@ struct Interpreter::Impl {
     bool ldir_dirty = true;
     int16_t fog_mul = 0, fog_off = 0;
     uint32_t proj_id = 0;
+    // gEXMatrixGroup id stacks as RT64 keeps them: a push adds a level, the
+    // group sets the top. RT64 reads gEXPopMatrixGroup's projection flag from
+    // a bit that is always clear, so pops only ever reach the modelview stack;
+    // mirrored, since the desktop stereo was tuned against that.
+    static constexpr int kGroupStack = 16;
+    static constexpr uint32_t kIdAuto = 0xFFFFFFFFu;
+    uint32_t proj_groups[kGroupStack] = {}, mv_groups[kGroupStack] = {};
+    int proj_group_depth = 0, mv_group_depth = 0;
+    uint32_t mv_seq = 0;
+    uint32_t world_proj_ids[4] = { 5, 5, 5, 5 };
+    bool is_world_proj(uint32_t id) const {
+        return id == world_proj_ids[0] || id == world_proj_ids[1] || id == world_proj_ids[2] || id == world_proj_ids[3];
+    }
+    bool split_untagged_ortho = false;
     // Loaded vertices, already in N64 screen homogeneous space (the RSP
     // applies the viewport at load time): x/w, y/w are pixels (y down),
     // z/w in [0, 1]; u/v are texel coordinates after the G_TEXTURE scale.
@@ -445,6 +459,8 @@ struct Interpreter::Impl {
         memcpy(r.scissor, scissor, sizeof(scissor));
         r.proj_id = proj_id;
         r.perspective = proj.m[2][3] != 0.0f || proj.m[3][3] == 0.0f;
+        r.mv_auto = mv_groups[mv_group_depth] == kIdAuto;
+        r.mv_seq = mv_seq;
         r.dbg_vtx = last_vtx_addr;
         set_uv1(r, texture.tile);
         r.dbg_vp[0] = vp.scale[0]; r.dbg_vp[1] = vp.scale[1]; r.dbg_vp[2] = vp.trans[0]; r.dbg_vp[3] = vp.trans[1];
@@ -479,7 +495,10 @@ struct Interpreter::Impl {
         DrawRecord* r = nullptr;
         if (!out->draws.empty()) {
             DrawRecord& last = out->draws.back();
-            if (last.kind == DrawRecord::Tris && last.first + last.count == out->verts.size()) {
+            // Reticle candidates (see set_split_untagged_ortho) end at a
+            // modelview load.
+            bool split = split_untagged_ortho && !last.perspective && last.mv_auto && last.mv_seq != mv_seq;
+            if (last.kind == DrawRecord::Tris && last.first + last.count == out->verts.size() && !split) {
                 if (last_draw_seq == state_seq) {
                     r = &last;
                 }
@@ -646,6 +665,7 @@ struct Interpreter::Impl {
     bool same_as_last(const DrawRecord& a, const TexDesc* tex) const {
         if (a.cc_w0 != cc_w0 || a.cc_w1 != cc_w1 || a.othermode_h != othermode_h || a.othermode_l != othermode_l ||
             a.geometry_mode != geometry_mode || a.prim_lod_frac != prim_lod_frac || a.proj_id != proj_id) return false;
+        if (a.mv_auto != (mv_groups[mv_group_depth] == kIdAuto)) return false;
         if (memcmp(a.prim, prim, 4) != 0 || memcmp(a.env, env, 4) != 0 || memcmp(a.blend, blend, 4) != 0 || memcmp(a.fog, fog, 4) != 0) return false;
         if (memcmp(a.scissor, scissor, sizeof(a.scissor)) != 0) return false;
         if (a.perspective != (proj.m[2][3] != 0.0f || proj.m[3][3] == 0.0f)) return false;
@@ -746,11 +766,22 @@ struct Interpreter::Impl {
             case EX_MATRIXGROUP: {
                 uint32_t id = w1;
                 uint32_t f = r32(pc + 8);
-                bool is_proj = (f >> 1) & 1;
-                if (is_proj && id != 0) proj_id = id;
+                bool push = f & 1, is_proj = (f >> 1) & 1;
+                uint32_t* stack = is_proj ? proj_groups : mv_groups;
+                int& depth = is_proj ? proj_group_depth : mv_group_depth;
+                if (push && depth + 1 < kGroupStack) depth++;
+                stack[depth] = id;
+                if (is_proj) proj_id = id;
                 return 1;
             }
-            case EX_POPMATRIXGROUP: return 0;
+            case EX_POPMATRIXGROUP: {
+                int count = w1 & 0xFF;
+                bool is_proj = (sub >> 8) & 1;     // always clear in practice, as in RT64
+                int& depth = is_proj ? proj_group_depth : mv_group_depth;
+                depth = depth > count ? depth - count : 0;
+                if (is_proj) proj_id = proj_groups[proj_group_depth];
+                return 0;
+            }
             case EX_EDITGROUPBYADDRESS: return 1;
             case EX_SETRECTALIGN: {
                 rect_lorigin = w1 & 0xFFF; rect_rorigin = (w1 >> 12) & 0xFFF;
@@ -972,9 +1003,17 @@ struct Interpreter::Impl {
                     load_mtx(m, seg(w1));
                     if (p & 4) {
                         if (p & 2) proj = m; else mul(proj, m, proj);
-                        if (!out->has_cam && proj.m[2][3] != 0.0f) { out->has_cam = true; memcpy(out->cam, &proj, sizeof(out->cam)); }
+                        if (proj.m[2][3] != 0.0f) {
+                            bool world = is_world_proj(proj_id);
+                            if (!out->has_cam || (world && !out->cam_is_world)) {
+                                out->has_cam = true;
+                                out->cam_is_world = world;
+                                memcpy(out->cam, &proj, sizeof(out->cam));
+                            }
+                        }
                     }
                     else {
+                        mv_seq++;
                         if (p & 1) {
                             if (mv_depth + 1 < kMaxMtxStack) { mv_stack[mv_depth + 1] = mv_stack[mv_depth]; mv_depth++; }
                         }
@@ -1189,6 +1228,10 @@ bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
     // Per-task RSP state that must not leak between lists.
     impl_->mv_depth = 0;
     impl_->mvp_dirty = true;
+    impl_->proj_group_depth = impl_->mv_group_depth = 0;
+    impl_->proj_groups[0] = impl_->mv_groups[0] = 0;
+    impl_->proj_id = 0;
+    impl_->mv_seq = 0;
     impl_->vp_depth = 0;
     impl_->scissor_depth = 0;
     impl_->load_count = 0;
@@ -1196,5 +1239,10 @@ bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
     for (auto& L : impl_->loads) L.valid = false;
     return impl_->run(data_ptr);
 }
+
+void Interpreter::set_world_proj_ids(const uint32_t* ids, int count) {
+    for (int i = 0; i < 4; i++) impl_->world_proj_ids[i] = count > 0 ? ids[i < count ? i : count - 1] : 5;
+}
+void Interpreter::set_split_untagged_ortho(bool on) { impl_->split_untagged_ortho = on; }
 
 }   // namespace rt64_3ds

@@ -41,6 +41,9 @@ namespace recomp3ds {
     void autotest_scan_line(const char* line);
     u32  autotest_tick();
     bool autotest_touch(int* x, int* y);
+    // Stereo settings on the touch screen (stereo_panel.cpp).
+    void stereo_panel_init(const char* base_path);
+    void stereo_panel_update();
 
     void loadmon_start(bool has_core2);
     void loadmon_sample(int* busy0, int* busy2);

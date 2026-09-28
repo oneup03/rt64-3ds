@@ -33,6 +33,12 @@ public:
     void note_presented_framebuffer(uint32_t addr);
     // Snapshot texture geometry the interpreter maps texel coordinates to.
     void set_snapshot_layout(int screen_x_offset);
+    // Stereo support: the projection group id of the world camera (its
+    // projection is recorded in FrameRecord::cam), and whether orthographic
+    // draws with an untagged modelview start a new record at every modelview
+    // load, so a reticle made of quads stays one quad per record.
+    void set_world_proj_ids(const uint32_t* ids, int count);   // up to 4
+    void set_split_untagged_ortho(bool on);
 
 private:
     struct Impl;

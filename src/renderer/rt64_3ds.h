@@ -57,11 +57,15 @@ create_render_context(uint8_t* rdram, ultramodern::renderer::WindowHandle window
 std::unique_ptr<ultramodern::renderer::RendererContext>
 create_null_render_context(uint8_t* rdram, ultramodern::renderer::WindowHandle window_handle, bool developer_mode);
 
+// The desktop's stereo settings and units (DK64 defaults), plus the 3DS
+// panel's gain: separation at full 3D slider = sep_slider * 0.002 * gain of
+// the half screen width per eye (25 * 0.002 * 0.5 = 5 px each way).
 struct Settings {
-    int sep_slider = 10;              // 0..50, x0.002 = separation as a fraction of width
-    int convergence_hundredths = 2000;// 10..2000, x0.2 = world units
-    int hud_depth = 35;               // 0..100, 50 = screen plane
+    int sep_slider = 25;              // 0..50, x0.002 = per-eye separation (fraction of half width)
+    int convergence_hundredths = 600; // 10..2000, x0.2 = world units
+    int hud_depth = 50;               // 0..100, 50 = screen plane
     bool auto_convergence = true;
+    int comfort_target = 0;           // auto-convergence pop-out budget, thousandths of width (-20..30)
     bool hud_on_bottom = true;
     bool show_fps = true;
     bool ghost_reduction = false;
@@ -72,6 +76,8 @@ Settings& settings();
 // Fed by the game's patches through host functions.
 void set_first_person(bool on);
 void set_low_convergence_scene(bool on);
+bool first_person_scene();
+bool low_convergence_scene();
 
 // Copy a region of the last presented frame back into the game's framebuffer
 // in RDRAM (for effects whose CPU code reads pixels). Synchronous.

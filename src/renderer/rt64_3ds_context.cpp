@@ -3,16 +3,19 @@
 // same replay with per-draw shifts).
 #include <3ds.h>
 #include <citro3d.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "rt64_3ds.h"
 #include "rt64_3ds_dl.h"
 #include "rt64_3ds_record.h"
 #include "rt64_3ds_texture.h"
 #include "rt64_3ds_tev.h"
+#include "rt64_3ds_stereo.h"
 #include "rt64_3ds_shbin.h"
 
 extern "C" void C3Di_UpdateContext(void);
@@ -113,6 +116,8 @@ public:
         frame_.verts.set_storage((rt64_3ds::Vtx3ds*)vbo_[vbo_idx_], kVboVerts);
         g_progress.phase = 1;
         maybe_capture(task);
+        // In first person the reticle's quads must stay one per record.
+        interp_.set_split_untagged_ortho(rt64_3ds::first_person_scene());
         bool present = interp_.run(task->t.data_ptr, frame_);
         u64 t1 = svcGetSystemTick();
         dl_count_++;
@@ -172,6 +177,19 @@ public:
                         frames_, (unsigned)last_draws_, (unsigned)last_verts_, g_stats.gfx_ms, g_stats.replay_ms, wait_ms_, end_ms_, depth_ms_, textures_.live(), textures_.bytes() / 1024, last_uploads_,
                         (unsigned)(linearSpaceFree() / 1024), is.unknown, is.ex_unknown, g_stats.combiner_fallbacks, frame_.color_image, frame_.color_width, snapshots_,
                         is.branch_z_taken, is.branch_z_taken + is.branch_z_not, is.cull_dl);
+                {
+                    const float fw = (float)(frames_ - frames_at_stereo_ > 0 ? frames_ - frames_at_stereo_ : 1);
+                    frames_at_stereo_ = frames_;
+                    const rt64_3ds::Settings& st = rt64_3ds::settings();
+                    fprintf(stderr, "rt64-3ds:   stereo draws: world %u infinity %u overlay %u hud %u bubble %u rect %u none %u reticle %u\n",
+                            class_count_[1], class_count_[2], class_count_[3], class_count_[4], class_count_[5], class_count_[6], class_count_[0], class_count_[7]);
+                    fprintf(stderr, "rt64-3ds:   stereo %s: slider %.2f sep %d (%.3f) conv %.1f (manual %.1f%s) near %.1f hud %d%s aim %.1f, replay per frame left %.1f right %.1f ms\n",
+                            s3d_on_ ? "on" : "off", slider_, st.sep_slider, (float)st.sep_slider * 0.002f * slider_ * st.slider_gain,
+                            applied_conv_, (float)st.convergence_hundredths * 0.2f, st.auto_convergence ? ", auto" : "", near_z_, st.hud_depth,
+                            rt64_3ds::first_person_scene() ? " first-person" : "", aim_z_,
+                            (float)acc_left_ * 1000.0f / SYSCLOCK_ARM11 / fw, (float)acc_right_ * 1000.0f / SYSCLOCK_ARM11 / fw);
+                    acc_left_ = acc_right_ = 0;
+                }
                 // Where the geometry lands: screen-space bounds of the last frame.
                 float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f, minz = 1e9f, maxz = -1e9f;
                 int behind = 0, tris = 0, rects = 0;
@@ -214,6 +232,10 @@ private:
             return;
         }
         C3D_RenderTargetSetOutput(top_, GFX_TOP, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
+        // The right eye, drawn only while the 3D slider is up.
+        top_r_ = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
+        if (top_r_ != nullptr) C3D_RenderTargetSetOutput(top_r_, GFX_TOP, GFX_RIGHT, DISPLAY_TRANSFER_FLAGS);
+        else fprintf(stderr, "rt64-3ds: no right-eye target (VRAM): stereo off\n");
         gfxSet3D(false);
 
         dvlb_ = DVLB_ParseFile((u32*)rt64_3ds_shbin, rt64_3ds_shbin_size);
@@ -255,6 +277,19 @@ private:
         C3D_TexSetFilter(&snapshot_, GPU_LINEAR, GPU_LINEAR);
         C3D_TexSetWrap(&snapshot_, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
         interp_.set_snapshot_layout(40);
+        {
+            // The perspective groups the game's rules place as world: their
+            // projection turns the depth buffer into distances.
+            const rt64_3ds::RenderDesc& desc = rt64_3ds::render_desc();
+            uint32_t ids[4];
+            int n = 0;
+            for (size_t i = 0; i < desc.rule_count && n < 4; i++) {
+                const rt64_3ds::StereoRule& r = desc.rules[i];
+                if (r.cls == rt64_3ds::StereoClass::World && r.kind != rt64_3ds::ProjKind::Ortho && r.id_lo == r.id_hi) ids[n++] = r.id_lo;
+            }
+            if (n == 0) ids[n++] = desc.frame_head_proj_id;
+            interp_.set_world_proj_ids(ids, n);
+        }
 
         // The N64's 320x240 sits centred on the 400 px wide screen for now.
         // Everything arrives in N64 screen pixels with y growing downward:
@@ -303,11 +338,20 @@ private:
         C3D_FrameBegin(0);
         acc_wait_ += svcGetSystemTick() - tb0;
         maybe_capture_framebuffer();
-        if (rt64_3ds::render_desc().depth_to_rdram && prev_depth_image_ != 0) {
+        const rt64_3ds::StereoFrame sf = begin_stereo_frame();
+        {
+            // The finished frame's depth, read once on a grid: the game's
+            // RDRAM depth buffer and the stereo near statistic both use it.
             u64 td = svcGetSystemTick();
-            depth_to_rdram(prev_depth_image_);
+            bool rdram = rt64_3ds::render_desc().depth_to_rdram && prev_depth_image_ != 0;
+            if (rdram || stereo_wants_depth_) {
+                read_depth_grid();
+                if (rdram) depth_to_rdram(prev_depth_image_);
+            }
             acc_depth_ += svcGetSystemTick() - td;
         }
+        const rt64_3ds::StereoFrame sfd = finish_stereo_frame(sf);
+        classify_frame(sfd);
         g_progress.phase = 3;
         for (const rt64_3ds::DrawRecord& d : frame_.draws) {
             if (d.tex[0].valid && d.tex[0].snapshot) {
@@ -335,6 +379,7 @@ private:
         C3D_BindProgram(&prog_);
         C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &proj_);
         C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, 0.0f, 0.0f, 0.0f, 0.0f);
+        last_sa_ = last_sb_ = 0.0f;
         C3D_TexBind(0, &white_);
         C3D_TexBind(1, &white_);
         C3D_TexBind(2, &white_);
@@ -356,12 +401,34 @@ private:
         BufInfo_Add(bi, vb, sizeof(GpuVertex), 3, 0x210);
 
         int fallbacks = 0;
+        u64 tl0 = svcGetSystemTick(), tl_split = 0;
+        const int eyes = sfd.on ? 2 : 1;
+        for (int pass = 0; pass < eyes; pass++) {
+        const int eye = pass == 0 ? 1 : -1;       // +1 left, -1 right
+        if (pass == 1) {
+            // The right eye: same records, same state, the other shift.
+            tl_split = svcGetSystemTick();
+            C3D_RenderTargetClear(top_r_, C3D_CLEAR_ALL, 0x000000FF, 0);
+            C3D_FrameDrawOn(top_r_);
+            C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &proj_);
+        }
         for (size_t i = 0; i < frame_.draws.size(); i++) {
             const rt64_3ds::DrawRecord& d = frame_.draws[i];
             g_progress.draw_index = (uint32_t)i;
             g_progress_draw = &d;
             if (d.count < 3 || d.first + d.count > n) continue;
             apply_state(d, fallbacks);
+            {
+                float sa = 0.0f, sb = 0.0f;
+                if (sfd.on) {
+                    if (classes_[i] == kReticle) sa = -(float)eye * sfd.aim_ndc * 200.0f;
+                    else rt64_3ds::stereo_shift(sfd, (rt64_3ds::StereoClass)classes_[i], d, eye, &sa, &sb);
+                }
+                if (sa != last_sa_ || sb != last_sb_) {
+                    C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, sa, sb, 0.0f, 0.0f);
+                    last_sa_ = sa; last_sb_ = sb;
+                }
+            }
             u64 td = tick();
             C3Di_UpdateContext();          // the state flush, timed apart from the draw itself
             u64 tf = tick();
@@ -376,17 +443,23 @@ private:
                 C3D_FrameEnd(0);
                 g_progress.phase = 2;
                 C3D_FrameBegin(0);
-                C3D_FrameDrawOn(top_);
+                C3D_FrameDrawOn(pass == 0 ? top_ : top_r_);
                 g_progress.phase = 3;
                 C3D_BindProgram(&prog_);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &proj_);
-                C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, 0.0f, 0.0f, 0.0f, 0.0f);
+                C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, last_sa_, last_sb_, 0.0f, 0.0f);
                 C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uvscale_, last_us_, last_vs_, 0.0f, 0.0f);
                 C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uv1_, last_uv1_[0], last_uv1_[1], last_uv1_[2], last_uv1_[3]);
                 bi = C3D_GetBufInfo();
                 BufInfo_Init(bi);
                 BufInfo_Add(bi, vb, sizeof(GpuVertex), 3, 0x210);
             }
+        }
+        }   // eye passes
+        {
+            u64 tl1 = svcGetSystemTick();
+            if (tl_split != 0) { acc_left_ += tl_split - tl0; acc_right_ += tl1 - tl_split; }
+            else acc_left_ += tl1 - tl0;
         }
         g_progress.phase = 4;
         g_stats.combiner_fallbacks = fallbacks;
@@ -397,6 +470,11 @@ private:
         acc_end_ += svcGetSystemTick() - te0;
         interp_.note_presented_framebuffer(frame_.color_image);
         prev_depth_image_ = (frame_.color_width == 320) ? frame_.depth_image : 0;
+        // The depth grid read at the next frame start is this frame's: keep
+        // the world projection terms that turn it into distances.
+        prev_cam_world_ = frame_.cam_is_world;
+        prev_m22_ = frame_.cam[10];
+        prev_m32_ = frame_.cam[14];
         last_uploads_ = textures_.uploads_this_frame();
         textures_.end_frame();
     }
@@ -684,26 +762,172 @@ public:
         else { e = 7; m = z; }
         return (uint16_t)((e << 13) | ((m & 0x7FF) << 2));
     }
-    void depth_to_rdram(uint32_t zimg) {
+    // One depth texel of the finished left-eye frame as z' (1 = cleared).
+    // sx, sy on the 400x240 screen.
+    float read_depth_zp(int sx, int sy) const {
         const uint32_t* db = (const uint32_t*)top_->frameBuf.depthBuf;
-        if (db == nullptr || (zimg & 0xFFFFFF) + 320 * 240 * 2 > 16u * 1024 * 1024) return;
+        if (sx < 0) sx = 0; if (sx > 399) sx = 399;
+        if (sy < 0) sy = 0; if (sy > 239) sy = 239;
+        const int r = sx, c = 239 - sy;
+        const uint32_t tile = (uint32_t)(r >> 3) * 30 + (uint32_t)(c >> 3);
+        const uint32_t mo = (c & 1) | ((r & 1) << 1) | ((c & 2) << 1) | ((r & 2) << 2) | ((c & 4) << 2) | ((r & 4) << 3);
+        const uint32_t d = db[tile * 64 + mo] & 0xFFFFFF;
+        return 1.0f - (float)d * (1.0f / 16777215.0f);
+    }
+    // The grid: one texel per 8x8 block of the N64's 320x240, at the block
+    // centre (VRAM reads by the CPU are slow on the console).
+    void read_depth_grid() {
+        for (int gy = 0; gy < kGridRows; gy++) {
+            for (int gx = 0; gx < kGridCols; gx++) {
+                depth_grid_[gy * kGridCols + gx] = read_depth_zp(gx * 8 + 4 + 40, gy * 8 + 4);
+            }
+        }
+    }
+    void depth_to_rdram(uint32_t zimg) {
+        if ((zimg & 0xFFFFFF) + 320 * 240 * 2 > 16u * 1024 * 1024) return;
         uint8_t* z = rdram_ + (zimg & 0xFFFFFF);
-        constexpr int B = 8;   // block size: VRAM reads by the CPU are slow on the console
-        for (int by = 0; by < 240; by += B) {
-            for (int bx = 0; bx < 320; bx += B) {
-                int sx = bx + B / 2 + 40, sy = by + B / 2;   // block centre on the 400-wide screen
-                int r = sx, c = 239 - sy;
-                uint32_t tile = (uint32_t)(r >> 3) * 30 + (uint32_t)(c >> 3);
-                uint32_t mo = (c & 1) | ((r & 1) << 1) | ((c & 2) << 1) | ((r & 2) << 2) | ((c & 4) << 2) | ((r & 4) << 3);
-                uint32_t d = db[tile * 64 + mo] & 0xFFFFFF;
-                uint16_t v = n64_depth(1.0f - (float)d * (1.0f / 16777215.0f));
-                for (int y = by; y < by + B; y++) {
+        for (int gy = 0; gy < kGridRows; gy++) {
+            for (int gx = 0; gx < kGridCols; gx++) {
+                const uint16_t v = n64_depth(depth_grid_[gy * kGridCols + gx]);
+                for (int y = gy * 8; y < gy * 8 + 8; y++) {
                     uint8_t* row = z + (uint32_t)y * 640;
-                    for (int x = bx; x < bx + B; x++) *(uint16_t*)(row + ((x * 2) ^ 2)) = v;
+                    for (int x = gx * 8; x < gx * 8 + 8; x++) *(uint16_t*)(row + ((x * 2) ^ 2)) = v;
                 }
             }
         }
     }
+
+    // ---- stereo (see rt64_3ds_stereo.h)
+    rt64_3ds::StereoFrame begin_stereo_frame() {
+        rt64_3ds::StereoFrame sf;
+        const rt64_3ds::Settings& st = rt64_3ds::settings();
+        slider_ = osGet3DSliderState();
+        sf.sep = (float)st.sep_slider * 0.002f * slider_ * st.slider_gain;
+        sf.on = top_r_ != nullptr && slider_ > 0.001f && sf.sep > 0.0f;
+        if (sf.on != s3d_on_) {
+            gfxSet3D(sf.on);
+            s3d_on_ = sf.on;
+        }
+        stereo_wants_depth_ = sf.on && (st.auto_convergence || rt64_3ds::first_person_scene());
+        return sf;
+    }
+
+    rt64_3ds::StereoFrame finish_stereo_frame(rt64_3ds::StereoFrame sf) {
+        const rt64_3ds::Settings& st = rt64_3ds::settings();
+        const float manual = (float)st.convergence_hundredths * 0.2f;
+        sf.conv = manual;
+        near_z_ = -1.0f;
+        if (sf.on && st.auto_convergence) {
+            if (prev_cam_world_) {
+                const float zp = rt64_3ds::near_depth_statistic(depth_grid_, kGridCols, kGridRows);
+                near_z_ = zp > 0.0f ? rt64_3ds::view_depth(zp, prev_m22_, prev_m32_) : -1.0f;
+            }
+            sf.conv = autoconv_.update(near_z_, manual, sf.sep, st.comfort_target, rt64_3ds::low_convergence_scene());
+        }
+        else {
+            autoconv_.reset();
+        }
+        applied_conv_ = sf.conv;
+        if (sf.on && st.hud_depth != 50) {
+            // 50 is the screen plane; above pops the HUD out, below pushes it
+            // back. Triangles scale with separation (so the HUD flattens with
+            // the world); rectangles carry the desktop's fixed offset, here
+            // scaled by the 3D slider.
+            const float centered = ((float)st.hud_depth - 50.0f) / 50.0f;
+            sf.hud_offset = -centered * 0.04f * (sf.sep / 0.10f);
+            sf.rect_ndc = -centered * 0.04f * 2.75f * slider_ * st.slider_gain;
+        }
+        sf.reticle = sf.on && rt64_3ds::first_person_scene() && !rt64_3ds::low_convergence_scene();
+        aim_z_ = -1.0f;
+        if (sf.reticle) {
+            aim_z_ = sample_aim_depth(sf);
+            // Zero at the convergence distance, the full separation at
+            // infinity (also when nothing was sampled: open sky), negative
+            // nearer; clamped harder behind the screen than in front.
+            const float ratio = aim_z_ > 0.0f ? sf.conv / aim_z_ : 0.0f;
+            const float off = sf.sep * (1.0f - ratio);
+            const float limit = off > 0.0f ? 0.10f : 0.30f;
+            sf.aim_ndc = off < -limit ? -limit : off > limit ? limit : off;
+        }
+        return sf;
+    }
+
+    // The depth under the reticle, from the left eye's finished frame. That
+    // image is displaced by the left eye's own parallax, which depends on the
+    // depth being measured, so a strip of candidates is read and the one
+    // whose depth predicts its own displacement wins.
+    float sample_aim_depth(const rt64_3ds::StereoFrame& sf) const {
+        if (!prev_cam_world_) return -1.0f;
+        constexpr int kCandidates = 13;
+        const float s_px = sf.sep * 200.0f;
+        const float lo = -s_px - 2.0f, hi = 3.0f * s_px + 2.0f;
+        const int sx = (int)(reticle_cx_ + 40.0f), sy = (int)reticle_cy_;
+        float best_err = 1e9f, best_z = -1.0f;
+        for (int i = 0; i < kCandidates; i++) {
+            const float o = lo + (hi - lo) * (float)i / (float)(kCandidates - 1);
+            float zs[3];
+            int n = 0;
+            for (int k = -1; k <= 1; k++) {
+                const float zp = read_depth_zp(sx + (int)o, sy + k * 3);
+                if (zp > 0.0f && zp < 1.0f) zs[n++] = zp;
+            }
+            if (n == 0) continue;
+            std::sort(zs, zs + n);
+            const float z = rt64_3ds::view_depth(zs[n / 2], prev_m22_, prev_m32_);
+            if (z <= 0.0f) continue;
+            const float predicted = s_px * (sf.conv / z - 1.0f);
+            const float err = std::fabs(predicted - o);
+            if (err < best_err) { best_err = err; best_z = z; }
+        }
+        return best_z;
+    }
+
+    // Each draw's treatment for this frame, and where the reticle is (for
+    // the next frame's depth sample).
+    void classify_frame(const rt64_3ds::StereoFrame& sf) {
+        classes_.resize(frame_.draws.size());
+        memset(class_count_, 0, sizeof(class_count_));
+        if (!sf.on) return;
+        const rt64_3ds::RenderDesc& desc = rt64_3ds::render_desc();
+        const rt64_3ds::Vtx3ds* verts = frame_.verts.data();
+        bool any = false;
+        float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+        for (size_t i = 0; i < frame_.draws.size(); i++) {
+            const rt64_3ds::DrawRecord& d = frame_.draws[i];
+            rt64_3ds::StereoClass cls = rt64_3ds::classify_draw(d, desc);
+            if (cls == rt64_3ds::StereoClass::Rect && rt64_3ds::rect_covers_scissor(d, verts)) {
+                cls = rt64_3ds::StereoClass::ScreenOverlay;   // full-screen tints stay on the glass
+            }
+            uint8_t c = (uint8_t)cls;
+            float a, b, e, f;
+            if (sf.reticle && !d.perspective && cls != rt64_3ds::StereoClass::Infinity &&
+                rt64_3ds::is_reticle_quad(d, verts, &a, &b, &e, &f)) {
+                c = kReticle;
+                any = true;
+                x0 = std::min(x0, a); x1 = std::max(x1, b); y0 = std::min(y0, e); y1 = std::max(y1, f);
+            }
+            classes_[i] = c;
+            class_count_[c == kReticle ? 7 : (c < 7 ? c : 0)]++;
+        }
+        if (any) { reticle_cx_ = (x0 + x1) * 0.5f; reticle_cy_ = (y0 + y1) * 0.5f; }
+        else { reticle_cx_ = 160.0f; reticle_cy_ = 120.0f; }
+    }
+
+    static constexpr uint8_t kReticle = 0xFF;
+    static constexpr int kGridCols = 40, kGridRows = 30;
+    C3D_RenderTarget* top_r_ = nullptr;
+    bool s3d_on_ = false, stereo_wants_depth_ = false;
+    float slider_ = 0.0f;
+    std::vector<uint8_t> classes_;
+    uint32_t class_count_[8] = {};   // last frame's draws per StereoClass, [7] = reticle quads
+    float last_sa_ = 0.0f, last_sb_ = 0.0f;
+    u64 acc_left_ = 0, acc_right_ = 0;
+    rt64_3ds::AutoConvergence autoconv_;
+    float depth_grid_[kGridCols * kGridRows] = {};
+    bool prev_cam_world_ = false;
+    float prev_m22_ = 0.0f, prev_m32_ = 0.0f;
+    float reticle_cx_ = 160.0f, reticle_cy_ = 120.0f;
+    float applied_conv_ = 0.0f, near_z_ = -1.0f, aim_z_ = -1.0f;
     int capture_snapshot_frames_ = 0;
     int seq_first_ = 0, seq_count_ = 0;
     int cam_log_first_ = 0, cam_log_count_ = 0;
@@ -734,7 +958,7 @@ public:
     u64 prof_[5] = {};
     bool prof_on_ = false;   // PROFILE.TXT: time the replay's sections (a syscall per sample)
     u64 tick() const { return prof_on_ ? svcGetSystemTick() : 0; }
-    uint32_t frames_at_profile_ = 0;
+    uint32_t frames_at_profile_ = 0, frames_at_stereo_ = 0;
     C3D_Tex* last_tex_[2] = { nullptr, nullptr };
     uint32_t last_tex_param_[2] = { 0, 0 };
     uint32_t last_cc_[2] = { 0, 0 }, last_omh_ = 0, last_oml_ = 0, last_gm_ = 0;
