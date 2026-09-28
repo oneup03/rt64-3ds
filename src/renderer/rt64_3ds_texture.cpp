@@ -91,13 +91,22 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
                    ((uint64_t)d.pitch << 44) ^ ((uint64_t)d.nibble << 63) ^
                    (d.block ? (((uint64_t)d.dxt << 27) ^ ((uint64_t)d.load_word << 50) ^ (1ull << 62)) : 0);
     auto content_hash = [&]() {
+        // A fixed sample: up to 8 rows spread over the texture, up to 8 words
+        // spread over each, plus the row's last word. A texture reloaded into
+        // reused memory or animated in place changes far more than that;
+        // hashing every fourth word cost up to ~9 ms a frame on the console.
         uint32_t h = 2166136261u;
-        for (uint32_t y = 0; y < d.height; y++) {
-            uint32_t a = d.addr + y * d.pitch;
-            uint32_t end = a + row_bytes;
-            // Every fourth word: enough to catch a rewritten texture cheaply.
-            for (uint32_t p = a & ~3u; p < end; p += 16) { h ^= rw(rdram_, p); h *= 16777619u; }
-            h ^= rw(rdram_, (end - 4) & ~3u); h *= 16777619u;
+        const uint32_t rows = d.height < 8 ? d.height : 8;
+        const uint32_t words = (row_bytes + 3) / 4;
+        const uint32_t cols = words < 8 ? words : 8;
+        for (uint32_t i = 0; i < rows; i++) {
+            uint32_t y = rows > 1 ? i * (d.height - 1) / (rows - 1) : 0;
+            uint32_t a = (d.addr + y * d.pitch) & ~3u;
+            for (uint32_t j = 0; j < cols; j++) {
+                uint32_t w = cols > 1 ? j * (words - 1) / (cols - 1) : 0;
+                h ^= rw(rdram_, a + w * 4); h *= 16777619u;
+            }
+            h ^= rw(rdram_, (d.addr + y * d.pitch + row_bytes - 4) & ~3u); h *= 16777619u;
         }
         return h;
     };

@@ -97,6 +97,7 @@ RspUcodeFunc* timed_get_ucode(const OSTask* task) {
 }
 
 extern "C" void __appExit(void);   // libctru: closes the services __appInit opened
+extern "C" void (*__system_retAddr)(void);   // libctru: set by aptExit to finish closing the application
 
 const recomp3ds::GameDesc* g_desc = nullptr;
 int g_sp_core = 2;
@@ -212,12 +213,15 @@ void update_gfx_inner() {
                 svcSleepThread(300000000ll);      // the renderer finishes its frame and goes idle
                 recomp3ds::audio_shutdown();
                 gfxExit();                        // give the GPU and screens back to the system
-                // libctru's service teardown; its aptExit asks NS to close the
-                // application, and NS then ends the process itself. Exiting
-                // on our own before that completes raced the HOME Menu.
+                // libctru's own exit, minus the heap unmapping (other threads
+                // still run): __appExit's aptExit sends PrepareToClose and
+                // leaves the final APT_CloseApplication in __system_retAddr,
+                // which __libctru_exit calls just before svcExitProcess.
+                // Skipping that call left the HOME Menu with a half-closed
+                // application (the "restart the system" error).
                 __appExit();
-                svcSleepThread(3000000000ll);
-                svcExitProcess();                 // fallback if nothing ended us
+                if (__system_retAddr) __system_retAddr();
+                svcExitProcess();
             }, nullptr, 16 * 1024, 0x20, -2, true);
         }
     }
