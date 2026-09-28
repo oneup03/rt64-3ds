@@ -5,6 +5,7 @@
 // SELECT belongs to the platform (settings menu, frame capture), and the
 // D-pad to the menu while it is open.
 #include <3ds.h>
+#include <cmath>
 #include <cstring>
 
 #include "ultramodern/input.hpp"
@@ -14,12 +15,28 @@
 namespace {
 using namespace recomp3ds;
 constexpr int CPAD_MAX = 156;
-constexpr int CSTICK_THRESHOLD = 60;
+// A C-Stick direction presses its C button past a quarter of the range left
+// after the deadzone (at the default 20% that is ~40% of the raw travel).
+constexpr float CSTICK_BUTTON = 0.25f;
 u32 g_held = 0;
 circlePosition g_cpad{};
 circlePosition g_cstick{};
 volatile bool g_blocked = false;
 volatile bool g_cstick_buttons = true;
+volatile float g_stick_dz = 0.05f, g_cstick_dz = 0.20f;
+
+// Radial deadzone over the stick's raw counts, the rest of the range scaled
+// back to 0..1 so movement still starts at zero and still reaches full.
+void stick_value(const circlePosition& p, float dz, float* x, float* y) {
+    float fx = (float)p.dx / CPAD_MAX, fy = (float)p.dy / CPAD_MAX;
+    const float m = sqrtf(fx * fx + fy * fy);
+    if (m <= dz || m <= 0.0f) { *x = 0.0f; *y = 0.0f; return; }
+    float k = (m - dz) / (1.0f - dz);
+    if (k > 1.0f) k = 1.0f;
+    fx *= k / m; fy *= k / m;
+    *x = fx > 1.0f ? 1.0f : fx < -1.0f ? -1.0f : fx;
+    *y = fy > 1.0f ? 1.0f : fy < -1.0f ? -1.0f : fy;
+}
 
 const ButtonMap kDefaultMap[] = {
     { KEY_A, N64_A }, { KEY_B, N64_B }, { KEY_Y | KEY_ZL, N64_Z }, { KEY_X, N64_CUP }, { KEY_L, N64_L },
@@ -35,6 +52,11 @@ void recomp3ds::input_set_map(const ButtonMap* map, size_t count) {
 }
 
 void recomp3ds::input_set_cstick_buttons(bool on) { g_cstick_buttons = on; }
+
+void recomp3ds::input_set_deadzones(int stick_percent, int cstick_percent) {
+    g_stick_dz = (float)stick_percent * 0.01f;
+    g_cstick_dz = (float)cstick_percent * 0.01f;
+}
 
 // A modal prompt owns the pad (and hidScanInput) while it is up.
 void recomp3ds::input_set_blocked(bool blocked) { g_blocked = blocked; }
@@ -68,24 +90,20 @@ bool recomp3ds::input_get(int controller_num, uint16_t* buttons, float* x, float
         if (h & g_map[i].keys) b |= g_map[i].n64;
     }
     if (g_cstick_buttons) {
-        if (g_cstick.dy > CSTICK_THRESHOLD) b |= N64_CUP;
-        if (g_cstick.dy < -CSTICK_THRESHOLD) b |= N64_CDOWN;
-        if (g_cstick.dx < -CSTICK_THRESHOLD) b |= N64_CLEFT;
-        if (g_cstick.dx > CSTICK_THRESHOLD) b |= N64_CRIGHT;
+        float cx, cy;
+        stick_value(g_cstick, g_cstick_dz, &cx, &cy);
+        if (cy > CSTICK_BUTTON) b |= N64_CUP;
+        if (cy < -CSTICK_BUTTON) b |= N64_CDOWN;
+        if (cx < -CSTICK_BUTTON) b |= N64_CLEFT;
+        if (cx > CSTICK_BUTTON) b |= N64_CRIGHT;
     }
     *buttons = b;
-    float fx = (float)g_cpad.dx / CPAD_MAX;
-    float fy = (float)g_cpad.dy / CPAD_MAX;
-    if (fx > 1.0f) fx = 1.0f; if (fx < -1.0f) fx = -1.0f;
-    if (fy > 1.0f) fy = 1.0f; if (fy < -1.0f) fy = -1.0f;
-    *x = fx;
-    *y = fy;
+    stick_value(g_cpad, g_stick_dz, x, y);
     return true;
 }
 
 void recomp3ds::input_get_right_stick(float* x, float* y) {
-    *x = (float)g_cstick.dx / CPAD_MAX;
-    *y = (float)g_cstick.dy / CPAD_MAX;
+    stick_value(g_cstick, g_cstick_dz, x, y);
 }
 
 u32 recomp3ds::input_raw_held() {

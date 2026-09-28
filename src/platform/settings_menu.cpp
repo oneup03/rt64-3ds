@@ -26,7 +26,7 @@ int g_sel = 0;
 // Console layout (40 x 30 characters): the game's name on row 0 and the
 // stats on row 2 belong to recomp3ds_run.cpp, as do the HOME prompt (rows
 // 23-26) and the capture message (row 28).
-constexpr int kHintRow = 4, kHeaderRow = 6, kFirstRow = 8, kRowStep = 2, kLastRow = 21;
+constexpr int kHintRow = 4, kFirstRow = 6, kRowStep = 2, kLastRow = 22;
 constexpr int kMinusCol = 16, kValueCol = 22, kValueWidth = 11, kPlusCol = 35;
 
 struct Row {
@@ -36,9 +36,10 @@ struct Row {
     int* value;
     const char* const* names;       // shown instead of the number; stepping wraps
     bool tenths;                    // shown as n.n
+    const char* suffix;             // after the number ("%")
     void (*on_change)(int value);
 };
-constexpr int kMaxRows = 7;
+constexpr int kMaxRows = 8;
 Row g_rows[kMaxRows];
 int g_row_count = 0;
 
@@ -51,6 +52,10 @@ const char* const kOffOn[] = { "off", "on" };
 void apply_conv(int v) { rt64_3ds::settings().convergence_hundredths = v * 10; }
 void apply_auto(int v) { rt64_3ds::settings().auto_convergence = v != 0; }
 
+// Stick deadzones in percent of the travel.
+int g_stick_dz = 5, g_cstick_dz = 20;
+void apply_deadzones(int) { recomp3ds::input_set_deadzones(g_stick_dz, g_cstick_dz); }
+
 void add_row(const Row& r) {
     if (g_row_count < kMaxRows) g_rows[g_row_count++] = r;
 }
@@ -62,12 +67,12 @@ void draw_row(int i) {
     char val[24];
     if (r.names != nullptr) snprintf(val, sizeof(val), "%s", r.names[*r.value - r.lo]);
     else if (r.tenths) snprintf(val, sizeof(val), "%d.%d", *r.value / 10, *r.value % 10);
-    else snprintf(val, sizeof(val), "%d", *r.value);
+    else snprintf(val, sizeof(val), "%d%s", *r.value, r.suffix != nullptr ? r.suffix : "");
     // Centred in its field.
     const int len = (int)strlen(val) < kValueWidth ? (int)strlen(val) : kValueWidth;
     const int left = (kValueWidth - len) / 2;
     const bool sel = i == g_sel;
-    printf("\x1b[%d;0H%s%s %-12s\x1b[0m  [ - ] %*s%-*s  [ + ]", row_line(i), sel ? "\x1b[33m" : "", sel ? ">" : " ", r.label,
+    printf("\x1b[%d;0H%s%s %-13s\x1b[0m [ - ] %*s%-*s  [ + ]", row_line(i), sel ? "\x1b[33m" : "", sel ? ">" : " ", r.label,
            left + len, val, kValueWidth - left - len, "");
 }
 
@@ -83,12 +88,9 @@ void draw() {
     blank_rows(kHintRow - 1, kLastRow);
     draw_hint();
     if (!g_open) return;
-    printf("\x1b[%d;0H--------------- Settings ---------------", kHeaderRow);
     for (int i = 0; i < g_row_count; i++) draw_row(i);
-    const int after = row_line(g_row_count - 1) + kRowStep;
-    if (after + 1 <= kLastRow) {
-        printf("\x1b[%d;0HThe 3D slider sets the strength.", after);
-        printf("\x1b[%d;0HHUD depth 50 = on the screen.", after + 1);
+    if (row_line(g_row_count - 1) + 2 <= kLastRow) {
+        printf("\x1b[%d;0H3D slider: strength.  HUD 50: on screen.", row_line(g_row_count - 1) + 2);
     }
 }
 
@@ -148,14 +150,16 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     g_conv_tenths = st.convergence_hundredths / 10;
     g_auto = st.auto_convergence ? 1 : 0;
     g_row_count = 0;
-    add_row({ "separation", "3D depth", 0, 100, &st.sep_slider, nullptr, false, nullptr });
-    add_row({ "convergence_tenths", "Convergence", 1, 200, &g_conv_tenths, nullptr, true, apply_conv });
-    add_row({ "hud_depth", "HUD depth", 0, 100, &st.hud_depth, nullptr, false, nullptr });
-    add_row({ "auto_convergence", "Auto conv.", 0, 1, &g_auto, kOffOn, false, apply_auto });
-    add_row({ "comfort_target", "Comfort", -20, 30, &st.comfort_target, nullptr, false, nullptr });
+    add_row({ "separation", "3D depth", 0, 100, &st.sep_slider, nullptr, false, nullptr, nullptr });
+    add_row({ "convergence_tenths", "Convergence", 1, 200, &g_conv_tenths, nullptr, true, nullptr, apply_conv });
+    add_row({ "hud_depth", "HUD depth", 0, 100, &st.hud_depth, nullptr, false, nullptr, nullptr });
+    add_row({ "auto_convergence", "Auto conv.", 0, 1, &g_auto, kOffOn, false, nullptr, apply_auto });
+    add_row({ "comfort_target", "Comfort", -20, 30, &st.comfort_target, nullptr, false, nullptr, nullptr });
+    add_row({ "stick_deadzone", "Circle Pad dz", 0, 50, &g_stick_dz, nullptr, false, "%", apply_deadzones });
+    add_row({ "cstick_deadzone", "C-Stick dz", 0, 50, &g_cstick_dz, nullptr, false, "%", apply_deadzones });
     for (size_t i = 0; i < desc.menu_option_count; i++) {
         const MenuOption& o = desc.menu_options[i];
-        add_row({ o.key, o.label, o.lo, o.hi, o.value, o.names, false, o.on_change });
+        add_row({ o.key, o.label, o.lo, o.hi, o.value, o.names, false, nullptr, o.on_change });
     }
     load();
     for (int i = 0; i < g_row_count; i++) {
@@ -229,8 +233,9 @@ void recomp3ds::settings_menu_update() {
         was_down = touch;
         if (tfire) {
             const int col = tx / 8, line = ty / 8;
-            for (int i = 0; i < g_row_count; i++) {
-                if (line < row_line(i) - 1 || line > row_line(i) + 1) continue;
+            // Each row owns its line and the one above it.
+            const int i = line >= kFirstRow - 1 ? (line - kFirstRow + 1) / kRowStep : -1;
+            if (i >= 0 && i < g_row_count) {
                 int d = 0;
                 if (col >= kMinusCol - 1 && col <= kMinusCol + 5) d = -1;
                 else if (col >= kPlusCol - 1 && col <= kPlusCol + 5) d = 1;
