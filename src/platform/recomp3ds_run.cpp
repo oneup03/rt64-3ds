@@ -433,7 +433,20 @@ u32 log_cpu(const char* when) {
     return mhz;
 }
 
+// The New 3DS clock and L2 cache (settings menu: CPU speed). Off, a New 3DS
+// runs at an Old 3DS's 268 MHz without L2 - the CPU side of an Old 3DS,
+// though it keeps the fourth core and the memory.
+bool g_speedup = true;
+bool g_clock_booted = false;
+
 }   // namespace
+
+void recomp3ds::set_cpu_speed(bool new3ds) {
+    g_speedup = new3ds;
+    if (!g_clock_booted) return;       // run() applies the saved choice at boot
+    osSetSpeedupEnable(new3ds);
+    log_cpu(new3ds ? "CPU speed set to New 3DS" : "CPU speed set to Old 3DS");
+}
 
 const char* recomp3ds::base_path() { return g_base_path; }
 
@@ -473,7 +486,8 @@ int recomp3ds::run(const GameDesc& desc) {
     recomp3ds::settings_menu_init(g_base_path, desc);
     recomp3ds::input_set_map(desc.button_map, desc.button_map_count);
     u32 cpu_mhz = log_cpu("boot");
-    if (is_new_3ds) {
+    g_clock_booted = true;
+    if (is_new_3ds && g_speedup) {
         // The exheader asks for 804 MHz and the L2 cache, but on hardware the
         // CIA still starts at 268 MHz without L2 (measured: 271 MHz, 230 ns
         // loads; 816 MHz, 33 ns after this). libctru re-applies it after

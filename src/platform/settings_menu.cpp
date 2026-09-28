@@ -63,6 +63,11 @@ const char* const kOffOn[] = { "off", "on" };
 void apply_conv(int v) { rt64_3ds::settings().convergence_hundredths = v * 10; }
 void apply_auto(int v) { rt64_3ds::settings().auto_convergence = v != 0; }
 
+// The New 3DS CPU speed, to see how an Old 3DS would fare.
+int g_cpu_new = 1;
+const char* const kCpuNames[] = { "Old 3DS", "New 3DS" };
+void apply_cpu(int v) { recomp3ds::set_cpu_speed(v != 0); }
+
 // Stick deadzones in percent of the travel.
 int g_stick_dz = 5, g_cstick_dz = 20;
 void apply_deadzones(int) { recomp3ds::input_set_deadzones(g_stick_dz, g_cstick_dz); }
@@ -231,6 +236,9 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
         const MenuOption& o = desc.menu_options[i];
         add_row({ o.key, o.label, o.lo, o.hi, o.value, o.names, false, o.suffix, o.on_change, o.page, o.step > 0 ? o.step : 1, o.zero_text });
     }
+    bool is_new_3ds = false;
+    APT_CheckNew3DS(&is_new_3ds);
+    if (is_new_3ds) add_row({ "cpu_speed", "CPU speed", 0, 1, &g_cpu_new, kCpuNames, false, nullptr, apply_cpu, PageGame, 1, nullptr });
     load();
     for (int i = 0; i < g_row_count; i++) {
         if (g_rows[i].on_change != nullptr) g_rows[i].on_change(*g_rows[i].value);

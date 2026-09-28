@@ -54,6 +54,7 @@ namespace recomp3ds {
     // The settings menu on the touch screen (settings_menu.cpp).
     struct GameDesc;
     void settings_menu_init(const char* base_path, const GameDesc& desc);
+    void set_cpu_speed(bool new3ds);    // the New 3DS clock and L2 on or off (recomp3ds_run.cpp)
     void settings_menu_update();        // ~60 times a second, main thread
     void settings_menu_toggle();
     void settings_menu_redraw();        // after something else wrote over the console
