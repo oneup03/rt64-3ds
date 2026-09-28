@@ -83,13 +83,31 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
     uint32_t bpp_shift = d.siz;                          // bytes per row = width << siz >> 1
     uint32_t row_bytes = ((uint32_t)d.width << bpp_shift) >> 1;
     if (row_bytes == 0) row_bytes = 1;
-    // Key on where and how the texels are read; the content hash is checked
-    // once per frame per key so a texture the game rewrites in place is
-    // picked up without hashing every draw.
-    uint64_t key = ((uint64_t)d.addr * 2654435761u) ^ ((uint64_t)d.fmt << 3) ^ ((uint64_t)d.siz << 6) ^
-                   ((uint64_t)d.width << 10) ^ ((uint64_t)d.height << 21) ^ ((uint64_t)d.tlut_hash << 40) ^ ((uint64_t)d.palette << 56) ^
-                   ((uint64_t)d.pitch << 44) ^ ((uint64_t)d.nibble << 63) ^
-                   (d.block ? (((uint64_t)d.dxt << 27) ^ ((uint64_t)d.load_word << 50) ^ (1ull << 62)) : 0);
+    // Key on where and how the texels are read, plus a fingerprint of 16
+    // words from the texture's interior: games load textures into heap
+    // blocks they free and reuse (DK64's animated torch flames move between
+    // 4 KB blocks every few frames), so one address and format can hold a
+    // different texture from one frame to the next. The fuller content hash
+    // below still catches in-place edits the fingerprint misses, every
+    // fourth frame.
+    auto mix = [](uint64_t h, uint64_t v) {
+        h ^= v;
+        h *= 0xFF51AFD7ED558CCDull;
+        return h ^ (h >> 33);
+    };
+    uint32_t fp = 2166136261u;
+    for (uint32_t j = 0; j < 4; j++) {
+        const uint32_t row = d.addr + (2 * j + 1) * d.height / 8 * d.pitch;
+        for (uint32_t i = 0; i < 4; i++) {
+            fp ^= rw(rdram_, row + (2 * i + 1) * row_bytes / 8);
+            fp *= 16777619u;
+        }
+    }
+    uint64_t key = mix(0, d.addr);
+    key = mix(key, (uint64_t)d.fmt | ((uint64_t)d.siz << 4) | ((uint64_t)d.width << 8) | ((uint64_t)d.height << 24) | ((uint64_t)d.pitch << 40));
+    key = mix(key, (uint64_t)d.tlut_hash | ((uint64_t)d.palette << 32) | ((uint64_t)d.nibble << 40) | ((uint64_t)d.block << 48));
+    if (d.block) key = mix(key, (uint64_t)d.dxt | ((uint64_t)d.load_word << 32));
+    key = mix(key, fp);
     auto content_hash = [&]() {
         // A fixed sample: up to 8 rows spread over the texture, up to 8 words
         // spread over each, plus the row's last word. A texture reloaded into

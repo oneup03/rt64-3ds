@@ -388,6 +388,7 @@ private:
         u64 tb0 = svcGetSystemTick();
         C3D_FrameBegin(0);
         acc_wait_ += svcGetSystemTick() - tb0;
+        if (check_snapshot_) { verify_snapshot(); check_snapshot_ = false; }
         maybe_capture_framebuffer();
         const rt64_3ds::StereoFrame sf = begin_stereo_frame();
         {
@@ -529,7 +530,8 @@ private:
     void copy_snapshot() {
         {
             // Outside a frame (C3D_SyncTextureCopy then waits for the last
-            // frame's GPU work and copies synchronously; inside one it queues
+            // frame's GPU work and starts the copy, and the next
+            // C3D_FrameBegin waits for the copy to finish; inside one it queues
             // a frame split and the copy on citro3d's 32-entry GX queue, which
             // 50 copies overflow: a PANIC). The target still holds the last
             // presented frame: copy it, one 8x8-tile row at a time, into the
@@ -562,20 +564,26 @@ private:
                                     kTextureCopyMode);
             }
             snapshots_++;
-            if (snapshots_ <= 3) {
-                // Self-check (CPU reads of VRAM are fine): the copy must hold
-                // the colour buffer tile row for tile row.
-                const u32* src = (const u32*)top_->frameBuf.colorBuf;
-                const u32* dst = (const u32*)snapshot_.data;
-                u32 bad = 0, seed = 0x1234567u;
-                for (int i = 0; i < 512; i++) {
-                    seed = seed * 1103515245u + 12345u;
-                    const u32 tr = (seed >> 8) % 50, off = (seed >> 3) % (row / 4);
-                    if (src[tr * (row / 4) + off] != dst[tr * ((row + gap) / 4) + off]) bad++;
-                }
-                fprintf(stderr, "rt64-3ds: snapshot copy %u: %u/512 words differ from the frame\n", snapshots_, bad);
-            }
+            // Checked once the copy has finished: out of a frame citro3d
+            // returns before it does on the console (gspWaitForPPF sees the
+            // last frame's display transfer); C3D_FrameBegin waits for it.
+            check_snapshot_ = snapshots_ <= 3;
         }
+    }
+
+    // Self-check (CPU reads of VRAM are fine): the copy must hold the colour
+    // buffer tile row for tile row.
+    void verify_snapshot() {
+        const u32 row = 240 * 8 * 4, gap = (256 - 240) * 8 * 4;
+        const u32* src = (const u32*)top_->frameBuf.colorBuf;
+        const u32* dst = (const u32*)snapshot_.data;
+        u32 bad = 0, seed = 0x1234567u;
+        for (int i = 0; i < 512; i++) {
+            seed = seed * 1103515245u + 12345u;
+            const u32 tr = (seed >> 8) % 50, off = (seed >> 3) % (row / 4);
+            if (src[tr * (row / 4) + off] != dst[tr * ((row + gap) / 4) + off]) bad++;
+        }
+        fprintf(stderr, "rt64-3ds: snapshot copy %u: %u/512 words differ from the frame\n", snapshots_, bad);
     }
 
     void apply_state(const rt64_3ds::DrawRecord& d, int& fallbacks) {
@@ -1087,6 +1095,7 @@ public:
     C3D_Tex white_{};
     C3D_Tex snapshot_{};
     uint32_t snapshots_ = 0;
+    bool check_snapshot_ = false;
     bool gpu_debug_ = false, debug_sync_ = true;
     uint32_t debug_from_ = 0, debug_count_ = 0, debug_step_ = 1;
     DVLB_s* dvlb_ = nullptr;
