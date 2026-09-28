@@ -382,7 +382,10 @@ private:
             // bytes; a tile row of the 240-wide buffer is 30 tiles.
             // TextureCopy line widths and gaps are in 16-byte units.
             const u32 row = 240 * 8 * 4, gap = (256 - 240) * 8 * 4;
-            static int cpu_copy = -1;   // SNAPSHOT_CPU.TXT: copy with the CPU (checks the path in the emulator)
+            // SNAPSHOT_CPU.TXT: copy with the CPU, to check the path in the
+            // emulator (which keeps sampling a stale texture after a GPU
+            // copy). Emulator only: the console faults on CPU writes to VRAM.
+            static int cpu_copy = -1;
             if (cpu_copy < 0) {
                 FILE* f = fopen("sdmc:/3ds/DK64/SNAPSHOT_CPU.TXT", "r");
                 cpu_copy = f ? 1 : 0;
@@ -397,10 +400,6 @@ private:
                 C3D_SyncTextureCopy((u32*)top_->frameBuf.colorBuf, GX_BUFFER_DIM(row / 16, 0),
                                     (u32*)snapshot_.data, GX_BUFFER_DIM(row / 16, gap / 16), 240 * 400 * 4, 0);
             }
-            // A CPU write to each page of the texture: the emulator otherwise
-            // keeps sampling its cached copy from before the GPU copy.
-            volatile u32* touch = (volatile u32*)snapshot_.data;
-            for (u32 i = 0; i < 256 * 512; i += 1024) touch[i] = touch[i];
             snapshots_++;
         }
         C3D_RenderTargetClear(top_, C3D_CLEAR_ALL, 0x000000FF, 0);
