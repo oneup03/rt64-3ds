@@ -27,14 +27,22 @@ struct ButtonMap {
     uint16_t n64;
 };
 
+// The settings menu's pages; the stereo rows are on Page3D and the stick
+// deadzones on PageControls. Empty pages are skipped.
+enum MenuPage : uint8_t { Page3D, PageControls, PageCamera, PageGame, PageCount };
+
 // A game setting on the touch-screen menu, saved to settings.ini under `key`.
 struct MenuOption {
     const char* key;
-    const char* label;                  // up to 12 characters
+    const char* label;                  // up to 13 characters
     int lo, hi;
     int* value;                         // holds the default until settings.ini is read
     const char* const* names = nullptr; // hi - lo + 1 names (up to 11 characters) instead of the number
     void (*on_change)(int value) = nullptr;   // also called once after loading
+    MenuPage page = PageGame;
+    int step = 1;
+    const char* suffix = nullptr;       // after the number ("%")
+    const char* zero_text = nullptr;    // shown for 0 instead of the number ("Off")
 };
 
 struct GameDesc {
@@ -75,6 +83,12 @@ const char* base_path();
 // Whether the C-Stick also presses the C buttons (on by default). A game
 // that reads the C-Stick as an analog camera turns it off.
 void input_set_cstick_buttons(bool on);
+
+// The gyroscope, for games that aim with it: turned on only while wanted
+// (it costs power). Degrees per second, turning right and tilting the top
+// towards the player positive, the resting offset removed.
+void input_set_gyro(bool on);
+void input_get_gyro(float* yaw_dps, float* pitch_dps);
 
 }   // namespace recomp3ds
 

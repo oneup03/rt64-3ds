@@ -1,13 +1,15 @@
 // The settings menu on the touch screen. A tap of SELECT opens and closes it
 // (holding SELECT takes a frame capture instead, see recomp3ds_run.cpp).
-// While it is open the D-pad chooses a row (up/down) and changes it
-// (left/right, held to repeat) and the game does not see the D-pad; the
-// [-]/[+] buttons work by touch as well. Values go to <base>/settings.ini a
-// second after the last change.
+// While it is open the D-pad works it and the game does not see the D-pad:
+// up/down chooses a row, left/right changes it (held to repeat); on the tab
+// row at the top left/right changes the page. Tabs, rows and the [-]/[+]
+// buttons work by touch as well. Values go to <base>/settings.ini a second
+// after the last change.
 //
-// The stereo rows come first: the 3D slider sets the strength, these its
-// shape (the owner's desktop settings, same units and defaults). The game's
-// own options (GameDesc::menu_options) follow.
+// The 3D page holds the stereo rows: the 3D slider sets the strength, these
+// its shape (the owner's desktop settings, same units and defaults). The
+// stick deadzones start the Controls page; the game's own options
+// (GameDesc::menu_options) go on the pages they name.
 #include <3ds.h>
 #include <cstdio>
 #include <cstring>
@@ -18,16 +20,23 @@
 
 namespace {
 
+using recomp3ds::MenuPage;
+
 char g_path[160] = "";
 bool g_open = false, g_dirty = false, g_redraw = true;
 u64 g_changed_at = 0;
-int g_sel = 0;
+int g_page = 0;
+int g_sel = -1;                         // slot on the page, -1 = the tab row
 
 // Console layout (40 x 30 characters): the game's name on row 0 and the
 // stats on row 2 belong to recomp3ds_run.cpp, as do the HOME prompt (rows
 // 23-26) and the capture message (row 28).
-constexpr int kHintRow = 4, kFirstRow = 6, kRowStep = 2, kLastRow = 22;
-constexpr int kMinusCol = 16, kValueCol = 22, kValueWidth = 11, kPlusCol = 35;
+constexpr int kHintRow = 4, kTabRow = 6, kFirstRow = 8, kRowStep = 2, kLastRow = 22;
+constexpr int kSlots = 7;               // rows 8..20; row 22 is the page's note
+constexpr int kMinusCol = 16, kValueWidth = 11, kPlusCol = 35;
+
+const char* const kPageNames[recomp3ds::PageCount] = { "3D", "Controls", "Camera", "Game" };
+int g_tab_col[recomp3ds::PageCount];
 
 struct Row {
     const char* key;
@@ -38,8 +47,10 @@ struct Row {
     bool tenths;                    // shown as n.n
     const char* suffix;             // after the number ("%")
     void (*on_change)(int value);
+    int page, step;
+    const char* zero_text;          // shown for 0 ("Off")
 };
-constexpr int kMaxRows = 8;
+constexpr int kMaxRows = 32;
 Row g_rows[kMaxRows];
 int g_row_count = 0;
 
@@ -60,20 +71,53 @@ void add_row(const Row& r) {
     if (g_row_count < kMaxRows) g_rows[g_row_count++] = r;
 }
 
-int row_line(int i) { return kFirstRow + i * kRowStep; }
+// The rows of the current page, in order.
+int page_rows(int page, int* out) {
+    int n = 0;
+    for (int i = 0; i < g_row_count && n < kSlots; i++) {
+        if (g_rows[i].page == page) out[n++] = i;
+    }
+    return n;
+}
+int page_count(int page) {
+    int idx[kSlots];
+    return page_rows(page, idx);
+}
 
-void draw_row(int i) {
-    const Row& r = g_rows[i];
+int slot_line(int slot) { return kFirstRow + slot * kRowStep; }
+
+void draw_row(int slot) {
+    int idx[kSlots];
+    if (slot < 0 || slot >= page_rows(g_page, idx)) return;
+    const Row& r = g_rows[idx[slot]];
     char val[24];
     if (r.names != nullptr) snprintf(val, sizeof(val), "%s", r.names[*r.value - r.lo]);
+    else if (*r.value == 0 && r.zero_text != nullptr) snprintf(val, sizeof(val), "%s", r.zero_text);
     else if (r.tenths) snprintf(val, sizeof(val), "%d.%d", *r.value / 10, *r.value % 10);
     else snprintf(val, sizeof(val), "%d%s", *r.value, r.suffix != nullptr ? r.suffix : "");
     // Centred in its field.
     const int len = (int)strlen(val) < kValueWidth ? (int)strlen(val) : kValueWidth;
     const int left = (kValueWidth - len) / 2;
-    const bool sel = i == g_sel;
-    printf("\x1b[%d;0H%s%s %-13s\x1b[0m [ - ] %*s%-*s  [ + ]", row_line(i), sel ? "\x1b[33m" : "", sel ? ">" : " ", r.label,
+    const bool sel = slot == g_sel;
+    printf("\x1b[%d;0H%s%s %-13s\x1b[0m [ - ] %*s%-*s  [ + ]", slot_line(slot), sel ? "\x1b[33m" : "", sel ? ">" : " ", r.label,
            left + len, val, kValueWidth - left - len, "");
+}
+
+void draw_tabs() {
+    // " 3D   Controls   Camera   Game": the current page in brackets,
+    // yellow while the tab row is chosen.
+    printf("\x1b[%d;0H%40s\x1b[%d;0H", kTabRow, "", kTabRow);
+    int col = 0;
+    for (int p = 0; p < recomp3ds::PageCount; p++) {
+        g_tab_col[p] = -1;
+        if (page_count(p) == 0) continue;
+        g_tab_col[p] = col;
+        const bool cur = p == g_page;
+        if (cur && g_sel < 0) printf("\x1b[33m[%s]\x1b[0m ", kPageNames[p]);
+        else if (cur) printf("[%s] ", kPageNames[p]);
+        else printf(" %s  ", kPageNames[p]);
+        col += (int)strlen(kPageNames[p]) + 3;
+    }
 }
 
 void blank_rows(int from, int to) {
@@ -84,14 +128,19 @@ void draw_hint() {
     printf("\x1b[%d;0H%-40s", kHintRow, g_open ? "SELECT: close   D-Pad: choose, change" : "SELECT: settings");
 }
 
+void draw_page() {
+    blank_rows(kFirstRow - 1, kLastRow);
+    const int n = page_count(g_page);
+    for (int s = 0; s < n; s++) draw_row(s);
+    if (g_page == recomp3ds::Page3D) printf("\x1b[%d;0H3D slider: strength.  HUD 50: on screen.", kLastRow);
+}
+
 void draw() {
     blank_rows(kHintRow - 1, kLastRow);
     draw_hint();
     if (!g_open) return;
-    for (int i = 0; i < g_row_count; i++) draw_row(i);
-    if (row_line(g_row_count - 1) + 2 <= kLastRow) {
-        printf("\x1b[%d;0H3D slider: strength.  HUD 50: on screen.", row_line(g_row_count - 1) + 2);
-    }
+    draw_tabs();
+    draw_page();
 }
 
 void save() {
@@ -122,24 +171,45 @@ void changed() {
     g_changed_at = svcGetSystemTick();
 }
 
-void step(int i, int d) {
-    Row& r = g_rows[i];
-    int v = *r.value + d;
+void step(int slot, int d) {
+    int idx[kSlots];
+    if (slot < 0 || slot >= page_rows(g_page, idx)) return;
+    Row& r = g_rows[idx[slot]];
+    int v = *r.value + d * r.step;
     if (r.names != nullptr) v = v < r.lo ? r.hi : v > r.hi ? r.lo : v;
     else v = v < r.lo ? r.lo : v > r.hi ? r.hi : v;
     if (v == *r.value) return;
     *r.value = v;
     if (r.on_change != nullptr) r.on_change(v);
     changed();
-    draw_row(i);
+    draw_row(slot);
 }
 
-void select_row(int i) {
-    if (i == g_sel || i < 0 || i >= g_row_count) return;
+void select_slot(int s) {
+    const int n = page_count(g_page);
+    if (s >= n) s = n - 1;
+    if (s < -1) s = -1;
+    if (s == g_sel) return;
     const int old = g_sel;
-    g_sel = i;
+    g_sel = s;
+    if (old < 0 || s < 0) draw_tabs();
     draw_row(old);
-    draw_row(i);
+    draw_row(s);
+}
+
+void set_page(int p) {
+    if (p == g_page || p < 0 || p >= recomp3ds::PageCount || page_count(p) == 0) return;
+    g_page = p;
+    draw_tabs();
+    draw_page();
+}
+
+// The next non-empty page that way, wrapping.
+void turn_page(int d) {
+    for (int k = 1; k < recomp3ds::PageCount; k++) {
+        const int p = (g_page + d * k + recomp3ds::PageCount * 2) % recomp3ds::PageCount;
+        if (page_count(p) != 0) { set_page(p); return; }
+    }
 }
 
 }   // namespace
@@ -150,16 +220,16 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     g_conv_tenths = st.convergence_hundredths / 10;
     g_auto = st.auto_convergence ? 1 : 0;
     g_row_count = 0;
-    add_row({ "separation", "3D depth", 0, 100, &st.sep_slider, nullptr, false, nullptr, nullptr });
-    add_row({ "convergence_tenths", "Convergence", 1, 200, &g_conv_tenths, nullptr, true, nullptr, apply_conv });
-    add_row({ "hud_depth", "HUD depth", 0, 100, &st.hud_depth, nullptr, false, nullptr, nullptr });
-    add_row({ "auto_convergence", "Auto conv.", 0, 1, &g_auto, kOffOn, false, nullptr, apply_auto });
-    add_row({ "comfort_target", "Comfort", -20, 30, &st.comfort_target, nullptr, false, nullptr, nullptr });
-    add_row({ "stick_deadzone", "Circle Pad dz", 0, 50, &g_stick_dz, nullptr, false, "%", apply_deadzones });
-    add_row({ "cstick_deadzone", "C-Stick dz", 0, 50, &g_cstick_dz, nullptr, false, "%", apply_deadzones });
+    add_row({ "separation", "3D depth", 0, 100, &st.sep_slider, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
+    add_row({ "convergence_tenths", "Convergence", 1, 200, &g_conv_tenths, nullptr, true, nullptr, apply_conv, Page3D, 1, nullptr });
+    add_row({ "hud_depth", "HUD depth", 0, 100, &st.hud_depth, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
+    add_row({ "auto_convergence", "Auto conv.", 0, 1, &g_auto, kOffOn, false, nullptr, apply_auto, Page3D, 1, nullptr });
+    add_row({ "comfort_target", "Comfort", -20, 30, &st.comfort_target, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
+    add_row({ "stick_deadzone", "Circle Pad dz", 0, 50, &g_stick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
+    add_row({ "cstick_deadzone", "C-Stick dz", 0, 50, &g_cstick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
     for (size_t i = 0; i < desc.menu_option_count; i++) {
         const MenuOption& o = desc.menu_options[i];
-        add_row({ o.key, o.label, o.lo, o.hi, o.value, o.names, false, nullptr, o.on_change });
+        add_row({ o.key, o.label, o.lo, o.hi, o.value, o.names, false, o.suffix, o.on_change, o.page, o.step > 0 ? o.step : 1, o.zero_text });
     }
     load();
     for (int i = 0; i < g_row_count; i++) {
@@ -208,14 +278,19 @@ void recomp3ds::settings_menu_update() {
         if (down != 0) { fire = true; act = down; next_repeat = now + SYSCLOCK_ARM11 * 2 / 5; }
         else if (pad != 0 && now >= next_repeat) { fire = true; act = pad; next_repeat = now + SYSCLOCK_ARM11 / 12; }
         if (fire) {
-            if (act & KEY_DUP) select_row(g_sel > 0 ? g_sel - 1 : g_row_count - 1);
-            else if (act & KEY_DDOWN) select_row(g_sel + 1 < g_row_count ? g_sel + 1 : 0);
-            else if (act & KEY_DLEFT) step(g_sel, -1);
-            else if (act & KEY_DRIGHT) step(g_sel, +1);
+            const int n = page_count(g_page);
+            if (act & KEY_DUP) select_slot(g_sel >= 0 ? g_sel - 1 : n - 1);
+            else if (act & KEY_DDOWN) select_slot(g_sel + 1 < n ? g_sel + 1 : -1);
+            else if (act & (KEY_DLEFT | KEY_DRIGHT)) {
+                const int d = (act & KEY_DLEFT) ? -1 : 1;
+                // Pages turn on the press only.
+                if (g_sel < 0) { if (down & (KEY_DLEFT | KEY_DRIGHT)) turn_page(d); }
+                else step(g_sel, d);
+            }
         }
 
-        // Touch: [-]/[+] on a row (held to repeat, choice rows only on the
-        // press), or the row's label to choose it.
+        // Touch: a tab, [-]/[+] on a row (held to repeat, choice rows only
+        // on the press), or the row's label to choose it.
         static bool was_down = false;
         static u64 next_touch = 0;
         int tx = 0, ty = 0;
@@ -233,14 +308,24 @@ void recomp3ds::settings_menu_update() {
         was_down = touch;
         if (tfire) {
             const int col = tx / 8, line = ty / 8;
-            // Each row owns its line and the one above it.
-            const int i = line >= kFirstRow - 1 ? (line - kFirstRow + 1) / kRowStep : -1;
-            if (i >= 0 && i < g_row_count) {
-                int d = 0;
-                if (col >= kMinusCol - 1 && col <= kMinusCol + 5) d = -1;
-                else if (col >= kPlusCol - 1 && col <= kPlusCol + 5) d = 1;
-                if (d != 0 && (press || g_rows[i].names == nullptr)) { select_row(i); step(i, d); }
-                else if (press && col < kMinusCol - 1) select_row(i);
+            if (press && line >= kTabRow - 1 && line <= kTabRow) {
+                for (int p = recomp3ds::PageCount - 1; p >= 0; p--) {
+                    if (g_tab_col[p] >= 0 && col >= g_tab_col[p]) { set_page(p); select_slot(-1); break; }
+                }
+            }
+            else {
+                // Each row owns its line and the one above it.
+                const int s = line >= kFirstRow - 1 ? (line - kFirstRow + 1) / kRowStep : -1;
+                const Row* r = nullptr;
+                int idx[kSlots];
+                if (s >= 0 && s < page_rows(g_page, idx)) r = &g_rows[idx[s]];
+                if (r != nullptr) {
+                    int d = 0;
+                    if (col >= kMinusCol - 1 && col <= kMinusCol + 5) d = -1;
+                    else if (col >= kPlusCol - 1 && col <= kPlusCol + 5) d = 1;
+                    if (d != 0 && (press || r->names == nullptr)) { select_slot(s); step(s, d); }
+                    else if (press && col < kMinusCol - 1) select_slot(s);
+                }
             }
         }
     }

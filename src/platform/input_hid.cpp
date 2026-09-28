@@ -53,6 +53,55 @@ void recomp3ds::input_set_map(const ButtonMap* map, size_t count) {
 
 void recomp3ds::input_set_cstick_buttons(bool on) { g_cstick_buttons = on; }
 
+// Gyroscope (for aiming). libctru names the rates x = roll, y = pitch,
+// z = yaw, in raw counts; the HID coefficient turns them into degrees per
+// second. The resting offset drifts, so it is learned while the console is
+// held still (every poll, whether or not anything reads the gyro), and
+// motion slower than kGyroStill is taken as drift.
+namespace {
+volatile bool g_gyro_on = false;
+float g_gyro_coef = 14.375f;            // counts per degree/second (the ITG-3200's)
+float g_gyro_bias[2] = { 0.0f, 0.0f };  // yaw, pitch counts
+float g_gyro_rate[2] = { 0.0f, 0.0f };  // yaw, pitch degrees/second after the bias
+bool g_gyro_primed = false;
+constexpr float kGyroStill = 2.0f;      // degrees/second
+constexpr float kGyroBiasRate = 0.01f;  // per poll (~3 s at 30 polls a second)
+
+void gyro_poll() {
+    angularRate r;
+    hidGyroRead(&r);
+    const float raw[2] = { (float)r.z, (float)r.y };
+    if (!g_gyro_primed) { g_gyro_bias[0] = raw[0]; g_gyro_bias[1] = raw[1]; g_gyro_primed = true; }
+    for (int a = 0; a < 2; a++) {
+        const float dps = (raw[a] - g_gyro_bias[a]) / g_gyro_coef;
+        if (std::fabs(dps) < kGyroStill) g_gyro_bias[a] += (raw[a] - g_gyro_bias[a]) * kGyroBiasRate;
+        g_gyro_rate[a] = dps;
+    }
+}
+}
+
+void recomp3ds::input_set_gyro(bool on) {
+    if (on == g_gyro_on) return;
+    if (on) {
+        HIDUSER_EnableGyroscope();
+        float c = 0.0f;
+        if (R_SUCCEEDED(HIDUSER_GetGyroscopeRawToDpsCoefficient(&c)) && c > 0.0f) g_gyro_coef = c;
+        g_gyro_primed = false;
+    }
+    else {
+        HIDUSER_DisableGyroscope();
+        g_gyro_rate[0] = g_gyro_rate[1] = 0.0f;
+    }
+    g_gyro_on = on;
+}
+
+// Turning the console right is positive yaw, tilting its top towards you
+// (looking up through it) positive pitch.
+void recomp3ds::input_get_gyro(float* yaw_dps, float* pitch_dps) {
+    *yaw_dps = g_gyro_on ? -g_gyro_rate[0] : 0.0f;
+    *pitch_dps = g_gyro_on ? g_gyro_rate[1] : 0.0f;
+}
+
 void recomp3ds::input_set_deadzones(int stick_percent, int cstick_percent) {
     g_stick_dz = (float)stick_percent * 0.01f;
     g_cstick_dz = (float)cstick_percent * 0.01f;
@@ -73,6 +122,7 @@ void recomp3ds::input_poll() {
     g_held = hidKeysHeld() | scripted;
     hidCircleRead(&g_cpad);
     hidCstickRead(&g_cstick);
+    if (g_gyro_on) gyro_poll();
     // Scripted stick directions (AUTOTEST STICK_*): full deflection.
     if (scripted & (KEY_CPAD_UP | KEY_CPAD_DOWN | KEY_CPAD_LEFT | KEY_CPAD_RIGHT)) {
         g_cpad.dx = (scripted & KEY_CPAD_RIGHT) ? CPAD_MAX : ((scripted & KEY_CPAD_LEFT) ? -CPAD_MAX : 0);
