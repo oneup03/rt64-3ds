@@ -19,6 +19,8 @@ ndspWaveBuf g_bufs[kNumBufs];
 int16_t* g_storage[kNumBufs];
 int g_next = 0;
 float g_volume = 1.0f;
+bool g_started = false;
+volatile uint32_t g_submitted = 0, g_dropped = 0, g_underruns = 0;
 
 }   // namespace
 
@@ -58,10 +60,18 @@ void recomp3ds::audio_queue_samples(int16_t* samples, size_t sample_count) {
     }
     size_t frames = sample_count / 2;
     size_t done = 0;
+    bool starved = true;
+    for (int i = 0; i < kNumBufs && starved; i++) {
+        starved = g_bufs[i].status != NDSP_WBUF_QUEUED && g_bufs[i].status != NDSP_WBUF_PLAYING;
+    }
+    if (starved && g_started) g_underruns = g_underruns + 1;
+    g_started = true;
+    g_submitted = g_submitted + (uint32_t)frames;
     while (done < frames) {
         ndspWaveBuf* wb = &g_bufs[g_next];
         if (wb->status != NDSP_WBUF_DONE && wb->status != NDSP_WBUF_FREE) {
             // The ring is full: the game is ahead of the DSP. Drop the rest.
+            g_dropped = g_dropped + (uint32_t)(frames - done);
             return;
         }
         size_t n = frames - done;
@@ -98,6 +108,12 @@ size_t recomp3ds::audio_frames_remaining() {
     // Like the desktop: report one VI's worth less so the game keeps a margin.
     size_t frames_per_vi = g_rate / 60;
     return queued > frames_per_vi ? queued - frames_per_vi : 0;
+}
+
+recomp3ds::AudioCounters recomp3ds::audio_take_counters() {
+    AudioCounters c{ g_submitted, g_dropped, g_underruns, g_rate };
+    g_submitted = 0; g_dropped = 0; g_underruns = 0;
+    return c;
 }
 
 void recomp3ds::audio_shutdown() {

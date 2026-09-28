@@ -141,6 +141,7 @@ ultramodern::renderer::WindowHandle create_window(void*) {
     recomp3ds::loadmon_stop();
     recomp3ds::audio_shutdown();
     gfxExit();
+    osSetSpeedupEnable(false);             // hand the system back at the clock it had
     __appExit();
     if (__system_retAddr) __system_retAddr();
     svcExitProcess();
@@ -197,9 +198,11 @@ void update_gfx_inner() {
                 fflush(stderr);
             }
         }
-        fprintf(stderr, "stats: %d dl/s core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued hle %u/%u diff-mismatch %u/%u unknown %u\n",
+        const recomp3ds::AudioCounters ac = recomp3ds::audio_take_counters();
+        fprintf(stderr, "stats: %d dl/s core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu, hle %u/%u unknown %u\n",
                 st.dl_per_sec, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_remaining(),
-                hs.tasks, hs.commands, hs.diff_mismatches, hs.diff_tasks, hs.unknown_opcodes);
+                (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped,
+                hs.tasks, hs.commands, hs.unknown_opcodes);
         printf("\x1b[2;0H%3d fps  cpu0 %3d%%  cpu2 %3d%%  ucode %3u ms/s   \n", st.dl_per_sec, busy0, busy2, ucode_ms);
     }
     // Watchdog: a frame that stays in the replay or the GPU wait for 4 s is
@@ -219,6 +222,7 @@ void update_gfx_inner() {
         if (!quitting) {
             quitting = true;
             fprintf(stderr, "recomp3ds: quitting\n");
+            rt64_3ds::set_quitting();      // no more frames: the renderer's thread can leave its loop
             ultramodern::quit();
             // The runtime joins its own threads and recomp::start returns
             // (run() then finishes the exit). Should a join ever hang, leave
@@ -356,8 +360,10 @@ int recomp3ds::run(const GameDesc& desc) {
     log_memory("boot");
     log_cpu("boot");
     if (is_new_3ds) {
-        // An installed title gets 804 MHz and the L2 cache from its exheader;
-        // ask PTM as well in case the launcher did not apply them.
+        // The exheader asks for 804 MHz and the L2 cache, but on hardware the
+        // CIA still starts at 268 MHz without L2 (measured: 271 MHz, 230 ns
+        // loads; 816 MHz, 33 ns after this). libctru re-applies it after
+        // every HOME Menu visit.
         osSetSpeedupEnable(true);
         log_cpu("after speedup request");
     }

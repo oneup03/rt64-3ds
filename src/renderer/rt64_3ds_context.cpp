@@ -31,6 +31,33 @@ using GpuVertex = rt64_3ds::Vtx3ds;   // the record's vertex is the PICA's attri
 #define g_stats rt64_3ds::mutable_stats()
 int g_debug_gfx_delay_ms = 0;
 volatile bool g_quitting = false;
+
+// While the HOME Menu (or sleep) has the GPU, libctru has released the GPU
+// rights: anything submitted then never completes and the gfx thread hangs
+// in citro3d's queue wait (which also kept "Close" from ever finishing). The
+// APT hook, on the main thread before the rights go, waits out the frame in
+// flight under g_gpu_lock and raises the flags; send_dl then holds the game
+// until the rights are back. The hook is registered after C3D_Init so it runs
+// ahead of citro3d's own, which then drains the queue.
+LightLock g_gpu_lock;
+volatile bool g_suspended = false, g_sleeping = false;
+aptHookCookie g_apt_cookie;
+
+void apt_hook(APT_HookType type, void*) {
+    switch (type) {
+        case APTHOOK_ONSUSPEND:
+        case APTHOOK_ONSLEEP:
+            LightLock_Lock(&g_gpu_lock);
+            if (type == APTHOOK_ONSUSPEND) g_suspended = true; else g_sleeping = true;
+            LightLock_Unlock(&g_gpu_lock);
+            break;
+        case APTHOOK_ONRESTORE: g_suspended = false; break;
+        case APTHOOK_ONWAKEUP:  g_sleeping = false; break;
+        default: break;
+    }
+}
+
+bool gpu_away() { return g_suspended || g_sleeping; }
 rt64_3ds::Progress g_progress{};
 const rt64_3ds::DrawRecord* g_progress_draw = nullptr;
 
@@ -53,6 +80,7 @@ public:
     void shutdown() override {
         if (!ok_) return;
         ok_ = false;
+        aptUnhook(&g_apt_cookie);
         C3D_Fini();
         fprintf(stderr, "rt64-3ds: renderer shut down\n");
     }
@@ -61,6 +89,9 @@ public:
 
     void send_dl(const OSTask* task) override {
         if (!ok_ || g_quitting) return;
+        // Hold the game while the GPU is away (it would only run ahead unseen).
+        while (gpu_away() && !g_quitting) svcSleepThread(10 * 1000000ll);
+        if (g_quitting) return;
         u64 t0 = svcGetSystemTick();
         frame_.clear();
         vbo_idx_ ^= 1;
@@ -85,7 +116,11 @@ public:
                     last ? (double)(now - last) * 1000.0 / SYSCLOCK_ARM11 : 0.0, ex, ey, ez, ax, ay, az);
             last = now;
         }
-        if (present) replay_and_present();
+        if (present) {
+            LightLock_Lock(&g_gpu_lock);
+            if (!gpu_away() && !g_quitting) replay_and_present();
+            LightLock_Unlock(&g_gpu_lock);
+        }
         if (g_debug_gfx_delay_ms > 0) svcSleepThread((s64)g_debug_gfx_delay_ms * 1000000);
         g_progress.phase = 0;
         u64 t2 = svcGetSystemTick();
@@ -150,6 +185,8 @@ private:
             fprintf(stderr, "rt64-3ds: C3D_Init failed\n");
             return;
         }
+        LightLock_Init(&g_gpu_lock);
+        aptHook(&g_apt_cookie, apt_hook, nullptr);
         top_ = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
         if (top_ == nullptr) {
             fprintf(stderr, "rt64-3ds: render target creation failed\n");
