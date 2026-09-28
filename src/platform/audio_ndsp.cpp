@@ -60,9 +60,10 @@ void recomp3ds::audio_queue_samples(int16_t* samples, size_t sample_count) {
     }
     size_t frames = sample_count / 2;
     size_t done = 0;
-    bool starved = true;
-    for (int i = 0; i < kNumBufs && starved; i++) {
-        starved = g_bufs[i].status != NDSP_WBUF_QUEUED && g_bufs[i].status != NDSP_WBUF_PLAYING;
+    bool starved = !ndspChnIsPlaying(kChannel);
+    for (int i = 0; i < kNumBufs && !starved; i++) {
+        if (g_bufs[i].status == NDSP_WBUF_QUEUED || g_bufs[i].status == NDSP_WBUF_PLAYING) break;
+        if (i == kNumBufs - 1) starved = true;
     }
     if (starved && g_started) g_underruns = g_underruns + 1;
     g_started = true;
@@ -99,10 +100,18 @@ size_t recomp3ds::audio_frames_remaining() {
     if (!g_ready) {
         return 0;
     }
+    // Only what is left of the buffer being played counts: counting all of it
+    // made the game (which sizes each batch from this) produce ~5% less than
+    // the DSP plays, so the music ran slow and the DSP ran dry between
+    // buffers (pops).
     size_t queued = 0;
     for (int i = 0; i < kNumBufs; i++) {
-        if (g_bufs[i].status == NDSP_WBUF_QUEUED || g_bufs[i].status == NDSP_WBUF_PLAYING) {
+        if (g_bufs[i].status == NDSP_WBUF_QUEUED) {
             queued += g_bufs[i].nsamples;
+        }
+        else if (g_bufs[i].status == NDSP_WBUF_PLAYING) {
+            u32 pos = ndspChnGetSamplePos(kChannel);
+            queued += pos < g_bufs[i].nsamples ? g_bufs[i].nsamples - pos : 0;
         }
     }
     // Like the desktop: report one VI's worth less so the game keeps a margin.
