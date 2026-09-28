@@ -119,6 +119,18 @@ public:
         // In first person the reticle's quads must stay one per record.
         interp_.set_split_untagged_ortho(rt64_3ds::first_person_scene());
         bool present = interp_.run(task->t.data_ptr, frame_);
+        if (frame_.snapshot_request) {
+            fprintf(stderr, "rt64-3ds: frame %u stores the screen (cimg %06x)\n", frames_, frame_.color_image);
+            if (store_delay_ >= 0 && capture_want_ < 0) { capture_want_ = (int)frames_ + store_delay_; store_delay_ = -1; }
+            // STORE_DEBUG.TXT: every draw of the frame 3 frames after each store.
+            static int store_debug = -1;
+            if (store_debug < 0) {
+                FILE* f = fopen("sdmc:/3ds/DK64/STORE_DEBUG.TXT", "r");
+                store_debug = f ? 1 : 0;
+                if (f) fclose(f);
+            }
+            if (store_debug == 1) { gpu_debug_ = true; debug_from_ = frames_ + 3; debug_count_ = 1; debug_sync_ = false; debug_step_ = 1; }
+        }
         u64 t1 = svcGetSystemTick();
         dl_count_++;
         if (cam_log_now_) {
@@ -276,6 +288,8 @@ private:
         }
         C3D_TexSetFilter(&snapshot_, GPU_LINEAR, GPU_LINEAR);
         C3D_TexSetWrap(&snapshot_, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+        // Rows 400..511 are never copied into: black rather than stale VRAM.
+        if (snapshot_.data != nullptr) memset(snapshot_.data, 0, 256 * 512 * 4);
         interp_.set_snapshot_layout(40);
         {
             // The perspective groups the game's rules place as world: their
@@ -370,8 +384,25 @@ private:
             // bytes; a tile row of the 240-wide buffer is 30 tiles.
             // TextureCopy line widths and gaps are in 16-byte units.
             const u32 row = 240 * 8 * 4, gap = (256 - 240) * 8 * 4;
-            C3D_SyncTextureCopy((u32*)top_->frameBuf.colorBuf, GX_BUFFER_DIM(row / 16, 0),
-                                (u32*)snapshot_.data, GX_BUFFER_DIM(row / 16, gap / 16), 240 * 400 * 4, 0);
+            static int cpu_copy = -1;   // SNAPSHOT_CPU.TXT: copy with the CPU (checks the path in the emulator)
+            if (cpu_copy < 0) {
+                FILE* f = fopen("sdmc:/3ds/DK64/SNAPSHOT_CPU.TXT", "r");
+                cpu_copy = f ? 1 : 0;
+                if (f) fclose(f);
+            }
+            if (cpu_copy == 1) {
+                const u8* src = (const u8*)top_->frameBuf.colorBuf;
+                u8* dst = (u8*)snapshot_.data;
+                for (u32 tr = 0; tr < 400 / 8; tr++) memcpy(dst + tr * (row + gap), src + tr * row, row);
+            }
+            else {
+                C3D_SyncTextureCopy((u32*)top_->frameBuf.colorBuf, GX_BUFFER_DIM(row / 16, 0),
+                                    (u32*)snapshot_.data, GX_BUFFER_DIM(row / 16, gap / 16), 240 * 400 * 4, 0);
+            }
+            // A CPU write to each page of the texture: the emulator otherwise
+            // keeps sampling its cached copy from before the GPU copy.
+            volatile u32* touch = (volatile u32*)snapshot_.data;
+            for (u32 i = 0; i < 256 * 512; i += 1024) touch[i] = touch[i];
             snapshots_++;
         }
         C3D_RenderTargetClear(top_, C3D_CLEAR_ALL, 0x000000FF, 0);
@@ -629,7 +660,7 @@ public:
     // GFX_CAPTURE.TXT holds a frame number: that frame's RDRAM and OSTask go
     // to gfx_task.bin for tools/dl_test (host-side interpreter profiling).
     void maybe_capture(const OSTask* task) {
-        static int want = -2;
+        int& want = capture_want_;
         if (want == -2) {
             want = -1;
             if (FILE* f = fopen("sdmc:/3ds/DK64/GFX_CAPTURE.TXT", "r")) {
@@ -639,6 +670,10 @@ public:
                     else if (strcmp(word, "cam") == 0) {
                         // "cam <first frame> <count>": log the camera projection per frame
                         if (fscanf(f, "%d %d", &cam_log_first_, &cam_log_count_) != 2) cam_log_count_ = 0;
+                    }
+                    else if (strcmp(word, "store") == 0) {
+                        // "store <delay>": the frame <delay> frames after the game first stores the screen
+                        if (fscanf(f, "%d", &store_delay_) != 1) store_delay_ = 5;
                     }
                     else if (strcmp(word, "seq") == 0) {
                         // "seq <first frame> <count>": the rendered frames only, one file each
@@ -929,6 +964,7 @@ public:
     float reticle_cx_ = 160.0f, reticle_cy_ = 120.0f;
     float applied_conv_ = 0.0f, near_z_ = -1.0f, aim_z_ = -1.0f;
     int capture_snapshot_frames_ = 0;
+    int capture_want_ = -2, store_delay_ = -1;
     int seq_first_ = 0, seq_count_ = 0;
     int cam_log_first_ = 0, cam_log_count_ = 0;
     bool cam_log_now_ = false;

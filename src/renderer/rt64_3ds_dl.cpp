@@ -125,8 +125,10 @@ struct Interpreter::Impl {
     Mtx mvp{};
     bool mvp_dirty = true;
     uint32_t geometry_mode = 0;
-    struct Viewport { float scale[3], trans[3]; };
-    Viewport vp{ { 160, -120, 511 }, { 160, 120, 511 } };
+    // trans_stretch: the x translate without the origin's shift to the wide
+    // screen's edge, for STRETCH content (see stretch_x).
+    struct Viewport { float scale[3], trans[3]; float trans_stretch = 160.0f; };
+    Viewport vp{ { 160, -120, 511 }, { 160, 120, 511 }, 160.0f };
     Viewport vp_stack[8]{};
     int vp_depth = 0;
     int16_t vp_align_x = 0, vp_align_y = 0;
@@ -147,6 +149,7 @@ struct Interpreter::Impl {
     static constexpr int kGroupStack = 16;
     static constexpr uint32_t kIdAuto = 0xFFFFFFFFu;
     uint32_t proj_groups[kGroupStack] = {}, mv_groups[kGroupStack] = {};
+    uint8_t proj_aspects[kGroupStack] = {};   // G_EX_ASPECT_* of each projection group
     int proj_group_depth = 0, mv_group_depth = 0;
     uint32_t mv_seq = 0;
     uint32_t world_proj_ids[4] = { 5, 5, 5, 5 };
@@ -294,7 +297,9 @@ struct Interpreter::Impl {
         // Model -> clip -> screen in one matrix: the viewport is a scale and
         // translate of x/w and y/w (y negated: screen y grows downward) and
         // z' = (z + w) / 2, all linear in homogeneous coordinates.
-        const float sx = vp.scale[0], sy = -vp.scale[1], tx = vp.trans[0], ty = vp.trans[1];
+        const bool stretch = proj_stretch();
+        const float sx = stretch ? vp.scale[0] * 1.25f : vp.scale[0], sy = -vp.scale[1];
+        const float tx = stretch ? stretch_x(vp.trans_stretch) : vp.trans[0], ty = vp.trans[1];
         float m[4][4];
         for (int i = 0; i < 4; i++) {
             const float cx = mvp.m[i][0], cy = mvp.m[i][1], cz = mvp.m[i][2], cw = mvp.m[i][3];
@@ -456,7 +461,7 @@ struct Interpreter::Impl {
         r.geometry_mode = geometry_mode;
         memcpy(r.prim, prim, 4); memcpy(r.env, env, 4); memcpy(r.blend, blend, 4); memcpy(r.fog, fog, 4);
         r.prim_lod_frac = prim_lod_frac;
-        memcpy(r.scissor, scissor, sizeof(scissor));
+        effective_scissor(r.scissor, r.kind == DrawRecord::Tris && proj_stretch());
         r.proj_id = proj_id;
         r.perspective = proj.m[2][3] != 0.0f || proj.m[3][3] == 0.0f;
         r.mv_auto = mv_groups[mv_group_depth] == kIdAuto;
@@ -559,7 +564,7 @@ struct Interpreter::Impl {
             t.x = v.x; t.y = v.y; t.z = v.z; t.w = v.w;
             t.u = v.u * ss - uls;
             t.v = v.v * st - ult;
-            if (snap) snapshot_uv(r->tex[0], t.u, t.v, t.u, t.v);
+            if (snap) snapshot_uv(r->tex[0], t.u, t.v, t.u, t.v, proj_stretch());
             t.r = v.r; t.g = v.g; t.b = v.b; t.a = v.a;
         }
         stats->tris++;
@@ -634,13 +639,18 @@ struct Interpreter::Impl {
     // snapshot texture texels. The snapshot is the rotated 240x400 colour
     // buffer copied into a 256x512 texture: its u axis runs along screen y
     // (bottom row first), its v axis along screen x.
-    void snapshot_uv(const TexDesc& d, float u, float v, float& su, float& sv) const {
+    // The stored frame covers the 4:3 centre of the screen for squeezed
+    // draws and the whole wide screen for stretched ones (what RT64's frame
+    // copies are). The copy keeps the colour buffer's memory order, row =
+    // screen x, and the PICA puts t = 0 at the LAST row (normal textures are
+    // stored flipped for that), so t counts back from 512.
+    void snapshot_uv(const TexDesc& d, float u, float v, float& su, float& sv, bool stretch) const {
         uint32_t texel = (d.addr - snapshot_base) / 2;
         float x0 = (float)(texel % 320), y0 = (float)(texel / 320);
-        float sx = x0 + u + (float)snapshot_x_offset;     // screen pixel
+        float sx = stretch ? (x0 + u) * 1.25f : x0 + u + (float)snapshot_x_offset;   // screen pixel, 0..400
         float sy = y0 + v;
         su = 240.0f - sy;
-        sv = sx;
+        sv = 512.0f - sx;
     }
 
     static bool same_tex(const TexDesc& a, const TexDesc& b) {
@@ -667,7 +677,9 @@ struct Interpreter::Impl {
             a.geometry_mode != geometry_mode || a.prim_lod_frac != prim_lod_frac || a.proj_id != proj_id) return false;
         if (a.mv_auto != (mv_groups[mv_group_depth] == kIdAuto)) return false;
         if (memcmp(a.prim, prim, 4) != 0 || memcmp(a.env, env, 4) != 0 || memcmp(a.blend, blend, 4) != 0 || memcmp(a.fog, fog, 4) != 0) return false;
-        if (memcmp(a.scissor, scissor, sizeof(a.scissor)) != 0) return false;
+        int16_t sc[4];
+        effective_scissor(sc, proj_stretch());
+        if (memcmp(a.scissor, sc, sizeof(a.scissor)) != 0) return false;
         if (a.perspective != (proj.m[2][3] != 0.0f || proj.m[3][3] == 0.0f)) return false;
         float uv1[4];
         compute_uv1(uv1, texture.tile);
@@ -683,10 +695,13 @@ struct Interpreter::Impl {
 
     // Rectangles are emitted in N64 pixels with w = 1.
     void emit_rect(float ulx, float uly, float lrx, float lry, bool textured, int tile, float s, float t, float dsdx, float dtdy, bool flip) {
-        emit_rect_aligned(ulx, uly, lrx, lry, textured, tile, s, t, dsdx, dtdy, flip, rect_lorigin, rect_rorigin, rect_align);
+        emit_rect_aligned(ulx, uly, lrx, lry, textured, tile, s, t, dsdx, dtdy, flip, rect_lorigin, rect_rorigin, rect_align,
+                          rect_lorigin == 0x800 && rect_rorigin == 0x800);
     }
+    // plain_origins: neither edge is anchored to a screen edge (the only
+    // rectangles RT64 stretches for covering the width).
     void emit_rect_aligned(float ulx, float uly, float lrx, float lry, bool textured, int tile, float s, float t, float dsdx, float dtdy, bool flip,
-                           uint32_t lorigin, uint32_t rorigin, const int16_t* align) {
+                           uint32_t lorigin, uint32_t rorigin, const int16_t* align, bool plain_origins) {
         ulx += align[0] + origin_shift(lorigin); uly += align[1];
         lrx += align[2] + origin_shift(rorigin); lry += align[3];
         if (offscreen_target()) {
@@ -730,13 +745,23 @@ struct Interpreter::Impl {
         float u1 = u0 + dsdx * w, v1 = v0 + dtdy * h;
         if (cyc == 2) u1 = u0 + dsdx * w / 4.0f;   // copy mode: dsdx is in 4-texel units
         Vtx3ds q[4];
+        // RT64 spreads a rectangle over the whole wide screen when it reads a
+        // frame copy, spans the full width with plain origins (full-screen
+        // fills and tints), or is tagged STRETCH, unless it is tagged ADJUST.
+        const bool stretch = ((textured && r.tex[0].snapshot) || (plain_origins && ulx <= 0.0f && lrx >= 320.0f) ||
+                              rect_aspect == kAspectStretch) && rect_aspect != kAspectAdjust;
+        if (stretch) {
+            ulx = stretch_x(ulx);
+            lrx = stretch_x(lrx);
+            effective_scissor(r.scissor, true);
+        }
         float xs[4] = { ulx, lrx, lrx, ulx }, ys[4] = { uly, uly, lry, lry };
         float us[4] = { u0, u1, u1, u0 }, vs[4] = { v0, v0, v1, v1 };
         if (flip) { us[1] = u0; vs[1] = v1; us[3] = u1; vs[3] = v0; }
         for (int i = 0; i < 4; i++) {
             q[i].x = xs[i]; q[i].y = ys[i]; q[i].z = 0.0f; q[i].w = 1.0f;
             q[i].u = us[i]; q[i].v = vs[i];
-            if (r.tex[0].snapshot) snapshot_uv(r.tex[0], q[i].u, q[i].v, q[i].u, q[i].v);
+            if (r.tex[0].snapshot) snapshot_uv(r.tex[0], q[i].u, q[i].v, q[i].u, q[i].v, stretch);
             q[i].r = q[i].g = q[i].b = q[i].a = 0;   // rectangles have no shade: SHADE reads as 0 (as RT64)
         }
         Vtx3ds* o = out->verts.append(6);
@@ -771,7 +796,10 @@ struct Interpreter::Impl {
                 int& depth = is_proj ? proj_group_depth : mv_group_depth;
                 if (push && depth + 1 < kGroupStack) depth++;
                 stack[depth] = id;
-                if (is_proj) proj_id = id;
+                if (is_proj) {
+                    proj_id = id;
+                    proj_aspects[depth] = (f >> 20) & 3;
+                }
                 return 1;
             }
             case EX_POPMATRIXGROUP: {
@@ -834,7 +862,7 @@ struct Interpreter::Impl {
                 float s = (int16_t)(c >> 16) / 32.0f, t = (int16_t)(c & 0xFFFF) / 32.0f;
                 float dsdx = (int16_t)(d >> 16) / 1024.0f, dtdy = (int16_t)(d & 0xFFFF) / 1024.0f;
                 static const int16_t none[4] = { 0, 0, 0, 0 };
-                emit_rect_aligned(ulx, uly, lrx, lry, true, tile, s, t, dsdx, dtdy, flip, 0x800, 0x800, none);
+                emit_rect_aligned(ulx, uly, lrx, lry, true, tile, s, t, dsdx, dtdy, flip, 0x800, 0x800, none, lorigin == 0x800 && rorigin == 0x800);
                 return 2;
             }
             case EX_FILLRECT: {
@@ -843,7 +871,7 @@ struct Interpreter::Impl {
                 float ulx = (int16_t)(a >> 16) / 4.0f + origin_x(lorigin), uly = (int16_t)(a & 0xFFFF) / 4.0f;
                 float lrx = (int16_t)(b >> 16) / 4.0f + origin_x(rorigin), lry = (int16_t)(b & 0xFFFF) / 4.0f;
                 static const int16_t none[4] = { 0, 0, 0, 0 };
-                emit_rect_aligned(ulx, uly, lrx, lry, false, 0, 0, 0, 0, 0, false, 0x800, 0x800, none);
+                emit_rect_aligned(ulx, uly, lrx, lry, false, 0, 0, 0, 0, 0, false, 0x800, 0x800, none, lorigin == 0x800 && rorigin == 0x800);
                 return 1;
             }
             case EX_VERTEX: return 1;
@@ -888,6 +916,25 @@ struct Interpreter::Impl {
         float x = raw_vtrans_x;
         if (vp_origin < 0x800) x += (float)vp_origin * 320.0f * 4.0f / 1024.0f;
         vp.trans[0] = (x + (float)vp_align_x) / 4.0f + (float)origin_shift(vp_origin);
+        vp.trans_stretch = (x + (float)vp_align_x) / 4.0f;
+    }
+
+    // Widescreen, as RT64 does it: its native mapping spreads the N64's
+    // 0..320 across the whole wide screen and ADJUST squeezes content back to
+    // 4:3; here the default is the squeezed 4:3 placement (0..320 centred,
+    // the screen spanning -40..360) and STRETCH content is spread out. Origins
+    // only anchor squeezed content, so stretched content ignores them.
+    static float stretch_x(float x) { return x * 1.25f - 40.0f; }
+    static constexpr uint8_t kAspectStretch = 1, kAspectAdjust = 2;
+    bool proj_stretch() const { return proj_aspects[proj_group_depth] == kAspectStretch; }
+    // A scissor still in 4:3 space goes wide with stretched content; one set
+    // through origins already is.
+    void effective_scissor(int16_t* out, bool stretch) const {
+        memcpy(out, scissor, sizeof(scissor));
+        if (stretch && scissor[0] >= 0 && scissor[2] <= 320) {
+            out[0] = (int16_t)stretch_x((float)scissor[0]);
+            out[2] = (int16_t)stretch_x((float)scissor[2]);
+        }
     }
 
     // ---- main loop
@@ -946,8 +993,10 @@ struct Interpreter::Impl {
                     if (v < kMaxVerts) {
                         if (where == 0x10) { vtx[v].r = w1 >> 24; vtx[v].g = w1 >> 16; vtx[v].b = w1 >> 8; vtx[v].a = w1; }
                         else if (where == 0x14) {
-                            vtx[v].u = (float)(int16_t)(w1 >> 16) * (float)texture.scaleS / 65536.0f / 32.0f;
-                            vtx[v].v = (float)(int16_t)(w1 & 0xFFFF) * (float)texture.scaleT / 65536.0f / 32.0f;
+                            // The vertex buffer holds coordinates already
+                            // scaled by G_TEXTURE: the new ones go in as given.
+                            vtx[v].u = (float)(int16_t)(w1 >> 16) / 32.0f;
+                            vtx[v].v = (float)(int16_t)(w1 & 0xFFFF) / 32.0f;
                         }
                     }
                     break;
@@ -1230,6 +1279,7 @@ bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
     impl_->mvp_dirty = true;
     impl_->proj_group_depth = impl_->mv_group_depth = 0;
     impl_->proj_groups[0] = impl_->mv_groups[0] = 0;
+    impl_->proj_aspects[0] = 0;
     impl_->proj_id = 0;
     impl_->mv_seq = 0;
     impl_->vp_depth = 0;

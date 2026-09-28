@@ -53,12 +53,13 @@ int main(int argc, char** argv) {
                 float x = v.x / v.w, y = v.y / v.w;
                 if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y;
             }
-            fprintf(o, "draw %zu kind %d first %u count %u cc %06x %08x om %06x %08x gm %06x prim %02x%02x%02x%02x env %02x%02x%02x%02x blend %02x%02x%02x%02x fog %02x%02x%02x%02x plf %u proj %x persp %d tex0 %d %x fmt %u/%u %ux%u tlut %u tex1 %d %x fmt %u/%u %ux%u vtx %06x | x %.0f..%.0f y %.0f..%.0f\n",
+            fprintf(o, "draw %zu kind %d first %u count %u cc %06x %08x om %06x %08x gm %06x prim %02x%02x%02x%02x env %02x%02x%02x%02x blend %02x%02x%02x%02x fog %02x%02x%02x%02x plf %u proj %x persp %d tex0 %d %x fmt %u/%u %ux%u tlut %u tex1 %d %x fmt %u/%u %ux%u vtx %06x snap %d pitch %u blk %d | x %.0f..%.0f y %.0f..%.0f\n",
                     i, (int)d.kind, d.first, d.count, d.cc_w0, d.cc_w1, d.othermode_h, d.othermode_l, d.geometry_mode,
                     d.prim[0], d.prim[1], d.prim[2], d.prim[3], d.env[0], d.env[1], d.env[2], d.env[3],
                     d.blend[0], d.blend[1], d.blend[2], d.blend[3], d.fog[0], d.fog[1], d.fog[2], d.fog[3], d.prim_lod_frac, d.proj_id, (int)d.perspective,
                     (int)d.tex[0].valid, d.tex[0].addr, d.tex[0].fmt, d.tex[0].siz, d.tex[0].width, d.tex[0].height, d.tex[0].tlut_mode,
-                    (int)d.tex[1].valid, d.tex[1].addr, d.tex[1].fmt, d.tex[1].siz, d.tex[1].width, d.tex[1].height, d.dbg_vtx, minx, maxx, miny, maxy);
+                    (int)d.tex[1].valid, d.tex[1].addr, d.tex[1].fmt, d.tex[1].siz, d.tex[1].width, d.tex[1].height, d.dbg_vtx,
+                    (int)d.tex[0].snapshot, d.tex[0].pitch, (int)d.tex[0].block, minx, maxx, miny, maxy);
         }
         for (size_t i = 0; i < frame.verts.size(); i++) {
             const auto& v = frame.verts[i];
