@@ -955,8 +955,23 @@ struct Interpreter::Impl {
             // that run while the frame has that many draws.
             static int trace_lo = -2, trace_hi = -1;
             if (trace_lo == -2) { trace_lo = -1; if (const char* e = getenv("DL_TRACE")) sscanf(e, "%d,%d", &trace_lo, &trace_hi); }
-            if (trace_lo >= 0 && (int)out->draws.size() >= trace_lo && (int)out->draws.size() <= trace_hi)
+            if (trace_lo >= 0 && (int)out->draws.size() >= trace_lo && (int)out->draws.size() <= trace_hi) {
                 fprintf(stderr, "  [%zu] %08x: %02x %08x %08x\n", out->draws.size(), pc, op, w0, w1);
+                if (op == G_VTX) {
+                    int n = (w0 >> 12) & 0xFF, v0 = ((w0 >> 1) & 0x7F) - n;
+                    fprintf(stderr, "        vtx %d..%d from %06x (mv depth %d)\n", v0, v0 + n - 1, seg(w1), mv_depth);
+                    for (int i = 0; i < n && i < 32; i++) {
+                        const uint8_t* src = rdram + ((seg(w1) + i * 16) & 0xFFFFFC);
+                        fprintf(stderr, "          v%-2d ob %6d %6d %6d\n", v0 + i, *(const int16_t*)(src + 2), *(const int16_t*)(src + 0), *(const int16_t*)(src + 6));
+                    }
+                }
+                if (op == G_MTX) {
+                    Mtx m; load_mtx(m, seg(w1));
+                    fprintf(stderr, "        mtx %s %s %s from %06x:", ((w0 ^ 1) & 4) ? "proj" : "mv", ((w0 ^ 1) & 2) ? "load" : "mul", ((w0 ^ 1) & 1) ? "push" : "nopush", seg(w1));
+                    for (int r = 0; r < 4; r++) fprintf(stderr, " [%.3g %.3g %.3g %.3g]", m.m[r][0], m.m[r][1], m.m[r][2], m.m[r][3]);
+                    fprintf(stderr, "\n");
+                }
+            }
 #endif
             uint32_t next = pc + 8;
             // Anything but drawing, vertex loads and list flow may change the
