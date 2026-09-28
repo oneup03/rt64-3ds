@@ -9,7 +9,7 @@
 
 namespace {
 
-struct Monitor {
+struct alignas(32) Monitor {   // one cache line each: the two cores write them
     Thread thread = nullptr;
     volatile u32 count = 0;
     u32 calibration = 0;      // counts per second with nothing else running

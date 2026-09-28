@@ -47,7 +47,15 @@ public:
     void enable_instant_present() override {}
     void send_dummy_workload(uint32_t fb_address) { (void)fb_address; }
     void update_screen() override {}
-    void shutdown() override {}
+    // Runs on the gfx thread when the runtime quits: let the GPU finish what
+    // it was given and give citro3d's hooks and queues back before the
+    // process closes (C3D_Fini waits for the render queue).
+    void shutdown() override {
+        if (!ok_) return;
+        ok_ = false;
+        C3D_Fini();
+        fprintf(stderr, "rt64-3ds: renderer shut down\n");
+    }
     uint32_t get_display_framerate() const override { return 60; }
     float get_resolution_scale() const override { return 1.0f; }
 

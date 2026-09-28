@@ -1,0 +1,48 @@
+From b448662e73ede7a4457951bf1920971439af3371 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sun, 27 Sep 2026 23:01:35 -0500
+Subject: [PATCH] Stop the RSP task thread through an explicit producer on the
+ 3DS
+
+The implicit producers of moodycamel's queue are keyed by
+std::this_thread::get_id(). On the 3DS main thread, which libctru did not
+create, that is the empty id the queue reserves as invalid, so the null
+task that tells the RSP task thread to exit was never enqueued and
+join_event_threads never returned.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ N64Recomp                  | 2 +-
+ ultramodern/src/events.cpp | 9 +++++++++
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/N64Recomp b/N64Recomp
+index e4928d1..2f94055 160000
+--- a/N64Recomp
++++ b/N64Recomp
+@@ -1 +1 @@
+-Subproject commit e4928d1e8c92a9f061d7841c47cbb90e331bc9c8
++Subproject commit 2f9405564b8080e96eedb236a9bfea89ef7d38d3
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index a8221ce..311aee6 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -633,6 +633,15 @@ void ultramodern::join_event_threads() {
+     events_context.vi.thread.join();
+ 
+     // Send a null RSP task to indicate that the RSP task thread should exit.
++#ifdef __3DS__
++    // Through an explicit producer: the implicit ones are keyed by
++    // std::this_thread::get_id(), which on the 3DS main thread (not a libctru
++    // thread) is the empty id the queue reserves, so that enqueue fails and
++    // the join below never returns.
++    moodycamel::ProducerToken token(events_context.sp_task_queue);
++    events_context.sp_task_queue.enqueue(token, nullptr);
++#else
+     events_context.sp_task_queue.enqueue(nullptr);
++#endif
+     events_context.sp.task_thread.join();
+ }
+-- 
+2.53.0
+

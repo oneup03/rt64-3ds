@@ -125,6 +125,27 @@ ultramodern::renderer::WindowHandle create_window(void*) {
     return ultramodern::renderer::WindowHandle{};
 }
 
+// The end of quitting, from run() once the runtime has returned or from the
+// exit watchdog: libctru's exit minus C++ destructors and the heap unmapping,
+// which would pull memory from under the game threads the runtime leaves
+// blocked (a data abort on the way out). __appExit's aptExit sends
+// PrepareToClose and leaves the final APT_CloseApplication in
+// __system_retAddr, which __libctru_exit calls just before svcExitProcess;
+// skipping that left the HOME Menu with a half-closed application.
+[[noreturn]] void finish_exit() {
+    static volatile u32 once = 0;
+    if (__atomic_exchange_n(&once, 1u, __ATOMIC_SEQ_CST) != 0) {
+        for (;;) svcSleepThread(1000000000ll);    // the other path is already leaving
+    }
+    fflush(stderr);
+    recomp3ds::loadmon_stop();
+    recomp3ds::audio_shutdown();
+    gfxExit();
+    __appExit();
+    if (__system_retAddr) __system_retAddr();
+    svcExitProcess();
+}
+
 // Called by the runtime's main loop (which sleeps 1 ms between calls) on
 // core 0, the game's core: it sleeps most of a VI itself so the main thread
 // wakes ~60 times a second instead of 1000.
@@ -199,29 +220,15 @@ void update_gfx_inner() {
             quitting = true;
             fprintf(stderr, "recomp3ds: quitting\n");
             ultramodern::quit();
-            // The runtime joins its threads; a game thread stuck in a wait
-            // would keep the HOME Menu on "closing", so leave regardless.
+            // The runtime joins its own threads and recomp::start returns
+            // (run() then finishes the exit). Should a join ever hang, leave
+            // anyway rather than keep the HOME Menu on "closing".
             threadCreate([](void*) {
-                svcSleepThread(1500000000ll);
-                fprintf(stderr, "recomp3ds: exit forced after 1.5 s\n");
-                fflush(stderr);
-                // exit() would run C++ destructors and unmap the heaps while
-                // the renderer, audio and game threads still run (a data
-                // abort on the way out). Quiesce the GPU and DSP users, then
-                // end the process; the kernel reclaims the rest.
+                svcSleepThread(3000000000ll);
+                fprintf(stderr, "recomp3ds: exit forced after 3 s\n");
                 rt64_3ds::set_quitting();
                 svcSleepThread(300000000ll);      // the renderer finishes its frame and goes idle
-                recomp3ds::audio_shutdown();
-                gfxExit();                        // give the GPU and screens back to the system
-                // libctru's own exit, minus the heap unmapping (other threads
-                // still run): __appExit's aptExit sends PrepareToClose and
-                // leaves the final APT_CloseApplication in __system_retAddr,
-                // which __libctru_exit calls just before svcExitProcess.
-                // Skipping that call left the HOME Menu with a half-closed
-                // application (the "restart the system" error).
-                __appExit();
-                if (__system_retAddr) __system_retAddr();
-                svcExitProcess();
+                finish_exit();
             }, nullptr, 16 * 1024, 0x20, -2, true);
         }
     }
@@ -251,6 +258,63 @@ void log_memory(const char* when) {
     fprintf(stderr, "recomp3ds: %s: app region free %lu KB, linear free %lu KB\n", when,
             (unsigned long)(osGetMemRegionFree(MEMREGION_APPLICATION) / 1024),
             (unsigned long)(linearSpaceFree() / 1024));
+}
+
+// The CPU clock, from a loop of single-cycle ALU ops timed against the system
+// tick (268 MHz whatever the CPU runs at). Best of three to ride out preemption.
+u32 measure_cpu_mhz() {
+    constexpr u32 kIters = 100000, kOpsPerIter = 64 + 2;
+    u64 best = UINT64_MAX;
+    for (int run = 0; run < 3; run++) {
+        u32 n = kIters, a = 0;
+        u64 t0 = svcGetSystemTick();
+        __asm__ volatile(
+            "1:\n"
+            ".rept 64\n"
+            "add %1, %1, #1\n"
+            ".endr\n"
+            "subs %0, %0, #1\n"
+            "bne 1b\n"
+            : "+r"(n), "+r"(a) : : "cc");
+        u64 ticks = svcGetSystemTick() - t0;
+        if (ticks < best) best = ticks;
+    }
+    return (u32)((u64)kIters * kOpsPerIter * (SYSCLOCK_ARM11 / 1000) / best / 1000);
+}
+
+// Average latency of a dependent load walk over 1 MB: slow from FCRAM, far
+// quicker when the New 3DS L2 cache (2 MB) is on.
+u32 measure_load_ns() {
+    constexpr u32 kNodes = (1024 * 1024) / 32, kHops = 100000;
+    u32* buf = static_cast<u32*>(malloc(kNodes * 32));
+    u32* order = static_cast<u32*>(malloc(kNodes * sizeof(u32)));
+    if (buf == nullptr || order == nullptr) { free(buf); free(order); return 0; }
+    // One random cycle through all nodes, 32 bytes (one cache line) apart.
+    for (u32 i = 0; i < kNodes; i++) order[i] = i;
+    u32 seed = 12345;
+    for (u32 i = kNodes - 1; i > 0; i--) {
+        seed = seed * 1103515245u + 12345u;
+        u32 j = (seed >> 8) % (i + 1);
+        u32 t = order[i]; order[i] = order[j]; order[j] = t;
+    }
+    for (u32 i = 0; i < kNodes; i++) {
+        buf[order[i] * 8] = order[(i + 1) % kNodes] * 8;
+    }
+    free(order);
+    u32 p = 0;
+    for (u32 i = 0; i < kNodes; i++) p = buf[p];    // warm up
+    u64 t0 = svcGetSystemTick();
+    for (u32 i = 0; i < kHops; i++) p = buf[p];
+    u64 ticks = svcGetSystemTick() - t0;
+    volatile u32 sink = p; (void)sink;
+    free(buf);
+    return (u32)(ticks * 1000000000ull / SYSCLOCK_ARM11 / kHops);
+}
+
+void log_cpu(const char* when) {
+    u32 mhz = measure_cpu_mhz();
+    fprintf(stderr, "recomp3ds: %s: CPU ~%lu MHz, 1 MB load walk %lu ns/load\n", when,
+            (unsigned long)mhz, (unsigned long)measure_load_ns());
 }
 
 }   // namespace
@@ -290,6 +354,13 @@ int recomp3ds::run(const GameDesc& desc) {
     fprintf(stderr, "recomp3ds: %s starting on %s 3DS\n", desc.render.game_name, is_new_3ds ? "a New" : "an Old");
     printf("%s\n", desc.render.game_name);
     log_memory("boot");
+    log_cpu("boot");
+    if (is_new_3ds) {
+        // An installed title gets 804 MHz and the L2 cache from its exheader;
+        // ask PTM as well in case the launcher did not apply them.
+        osSetSpeedupEnable(true);
+        log_cpu("after speedup request");
+    }
     {
         char sub[160];
         snprintf(sub, sizeof(sub), "%s/saves", g_base_path);
@@ -413,9 +484,5 @@ int recomp3ds::run(const GameDesc& desc) {
     log_memory("before start");
     recomp::start(cfg);        // returns when the game has quit
     log_memory("after exit");
-
-    recomp3ds::loadmon_stop();
-    recomp3ds::audio_shutdown();
-    gfxExit();
-    return 0;
+    finish_exit();
 }
