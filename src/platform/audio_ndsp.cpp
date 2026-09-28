@@ -3,10 +3,12 @@
 // are, apart from the L/R swap the runtime's byte-swapped RDRAM imposes.
 #include <3ds.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "ultramodern/ultramodern.hpp"
 #include "recomp3ds_internal.h"
+#include "recomp3ds.h"
 
 namespace {
 
@@ -21,6 +23,53 @@ int g_next = 0;
 float g_volume = 1.0f;
 bool g_started = false;
 volatile uint32_t g_submitted = 0, g_dropped = 0, g_underruns = 0;
+
+// AUDIO_WAV.TXT beside the executable ("<start s> <length s>"): the game's
+// output from <start> seconds of audio in, for <length> seconds, to
+// audio.wav there (source material for the HOME Menu banner sound). Kept in
+// memory and written once at the end so the card never stalls the audio.
+int16_t* g_wav = nullptr;
+size_t g_wav_frames = 0, g_wav_cap = 0, g_wav_skip = 0;
+bool g_wav_written = false;
+
+void wav_setup() {
+    char path[192];
+    snprintf(path, sizeof(path), "%s/AUDIO_WAV.TXT", recomp3ds::base_path());
+    FILE* f = fopen(path, "r");
+    if (f == nullptr) return;
+    float start = 0.0f, length = 10.0f;
+    if (fscanf(f, "%f %f", &start, &length) < 1) start = 0.0f;
+    fclose(f);
+    // Counted in frames at the rate the game first asks for (DK64: fixed).
+    g_wav_skip = (size_t)(start * (float)g_rate);
+    g_wav_cap = (size_t)(length * (float)g_rate);
+    g_wav = (int16_t*)malloc(g_wav_cap * 2 * sizeof(int16_t));
+    fprintf(stderr, "recomp3ds: recording %.1f s of audio from %.1f s to audio.wav\n", length, start);
+}
+
+void wav_record(const int16_t* src, size_t frames) {
+    for (size_t i = 0; i < frames && g_wav_frames < g_wav_cap; i++) {
+        if (g_wav_skip > 0) { g_wav_skip--; continue; }
+        g_wav[g_wav_frames * 2 + 0] = src[i * 2 + 1];      // L/R as played
+        g_wav[g_wav_frames * 2 + 1] = src[i * 2 + 0];
+        g_wav_frames++;
+    }
+    if (g_wav_frames < g_wav_cap || g_wav_written) return;
+    g_wav_written = true;
+    char path[192];
+    snprintf(path, sizeof(path), "%s/audio.wav", recomp3ds::base_path());
+    FILE* f = fopen(path, "wb");
+    if (f == nullptr) return;
+    const uint32_t data = (uint32_t)(g_wav_frames * 4), rate = g_rate;
+    auto u32 = [&](uint32_t v) { fwrite(&v, 4, 1, f); };
+    auto u16 = [&](uint16_t v) { fwrite(&v, 2, 1, f); };
+    fwrite("RIFF", 1, 4, f); u32(36 + data); fwrite("WAVEfmt ", 1, 8, f);
+    u32(16); u16(1); u16(2); u32(rate); u32(rate * 4); u16(4); u16(16);
+    fwrite("data", 1, 4, f); u32(data);
+    fwrite(g_wav, 4, g_wav_frames, f);
+    fclose(f);
+    fprintf(stderr, "recomp3ds: audio.wav written (%zu frames at %lu Hz)\n", g_wav_frames, (unsigned long)rate);
+}
 
 }   // namespace
 
@@ -59,6 +108,9 @@ void recomp3ds::audio_queue_samples(int16_t* samples, size_t sample_count) {
         return;
     }
     size_t frames = sample_count / 2;
+    static bool wav_checked = false;
+    if (!wav_checked) { wav_checked = true; wav_setup(); }
+    if (g_wav != nullptr) wav_record(samples, frames);
     size_t done = 0;
     bool starved = !ndspChnIsPlaying(kChannel);
     for (int i = 0; i < kNumBufs && !starved; i++) {
