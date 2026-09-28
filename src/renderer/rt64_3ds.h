@@ -65,7 +65,7 @@ create_null_render_context(uint8_t* rdram, ultramodern::renderer::WindowHandle w
 // panel's gain: separation at full 3D slider = sep_slider * 0.002 * gain of
 // the half screen width per eye (25 * 0.002 * 0.5 = 5 px each way).
 struct Settings {
-    int sep_slider = 25;              // 0..50, x0.002 = per-eye separation (fraction of half width)
+    int sep_slider = 25;              // 0..100 (the desktop stops at 50), x0.002 = per-eye separation (fraction of half width)
     int convergence_hundredths = 600; // 10..2000, x0.2 = world units
     int hud_depth = 50;               // 0..100, 50 = screen plane
     bool auto_convergence = true;

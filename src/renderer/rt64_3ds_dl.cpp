@@ -1296,7 +1296,10 @@ bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
     impl_->mv_depth = 0;
     impl_->mvp_dirty = true;
     impl_->proj_group_depth = impl_->mv_group_depth = 0;
-    impl_->proj_groups[0] = impl_->mv_groups[0] = 0;
+    impl_->proj_groups[0] = 0;
+    // Untagged modelview draws carry G_EX_ID_AUTO, as RT64's TransformGroup
+    // does by default: DK64's crosshair quads are matched on that.
+    impl_->mv_groups[0] = Impl::kIdAuto;
     impl_->proj_aspects[0] = 0;
     impl_->proj_id = 0;
     impl_->mv_seq = 0;

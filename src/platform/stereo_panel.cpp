@@ -30,7 +30,7 @@ struct Row {
 int g_conv_tenths = 60;
 
 Row g_rows[] = {
-    { "3D depth",    kFirstRow + 2, 0, 50, 1, nullptr },
+    { "3D depth",    kFirstRow + 2, 0, 100, 1, nullptr },
     { "Convergence", kFirstRow + 4, 1, 200, 1, nullptr },
     { "HUD depth",   kFirstRow + 6, 0, 100, 1, nullptr },
     { "Comfort",     kFirstRow + 10, -20, 30, 1, nullptr },
@@ -80,7 +80,7 @@ void load() {
         char key[48];
         int v;
         if (sscanf(line, "%47[^=]=%d", key, &v) != 2) continue;
-        if (strcmp(key, "separation") == 0) st.sep_slider = v < 0 ? 0 : v > 50 ? 50 : v;
+        if (strcmp(key, "separation") == 0) st.sep_slider = v < 0 ? 0 : v > 100 ? 100 : v;
         else if (strcmp(key, "convergence_tenths") == 0) g_conv_tenths = v < 1 ? 1 : v > 200 ? 200 : v;
         else if (strcmp(key, "hud_depth") == 0) st.hud_depth = v < 0 ? 0 : v > 100 ? 100 : v;
         else if (strcmp(key, "auto_convergence") == 0) st.auto_convergence = v != 0;

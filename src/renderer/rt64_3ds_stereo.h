@@ -31,6 +31,10 @@ struct StereoFrame {
     float rect_ndc = 0;      // texture/fill rectangles (eye-independent, NDC)
     float aim_ndc = 0;       // the reticle at the aimed depth (eye-independent, NDC)
     bool reticle = false;    // look for the first-person reticle this frame
+    // The world wrote no depth last frame (menus drawn from rectangles,
+    // such as DK64's file select): its stray world draws, like a shadow
+    // under the camera, would otherwise float out of the screen.
+    bool world_empty = false;
 };
 
 // The (a, b) for one draw and eye (+1 left, -1 right).

@@ -238,7 +238,7 @@ void update_gfx_inner() {
         // next frame for the host tools, and say so on the touch screen.
         static u64 select_since = 0;
         static bool fired = false;
-        if (hidKeysHeld() & KEY_SELECT) {
+        if ((hidKeysHeld() | recomp3ds::autotest_keys()) & KEY_SELECT) {
             const u64 now = svcGetSystemTick();
             if (select_since == 0) select_since = now;
             else if (!fired && now - select_since > SYSCLOCK_ARM11) {

@@ -149,6 +149,8 @@ u32 recomp3ds::autotest_tick() {
     return keys;
 }
 
+u32 recomp3ds::autotest_keys() { return g_keys; }
+
 bool recomp3ds::autotest_take_home() {
     bool h = g_home;
     g_home = false;

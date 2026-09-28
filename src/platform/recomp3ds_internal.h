@@ -44,6 +44,7 @@ namespace recomp3ds {
     void autotest_load(const char* base_path);
     void autotest_scan_line(const char* line);
     u32  autotest_tick();
+    u32  autotest_keys();               // the scripted keys autotest_tick last returned
     bool autotest_touch(int* x, int* y);
     bool autotest_take_home();          // a scripted HOME press since the last call
     void input_set_blocked(bool blocked);

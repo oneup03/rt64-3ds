@@ -964,7 +964,7 @@ public:
             gfxSet3D(sf.on);
             s3d_on_ = sf.on;
         }
-        stereo_wants_depth_ = sf.on && (st.auto_convergence || rt64_3ds::first_person_scene());
+        stereo_wants_depth_ = sf.on;
         return sf;
     }
 
@@ -984,6 +984,11 @@ public:
             autoconv_.reset();
         }
         applied_conv_ = sf.conv;
+        if (sf.on) {
+            bool any = false;
+            for (int i = 0; i < kGridCols * kGridRows && !any; i++) any = depth_grid_[i] > 0.0f && depth_grid_[i] < 1.0f;
+            sf.world_empty = !any;
+        }
         if (sf.on && st.hud_depth != 50) {
             // 50 is the screen plane; above pops the HUD out, below pushes it
             // back. Triangles scale with separation (so the HUD flattens with
@@ -1054,6 +1059,7 @@ public:
             if (cls == rt64_3ds::StereoClass::Rect && rt64_3ds::rect_covers_scissor(d, verts)) {
                 cls = rt64_3ds::StereoClass::ScreenOverlay;   // full-screen tints stay on the glass
             }
+            if (cls == rt64_3ds::StereoClass::World && sf.world_empty) cls = rt64_3ds::StereoClass::Hud;
             uint8_t c = (uint8_t)cls;
             float a, b, e, f;
             if (sf.reticle && !d.perspective && cls != rt64_3ds::StereoClass::Infinity &&
