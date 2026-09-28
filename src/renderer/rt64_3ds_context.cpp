@@ -347,6 +347,7 @@ private:
                 }
             }
         }
+        if (frame_.snapshot_request && snapshot_.data != nullptr) copy_snapshot();
         u64 tb0 = svcGetSystemTick();
         C3D_FrameBegin(0);
         acc_wait_ += svcGetSystemTick() - tb0;
@@ -375,51 +376,6 @@ private:
                 u64 now = svcGetSystemTick();
                 if (now - last > SYSCLOCK_ARM11) { last = now; fprintf(stderr, "AUTOTEST shot snapshot-draw\n"); }
                 break;
-            }
-        }
-        if (frame_.snapshot_request && snapshot_.data != nullptr) {
-            // The target still holds the last presented frame: copy it, one
-            // 8x8-tile row at a time, into the wider texture. Sizes are in
-            // bytes; a tile row of the 240-wide buffer is 30 tiles.
-            // TextureCopy line widths and gaps are in 16-byte units.
-            const u32 row = 240 * 8 * 4, gap = (256 - 240) * 8 * 4;
-            // SNAPSHOT_CPU.TXT: copy with the CPU, to check the path in the
-            // emulator (which keeps sampling a stale texture after a GPU
-            // copy). Emulator only: the console faults on CPU writes to VRAM.
-            static int cpu_copy = -1;
-            if (cpu_copy < 0) {
-                FILE* f = fopen("sdmc:/3ds/DK64/SNAPSHOT_CPU.TXT", "r");
-                cpu_copy = f ? 1 : 0;
-                if (f) fclose(f);
-            }
-            if (cpu_copy == 1) {
-                const u8* src = (const u8*)top_->frameBuf.colorBuf;
-                u8* dst = (u8*)snapshot_.data;
-                for (u32 tr = 0; tr < 400 / 8; tr++) memcpy(dst + tr * (row + gap), src + tr * row, row);
-            }
-            else {
-                // One gap-free copy per tile row: a single copy with an output
-                // gap came out scrambled on the console.
-                const u8* src = (const u8*)top_->frameBuf.colorBuf;
-                u8* dst = (u8*)snapshot_.data;
-                for (u32 tr = 0; tr < 400 / 8; tr++) {
-                    C3D_SyncTextureCopy((u32*)(src + tr * row), GX_BUFFER_DIM(row / 16, 0),
-                                        (u32*)(dst + tr * (row + gap)), GX_BUFFER_DIM(row / 16, 0), row, 0);
-                }
-            }
-            snapshots_++;
-            if (snapshots_ <= 3) {
-                // Self-check (CPU reads of VRAM are fine): the copy must hold
-                // the colour buffer tile row for tile row.
-                const u32* src = (const u32*)top_->frameBuf.colorBuf;
-                const u32* dst = (const u32*)snapshot_.data;
-                u32 bad = 0, seed = 0x1234567u;
-                for (int i = 0; i < 512; i++) {
-                    seed = seed * 1103515245u + 12345u;
-                    const u32 tr = (seed >> 8) % 50, off = (seed >> 3) % (row / 4);
-                    if (src[tr * (row / 4) + off] != dst[tr * ((row + gap) / 4) + off]) bad++;
-                }
-                fprintf(stderr, "rt64-3ds: snapshot copy %u: %u/512 words differ from the frame\n", snapshots_, bad);
             }
         }
         C3D_RenderTargetClear(top_, C3D_CLEAR_ALL, 0x000000FF, 0);
@@ -525,6 +481,58 @@ private:
         prev_m32_ = frame_.cam[14];
         last_uploads_ = textures_.uploads_this_frame();
         textures_.end_frame();
+    }
+
+    void copy_snapshot() {
+        {
+            // Outside a frame (C3D_SyncTextureCopy then waits for the last
+            // frame's GPU work and copies synchronously; inside one it queues
+            // a frame split and the copy on citro3d's 32-entry GX queue, which
+            // 50 copies overflow: a PANIC). The target still holds the last
+            // presented frame: copy it, one 8x8-tile row at a time, into the
+            // wider texture. Sizes are in
+            // bytes; a tile row of the 240-wide buffer is 30 tiles.
+            // TextureCopy line widths and gaps are in 16-byte units.
+            const u32 row = 240 * 8 * 4, gap = (256 - 240) * 8 * 4;
+            // SNAPSHOT_CPU.TXT: copy with the CPU, to check the path in the
+            // emulator (which keeps sampling a stale texture after a GPU
+            // copy). Emulator only: the console faults on CPU writes to VRAM.
+            static int cpu_copy = -1;
+            if (cpu_copy < 0) {
+                FILE* f = fopen("sdmc:/3ds/DK64/SNAPSHOT_CPU.TXT", "r");
+                cpu_copy = f ? 1 : 0;
+                if (f) fclose(f);
+            }
+            if (cpu_copy == 1) {
+                const u8* src = (const u8*)top_->frameBuf.colorBuf;
+                u8* dst = (u8*)snapshot_.data;
+                for (u32 tr = 0; tr < 400 / 8; tr++) memcpy(dst + tr * (row + gap), src + tr * row, row);
+            }
+            else {
+                // One gap-free copy per tile row: a single copy with an output
+                // gap came out scrambled on the console.
+                const u8* src = (const u8*)top_->frameBuf.colorBuf;
+                u8* dst = (u8*)snapshot_.data;
+                for (u32 tr = 0; tr < 400 / 8; tr++) {
+                    C3D_SyncTextureCopy((u32*)(src + tr * row), GX_BUFFER_DIM(row / 16, 0),
+                                        (u32*)(dst + tr * (row + gap)), GX_BUFFER_DIM(row / 16, 0), row, 0);
+                }
+            }
+            snapshots_++;
+            if (snapshots_ <= 3) {
+                // Self-check (CPU reads of VRAM are fine): the copy must hold
+                // the colour buffer tile row for tile row.
+                const u32* src = (const u32*)top_->frameBuf.colorBuf;
+                const u32* dst = (const u32*)snapshot_.data;
+                u32 bad = 0, seed = 0x1234567u;
+                for (int i = 0; i < 512; i++) {
+                    seed = seed * 1103515245u + 12345u;
+                    const u32 tr = (seed >> 8) % 50, off = (seed >> 3) % (row / 4);
+                    if (src[tr * (row / 4) + off] != dst[tr * ((row + gap) / 4) + off]) bad++;
+                }
+                fprintf(stderr, "rt64-3ds: snapshot copy %u: %u/512 words differ from the frame\n", snapshots_, bad);
+            }
+        }
     }
 
     void apply_state(const rt64_3ds::DrawRecord& d, int& fallbacks) {
