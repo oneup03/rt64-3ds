@@ -17,6 +17,7 @@ struct InterpreterStats {
     uint32_t snapshots = 0;        // frames that copied the screen
     uint32_t op_hist[256] = {};    // commands run per opcode
     uint32_t mtx_loads = 0, vtx_loaded = 0, draws_merged = 0, probes = 0, clipped = 0;
+    uint32_t branch_z_taken = 0, branch_z_not = 0, cull_dl = 0;   // level-of-detail branches, cull tests
 };
 
 class Interpreter {

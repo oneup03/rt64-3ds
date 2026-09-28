@@ -921,8 +921,25 @@ struct Interpreter::Impl {
                     }
                     break;
                 }
-                case G_CULLDL: break;
-                case G_BRANCH_Z: break;   // keep the detailed branch
+                case G_CULLDL: stats->cull_dl++; break;
+                case G_BRANCH_Z: {
+                    // gSPBranchLessZ, the games' level of detail: jump to the
+                    // list in RDPHALF_1 when the vertex's screen depth (the
+                    // RSP's z/w * vscale + vtrans, 0..1023) is below w1/65536.
+                    // The near model sits behind the branch; what follows is
+                    // the far one, or nothing for objects that vanish.
+                    int vi = (w0 >> 1) & 0x7FF;
+                    if (vi < kMaxVerts) {
+                        const auto& v = vtx[vi];
+                        float zw = 2.0f * v.z / (v.w != 0.0f ? v.w : 1e-6f) - 1.0f;
+                        if (zw * vp.scale[2] + vp.trans[2] < (float)w1 / 65536.0f) {
+                            next = seg(rdphalf1);
+                            stats->branch_z_taken++;
+                        }
+                        else stats->branch_z_not++;
+                    }
+                    break;
+                }
                 case G_TRI1:
                     emit_tri(((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
                     break;
