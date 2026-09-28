@@ -84,11 +84,11 @@ const char* base_path();
 // that reads the C-Stick as an analog camera turns it off.
 void input_set_cstick_buttons(bool on);
 
-// The gyroscope, for games that aim with it: turned on only while wanted
-// (it costs power). Degrees per second, turning right and tilting the top
-// towards the player positive, the resting offset removed.
+// The gyroscope (and accelerometer), for games that aim with it: turned on
+// only while wanted (they cost power). The degrees the console turned right
+// (about gravity) and tilted up since the last call, calibrated.
 void input_set_gyro(bool on);
-void input_get_gyro(float* yaw_dps, float* pitch_dps);
+void input_take_gyro(float* turn_right_deg, float* look_up_deg);
 
 }   // namespace recomp3ds
 

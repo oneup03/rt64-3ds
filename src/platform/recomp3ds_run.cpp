@@ -225,7 +225,8 @@ void update_gfx(void*) {
 }
 
 void update_gfx_inner() {
-    recomp3ds::settings_menu_update();
+    recomp3ds::settings_menu_update();  // scans the pad
+    recomp3ds::input_motion_update();
     // HOME opens the quit prompt (above) rather than the HOME Menu.
     if (!g_home_trapped) {
         aptSetHomeAllowed(false);

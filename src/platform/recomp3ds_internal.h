@@ -31,6 +31,7 @@ namespace recomp3ds {
     void input_set_map(const ButtonMap* map, size_t count);
     void input_set_deadzones(int stick_percent, int cstick_percent);
     void input_poll();
+    void input_motion_update();         // main thread, after hidScanInput
     bool input_get(int controller_num, uint16_t* buttons, float* x, float* y);
     void input_get_right_stick(float* x, float* y);
     u32  input_raw_held();

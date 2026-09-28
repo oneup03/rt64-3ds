@@ -6,11 +6,13 @@
 // D-pad to the menu while it is open.
 #include <3ds.h>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 #include "ultramodern/input.hpp"
 #include "recomp3ds_internal.h"
 #include "recomp3ds.h"
+#include "GamepadMotion.hpp"
 
 namespace {
 using namespace recomp3ds;
@@ -53,53 +55,100 @@ void recomp3ds::input_set_map(const ButtonMap* map, size_t count) {
 
 void recomp3ds::input_set_cstick_buttons(bool on) { g_cstick_buttons = on; }
 
-// Gyroscope (for aiming). libctru names the rates x = roll, y = pitch,
-// z = yaw, in raw counts; the HID coefficient turns them into degrees per
-// second. The resting offset drifts, so it is learned while the console is
-// held still (every poll, whether or not anything reads the gyro), and
-// motion slower than kGyroStill is taken as drift.
+// Motion (gyro aiming), through JibbSmart's GamepadMotionHelpers (MIT, as
+// the desktop uses): gyro calibration while the console is still, gravity
+// from the accelerometer fused with the gyro, and "player space" gyro -
+// turning measured about gravity, so however the console is held, turning
+// it turns the aim.
+//
+// GamepadMotionHelpers works in the PlayStation/SDL frame (X right, Y up,
+// Z towards the player; degrees/second, anticlockwise positive; g). The
+// 3DS sensors use that frame with Y mirrored, as Azahar's controller
+// mapping has it (src/input_common/sdl/sdl_impl.cpp): accelerometer
+// (x, -y, z) at 512 counts per g, gyro (-first, second, -third) in its
+// shared-memory order. libctru's angularRate names those fields x, z, y
+// and calls x roll and y pitch; the first is really pitch, the third roll.
+//
+// Sampled from the main thread (~60 times a second); the game takes the
+// angle turned since it last asked.
 namespace {
 volatile bool g_gyro_on = false;
-float g_gyro_coef = 14.375f;            // counts per degree/second (the ITG-3200's)
-float g_gyro_bias[2] = { 0.0f, 0.0f };  // yaw, pitch counts
-float g_gyro_rate[2] = { 0.0f, 0.0f };  // yaw, pitch degrees/second after the bias
-bool g_gyro_primed = false;
-constexpr float kGyroStill = 2.0f;      // degrees/second
-constexpr float kGyroBiasRate = 0.01f;  // per poll (~3 s at 30 polls a second)
-
-void gyro_poll() {
-    angularRate r;
-    hidGyroRead(&r);
-    const float raw[2] = { (float)r.z, (float)r.y };
-    if (!g_gyro_primed) { g_gyro_bias[0] = raw[0]; g_gyro_bias[1] = raw[1]; g_gyro_primed = true; }
-    for (int a = 0; a < 2; a++) {
-        const float dps = (raw[a] - g_gyro_bias[a]) / g_gyro_coef;
-        if (std::fabs(dps) < kGyroStill) g_gyro_bias[a] += (raw[a] - g_gyro_bias[a]) * kGyroBiasRate;
-        g_gyro_rate[a] = dps;
-    }
-}
+float g_gyro_coef = 14.375f;            // counts per degree/second
+GamepadMotion g_motion;
+LightLock g_motion_lock;
+float g_turn_deg = 0.0f, g_pitch_deg = 0.0f;   // since the game last took them
+u64 g_motion_tick = 0, g_take_tick = 0;
 }
 
 void recomp3ds::input_set_gyro(bool on) {
     if (on == g_gyro_on) return;
     if (on) {
+        LightLock_Init(&g_motion_lock);
         HIDUSER_EnableGyroscope();
+        HIDUSER_EnableAccelerometer();
         float c = 0.0f;
         if (R_SUCCEEDED(HIDUSER_GetGyroscopeRawToDpsCoefficient(&c)) && c > 0.0f) g_gyro_coef = c;
-        g_gyro_primed = false;
+        g_motion.Reset();
+        g_motion.SetCalibrationMode(GamepadMotionHelpers::CalibrationMode::Stillness | GamepadMotionHelpers::CalibrationMode::SensorFusion);
+        g_motion_tick = 0;
     }
     else {
         HIDUSER_DisableGyroscope();
-        g_gyro_rate[0] = g_gyro_rate[1] = 0.0f;
+        HIDUSER_DisableAccelerometer();
     }
     g_gyro_on = on;
 }
 
-// Turning the console right is positive yaw, tilting its top towards you
-// (looking up through it) positive pitch.
-void recomp3ds::input_get_gyro(float* yaw_dps, float* pitch_dps) {
-    *yaw_dps = g_gyro_on ? -g_gyro_rate[0] : 0.0f;
-    *pitch_dps = g_gyro_on ? g_gyro_rate[1] : 0.0f;
+// After hidScanInput, on the main thread.
+void recomp3ds::input_motion_update() {
+    if (!g_gyro_on) return;
+    const u64 now = svcGetSystemTick();
+    const float dt = g_motion_tick == 0 ? 0.0f : (float)(now - g_motion_tick) / (float)SYSCLOCK_ARM11;
+    g_motion_tick = now;
+    if (dt <= 0.0f || dt > 0.25f) return;       // the first sample, or after a pause
+    angularRate r;
+    accelVector a;
+    hidGyroRead(&r);
+    hidAccelRead(&a);
+    const float k = 1.0f / g_gyro_coef;
+    g_motion.ProcessMotion(-(float)r.x * k, (float)r.z * k, -(float)r.y * k,
+                           (float)a.x / 512.0f, -(float)a.y / 512.0f, (float)a.z / 512.0f, dt);
+    float pitch_dps, yaw_dps;                   // yaw: anticlockwise about gravity, as seen from above
+    g_motion.GetPlayerSpaceGyro(pitch_dps, yaw_dps);
+    LightLock_Lock(&g_motion_lock);
+    g_turn_deg += -yaw_dps * dt;
+    g_pitch_deg += pitch_dps * dt;
+    LightLock_Unlock(&g_motion_lock);
+    // Once a second while it moves: what the aim got, and where gravity
+    // points in the console's frame (flat on a table: 0, -1, 0).
+    static float log_turn = 0.0f, log_up = 0.0f, log_t = 0.0f;
+    log_turn += -yaw_dps * dt;
+    log_up += pitch_dps * dt;
+    log_t += dt;
+    if (log_t >= 1.0f) {
+        if (std::fabs(log_turn) > 2.0f || std::fabs(log_up) > 2.0f) {
+            float gx, gy, gz;
+            g_motion.GetGravity(gx, gy, gz);
+            fprintf(stderr, "recomp3ds: gyro: turned %.0f deg right, %.0f deg up; gravity %.2f %.2f %.2f\n", log_turn, log_up, gx, gy, gz);
+        }
+        log_turn = log_up = log_t = 0.0f;
+    }
+}
+
+// Degrees turned right and tilted up (the top towards the player, looking
+// up through the screen) since the last call. Anything older than a
+// quarter second is dropped, so first person does not open with a jump.
+void recomp3ds::input_take_gyro(float* turn_right_deg, float* look_up_deg) {
+    *turn_right_deg = 0.0f;
+    *look_up_deg = 0.0f;
+    if (!g_gyro_on) return;
+    const u64 now = svcGetSystemTick();
+    const bool stale = g_take_tick == 0 || now - g_take_tick > SYSCLOCK_ARM11 / 4;
+    g_take_tick = now;
+    LightLock_Lock(&g_motion_lock);
+    if (!stale) { *turn_right_deg = g_turn_deg; *look_up_deg = g_pitch_deg; }
+    g_turn_deg = g_pitch_deg = 0.0f;
+    LightLock_Unlock(&g_motion_lock);
 }
 
 void recomp3ds::input_set_deadzones(int stick_percent, int cstick_percent) {
@@ -122,7 +171,6 @@ void recomp3ds::input_poll() {
     g_held = hidKeysHeld() | scripted;
     hidCircleRead(&g_cpad);
     hidCstickRead(&g_cstick);
-    if (g_gyro_on) gyro_poll();
     // Scripted stick directions (AUTOTEST STICK_*): full deflection.
     if (scripted & (KEY_CPAD_UP | KEY_CPAD_DOWN | KEY_CPAD_LEFT | KEY_CPAD_RIGHT)) {
         g_cpad.dx = (scripted & KEY_CPAD_RIGHT) ? CPAD_MAX : ((scripted & KEY_CPAD_LEFT) ? -CPAD_MAX : 0);

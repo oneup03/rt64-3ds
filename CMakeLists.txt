@@ -37,5 +37,6 @@ add_library(recomp_3ds STATIC
     src/platform/autotest.cpp
 )
 target_include_directories(recomp_3ds PUBLIC src/platform)
+target_include_directories(recomp_3ds PRIVATE third_party/GamepadMotionHelpers)
 target_link_libraries(recomp_3ds PUBLIC rt64_3ds ultramodern librecomp ctru m)
 target_compile_features(recomp_3ds PUBLIC cxx_std_20)
