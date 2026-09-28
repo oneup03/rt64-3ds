@@ -450,15 +450,13 @@ int recomp3ds::run(const GameDesc& desc) {
         return 1;
     }
 
-    // The audio task goes on core 2 with the renderer (and outranks it
-    // there). At 804 MHz that core has plenty of room, while on core 1 the
-    // system's share of the core delays audio tasks now and then, and DK64
-    // starts a frame's graphics only after the audio task: late frames the
-    // intro's pacing never makes up (Azahar does not model the share). At
-    // 268 MHz core 2 is too busy, so core 1 takes it when the system grants
-    // time there. AUDIO_CORE.TXT holds 1 or 2 to force a core.
+    // The audio microcode interpreter shares core 2 with the renderer and
+    // outranks it there, so every audio task stalls a frame. Core 1 (the
+    // system core, time-limited for applications) takes it when available.
+    // AUDIO_CORE.TXT holds 1 or 2 to force a core.
     {
-        int want = cpu_mhz >= 600 ? 2 : 1;
+        (void)cpu_mhz;
+        int want = 1;
         char path[192];
         snprintf(path, sizeof(path), "%s/AUDIO_CORE.TXT", g_base_path);
         if (FILE* f = fopen(path, "r")) { if (fscanf(f, "%d", &want) != 1) want = 1; fclose(f); }

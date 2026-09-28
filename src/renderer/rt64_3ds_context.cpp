@@ -288,8 +288,6 @@ private:
         }
         C3D_TexSetFilter(&snapshot_, GPU_LINEAR, GPU_LINEAR);
         C3D_TexSetWrap(&snapshot_, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
-        // Rows 400..511 are never copied into: black rather than stale VRAM.
-        if (snapshot_.data != nullptr) memset(snapshot_.data, 0, 256 * 512 * 4);
         interp_.set_snapshot_layout(40);
         {
             // The perspective groups the game's rules place as world: their
