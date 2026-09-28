@@ -820,10 +820,12 @@ struct Interpreter::Impl {
                 return 1;
             }
             case EX_SETVIEWPORTALIGN: {
+                // Takes effect at the next viewport load, as in RT64: DK64's
+                // rain sets it without reloading, and spreads its drops for
+                // the viewport it already has.
                 vp_origin = w1 & 0xFFF;
                 uint32_t a = r32(pc + 8);
                 vp_align_x = (int16_t)(a >> 16); vp_align_y = (int16_t)(a & 0xFFFF);
-                apply_viewport_align();
                 return 1;
             }
             case EX_SETSCISSOR: {
@@ -911,7 +913,8 @@ struct Interpreter::Impl {
         apply_viewport_align();
     }
     void apply_viewport_align() {
-        // gEXSetViewportAlign: the translate is re-based on an origin and
+        // gEXSetViewportAlign (the last one before this viewport was loaded):
+        // the translate is re-based on an origin and
         // shifted by an offset (quarter pixels); the origin then sits on the
         // wide screen's edge.
         float x = raw_vtrans_x;

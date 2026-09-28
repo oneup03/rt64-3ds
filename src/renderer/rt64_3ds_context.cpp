@@ -521,6 +521,10 @@ private:
         // The depth grid read at the next frame start is this frame's: keep
         // the world projection terms that turn it into distances.
         prev_cam_world_ = frame_.cam_is_world;
+        // What the left eye's world shift was drawn with (the aim sampler
+        // predicts displacements in that image).
+        prev_sep_ = sfd.on ? sfd.sep : 0.0f;
+        prev_conv_ = sfd.conv;
         prev_m22_ = frame_.cam[10];
         prev_m32_ = frame_.cam[14];
         last_uploads_ = textures_.uploads_this_frame();
@@ -1000,6 +1004,7 @@ public:
         }
         sf.reticle = sf.on && rt64_3ds::first_person_scene() && !rt64_3ds::low_convergence_scene();
         aim_z_ = -1.0f;
+        if (!sf.reticle) aim_have_prev_ = false;
         if (sf.reticle) {
             aim_z_ = sample_aim_depth(sf);
             // Zero at the convergence distance, the full separation at
@@ -1013,34 +1018,79 @@ public:
         return sf;
     }
 
-    // The depth under the reticle, from the left eye's finished frame. That
-    // image is displaced by the left eye's own parallax, which depends on the
-    // depth being measured, so a strip of candidates is read and the one
-    // whose depth predicts its own displacement wins.
-    float sample_aim_depth(const rt64_3ds::StereoFrame& sf) const {
-        if (!prev_cam_world_) return -1.0f;
-        constexpr int kCandidates = 13;
-        const float s_px = sf.sep * 200.0f;
-        const float lo = -s_px - 2.0f, hi = 3.0f * s_px + 2.0f;
-        const int sx = (int)(reticle_cx_ + 40.0f), sy = (int)reticle_cy_;
-        float best_err = 1e9f, best_z = -1.0f;
-        for (int i = 0; i < kCandidates; i++) {
-            const float o = lo + (hi - lo) * (float)i / (float)(kCandidates - 1);
-            float zs[3];
+    // The depth under the reticle: the desktop's aim strip (RT64's
+    // StereoDepthSampler and its consumer in the workload queue), read from
+    // the left eye's finished frame.
+    //
+    // That eye is not a centre view: content at fused position u and view
+    // depth z sits at u + s*(conv/z - 1) in it (s = its separation in
+    // pixels). So candidate patches are read across every position the aim
+    // point could resolve to, from -s (infinity) to +2s (a third of the
+    // convergence distance), and each patch's median depth predicts where
+    // that patch would have to sit. Those within one patch spacing of their
+    // prediction are consistent, and the NEAREST consistent one wins: at an
+    // occlusion edge both surfaces can be consistent and the near one is what
+    // is visible. An empty patch is cleared depth, the far plane: an infinity
+    // candidate whose position is known exactly (-s). With nothing consistent
+    // the previous answer holds (a guess only when there is none), and the
+    // result is smoothed in z behind a 1% relative deadband.
+    //
+    // The prediction uses the separation and convergence that frame was
+    // drawn with. Depth needs no viewport correction here (the desktop's
+    // G_MAXZ term): the interpreter writes z' = (z + w) / 2 itself, so
+    // 2 z' - 1 is exactly the projection's ndc.z.
+    float sample_aim_depth(const rt64_3ds::StereoFrame& sf) {
+        (void)sf;
+        if (!prev_cam_world_) { aim_have_prev_ = false; return -1.0f; }
+        constexpr int kCandidates = 13, kPatch = 5, kMinSamples = 2;
+        const float s_px = prev_sep_ * 200.0f, conv = prev_conv_;
+        const bool shifted = s_px > 0.5f && conv > 0.0f;
+        const float lo = shifted ? -s_px : 0.0f, hi = shifted ? 2.0f * s_px : 0.0f;
+        const float spacing = (hi - lo) / (float)(kCandidates - 1);
+        const float tolerance = std::max(spacing, (float)kPatch * 0.5f);
+        const int cx = (int)lroundf(reticle_cx_ + 40.0f), cy = (int)lroundf(reticle_cy_);
+        float aim_inv = -1.0f, best_res = 1e9f, best_inv = -1.0f;
+        for (int i = 0; i < (shifted ? kCandidates : 1); i++) {
+            const float o = lo + spacing * (float)i;
+            const int px = cx + (int)lroundf(o);
+            float zs[kPatch * kPatch];
             int n = 0;
-            for (int k = -1; k <= 1; k++) {
-                const float zp = read_depth_zp(sx + (int)o, sy + k * 3);
-                if (zp > 0.0f && zp < 1.0f) zs[n++] = zp;
+            for (int dy = -kPatch / 2; dy <= kPatch / 2; dy++) {
+                for (int dx = -kPatch / 2; dx <= kPatch / 2; dx++) {
+                    const float zp = read_depth_zp(px + dx, cy + dy);
+                    if (zp > 0.0f && zp < 1.0f) zs[n++] = zp;
+                }
             }
-            if (n == 0) continue;
-            std::sort(zs, zs + n);
-            const float z = rt64_3ds::view_depth(zs[n / 2], prev_m22_, prev_m32_);
-            if (z <= 0.0f) continue;
-            const float predicted = s_px * (sf.conv / z - 1.0f);
-            const float err = std::fabs(predicted - o);
-            if (err < best_err) { best_err = err; best_z = z; }
+            float inv = 0.0f, predicted = lo;
+            if (n >= kMinSamples) {
+                std::nth_element(zs, zs + n / 2, zs + n);
+                const float z = rt64_3ds::view_depth(zs[n / 2], prev_m22_, prev_m32_);
+                if (z <= 0.0f) continue;
+                inv = 1.0f / z;
+                predicted = shifted ? s_px * (conv * inv - 1.0f) : 0.0f;
+            }
+            const float res = std::fabs(predicted - o);
+            if (res <= tolerance) {
+                if (inv > aim_inv) aim_inv = inv;      // nearest; infinity (0) loses to any surface
+            }
+            else if (res < best_res) {
+                best_res = res;
+                best_inv = inv;
+            }
         }
-        return best_z;
+        if (aim_inv < 0.0f && !aim_have_prev_) aim_inv = best_inv;
+        if (aim_inv < 0.0f) return aim_have_prev_ ? aim_ema_ : -1.0f;   // hold
+        if (aim_inv <= 0.0f) {
+            // Infinity: nothing finite to ease toward.
+            aim_have_prev_ = false;
+            aim_ema_ = -1.0f;
+            return -1.0f;
+        }
+        const float z = 1.0f / aim_inv;
+        if (!aim_have_prev_) aim_ema_ = z;
+        else if (std::fabs(z - aim_ema_) / aim_ema_ > 0.01f) aim_ema_ += (z - aim_ema_) * 0.25f;
+        aim_have_prev_ = true;
+        return aim_ema_;
     }
 
     // Each draw's treatment for this frame, and where the reticle is (for
@@ -1092,6 +1142,9 @@ public:
     float prev_m22_ = 0.0f, prev_m32_ = 0.0f;
     float reticle_cx_ = 160.0f, reticle_cy_ = 120.0f;
     float applied_conv_ = 0.0f, near_z_ = -1.0f, aim_z_ = -1.0f;
+    float prev_sep_ = 0.0f, prev_conv_ = 0.0f;
+    float aim_ema_ = -1.0f;
+    bool aim_have_prev_ = false;
     int capture_snapshot_frames_ = 0;
     int capture_want_ = -2, store_delay_ = -1;
     int seq_first_ = 0, seq_count_ = 0;
