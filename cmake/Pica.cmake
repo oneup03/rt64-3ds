@@ -17,7 +17,8 @@ function(add_pica_shader target pica)
 endfunction()
 
 # add_3dsx(<target> [ICON png] [TITLE ..] [DESCRIPTION ..] [AUTHOR ..]):
-# produces <target>.3dsx (+ .smdh) next to the ELF.
+# produces <target>.3dsx (+ .smdh) next to the ELF. Without AUTHOR the
+# publisher is left blank.
 function(add_3dsx target)
     cmake_parse_arguments(A "" "ICON;TITLE;DESCRIPTION;AUTHOR" "" ${ARGN})
     if(NOT A_TITLE)
@@ -26,8 +27,8 @@ function(add_3dsx target)
     if(NOT A_DESCRIPTION)
         set(A_DESCRIPTION "${target}")
     endif()
-    if(NOT A_AUTHOR)
-        set(A_AUTHOR "unknown")
+    if("${A_AUTHOR}" STREQUAL "")
+        set(A_AUTHOR " ")      # a custom command drops an empty argument
     endif()
     set(elf "$<TARGET_FILE:${target}>")
     set(out "${CMAKE_CURRENT_BINARY_DIR}/${target}")

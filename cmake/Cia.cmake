@@ -11,8 +11,10 @@ function(add_cia target)
     if(NOT A_DESCRIPTION)
         set(A_DESCRIPTION "${A_TITLE}")
     endif()
-    if(NOT A_AUTHOR)
-        set(A_AUTHOR "unknown")
+    # No AUTHOR: a blank publisher. Both tools need the argument, and a custom
+    # command drops an empty one (bannertool also refuses it), so a space.
+    if("${A_AUTHOR}" STREQUAL "")
+        set(A_AUTHOR " ")
     endif()
     if(NOT MAKEROM_EXE)
         message(STATUS "makerom not found: no CIA target for ${target}")
