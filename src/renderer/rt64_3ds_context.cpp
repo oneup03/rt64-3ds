@@ -61,6 +61,7 @@ void apt_hook(APT_HookType type, void*) {
 }
 
 bool gpu_away() { return g_suspended || g_sleeping; }
+volatile bool g_paused = false;
 rt64_3ds::Progress g_progress{};
 const rt64_3ds::DrawRecord* g_progress_draw = nullptr;
 
@@ -92,8 +93,9 @@ public:
 
     void send_dl(const OSTask* task) override {
         if (!ok_ || g_quitting) return;
-        // Hold the game while the GPU is away (it would only run ahead unseen).
-        while (gpu_away() && !g_quitting) svcSleepThread(10 * 1000000ll);
+        // Hold the game while the GPU is away (it would only run ahead unseen)
+        // or a prompt has it paused.
+        while ((gpu_away() || g_paused) && !g_quitting) svcSleepThread(10 * 1000000ll);
         if (g_quitting) return;
         u64 t0 = svcGetSystemTick();
         // Frame pacing: a gap well past two VIs is a frame the game delivered
@@ -245,6 +247,8 @@ private:
         }
         C3D_RenderTargetSetOutput(top_, GFX_TOP, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
         // The right eye, drawn only while the 3D slider is up.
+        // What the screen shows while the game has the video blanked (below).
+        black_ = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, C3D_DEPTHTYPE(-1));
         top_r_ = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
         if (top_r_ != nullptr) C3D_RenderTargetSetOutput(top_r_, GFX_TOP, GFX_RIGHT, DISPLAY_TRANSFER_FLAGS);
         else fprintf(stderr, "rt64-3ds: no right-eye target (VRAM): stereo off\n");
@@ -348,6 +352,7 @@ private:
             }
         }
         if (frame_.snapshot_request && snapshot_.data != nullptr) copy_snapshot();
+        update_vi_blank();
         u64 tb0 = svcGetSystemTick();
         C3D_FrameBegin(0);
         acc_wait_ += svcGetSystemTick() - tb0;
@@ -465,6 +470,12 @@ private:
             if (tl_split != 0) { acc_left_ += tl_split - tl0; acc_right_ += tl1 - tl_split; }
             else acc_left_ += tl1 - tl0;
         }
+        if (vi_blanked_ && black_ != nullptr) {
+            // The frame is drawn (the game may store it for an effect) but
+            // the screen gets the black target, as the VI would show.
+            C3D_RenderTargetClear(black_, C3D_CLEAR_COLOR, 0x000000FF, 0);
+            C3D_FrameDrawOn(black_);
+        }
         g_progress.phase = 4;
         g_stats.combiner_fallbacks = fallbacks;
         g_stats.draws = (int)frame_.draws.size();
@@ -509,14 +520,14 @@ private:
                 for (u32 tr = 0; tr < 400 / 8; tr++) memcpy(dst + tr * (row + gap), src + tr * row, row);
             }
             else {
-                // One gap-free copy per tile row: a single copy with an output
-                // gap came out scrambled on the console.
-                const u8* src = (const u8*)top_->frameBuf.colorBuf;
-                u8* dst = (u8*)snapshot_.data;
-                for (u32 tr = 0; tr < 400 / 8; tr++) {
-                    C3D_SyncTextureCopy((u32*)(src + tr * row), GX_BUFFER_DIM(row / 16, 0),
-                                        (u32*)(dst + tr * (row + gap)), GX_BUFFER_DIM(row / 16, 0), row, 0);
-                }
+                // Flags bit 3 selects the texture-copy mode; libctru passes
+                // the flags through, and without it the engine ran a display
+                // transfer with whatever dimensions the last one left (our
+                // RGB8 screen output): the scrambled snapshot.
+                constexpr u32 kTextureCopyMode = BIT(3);
+                C3D_SyncTextureCopy((u32*)top_->frameBuf.colorBuf, GX_BUFFER_DIM(row / 16, 0),
+                                    (u32*)snapshot_.data, GX_BUFFER_DIM(row / 16, gap / 16), 240 * 400 * 4,
+                                    kTextureCopyMode);
             }
             snapshots_++;
             if (snapshots_ <= 3) {
@@ -862,13 +873,35 @@ public:
         }
     }
 
+    // osViBlack: the runtime zeroes VI_H_START while the game has the video
+    // blanked, and RT64 then shows nothing. DK64 blanks while it draws the
+    // frames of a new scene that its zipper transition stores and zips in;
+    // presenting them flashed the new scene between unzip and zip. Those
+    // frames still render into the eye target (a store copies it), but the
+    // screen output is switched to a black target.
+    void update_vi_blank() {
+        const ultramodern::renderer::ViRegs* vi = ultramodern::renderer::get_vi_regs();
+        const bool blanked = vi != nullptr && vi->VI_H_START_REG == 0 && vi->VI_V_START_REG != 0;
+        if (blanked == vi_blanked_ || black_ == nullptr) return;
+        vi_blanked_ = blanked;
+        fprintf(stderr, "rt64-3ds: video %s at frame %u\n", blanked ? "blanked" : "shown", frames_);
+        if (blanked) {
+            C3D_RenderTargetSetOutput(black_, GFX_TOP, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
+            if (top_r_ != nullptr) C3D_RenderTargetSetOutput(nullptr, GFX_TOP, GFX_RIGHT, DISPLAY_TRANSFER_FLAGS);
+        }
+        else {
+            C3D_RenderTargetSetOutput(top_, GFX_TOP, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
+            if (top_r_ != nullptr) C3D_RenderTargetSetOutput(top_r_, GFX_TOP, GFX_RIGHT, DISPLAY_TRANSFER_FLAGS);
+        }
+    }
+
     // ---- stereo (see rt64_3ds_stereo.h)
     rt64_3ds::StereoFrame begin_stereo_frame() {
         rt64_3ds::StereoFrame sf;
         const rt64_3ds::Settings& st = rt64_3ds::settings();
         slider_ = osGet3DSliderState();
         sf.sep = (float)st.sep_slider * 0.002f * slider_ * st.slider_gain;
-        sf.on = top_r_ != nullptr && slider_ > 0.001f && sf.sep > 0.0f;
+        sf.on = top_r_ != nullptr && slider_ > 0.001f && sf.sep > 0.0f && !vi_blanked_;
         if (sf.on != s3d_on_) {
             gfxSet3D(sf.on);
             s3d_on_ = sf.on;
@@ -981,6 +1014,8 @@ public:
     static constexpr uint8_t kReticle = 0xFF;
     static constexpr int kGridCols = 40, kGridRows = 30;
     C3D_RenderTarget* top_r_ = nullptr;
+    C3D_RenderTarget* black_ = nullptr;
+    bool vi_blanked_ = false;
     bool s3d_on_ = false, stereo_wants_depth_ = false;
     float slider_ = 0.0f;
     std::vector<uint8_t> classes_;
@@ -1059,3 +1094,4 @@ void rt64_3ds::dump_progress() {
 
 void rt64_3ds::set_debug_gfx_delay_ms(int ms) { g_debug_gfx_delay_ms = ms; }
 void rt64_3ds::set_quitting() { g_quitting = true; }
+void rt64_3ds::set_paused(bool paused) { g_paused = paused; }

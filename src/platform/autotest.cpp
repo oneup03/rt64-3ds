@@ -7,6 +7,7 @@
 //     <frame> SHOT <name>          log "AUTOTEST shot <name>" (the harness screenshots)
 //     <frame> LOG <text>           log the text
 //     <frame> EXIT                 exit(0)
+//     <frame> HOME                 a HOME button press
 //   Frames count from the start of the current phase.
 #include <3ds.h>
 #include <cstdio>
@@ -21,7 +22,7 @@ namespace {
 
 constexpr int kMaxCmds = 256;
 constexpr int kMaxPhases = 32;
-enum Kind { KEYS, TOUCH, SHOT, LOG, EXIT };
+enum Kind { KEYS, TOUCH, SHOT, LOG, EXIT, HOME };
 struct Cmd { int frame, frames; u32 keys; Kind kind; int phase; int tx, ty; char text[48]; };
 
 Cmd g_cmds[kMaxCmds];
@@ -34,6 +35,7 @@ u64 g_phase_start_ms = 0;
 int g_last_frame = -1;
 u32 g_keys = 0;
 bool g_touch = false;
+volatile bool g_home = false;
 int g_touch_x = 0, g_touch_y = 0;
 
 u32 key_bit(const char* name) {
@@ -81,6 +83,7 @@ void recomp3ds::autotest_load(const char* base_path) {
         if (strcasecmp(b, "SHOT") == 0)      { cmd->kind = SHOT; if (n > 2) strncpy(cmd->text, c, sizeof(cmd->text) - 1); }
         else if (strcasecmp(b, "LOG") == 0)  { cmd->kind = LOG;  if (n > 2) strncpy(cmd->text, c, sizeof(cmd->text) - 1); }
         else if (strcasecmp(b, "EXIT") == 0) { cmd->kind = EXIT; }
+        else if (strcasecmp(b, "HOME") == 0) { cmd->kind = HOME; }
         else if (n > 2 && strncasecmp(c, "TOUCH", 5) == 0) {
             cmd->kind = TOUCH; cmd->frames = atoi(b);
             sscanf(c + 5, "%d %d", &cmd->tx, &cmd->ty);
@@ -139,10 +142,17 @@ u32 recomp3ds::autotest_tick() {
             case SHOT: if (fired) fprintf(stderr, "AUTOTEST shot %s\n", c->text); break;
             case LOG:  if (fired) fprintf(stderr, "AUTOTEST: %s\n", c->text); break;
             case EXIT: if (fired) { fprintf(stderr, "AUTOTEST: exit\n"); recomp3ds::request_exit(); } break;
+            case HOME: if (fired) { fprintf(stderr, "AUTOTEST: home\n"); g_home = true; } break;
         }
     }
     g_keys = keys;
     return keys;
+}
+
+bool recomp3ds::autotest_take_home() {
+    bool h = g_home;
+    g_home = false;
+    return h;
 }
 
 bool recomp3ds::autotest_touch(int* x, int* y) {

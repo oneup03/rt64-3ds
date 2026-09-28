@@ -45,6 +45,8 @@ namespace recomp3ds {
     void autotest_scan_line(const char* line);
     u32  autotest_tick();
     bool autotest_touch(int* x, int* y);
+    bool autotest_take_home();          // a scripted HOME press since the last call
+    void input_set_blocked(bool blocked);
     // Stereo settings on the touch screen (stereo_panel.cpp).
     void stereo_panel_init(const char* base_path);
     void stereo_panel_update();

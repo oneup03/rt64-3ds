@@ -20,9 +20,19 @@ constexpr int CSTICK_THRESHOLD = 60;
 u32 g_held = 0;
 circlePosition g_cpad{};
 circlePosition g_cstick{};
+volatile bool g_blocked = false;
 }
 
+// A modal prompt owns the pad (and hidScanInput) while it is up.
+void recomp3ds::input_set_blocked(bool blocked) { g_blocked = blocked; }
+
 void recomp3ds::input_poll() {
+    if (g_blocked) {
+        g_held = 0;
+        g_cpad = circlePosition{};
+        g_cstick = circlePosition{};
+        return;
+    }
     hidScanInput();
     u32 scripted = recomp3ds::autotest_tick();
     g_held = hidKeysHeld() | scripted;

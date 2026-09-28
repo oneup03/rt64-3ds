@@ -115,6 +115,11 @@ void set_debug_gfx_delay_ms(int ms);
 // The process is about to end: stop submitting GPU work.
 void set_quitting();
 
+// Hold the game: the renderer takes no display list while paused, so the
+// game waits on its current one (a modal prompt). The top screen keeps the
+// last frame.
+void set_paused(bool paused);
+
 }   // namespace rt64_3ds
 
 #endif
