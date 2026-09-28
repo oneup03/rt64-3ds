@@ -123,6 +123,7 @@ void set_paused(bool paused);
 // Save the next frame for the host tools: its gfx task and RDRAM
 // (gfx_task.bin) and what it rendered (gfx_frame.ppm), in the game's folder.
 void request_capture();
+int capture_state();    // 0 none, 1 being written, 2 written
 
 }   // namespace rt64_3ds
 

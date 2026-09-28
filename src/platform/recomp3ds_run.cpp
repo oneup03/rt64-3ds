@@ -244,7 +244,7 @@ void update_gfx_inner() {
             else if (!fired && now - select_since > SYSCLOCK_ARM11) {
                 fired = true;
                 rt64_3ds::request_capture();
-                printf("\x1b[28;0HFrame captured to gfx_task.bin       ");
+                printf("\x1b[28;0HSaving a frame capture...            ");
                 gfxFlushBuffers();
             }
         }
@@ -252,6 +252,13 @@ void update_gfx_inner() {
             select_since = 0;
             fired = false;
         }
+        static int shown_state = 0;
+        const int state = rt64_3ds::capture_state();
+        if (state == 2 && shown_state != 2) {
+            printf("\x1b[28;0HCapture saved: gfx_task.bin          ");
+            gfxFlushBuffers();
+        }
+        shown_state = state;
     }
     // Once a second: frame rate and CPU load to the log and the touch screen.
     static u64 last_report = 0;

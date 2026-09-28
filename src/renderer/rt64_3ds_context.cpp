@@ -66,6 +66,37 @@ volatile bool g_capture_request = false;
 rt64_3ds::Progress g_progress{};
 const rt64_3ds::DrawRecord* g_progress_draw = nullptr;
 
+// A frame capture on its way to the SD card (see maybe_capture_framebuffer).
+struct CaptureJob {
+    OSTask task{};
+    uint8_t* rdram = nullptr;        // 16 MB copy, or null for an image-only capture
+    uint8_t* frame = nullptr;
+    size_t frame_bytes = 0;
+    char frame_name[64] = {};
+};
+volatile int g_capture_state = 0;    // 0 idle, 1 writing, 2 written
+
+void write_capture(void* arg) {
+    CaptureJob* job = static_cast<CaptureJob*>(arg);
+    if (job->rdram != nullptr) {
+        if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_task.bin", "wb")) {
+            fwrite(&job->task, 1, sizeof(OSTask), f);
+            for (uint32_t off = 0; off < 16u * 1024 * 1024; off += 65536) fwrite(job->rdram + off, 1, 65536, f);
+            fclose(f);
+        }
+        free(job->rdram);
+    }
+    if (job->frame != nullptr) {
+        if (FILE* f = fopen(job->frame_name, "wb")) { fwrite(job->frame, 1, job->frame_bytes, f); fclose(f); }
+        free(job->frame);
+    }
+    if (job->rdram != nullptr) {
+        fprintf(stderr, "rt64-3ds: capture written (gfx_task.bin, %s)\n", job->frame_name + 15);
+        g_capture_state = 2;
+    }
+    delete job;
+}
+
 class C3dRenderContext final : public ultramodern::renderer::RendererContext {
 public:
     C3dRenderContext(uint8_t* rdram) : rdram_(rdram), interp_(rdram), textures_(rdram) {
@@ -757,42 +788,43 @@ public:
     void maybe_capture_framebuffer() {
         if (!fb_capture_pending_) return;
         fb_capture_pending_ = false;
-        if (capture_copy_ != nullptr) {
-            if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_task.bin", "wb")) {
-                fwrite(&capture_task_, 1, sizeof(OSTask), f);
-                for (uint32_t off = 0; off < 16u * 1024 * 1024; off += 65536) fwrite(capture_copy_ + off, 1, 65536, f);
-                fclose(f);
-            }
-            free(capture_copy_);
-            capture_copy_ = nullptr;
-        }
-        if (snapshot_.data != nullptr && seq_count_ == 0) {
-            // The snapshot texture as stored (256x512 RGBA8, tiled), raw.
-            if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_snapshot.raw", "wb")) { fwrite(snapshot_.data, 1, 256 * 512 * 4, f); fclose(f); }
-        }
-        static int frame_captures = 0;
-        char fname[64];
-        snprintf(fname, sizeof(fname), frame_captures == 0 ? "sdmc:/3ds/DK64/gfx_frame.ppm" : "sdmc:/3ds/DK64/gfx_frame%d.ppm", frame_captures);
-        frame_captures++;
-        // Read the tiled target straight from VRAM (the CPU can read it; the
+        // The finished frame, untiled from VRAM (the CPU can read it; the
         // emulator flushes its cached copy on such reads): 8x8 tiles, 30 per
-        // tile row, Morton order inside a tile.
-        const uint32_t* lin = (const uint32_t*)top_->frameBuf.colorBuf;
-        if (FILE* f = fopen(fname, "wb")) {
-            // The target is 240 wide and 400 tall (rotated): written as is;
-            // the host rotates it to the 400x240 screen.
-            fprintf(f, "P6\n240 400\n255\n");
-            static uint8_t row[240 * 3];
+        // tile row, Morton order inside a tile. Rotated (240 wide, 400 tall):
+        // the host rotates it to the 400x240 screen.
+        static const char kHeader[] = "P6\n240 400\n255\n";
+        const size_t frame_bytes = sizeof(kHeader) - 1 + 240 * 400 * 3;
+        uint8_t* frame = (uint8_t*)malloc(frame_bytes);
+        if (frame != nullptr) {
+            memcpy(frame, kHeader, sizeof(kHeader) - 1);
+            uint8_t* o = frame + sizeof(kHeader) - 1;
+            const uint32_t* lin = (const uint32_t*)top_->frameBuf.colorBuf;
             for (int r = 0; r < 400; r++) {
                 for (int c = 0; c < 240; c++) {
                     uint32_t tile = (uint32_t)(r >> 3) * 30 + (uint32_t)(c >> 3);
                     uint32_t m = (c & 1) | ((r & 1) << 1) | ((c & 2) << 1) | ((r & 2) << 2) | ((c & 4) << 2) | ((r & 4) << 3);
                     uint32_t p = lin[tile * 64 + m];
-                    row[c * 3 + 0] = (uint8_t)(p >> 24); row[c * 3 + 1] = (uint8_t)(p >> 16); row[c * 3 + 2] = (uint8_t)(p >> 8);
+                    *o++ = (uint8_t)(p >> 24); *o++ = (uint8_t)(p >> 16); *o++ = (uint8_t)(p >> 8);
                 }
-                fwrite(row, 1, sizeof(row), f);
             }
-            fclose(f);
+        }
+        static int frame_captures = 0;
+        CaptureJob* job = new CaptureJob{};
+        snprintf(job->frame_name, sizeof(job->frame_name), frame_captures == 0 ? "sdmc:/3ds/DK64/gfx_frame.ppm" : "sdmc:/3ds/DK64/gfx_frame%d.ppm", frame_captures);
+        frame_captures++;
+        job->frame = frame;
+        job->frame_bytes = frame_bytes;
+        job->rdram = capture_copy_;
+        job->task = capture_task_;
+        capture_copy_ = nullptr;
+        if (job->rdram != nullptr) {
+            // A full capture: the SD card needs seconds for 16 MB, so a
+            // background thread writes it while the game plays on.
+            g_capture_state = 1;
+            if (threadCreate(write_capture, job, 32 * 1024, 0x2F, -2, true) == nullptr) write_capture(job);
+        }
+        else {
+            write_capture(job);      // a frame image only (sequence captures)
         }
         fprintf(stderr, "rt64-3ds: captured gfx frame\n");
     }
@@ -1113,3 +1145,4 @@ void rt64_3ds::set_debug_gfx_delay_ms(int ms) { g_debug_gfx_delay_ms = ms; }
 void rt64_3ds::set_quitting() { g_quitting = true; }
 void rt64_3ds::set_paused(bool paused) { g_paused = paused; }
 void rt64_3ds::request_capture() { g_capture_request = true; }
+int rt64_3ds::capture_state() { return g_capture_state; }
