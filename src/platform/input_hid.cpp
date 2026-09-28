@@ -1,7 +1,9 @@
 // ultramodern input callbacks on libctru's HID: one N64 controller from the
-// 3DS pad. Map (changeable later through settings):
+// 3DS pad. The buttons follow the game's ButtonMap (GameDesc), or by default:
 //   A=A  B=B  Y=Z  ZL=Z  X=C-up  L=L  R/ZR=R  D-pad=D-pad  START=START
-//   Circle Pad = stick, C-Stick = C buttons (New 3DS)
+// The Circle Pad is the stick and the C-Stick (New 3DS) the C buttons.
+// SELECT belongs to the platform (settings menu, frame capture), and the
+// D-pad to the menu while it is open.
 #include <3ds.h>
 #include <cstring>
 
@@ -10,18 +12,29 @@
 #include "recomp3ds.h"
 
 namespace {
-// N64 controller button bits (as OSContPad.button).
-constexpr uint16_t N64_A = 0x8000, N64_B = 0x4000, N64_Z = 0x2000, N64_START = 0x1000;
-constexpr uint16_t N64_DU = 0x0800, N64_DD = 0x0400, N64_DL = 0x0200, N64_DR = 0x0100;
-constexpr uint16_t N64_L = 0x0020, N64_R = 0x0010;
-constexpr uint16_t N64_CU = 0x0008, N64_CD = 0x0004, N64_CL = 0x0002, N64_CR = 0x0001;
+using namespace recomp3ds;
 constexpr int CPAD_MAX = 156;
 constexpr int CSTICK_THRESHOLD = 60;
 u32 g_held = 0;
 circlePosition g_cpad{};
 circlePosition g_cstick{};
 volatile bool g_blocked = false;
+volatile bool g_cstick_buttons = true;
+
+const ButtonMap kDefaultMap[] = {
+    { KEY_A, N64_A }, { KEY_B, N64_B }, { KEY_Y | KEY_ZL, N64_Z }, { KEY_X, N64_CUP }, { KEY_L, N64_L },
+    { KEY_R | KEY_ZR, N64_R }, { KEY_START, N64_START },
+    { KEY_DUP, N64_DUP }, { KEY_DDOWN, N64_DDOWN }, { KEY_DLEFT, N64_DLEFT }, { KEY_DRIGHT, N64_DRIGHT },
+};
+const ButtonMap* g_map = kDefaultMap;
+size_t g_map_count = sizeof(kDefaultMap) / sizeof(kDefaultMap[0]);
 }
+
+void recomp3ds::input_set_map(const ButtonMap* map, size_t count) {
+    if (map != nullptr && count != 0) { g_map = map; g_map_count = count; }
+}
+
+void recomp3ds::input_set_cstick_buttons(bool on) { g_cstick_buttons = on; }
 
 // A modal prompt owns the pad (and hidScanInput) while it is up.
 void recomp3ds::input_set_blocked(bool blocked) { g_blocked = blocked; }
@@ -50,22 +63,16 @@ bool recomp3ds::input_get(int controller_num, uint16_t* buttons, float* x, float
         return false;
     }
     uint16_t b = 0;
-    u32 h = g_held;
-    if (h & KEY_A) b |= N64_A;
-    if (h & KEY_B) b |= N64_B;
-    if (h & (KEY_Y | KEY_ZL)) b |= N64_Z;
-    if (h & KEY_X) b |= N64_CU;
-    if (h & KEY_L) b |= N64_L;
-    if (h & (KEY_R | KEY_ZR)) b |= N64_R;
-    if (h & KEY_START) b |= N64_START;
-    if (h & KEY_DUP) b |= N64_DU;
-    if (h & KEY_DDOWN) b |= N64_DD;
-    if (h & KEY_DLEFT) b |= N64_DL;
-    if (h & KEY_DRIGHT) b |= N64_DR;
-    if (g_cstick.dy > CSTICK_THRESHOLD) b |= N64_CU;
-    if (g_cstick.dy < -CSTICK_THRESHOLD) b |= N64_CD;
-    if (g_cstick.dx < -CSTICK_THRESHOLD) b |= N64_CL;
-    if (g_cstick.dx > CSTICK_THRESHOLD) b |= N64_CR;
+    const u32 h = g_held & ~settings_menu_keys();
+    for (size_t i = 0; i < g_map_count; i++) {
+        if (h & g_map[i].keys) b |= g_map[i].n64;
+    }
+    if (g_cstick_buttons) {
+        if (g_cstick.dy > CSTICK_THRESHOLD) b |= N64_CUP;
+        if (g_cstick.dy < -CSTICK_THRESHOLD) b |= N64_CDOWN;
+        if (g_cstick.dx < -CSTICK_THRESHOLD) b |= N64_CLEFT;
+        if (g_cstick.dx > CSTICK_THRESHOLD) b |= N64_CRIGHT;
+    }
     *buttons = b;
     float fx = (float)g_cpad.dx / CPAD_MAX;
     float fy = (float)g_cpad.dy / CPAD_MAX;

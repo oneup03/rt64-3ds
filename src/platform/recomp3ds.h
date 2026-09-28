@@ -11,6 +11,32 @@
 
 namespace recomp3ds {
 
+// N64 controller button bits (OSContPad.button).
+enum : uint16_t {
+    N64_A = 0x8000, N64_B = 0x4000, N64_Z = 0x2000, N64_START = 0x1000,
+    N64_DUP = 0x0800, N64_DDOWN = 0x0400, N64_DLEFT = 0x0200, N64_DRIGHT = 0x0100,
+    N64_L = 0x0020, N64_R = 0x0010,
+    N64_CUP = 0x0008, N64_CDOWN = 0x0004, N64_CLEFT = 0x0002, N64_CRIGHT = 0x0001,
+};
+
+// One line of a button map: any of these 3DS keys (libctru KEY_*) presses
+// these N64 buttons. The Circle Pad is always the stick and the C-Stick the
+// C buttons (see input_set_cstick_buttons).
+struct ButtonMap {
+    uint32_t keys;
+    uint16_t n64;
+};
+
+// A game setting on the touch-screen menu, saved to settings.ini under `key`.
+struct MenuOption {
+    const char* key;
+    const char* label;                  // up to 12 characters
+    int lo, hi;
+    int* value;                         // holds the default until settings.ini is read
+    const char* const* names = nullptr; // hi - lo + 1 names (up to 11 characters) instead of the number
+    void (*on_change)(int value) = nullptr;   // also called once after loading
+};
+
 struct GameDesc {
     std::u8string game_id;              // u8"DK64": also the stored ROM name (<id>.z64) and save name
     const char* sd_dir = "";            // folder under sdmc:/3ds/ holding the ROM, saves and settings
@@ -28,6 +54,12 @@ struct GameDesc {
     // Optional: game-specific numbers appended to the once-a-second stats
     // line (e.g. the game's own VI counter and frame pacing).
     void (*append_stats)(const uint8_t* rdram, char* buf, size_t size) = nullptr;
+    // Optional: the game's button map (null: the default in input_hid.cpp).
+    const ButtonMap* button_map = nullptr;
+    size_t button_map_count = 0;
+    // Optional: game settings shown on the menu after the stereo ones.
+    const MenuOption* menu_options = nullptr;
+    size_t menu_option_count = 0;
 };
 
 // Brings up the console, registers the game and runs the runtime. Returns the
@@ -39,6 +71,10 @@ void request_exit();
 
 // sdmc:/3ds/<sd_dir>
 const char* base_path();
+
+// Whether the C-Stick also presses the C buttons (on by default). A game
+// that reads the C-Stick as an analog camera turns it off.
+void input_set_cstick_buttons(bool on);
 
 }   // namespace recomp3ds
 

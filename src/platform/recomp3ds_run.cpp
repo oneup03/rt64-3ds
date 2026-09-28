@@ -207,6 +207,7 @@ bool home_prompt() {
         }
     }
     draw_home_prompt(false);
+    recomp3ds::settings_menu_redraw();
     ndspSetMasterVol(1.0f);
     recomp3ds::input_set_blocked(false);
     if (!quit) rt64_3ds::set_paused(false);   // quitting releases the renderer itself
@@ -224,7 +225,7 @@ void update_gfx(void*) {
 }
 
 void update_gfx_inner() {
-    recomp3ds::stereo_panel_update();
+    recomp3ds::settings_menu_update();
     // HOME opens the quit prompt (above) rather than the HOME Menu.
     if (!g_home_trapped) {
         aptSetHomeAllowed(false);
@@ -234,8 +235,9 @@ void update_gfx_inner() {
         if (home_prompt()) g_exit_requested = true;
     }
     {
-        // SELECT held for a second (the game has no use for it): capture the
-        // next frame for the host tools, and say so on the touch screen.
+        // SELECT (the game has no use for it): a tap opens or closes the
+        // settings menu; held for a second it captures the next frame for
+        // the host tools instead, and says so on the touch screen.
         static u64 select_since = 0;
         static bool fired = false;
         if ((hidKeysHeld() | recomp3ds::autotest_keys()) & KEY_SELECT) {
@@ -249,6 +251,7 @@ void update_gfx_inner() {
             }
         }
         else {
+            if (select_since != 0 && !fired) recomp3ds::settings_menu_toggle();
             select_since = 0;
             fired = false;
         }
@@ -308,7 +311,10 @@ void update_gfx_inner() {
         fprintf(stderr, "stats: %d dl/s (late %d, max gap %.0f ms) core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu%s\n",
                 st.dl_per_sec, st.late_frames, st.max_gap_ms, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_remaining(),
                 (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped, game_stats);
-        printf("\x1b[2;0H%3d fps  cpu0 %3d%%  cpu2 %3d%%  ucode %3u ms/s   \n", st.dl_per_sec, busy0, busy2, ucode_ms);
+        // One 40-column row: the audio microcode's ms per second last.
+        char line[64];
+        snprintf(line, sizeof(line), "%3d fps  cpu0 %3d%%  cpu2 %3d%%  audio %3u", st.dl_per_sec, busy0, busy2, ucode_ms);
+        printf("\x1b[2;0H%-39.39s\n", line);
     }
     // Watchdog: a frame that stays in the replay or the GPU wait for 4 s is
     // a hung GPU; say which draw it was on, once.
@@ -464,7 +470,8 @@ int recomp3ds::run(const GameDesc& desc) {
     fprintf(stderr, "recomp3ds: %s starting on %s 3DS\n", desc.render.game_name, is_new_3ds ? "a New" : "an Old");
     printf("%s\n", desc.render.game_name);
     log_memory("boot");
-    recomp3ds::stereo_panel_init(g_base_path);
+    recomp3ds::settings_menu_init(g_base_path, desc);
+    recomp3ds::input_set_map(desc.button_map, desc.button_map_count);
     u32 cpu_mhz = log_cpu("boot");
     if (is_new_3ds) {
         // The exheader asks for 804 MHz and the L2 cache, but on hardware the

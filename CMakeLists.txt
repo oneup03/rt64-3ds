@@ -28,7 +28,7 @@ target_compile_features(rt64_3ds PUBLIC cxx_std_20)
 
 add_library(recomp_3ds STATIC
     src/platform/recomp3ds_run.cpp
-    src/platform/stereo_panel.cpp
+    src/platform/settings_menu.cpp
     src/platform/audio_ndsp.cpp
     src/platform/naudio_hle.cpp
     src/platform/input_hid.cpp

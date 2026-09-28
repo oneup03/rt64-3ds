@@ -27,6 +27,8 @@ namespace recomp3ds {
     struct AudioCounters { uint32_t submitted, dropped, underruns, rate; };
     AudioCounters audio_take_counters();
 
+    struct ButtonMap;
+    void input_set_map(const ButtonMap* map, size_t count);
     void input_poll();
     bool input_get(int controller_num, uint16_t* buttons, float* x, float* y);
     void input_get_right_stick(float* x, float* y);
@@ -48,9 +50,13 @@ namespace recomp3ds {
     bool autotest_touch(int* x, int* y);
     bool autotest_take_home();          // a scripted HOME press since the last call
     void input_set_blocked(bool blocked);
-    // Stereo settings on the touch screen (stereo_panel.cpp).
-    void stereo_panel_init(const char* base_path);
-    void stereo_panel_update();
+    // The settings menu on the touch screen (settings_menu.cpp).
+    struct GameDesc;
+    void settings_menu_init(const char* base_path, const GameDesc& desc);
+    void settings_menu_update();        // ~60 times a second, main thread
+    void settings_menu_toggle();
+    void settings_menu_redraw();        // after something else wrote over the console
+    u32  settings_menu_keys();          // 3DS keys the open menu keeps from the game
 
     void loadmon_start(bool has_core2);
     void loadmon_sample(int* busy0, int* busy2);
