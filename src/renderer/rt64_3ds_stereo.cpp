@@ -29,7 +29,11 @@ StereoClass classify_draw(const DrawRecord& d, const RenderDesc& desc) {
     for (size_t i = 0; i < desc.rule_count; i++) {
         const StereoRule& r = desc.rules[i];
         if (!in_rule(d.proj_id, r.id_lo, r.id_hi)) continue;
-        if (r.kind == ProjKind::Any || (r.kind == ProjKind::Perspective) == d.perspective) return r.cls;
+        if (r.kind == ProjKind::Any || (r.kind == ProjKind::Perspective) == d.perspective) {
+            // Z_CMP and Z_UPD (othermode L bits 4, 5) both clear.
+            if (r.cls == StereoClass::World && desc.depthless_world_is_hud && (d.othermode_l & 0x30) == 0) return StereoClass::Hud;
+            return r.cls;
+        }
     }
     if (d.perspective && desc.hud_id_hi != 0 && in_rule(d.proj_id, desc.hud_id_lo, desc.hud_id_hi)) {
         return (desc.bubble_id_lo != 0 && d.proj_id >= desc.bubble_id_lo) ? StereoClass::HudBubble : StereoClass::Hud;
