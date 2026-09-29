@@ -30,6 +30,7 @@ namespace recomp3ds {
     struct ButtonMap;
     void input_set_map(const ButtonMap* map, size_t count);
     void input_set_deadzones(int stick_percent, int cstick_percent);
+    void input_set_cstick_up(bool on);  // C-Stick up presses C-Up (off: nothing)
     void input_poll();
     void input_motion_update();         // main thread, after hidScanInput
     bool input_get(int controller_num, uint16_t* buttons, float* x, float* y);

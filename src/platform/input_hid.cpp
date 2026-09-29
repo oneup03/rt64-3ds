@@ -25,6 +25,7 @@ circlePosition g_cpad{};
 circlePosition g_cstick{};
 volatile bool g_blocked = false;
 volatile bool g_cstick_buttons = true;
+volatile bool g_cstick_up = true;       // C-Stick up presses C-Up (settings menu)
 volatile float g_stick_dz = 0.05f, g_cstick_dz = 0.20f;
 
 // Radial deadzone over the stick's raw counts, the rest of the range scaled
@@ -54,6 +55,7 @@ void recomp3ds::input_set_map(const ButtonMap* map, size_t count) {
 }
 
 void recomp3ds::input_set_cstick_buttons(bool on) { g_cstick_buttons = on; }
+void recomp3ds::input_set_cstick_up(bool on) { g_cstick_up = on; }
 
 // Motion (gyro aiming), through JibbSmart's GamepadMotionHelpers (MIT, as
 // the desktop uses): gyro calibration while the console is still, gravity
@@ -190,7 +192,7 @@ bool recomp3ds::input_get(int controller_num, uint16_t* buttons, float* x, float
     if (g_cstick_buttons) {
         float cx, cy;
         stick_value(g_cstick, g_cstick_dz, &cx, &cy);
-        if (cy > CSTICK_BUTTON) b |= N64_CUP;
+        if (cy > CSTICK_BUTTON && g_cstick_up) b |= N64_CUP;
         if (cy < -CSTICK_BUTTON) b |= N64_CDOWN;
         if (cx < -CSTICK_BUTTON) b |= N64_CLEFT;
         if (cx > CSTICK_BUTTON) b |= N64_CRIGHT;

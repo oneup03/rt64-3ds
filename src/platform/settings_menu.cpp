@@ -72,6 +72,12 @@ void apply_cpu(int v) { recomp3ds::set_cpu_speed(v != 0); }
 int g_stick_dz = 5, g_cstick_dz = 20;
 void apply_deadzones(int) { recomp3ds::input_set_deadzones(g_stick_dz, g_cstick_dz); }
 
+// Whether pushing the C-Stick up presses C-Up (in many games first person,
+// easy to hit while turning the camera).
+int g_cstick_up = 1;
+const char* const kCstickUpNames[] = { "Off", "C-Up" };
+void apply_cstick_up(int v) { recomp3ds::input_set_cstick_up(v != 0); }
+
 void add_row(const Row& r) {
     if (g_row_count < kMaxRows) g_rows[g_row_count++] = r;
 }
@@ -235,6 +241,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "stereo_ghost_black_floor", "Black floor", 0, 20, &st.ghost_black_floor, nullptr, false, "%", nullptr, Page3D, 1, nullptr });
     add_row({ "stick_deadzone", "Circle Pad dz", 0, 50, &g_stick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
     add_row({ "cstick_deadzone", "C-Stick dz", 0, 50, &g_cstick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
+    add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, PageControls, 1, nullptr });
     for (size_t i = 0; i < desc.menu_option_count; i++) {
         const MenuOption& o = desc.menu_options[i];
         add_row({ o.key, o.label, o.lo, o.hi, o.value, o.names, false, o.suffix, o.on_change, o.page, o.step > 0 ? o.step : 1, o.zero_text });
