@@ -35,7 +35,7 @@ constexpr int kHintRow = 4, kTabRow = 6, kFirstRow = 8, kRowStep = 2, kLastRow =
 constexpr int kSlots = 7;               // rows 8..20; row 22 is the page's note
 constexpr int kMinusCol = 16, kValueWidth = 11, kPlusCol = 35;
 
-const char* const kPageNames[recomp3ds::PageCount] = { "3D", "Controls", "Camera", "Game" };
+const char* const kPageNames[recomp3ds::PageCount] = { "3D", "Controls", "Camera", "Game", "Mods" };
 int g_tab_col[recomp3ds::PageCount];
 
 struct Row {
@@ -115,19 +115,21 @@ void draw_row(int slot) {
 }
 
 void draw_tabs() {
-    // " 3D   Controls   Camera   Game": the current page in brackets,
-    // yellow while the tab row is chosen.
+    // "[3D]  Controls  Camera  Game  Mods": the current page in brackets,
+    // yellow while the tab row is chosen. Each tab is its name plus two
+    // columns, one apart, so five fit the 40 columns.
     printf("\x1b[%d;0H%40s\x1b[%d;0H", kTabRow, "", kTabRow);
     int col = 0;
     for (int p = 0; p < recomp3ds::PageCount; p++) {
         g_tab_col[p] = -1;
         if (page_count(p) == 0) continue;
+        if (col > 0) { printf(" "); col++; }
         g_tab_col[p] = col;
         const bool cur = p == g_page;
-        if (cur && g_sel < 0) printf("\x1b[33m[%s]\x1b[0m ", kPageNames[p]);
-        else if (cur) printf("[%s] ", kPageNames[p]);
-        else printf(" %s  ", kPageNames[p]);
-        col += (int)strlen(kPageNames[p]) + 3;
+        if (cur && g_sel < 0) printf("\x1b[33m[%s]\x1b[0m", kPageNames[p]);
+        else if (cur) printf("[%s]", kPageNames[p]);
+        else printf(" %s ", kPageNames[p]);
+        col += (int)strlen(kPageNames[p]) + 2;
     }
 }
 

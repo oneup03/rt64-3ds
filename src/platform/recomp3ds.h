@@ -29,7 +29,7 @@ struct ButtonMap {
 
 // The settings menu's pages; the stereo rows are on Page3D and the stick
 // deadzones on PageControls. Empty pages are skipped.
-enum MenuPage : uint8_t { Page3D, PageControls, PageCamera, PageGame, PageCount };
+enum MenuPage : uint8_t { Page3D, PageControls, PageCamera, PageGame, PageMods, PageCount };
 
 // A game setting on the touch-screen menu, saved to settings.ini under `key`.
 struct MenuOption {
