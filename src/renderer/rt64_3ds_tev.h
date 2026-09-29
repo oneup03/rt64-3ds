@@ -20,7 +20,9 @@ struct TevStage {
 struct TevPlan {
     int stages = 0;
     TevStage stage[6];
-    int fallbacks = 0;      // inputs that could not be expressed exactly
+    int combiner_stages = 0;    // the combiner's own; fog and blend-factor stages follow
+    uint32_t buffer_color = 0;  // the second constant, read as PREVIOUS_BUFFER
+    int fallbacks = 0;          // constants that could not be expressed exactly
 };
 
 // Plans the combiner of a draw (both cycles when in 2-cycle mode), plus the

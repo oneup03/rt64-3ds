@@ -477,7 +477,7 @@ private:
             g_progress.draw_index = (uint32_t)i;
             g_progress_draw = &d;
             if (d.count < 3 || d.first + d.count > n) continue;
-            apply_state(d, fallbacks);
+            apply_state(d, pass == 0 ? &fallbacks : nullptr);
             {
                 float sa = 0.0f, sb = 0.0f;
                 if (sfd.on) {
@@ -684,7 +684,8 @@ private:
         last_plan_.stages = -1;
     }
 
-    void apply_state(const rt64_3ds::DrawRecord& d, int& fallbacks) {
+    // fallbacks: counts the draws whose combiner is inexact (null: don't).
+    void apply_state(const rt64_3ds::DrawRecord& d, int* fallbacks) {
         u64 tp0 = tick();
         // Textures.
         float us = 1.0f, vs = 1.0f, us1 = 1.0f, vs1 = 1.0f;
@@ -763,9 +764,10 @@ private:
                 rt64_3ds::plan_tev(d, plan_cache_[slot]);
                 plan_keys_[slot] = pk; plan_valid_[slot] = true;
                 plan = &plan_cache_[slot];
-                fallbacks += plan->fallbacks;
             }
-            if (plan->stages != last_plan_.stages || memcmp(plan->stage, last_plan_.stage, sizeof(rt64_3ds::TevStage) * plan->stages) != 0) {
+            plan_fallbacks_ = plan->fallbacks;
+            if (plan->stages != last_plan_.stages || plan->buffer_color != last_plan_.buffer_color ||
+                memcmp(plan->stage, last_plan_.stage, sizeof(rt64_3ds::TevStage) * plan->stages) != 0) {
                 rt64_3ds::apply_tev(*plan);
                 last_plan_ = *plan;
             }
@@ -773,6 +775,7 @@ private:
             memcpy(last_prim_, d.prim, 4); memcpy(last_env_, d.env, 4); memcpy(last_fog_, d.fog, 4);
             last_plf_ = d.prim_lod_frac; last_kind_ = d.kind; last_gm_ = d.geometry_mode;
         }
+        if (fallbacks != nullptr && plan_fallbacks_ != 0) (*fallbacks)++;
         u64 tp2 = tick();
         prof_[1] += tp2 - tp1;
 
@@ -1293,6 +1296,7 @@ public:
     uint32_t last_cc_[2] = { 0, 0 }, last_omh_ = 0, last_oml_ = 0, last_gm_ = 0;
     uint8_t last_prim_[4] = {}, last_env_[4] = {}, last_fog_[4] = {}, last_plf_ = 0, last_kind_ = 0;
     rt64_3ds::TevPlan last_plan_{};
+    int plan_fallbacks_ = 0;            // the current plan's inexact constants
     static constexpr uint32_t kPlanCache = 256;
     rt64_3ds::TevPlan plan_cache_[kPlanCache]{};
     struct PlanKey { uint32_t w[8]; };

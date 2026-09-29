@@ -1,9 +1,12 @@
 // Combiner planner. Each RDP cycle computes (A - B) * C + D per channel; the
 // PICA offers REPLACE, MODULATE, ADD, SUBTRACT, INTERPOLATE and
-// MULTIPLY_ADD per stage with one constant colour per stage. Common forms
-// map to one stage; the general form takes two (SUBTRACT then MULTIPLY_ADD
-// on PREVIOUS). Sources the PICA lacks (noise, LOD fractions, key/convert
-// constants) become constants.
+// MULTIPLY_ADD per stage with one constant colour per stage, plus one more
+// the whole plan shares: the combiner buffer's colour, read as
+// PREVIOUS_BUFFER while no stage updates the buffer. (PRIM - ENV) * TEXEL0
+// + ENV, a common text and HUD combiner, needs both in one stage. Common
+// forms map to one stage; the general form takes two (SUBTRACT then
+// MULTIPLY_ADD on PREVIOUS). Sources the PICA lacks (noise, LOD fractions,
+// key/convert constants) become constants.
 #include "rt64_3ds_tev.h"
 
 #include <cstring>
@@ -102,33 +105,31 @@ GPU_TEVSRC tev_src(Src s, bool& alpha_operand) {
     }
 }
 
-// Fills a stage from an rgb op and an alpha op (either may be null =
-// pass PREVIOUS through). Resolves the constant conflict by keeping the
-// first constant and counting the rest as fallbacks.
-void build_stage(TevStage& st, const Op* rgb, const Op* alpha, const Consts& k, int& fallbacks) {
-    int cid = 0;
-    auto choose = [&](Src s) {
-        int c = const_id(s);
-        if (c == 0) return;
-        if (cid == 0) cid = c;
-        else if (cid != c) {
-            // white/black/half conflicts are tolerable substitutions; others are counted.
-            if (!(c == 3 || c == 4 || c == 7 || cid == 3 || cid == 4 || cid == 7)) fallbacks++;
-        }
+// A constant colour as the stages read it: the RGB part (an RGB operand
+// reading colour) and the alpha part (an alpha operand, or an RGB operand
+// reading alpha) can hold different colours' parts.
+struct ConstSlot {
+    bool has_rgb = false, has_a = false;
+    uint32_t rgb = 0;
+    uint8_t a = 0;
+    bool fits(bool alpha, uint32_t v) const { return alpha ? (!has_a || a == (uint8_t)(v >> 24)) : (!has_rgb || rgb == (v & 0x00FFFFFFu)); }
+    void take(bool alpha, uint32_t v) { if (alpha) { has_a = true; a = (uint8_t)(v >> 24); } else { has_rgb = true; rgb = v & 0x00FFFFFFu; } }
+    uint32_t value() const { return rgb | ((uint32_t)a << 24); }
+};
+
+// Fills a stage from an rgb op and an alpha op (either may be null = pass
+// PREVIOUS through). Each constant goes to the stage's constant, else to
+// the plan's buffer colour; only when both hold other colours is it
+// counted as a fallback (and reads the stage constant).
+void build_stage(TevStage& st, const Op* rgb, const Op* alpha, const Consts& k, ConstSlot& buf, int& fallbacks) {
+    ConstSlot own;
+    auto place = [&](Src s, bool alpha_part) -> GPU_TEVSRC {
+        uint32_t v = const_value(const_id(s), k);
+        if (own.fits(alpha_part, v)) { own.take(alpha_part, v); return GPU_CONSTANT; }
+        if (buf.fits(alpha_part, v)) { buf.take(alpha_part, v); return GPU_PREVIOUS_BUFFER; }
+        fallbacks++;
+        return GPU_CONSTANT;
     };
-    if (rgb) for (int i = 0; i < rgb->n; i++) choose(rgb->s[i]);
-    if (alpha) for (int i = 0; i < alpha->n; i++) choose(alpha->s[i]);
-    // Prim/env alpha constants read the constant's alpha, which for the
-    // shared constant is the same colour's alpha: prefer prim/env over
-    // white/black so the alpha channel is right.
-    st.constant = const_value(cid, k);
-    // Rebuild the constant from the channels: rgb from the rgb constant and
-    // alpha from the alpha constant when they differ.
-    int rgb_c = 0, a_c = 0;
-    if (rgb) for (int i = 0; i < rgb->n; i++) if (rgb_c == 0) rgb_c = const_id(rgb->s[i]);
-    if (alpha) for (int i = 0; i < alpha->n; i++) if (a_c == 0) a_c = const_id(alpha->s[i]);
-    uint32_t rgbv = const_value(rgb_c ? rgb_c : cid, k), av = const_value(a_c ? a_c : cid, k);
-    st.constant = (rgbv & 0x00FFFFFFu) | (av & 0xFF000000u);
 
     for (int i = 0; i < 3; i++) {
         st.src_rgb[i] = GPU_PREVIOUS; st.op_rgb[i] = GPU_TEVOP_RGB_SRC_COLOR;
@@ -140,6 +141,7 @@ void build_stage(TevStage& st, const Op* rgb, const Op* alpha, const Consts& k, 
             bool ao;
             st.src_rgb[i] = tev_src(rgb->s[i], ao);
             st.op_rgb[i] = ao ? GPU_TEVOP_RGB_SRC_ALPHA : GPU_TEVOP_RGB_SRC_COLOR;
+            if (st.src_rgb[i] == GPU_CONSTANT) st.src_rgb[i] = place(rgb->s[i], ao);
         }
     }
     else st.func_rgb = GPU_REPLACE;
@@ -149,16 +151,21 @@ void build_stage(TevStage& st, const Op* rgb, const Op* alpha, const Consts& k, 
             bool ao;
             st.src_a[i] = tev_src(alpha->s[i], ao);
             st.op_a[i] = GPU_TEVOP_A_SRC_ALPHA;
+            if (st.src_a[i] == GPU_CONSTANT) st.src_a[i] = place(alpha->s[i], true);
         }
     }
     else st.func_a = GPU_REPLACE;
+    st.constant = own.value();
 }
 
 }   // namespace
 
 void plan_tev(const DrawRecord& d, TevPlan& plan) {
     plan.stages = 0;
+    plan.combiner_stages = 0;
+    plan.buffer_color = 0;
     plan.fallbacks = 0;
+    ConstSlot buf;
     Consts k;
     k.prim = (uint32_t)d.prim[0] | ((uint32_t)d.prim[1] << 8) | ((uint32_t)d.prim[2] << 16) | ((uint32_t)d.prim[3] << 24);
     k.env = (uint32_t)d.env[0] | ((uint32_t)d.env[1] << 8) | ((uint32_t)d.env[2] << 16) | ((uint32_t)d.env[3] << 24);
@@ -172,13 +179,15 @@ void plan_tev(const DrawRecord& d, TevPlan& plan) {
         // 2-cycle mode go through the combiner like triangles.
         TevStage& st = plan.stage[plan.stages++];
         Op rgb = { GPU_REPLACE, { S_PRIM, S_PRIM, S_PRIM }, 1 }, a = { GPU_REPLACE, { S_PRIM_A, S_PRIM_A, S_PRIM_A }, 1 };
-        build_stage(st, &rgb, &a, k, plan.fallbacks);
+        build_stage(st, &rgb, &a, k, buf, plan.fallbacks);
+        plan.combiner_stages = plan.stages;
         return;
     }
     if (cyc == 2) {   // copy: texel straight through
         TevStage& st = plan.stage[plan.stages++];
         Op rgb = { GPU_REPLACE, { S_TEX0, S_TEX0, S_TEX0 }, 1 }, a = { GPU_REPLACE, { S_TEX0_A, S_TEX0_A, S_TEX0_A }, 1 };
-        build_stage(st, &rgb, &a, k, plan.fallbacks);
+        build_stage(st, &rgb, &a, k, buf, plan.fallbacks);
+        plan.combiner_stages = plan.stages;
         return;
     }
 
@@ -208,9 +217,11 @@ void plan_tev(const DrawRecord& d, TevPlan& plan) {
             const Op* r = i < nr ? &rgb[i] : nullptr;
             const Op* a = i < na ? &alpha[i] : nullptr;
             // When one channel finishes early its later stages pass PREVIOUS.
-            build_stage(st, r, a, k, plan.fallbacks);
+            build_stage(st, r, a, k, buf, plan.fallbacks);
         }
     }
+
+    plan.combiner_stages = plan.stages;
 
     // Fog: the blender mixes the fog colour by the shade alpha (fog factor).
     if ((d.geometry_mode & 0x00010000) && cycles == 2 && ((d.othermode_l >> 30) & 3) == 3 && ((d.othermode_l >> 26) & 3) == 2 && plan.stages < 6) {
@@ -218,12 +229,12 @@ void plan_tev(const DrawRecord& d, TevPlan& plan) {
         Op rgb = { GPU_INTERPOLATE, { S_PRIM, S_COMBINED, S_SHADE_A }, 3 };   // src0 * src2 + src1 * (1 - src2)
         Consts kf = k;
         kf.prim = (uint32_t)d.fog[0] | ((uint32_t)d.fog[1] << 8) | ((uint32_t)d.fog[2] << 16) | ((uint32_t)d.fog[3] << 24);
-        build_stage(st, &rgb, nullptr, kf, plan.fallbacks);
+        build_stage(st, &rgb, nullptr, kf, buf, plan.fallbacks);
     }
     if (plan.stages == 0) {
         TevStage& st = plan.stage[plan.stages++];
         Op rgb = { GPU_REPLACE, { S_SHADE, S_SHADE, S_SHADE }, 1 }, a = { GPU_REPLACE, { S_SHADE_A, S_SHADE_A, S_SHADE_A }, 1 };
-        build_stage(st, &rgb, &a, k, plan.fallbacks);
+        build_stage(st, &rgb, &a, k, buf, plan.fallbacks);
     }
 
     // Blend factor: the PICA blends by the fragment's alpha, the blender
@@ -255,12 +266,17 @@ void plan_tev(const DrawRecord& d, TevPlan& plan) {
             else a = { GPU_REPLACE, { S_SHADE_A, S_SHADE_A, S_SHADE_A }, 1 };
             Consts kf = k;   // the fog colour rides in the stage constant
             kf.prim = (uint32_t)d.fog[0] | ((uint32_t)d.fog[1] << 8) | ((uint32_t)d.fog[2] << 16) | ((uint32_t)d.fog[3] << 24);
-            build_stage(st, &rgb, &a, kf, plan.fallbacks);
+            build_stage(st, &rgb, &a, kf, buf, plan.fallbacks);
         }
     }
+    plan.buffer_color = buf.value();
 }
 
 void apply_tev(const TevPlan& plan) {
+    // The buffer colour is the plan's second constant: no stage writes the
+    // buffer, so every PREVIOUS_BUFFER read returns it.
+    C3D_TexEnvBufUpdate(C3D_Both, 0);
+    C3D_TexEnvBufColor(plan.buffer_color);
     for (int i = 0; i < 6; i++) {
         C3D_TexEnv* env = C3D_GetTexEnv(i);
         if (i < plan.stages) {
