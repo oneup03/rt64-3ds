@@ -379,8 +379,15 @@ make_render_context(uint8_t* rdram, ultramodern::renderer::WindowHandle handle, 
 }
 
 void log_memory(const char* when) {
-    fprintf(stderr, "recomp3ds: %s: app region free %lu KB, linear free %lu KB\n", when,
-            (unsigned long)(osGetMemRegionFree(MEMREGION_APPLICATION) / 1024),
+    // The memory the process got: libctru gives all of it, less the
+    // executable, to the two heaps at start, so heap + linear heap + the
+    // executable is the memory mode (64, 96, 124 MB...). The region's own
+    // size says the same on the console (Azahar reports 96 MB there while
+    // handing out 124 MB), and its free space reads 0 after the split.
+    fprintf(stderr, "recomp3ds: %s: heap %lu KB + linear heap %lu KB (%s; app region %lu KB), linear free %lu KB\n", when,
+            (unsigned long)(envGetHeapSize() / 1024), (unsigned long)(envGetLinearHeapSize() / 1024),
+            envIsHomebrew() ? ".3dsx" : "title",
+            (unsigned long)(osGetMemRegionSize(MEMREGION_APPLICATION) / 1024),
             (unsigned long)(linearSpaceFree() / 1024));
 }
 
