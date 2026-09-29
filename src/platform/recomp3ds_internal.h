@@ -22,6 +22,10 @@ namespace recomp3ds {
     void audio_queue_samples(int16_t* samples, size_t sample_count);
     size_t audio_frames_remaining();
     void audio_set_volume(float v);
+    // Audio off: the audio task is skipped (no microcode work, which the
+    // CPU does here) and silence is queued in place of its output.
+    void audio_set_enabled(bool on);
+    bool audio_enabled();
     // Since the previous call: frames the game queued, frames dropped because
     // the ring was full, and times the DSP had run dry before new samples came.
     struct AudioCounters { uint32_t submitted, dropped, underruns, rate; };

@@ -1,6 +1,7 @@
 // ultramodern audio callbacks on ndsp. The game produces 16-bit stereo at the
 // rate it asks for; ndsp resamples in hardware, so the samples go out as they
 // are, apart from the L/R swap the runtime's byte-swapped RDRAM imposes.
+#include <atomic>
 #include <3ds.h>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +22,7 @@ ndspWaveBuf g_bufs[kNumBufs];
 int16_t* g_storage[kNumBufs];
 int g_next = 0;
 float g_volume = 1.0f;
+std::atomic<bool> g_enabled{ true };     // the menu's Audio setting
 bool g_started = false;
 volatile uint32_t g_submitted = 0, g_dropped = 0, g_underruns = 0;
 
@@ -95,6 +97,8 @@ bool recomp3ds::audio_init() {
 }
 
 void recomp3ds::audio_set_volume(float v) { g_volume = v; }
+void recomp3ds::audio_set_enabled(bool on) { g_enabled = on; }
+bool recomp3ds::audio_enabled() { return g_enabled; }
 
 void recomp3ds::audio_set_frequency(uint32_t freq) {
     g_rate = freq;
@@ -133,10 +137,13 @@ void recomp3ds::audio_queue_samples(int16_t* samples, size_t sample_count) {
         }
         int16_t* dst = g_storage[g_next];
         const int16_t* src = samples + done * 2;
+        // With audio off the task that fills `samples` was skipped: silence,
+        // queued all the same so the game's pacing does not change.
+        const float vol = g_enabled ? g_volume : 0.0f;
         for (size_t i = 0; i < n; i++) {
             // Swap the pair: RDRAM halfwords are stored xor 2, so L and R arrive reversed.
-            dst[i * 2 + 0] = (int16_t)(src[i * 2 + 1] * g_volume);
-            dst[i * 2 + 1] = (int16_t)(src[i * 2 + 0] * g_volume);
+            dst[i * 2 + 0] = (int16_t)(src[i * 2 + 1] * vol);
+            dst[i * 2 + 1] = (int16_t)(src[i * 2 + 0] * vol);
         }
         DSP_FlushDataCache(dst, n * 2 * sizeof(int16_t));
         wb->data_pcm16 = dst;

@@ -49,7 +49,15 @@ RspExitReason timed_ucode(uint8_t* rdram, uint32_t ucode_addr) {
     return r;
 }
 
+// Audio off: the audio task completes at once, doing nothing.
+RspExitReason audio_off_ucode(uint8_t*, uint32_t) {
+    return RspExitReason::Broke;
+}
+
 RspUcodeFunc* timed_get_ucode(const OSTask* task) {
+    if (task->t.type == M_AUDTASK && !recomp3ds::audio_enabled()) {
+        return audio_off_ucode;
+    }
     RspUcodeFunc* f = g_game_get_ucode(task);
     if (f == nullptr) {
         return nullptr;

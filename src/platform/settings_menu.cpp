@@ -81,6 +81,12 @@ int g_cpu_new = 1;
 const char* const kCpuNames[] = { "Old 3DS", "New 3DS" };
 void apply_cpu(int v) { recomp3ds::set_cpu_speed(v != 0); }
 
+// Audio on or off: off skips the audio microcode, which the CPU runs here,
+// for speed (an Old 3DS).
+int g_audio_on = 1;
+const char* const kAudioNames[] = { "Off", "On" };
+void apply_audio(int v) { recomp3ds::audio_set_enabled(v != 0); }
+
 // Stick deadzones in percent of the travel.
 int g_stick_dz = 5, g_cstick_dz = 20;
 void apply_deadzones(int) { recomp3ds::input_set_deadzones(g_stick_dz, g_cstick_dz); }
@@ -335,6 +341,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     // After the game's rows: where C-Up is a camera (DK64's first person) it
     // follows the game's camera settings.
     add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, PageControls, 1, nullptr });
+    add_row({ "audio", "Audio", 0, 1, &g_audio_on, kAudioNames, false, nullptr, apply_audio, PageGame, 1, nullptr });
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
     if (is_new_3ds) add_row({ "cpu_speed", "CPU speed", 0, 1, &g_cpu_new, kCpuNames, false, nullptr, apply_cpu, PageGame, 1, nullptr });
