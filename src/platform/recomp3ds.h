@@ -45,6 +45,15 @@ struct MenuOption {
     const char* zero_text = nullptr;    // shown for 0 instead of the number ("Off")
 };
 
+// A game's starting value for a menu row by its key, the library's own rows
+// included (3D depth "separation", "convergence_tenths",
+// "stereo_ghost_contrast", "stick_deadzone", "cstick_deadzone",
+// "cstick_up", ...); settings.ini, once written, overrides it.
+struct MenuDefault {
+    const char* key;
+    int value;
+};
+
 struct GameDesc {
     std::u8string game_id;              // u8"DK64": also the stored ROM name (<id>.z64) and save name
     const char* sd_dir = "";            // folder under sdmc:/3ds/ holding the ROM, saves and settings
@@ -68,6 +77,9 @@ struct GameDesc {
     // Optional: game settings shown on the menu after the stereo ones.
     const MenuOption* menu_options = nullptr;
     size_t menu_option_count = 0;
+    // Optional: the game's defaults for rows, the library's included.
+    const MenuDefault* menu_defaults = nullptr;
+    size_t menu_default_count = 0;
 };
 
 // Brings up the console, registers the game and runs the runtime. Returns the

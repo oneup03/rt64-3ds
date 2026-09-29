@@ -8,9 +8,10 @@
 //
 // The 3D page holds the stereo rows: the 3D slider sets the strength, these
 // its shape (the owner's desktop settings, same units and defaults). The
-// stick deadzones start the Controls page and C-Stick up ends the Camera
-// page; the game's own options (GameDesc::menu_options) go on the pages
-// they name.
+// stick deadzones start the Controls page and C-Stick up follows the
+// game's rows there; the game's own options (GameDesc::menu_options) go on
+// the pages they name, and GameDesc::menu_defaults can change any row's
+// default. A page with more rows than fit scrolls.
 #include <3ds.h>
 #include <cstdio>
 #include <cstring>
@@ -27,13 +28,24 @@ char g_path[160] = "";
 bool g_open = false, g_dirty = false, g_redraw = true;
 u64 g_changed_at = 0;
 int g_page = 0;
-int g_sel = -1;                         // slot on the page, -1 = the tab row
+int g_sel = -1;                         // row of the page, -1 = the tab row
+int g_top = 0;                          // the page's first visible row
 
 // Console layout (40 x 30 characters): the game's name on row 0 and the
 // stats on row 2 belong to recomp3ds_run.cpp, as do the HOME prompt (rows
 // 23-26) and the capture message (row 28).
 constexpr int kHintRow = 4, kTabRow = 6, kFirstRow = 8, kRowStep = 2, kLastRow = 22;
-constexpr int kSlots = 7;               // rows 8..20; row 22 is the page's note
+constexpr int kSlots = 7;               // rows 8..20 visible; row 22 is the page's note
+// A page with more rows scrolls: markers on the note's line (only the 3D
+// page has a note, and it does not scroll) show there are more above or
+// below, and tapping one scrolls.
+constexpr int kMoreRow = kLastRow, kMoreUpCol = 22, kMoreDownCol = 32;
+// Touch: a target is its text line and this many pixels either side, so a
+// touch between two neighbouring targets hits neither.
+constexpr int kTouchPad = 3;
+// Contact must be gone this many updates (~60 a second) to count as lifted:
+// the panel drops it for a frame now and then, which read as a second tap.
+constexpr int kLiftFrames = 4;
 constexpr int kMinusCol = 16, kValueWidth = 11, kPlusCol = 35;
 
 const char* const kPageNames[recomp3ds::PageCount] = { "3D", "Controls", "Camera", "Game", "Mods" };
@@ -83,24 +95,25 @@ void add_row(const Row& r) {
     if (g_row_count < kMaxRows) g_rows[g_row_count++] = r;
 }
 
-// The rows of the current page, in order.
+// The rows of a page, in order.
 int page_rows(int page, int* out) {
     int n = 0;
-    for (int i = 0; i < g_row_count && n < kSlots; i++) {
+    for (int i = 0; i < g_row_count; i++) {
         if (g_rows[i].page == page) out[n++] = i;
     }
     return n;
 }
 int page_count(int page) {
-    int idx[kSlots];
+    int idx[kMaxRows];
     return page_rows(page, idx);
 }
 
-int slot_line(int slot) { return kFirstRow + slot * kRowStep; }
+bool visible(int slot) { return slot >= g_top && slot < g_top + kSlots; }
+int slot_line(int slot) { return kFirstRow + (slot - g_top) * kRowStep; }
 
 void draw_row(int slot) {
-    int idx[kSlots];
-    if (slot < 0 || slot >= page_rows(g_page, idx)) return;
+    int idx[kMaxRows];
+    if (slot < 0 || slot >= page_rows(g_page, idx) || !visible(slot)) return;
     const Row& r = g_rows[idx[slot]];
     char val[24];
     if (r.names != nullptr) snprintf(val, sizeof(val), "%s", r.names[*r.value - r.lo]);
@@ -146,7 +159,19 @@ void draw_page() {
     blank_rows(kFirstRow - 1, kLastRow);
     const int n = page_count(g_page);
     for (int s = 0; s < n; s++) draw_row(s);
+    if (g_top > 0) printf("\x1b[%d;%dH^ more", kMoreRow, kMoreUpCol);
+    if (g_top + kSlots < n) printf("\x1b[%d;%dHv more", kMoreRow, kMoreDownCol);
     if (g_page == recomp3ds::Page3D) printf("\x1b[%d;0H3D slider: strength.  HUD 50: on screen.", kLastRow);
+}
+
+// Scrolls so that the first visible row is `top`.
+void scroll_to(int top) {
+    const int n = page_count(g_page);
+    if (top > n - kSlots) top = n - kSlots;
+    if (top < 0) top = 0;
+    if (top == g_top) return;
+    g_top = top;
+    draw_page();
 }
 
 void draw() {
@@ -186,7 +211,7 @@ void changed() {
 }
 
 void step(int slot, int d) {
-    int idx[kSlots];
+    int idx[kMaxRows];
     if (slot < 0 || slot >= page_rows(g_page, idx)) return;
     Row& r = g_rows[idx[slot]];
     int v = *r.value + d * r.step;
@@ -207,6 +232,11 @@ void select_slot(int s) {
     const int old = g_sel;
     g_sel = s;
     if (old < 0 || s < 0) draw_tabs();
+    // Scroll the chosen row into view (redraws the page), else redraw the two.
+    const int top = g_top;
+    if (s >= 0 && s < g_top) scroll_to(s);
+    else if (s >= g_top + kSlots) scroll_to(s - kSlots + 1);
+    if (g_top != top) return;
     draw_row(old);
     draw_row(s);
 }
@@ -214,6 +244,7 @@ void select_slot(int s) {
 void set_page(int p) {
     if (p == g_page || p < 0 || p >= recomp3ds::PageCount || page_count(p) == 0) return;
     g_page = p;
+    g_top = 0;
     draw_tabs();
     draw_page();
 }
@@ -224,6 +255,59 @@ void turn_page(int d) {
         const int p = (g_page + d * k + recomp3ds::PageCount * 2) % recomp3ds::PageCount;
         if (page_count(p) != 0) { set_page(p); return; }
     }
+}
+
+// What a touch at (x, y) lands on.
+enum TouchKind { TouchNone, TouchTab, TouchMinus, TouchPlus, TouchLabel, TouchUp, TouchDown };
+struct TouchTarget {
+    TouchKind kind = TouchNone;
+    int arg = 0;                        // the page of a tab, the row of the others
+    bool operator==(const TouchTarget& o) const { return kind == o.kind && arg == o.arg; }
+};
+
+TouchTarget touch_target(int x, int y) {
+    const int col = x / 8;
+    auto on_line = [&](int line) { return y >= line * 8 - kTouchPad && y < line * 8 + 8 + kTouchPad; };
+    if (on_line(kTabRow)) {
+        for (int p = 0; p < recomp3ds::PageCount; p++) {
+            if (g_tab_col[p] >= 0 && col >= g_tab_col[p] && col < g_tab_col[p] + (int)strlen(kPageNames[p]) + 2) return { TouchTab, p };
+        }
+        return {};
+    }
+    if (on_line(kMoreRow)) {
+        if (col >= kMoreDownCol - 1) return g_top + kSlots < page_count(g_page) ? TouchTarget{ TouchDown, 0 } : TouchTarget{};
+        if (col >= kMoreUpCol - 1) return g_top > 0 ? TouchTarget{ TouchUp, 0 } : TouchTarget{};
+        return {};
+    }
+    for (int v = 0; v < kSlots; v++) {
+        if (!on_line(kFirstRow + v * kRowStep)) continue;
+        const int s = g_top + v;
+        if (s >= page_count(g_page)) return {};
+        if (col >= kMinusCol - 1 && col <= kMinusCol + 5) return { TouchMinus, s };
+        if (col >= kPlusCol - 1 && col <= kPlusCol + 5) return { TouchPlus, s };
+        if (col < kMinusCol - 1) return { TouchLabel, s };
+        return {};
+    }
+    return {};
+}
+
+void touch_act(const TouchTarget& t) {
+    switch (t.kind) {
+        case TouchTab: set_page(t.arg); select_slot(-1); break;
+        case TouchMinus: case TouchPlus: select_slot(t.arg); step(t.arg, t.kind == TouchPlus ? 1 : -1); break;
+        case TouchLabel: select_slot(t.arg); break;
+        case TouchUp: scroll_to(g_top - 1); break;
+        case TouchDown: scroll_to(g_top + 1); break;
+        default: break;
+    }
+}
+
+// Held, these repeat: the scroll markers and [-]/[+] on number rows.
+bool touch_repeats(const TouchTarget& t) {
+    if (t.kind == TouchUp || t.kind == TouchDown) return true;
+    if (t.kind != TouchMinus && t.kind != TouchPlus) return false;
+    int idx[kMaxRows];
+    return t.arg < page_rows(g_page, idx) && g_rows[idx[t.arg]].names == nullptr;
 }
 
 }   // namespace
@@ -248,12 +332,20 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
         const MenuOption& o = desc.menu_options[i];
         add_row({ o.key, o.label, o.lo, o.hi, o.value, o.names, false, o.suffix, o.on_change, o.page, o.step > 0 ? o.step : 1, o.zero_text });
     }
-    // After the game's camera rows: in a game where C-Up is a camera
-    // (DK64's first person), this is a camera setting.
-    add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, PageCamera, 1, nullptr });
+    // After the game's rows: where C-Up is a camera (DK64's first person) it
+    // follows the game's camera settings.
+    add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, PageControls, 1, nullptr });
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
     if (is_new_3ds) add_row({ "cpu_speed", "CPU speed", 0, 1, &g_cpu_new, kCpuNames, false, nullptr, apply_cpu, PageGame, 1, nullptr });
+    // The game's defaults, then what settings.ini holds.
+    for (size_t d = 0; d < desc.menu_default_count; d++) {
+        const MenuDefault& md = desc.menu_defaults[d];
+        for (int i = 0; i < g_row_count; i++) {
+            const Row& r = g_rows[i];
+            if (strcmp(md.key, r.key) == 0) *r.value = md.value < r.lo ? r.lo : md.value > r.hi ? r.hi : md.value;
+        }
+    }
     load();
     for (int i = 0; i < g_row_count; i++) {
         if (g_rows[i].on_change != nullptr) g_rows[i].on_change(*g_rows[i].value);
@@ -312,44 +404,40 @@ void recomp3ds::settings_menu_update() {
             }
         }
 
-        // Touch: a tab, [-]/[+] on a row (held to repeat, choice rows only
-        // on the press), or the row's label to choose it.
-        static bool was_down = false;
+        // Touch: a tab, [-]/[+] on a row, the row's label to choose it, or
+        // a scroll marker. A touch acts once its position has settled (its
+        // second update), on what it landed on, and after that only on that
+        // same target until it lifts: held on a repeating one, and while
+        // still on it.
+        static int contact_frames = 0, lift_frames = kLiftFrames;
+        static TouchTarget locked;
+        static bool acted = false;
         static u64 next_touch = 0;
         int tx = 0, ty = 0;
-        bool touch = false;
-        if (autotest_touch(&tx, &ty)) touch = true;
+        bool contact = false;
+        if (autotest_touch(&tx, &ty)) contact = true;
         else if (hidKeysHeld() & KEY_TOUCH) {
             touchPosition tp;
             hidTouchRead(&tp);
             tx = tp.px; ty = tp.py;
-            touch = true;
+            contact = true;
         }
-        bool press = touch && !was_down, tfire = false;
-        if (press) { tfire = true; next_touch = now + SYSCLOCK_ARM11 * 2 / 5; }
-        else if (touch && now >= next_touch) { tfire = true; next_touch = now + SYSCLOCK_ARM11 / 12; }
-        was_down = touch;
-        if (tfire) {
-            const int col = tx / 8, line = ty / 8;
-            if (press && line >= kTabRow - 1 && line <= kTabRow) {
-                for (int p = recomp3ds::PageCount - 1; p >= 0; p--) {
-                    if (g_tab_col[p] >= 0 && col >= g_tab_col[p]) { set_page(p); select_slot(-1); break; }
-                }
-            }
-            else {
-                // Each row owns its line and the one above it.
-                const int s = line >= kFirstRow - 1 ? (line - kFirstRow + 1) / kRowStep : -1;
-                const Row* r = nullptr;
-                int idx[kSlots];
-                if (s >= 0 && s < page_rows(g_page, idx)) r = &g_rows[idx[s]];
-                if (r != nullptr) {
-                    int d = 0;
-                    if (col >= kMinusCol - 1 && col <= kMinusCol + 5) d = -1;
-                    else if (col >= kPlusCol - 1 && col <= kPlusCol + 5) d = 1;
-                    if (d != 0 && (press || r->names == nullptr)) { select_slot(s); step(s, d); }
-                    else if (press && col < kMinusCol - 1) select_slot(s);
-                }
-            }
+        if (contact) { lift_frames = 0; contact_frames++; }
+        else if (lift_frames < kLiftFrames) lift_frames++;
+        if (!contact && lift_frames >= kLiftFrames) {
+            contact_frames = 0;
+            acted = false;
+            locked = {};
+        }
+        else if (contact && !acted && contact_frames >= 2) {
+            locked = touch_target(tx, ty);
+            touch_act(locked);
+            acted = true;
+            next_touch = now + SYSCLOCK_ARM11 / 2;
+        }
+        else if (contact && acted && now >= next_touch && touch_repeats(locked)) {
+            if (touch_target(tx, ty) == locked) touch_act(locked);
+            next_touch = now + SYSCLOCK_ARM11 / 12;
         }
     }
     prev = keys;
