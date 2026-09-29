@@ -30,8 +30,10 @@ StereoClass classify_draw(const DrawRecord& d, const RenderDesc& desc) {
         const StereoRule& r = desc.rules[i];
         if (!in_rule(d.proj_id, r.id_lo, r.id_hi)) continue;
         if (r.kind == ProjKind::Any || (r.kind == ProjKind::Perspective) == d.perspective) {
-            // Z_CMP and Z_UPD (othermode L bits 4, 5) both clear.
-            if (r.cls == StereoClass::World && desc.depthless_world_is_hud && (d.othermode_l & 0x30) == 0) return StereoClass::Hud;
+            // Z_CMP and Z_UPD (othermode L bits 4, 5) clear and FORCE_BL
+            // (bit 14) too: an opaque surface with no depth. Blob shadows are
+            // depthless as well but blended, and belong on the ground.
+            if (r.cls == StereoClass::World && desc.depthless_world_is_hud && (d.othermode_l & 0x4030) == 0) return StereoClass::Hud;
             return r.cls;
         }
     }

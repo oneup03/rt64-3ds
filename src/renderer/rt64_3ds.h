@@ -43,9 +43,10 @@ struct RenderDesc {
     // frame (N64 compressed format, sampled on a 4x4 grid): for games that
     // read depth on the CPU (DK64's camera wall avoidance).
     bool depth_to_rdram = false;
-    // World-class draws that neither test nor write depth are overlays drawn
-    // in front of the camera (DK64's fairy-camera film card): give them the
-    // HUD's depth instead of their very near world parallax.
+    // Opaque world-class draws that neither test nor write depth are
+    // overlays drawn in front of the camera (DK64's fairy-camera film card):
+    // give them the HUD's depth instead of their very near world parallax.
+    // Blended depthless draws (DK64's blob shadows) stay in the world.
     bool depthless_world_is_hud = false;
     // Always take gSPBranchLessZ's branch, i.e. always the near model of a
     // level-of-detail pair: what the recomp frontends set (RT64's
