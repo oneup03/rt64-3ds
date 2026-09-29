@@ -484,8 +484,9 @@ int recomp3ds::run(const GameDesc& desc) {
     fprintf(stderr, "recomp3ds: %s starting on %s 3DS\n", desc.render.game_name, is_new_3ds ? "a New" : "an Old");
     printf("%s\n", desc.render.game_name);
     log_memory("boot");
-    recomp3ds::settings_menu_init(g_base_path, desc);
+    // Before the settings: a loaded setting's on_change may pick another map.
     recomp3ds::input_set_map(desc.button_map, desc.button_map_count);
+    recomp3ds::settings_menu_init(g_base_path, desc);
     u32 cpu_mhz = log_cpu("boot");
     g_clock_booted = true;
     if (is_new_3ds && g_speedup) {

@@ -5,6 +5,7 @@
 // SELECT belongs to the platform (settings menu, frame capture), and the
 // D-pad to the menu while it is open.
 #include <3ds.h>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -46,12 +47,14 @@ const ButtonMap kDefaultMap[] = {
     { KEY_R | KEY_ZR, N64_R }, { KEY_START, N64_START },
     { KEY_DUP, N64_DUP }, { KEY_DDOWN, N64_DDOWN }, { KEY_DLEFT, N64_DLEFT }, { KEY_DRIGHT, N64_DRIGHT },
 };
-const ButtonMap* g_map = kDefaultMap;
-size_t g_map_count = sizeof(kDefaultMap) / sizeof(kDefaultMap[0]);
+// The menu can switch maps (main thread) while the game thread reads it:
+// pointer and count change together (8 bytes, LDREXD/STREXD).
+struct MapRef { const ButtonMap* map; uint32_t count; };
+std::atomic<MapRef> g_map{ MapRef{ kDefaultMap, sizeof(kDefaultMap) / sizeof(kDefaultMap[0]) } };
 }
 
 void recomp3ds::input_set_map(const ButtonMap* map, size_t count) {
-    if (map != nullptr && count != 0) { g_map = map; g_map_count = count; }
+    if (map != nullptr && count != 0) g_map.store(MapRef{ map, uint32_t(count) });
 }
 
 void recomp3ds::input_set_cstick_buttons(bool on) { g_cstick_buttons = on; }
@@ -186,8 +189,9 @@ bool recomp3ds::input_get(int controller_num, uint16_t* buttons, float* x, float
     }
     uint16_t b = 0;
     const u32 h = g_held & ~settings_menu_keys();
-    for (size_t i = 0; i < g_map_count; i++) {
-        if (h & g_map[i].keys) b |= g_map[i].n64;
+    const MapRef m = g_map.load();
+    for (uint32_t i = 0; i < m.count; i++) {
+        if (h & m.map[i].keys) b |= m.map[i].n64;
     }
     if (g_cstick_buttons) {
         float cx, cy;

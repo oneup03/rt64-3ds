@@ -84,6 +84,10 @@ const char* base_path();
 // that reads the C-Stick as an analog camera turns it off.
 void input_set_cstick_buttons(bool on);
 
+// Swap the button map while running (a setting that repurposes buttons).
+// The array must stay alive; GameDesc.button_map is the one at start.
+void input_set_map(const ButtonMap* map, size_t count);
+
 // The gyroscope (and accelerometer), for games that aim with it: turned on
 // only while wanted (they cost power). The degrees the console turned right
 // (about gravity) and tilted up since the last call, calibrated.

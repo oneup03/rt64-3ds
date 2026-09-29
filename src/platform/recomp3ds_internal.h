@@ -27,8 +27,6 @@ namespace recomp3ds {
     struct AudioCounters { uint32_t submitted, dropped, underruns, rate; };
     AudioCounters audio_take_counters();
 
-    struct ButtonMap;
-    void input_set_map(const ButtonMap* map, size_t count);
     void input_set_deadzones(int stick_percent, int cstick_percent);
     void input_set_cstick_up(bool on);  // C-Stick up presses C-Up (off: nothing)
     void input_poll();
