@@ -437,7 +437,9 @@ private:
         // frame's linear buffer (the other one may still be read by the GPU).
         GpuVertex* vb = vbo_[vbo_idx_];
         size_t n = frame_.verts.size();
-        GSPGPU_FlushDataCache(vb, n * sizeof(GpuVertex));
+        // A full-screen quad after the frame's vertices, for the ghost pass.
+        const bool ghost = n + 6 <= kVboVerts && write_ghost_quad(vb + n);
+        GSPGPU_FlushDataCache(vb, (n + (ghost ? 6 : 0)) * sizeof(GpuVertex));
         C3D_BufInfo* bi = C3D_GetBufInfo();
         BufInfo_Init(bi);
         BufInfo_Add(bi, vb, sizeof(GpuVertex), 3, 0x210);
@@ -497,6 +499,7 @@ private:
                 BufInfo_Add(bi, vb, sizeof(GpuVertex), 3, 0x210);
             }
         }
+        if (ghost && sfd.on) ghost_pass((uint32_t)n);
         }   // eye passes
         {
             u64 tl1 = svcGetSystemTick();
@@ -588,6 +591,49 @@ private:
             if (src[tr * (row / 4) + off] != dst[tr * ((row + gap) / 4) + off]) bad++;
         }
         fprintf(stderr, "rt64-3ds: snapshot copy %u: %u/512 words differ from the frame\n", snapshots_, bad);
+    }
+
+    // Ghost reduction, the desktop's GhostReduce (StereoComposePS.hlsl):
+    // (c - 0.5) * contrast + 0.5, then v * (1 - floor) + floor, on each eye's
+    // finished image. That is one affine map, c * A + B, drawn as a quad of
+    // colour B blended over the eye with the constant blend colour A. Frame
+    // copies taken from the eye (the pause background, the zipper) get it
+    // again when drawn, a second, slighter squeeze.
+    float ghost_a_ = 1.0f;
+    bool write_ghost_quad(GpuVertex* q) {
+        const rt64_3ds::Settings& st = rt64_3ds::settings();
+        const float c = (float)st.ghost_contrast / 100.0f, f = (float)st.ghost_black_floor / 100.0f;
+        if (c >= 1.0f && f <= 0.0f) return false;
+        ghost_a_ = c * (1.0f - f);
+        const float b = (0.5f - 0.5f * c) * (1.0f - f) + f;
+        const uint8_t bb = (uint8_t)(b * 255.0f + 0.5f);
+        const float xs[6] = { -40, 360, 360, -40, 360, -40 }, ys[6] = { 0, 0, 240, 0, 240, 240 };
+        for (int i = 0; i < 6; i++) {
+            q[i] = GpuVertex{ xs[i], ys[i], 0.0f, 1.0f, 0.0f, 0.0f, bb, bb, bb, 255 };
+        }
+        return true;
+    }
+    void ghost_pass(uint32_t first) {
+        for (int i = 0; i < 6; i++) {
+            C3D_TexEnv* env = C3D_GetTexEnv(i);
+            C3D_TexEnvInit(env);
+            if (i == 0) C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
+            else C3D_TexEnvSrc(env, C3D_Both, GPU_PREVIOUS, GPU_PREVIOUS, GPU_PREVIOUS);
+            C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+        }
+        const u32 a = (u32)(ghost_a_ * 255.0f + 0.5f);
+        C3D_BlendingColor(a | (a << 8) | (a << 16) | 0xFF000000u);
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_CONSTANT_COLOR, GPU_ZERO, GPU_ONE);
+        C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+        C3D_AlphaTest(false, GPU_ALWAYS, 0);
+        C3D_SetScissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, 0.0f, 0.0f, 0.0f, 0.0f);
+        C3D_DrawArrays(GPU_TRIANGLES, first, 6);
+        // Everything the draws cache is stale now.
+        last_sa_ = last_sb_ = 1e30f;
+        last_cc_[0] = last_cc_[1] = 0xFFFFFFFFu;
+        last_misc_ = ~0ull;
+        last_plan_.stages = -1;
     }
 
     void apply_state(const rt64_3ds::DrawRecord& d, int& fallbacks) {

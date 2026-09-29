@@ -72,7 +72,11 @@ struct Settings {
     int comfort_target = 0;           // auto-convergence pop-out budget, thousandths of width (-20..30)
     bool hud_on_bottom = true;
     bool show_fps = true;
-    bool ghost_reduction = false;
+    // Ghost reduction, the desktop's anti-crosstalk range compression (only
+    // while 3D is on): contrast squeezes each eye towards mid-grey, the black
+    // floor lifts blacks. 100 and 0 are off.
+    int ghost_contrast = 100;         // 50..100 percent
+    int ghost_black_floor = 0;        // 0..20 percent
     float slider_gain = 0.5f;         // scales the desktop separation range down for the 3DS panel
 };
 Settings& settings();

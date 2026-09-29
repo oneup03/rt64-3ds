@@ -230,6 +230,9 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "hud_depth", "HUD depth", 0, 100, &st.hud_depth, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
     add_row({ "auto_convergence", "Auto conv.", 0, 1, &g_auto, kOffOn, false, nullptr, apply_auto, Page3D, 1, nullptr });
     add_row({ "comfort_target", "Comfort", -20, 30, &st.comfort_target, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
+    // The desktop's ghost reduction: 100% contrast and a 0% floor are off.
+    add_row({ "stereo_ghost_contrast", "Ghost contr.", 50, 100, &st.ghost_contrast, nullptr, false, "%", nullptr, Page3D, 1, nullptr });
+    add_row({ "stereo_ghost_black_floor", "Black floor", 0, 20, &st.ghost_black_floor, nullptr, false, "%", nullptr, Page3D, 1, nullptr });
     add_row({ "stick_deadzone", "Circle Pad dz", 0, 50, &g_stick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
     add_row({ "cstick_deadzone", "C-Stick dz", 0, 50, &g_cstick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
     for (size_t i = 0; i < desc.menu_option_count; i++) {
