@@ -84,14 +84,14 @@ struct CaptureJob {
     uint8_t* rdram = nullptr;        // 16 MB copy, or null for an image-only capture
     uint8_t* frame = nullptr;
     size_t frame_bytes = 0;
-    char frame_name[64] = {};
+    char frame_name[224] = {};
 };
 volatile int g_capture_state = 0;    // 0 idle, 1 writing, 2 written
 
 void write_capture(void* arg) {
     CaptureJob* job = static_cast<CaptureJob*>(arg);
     if (job->rdram != nullptr) {
-        if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_task.bin", "wb")) {
+        if (FILE* f = rt64_3ds::data_fopen("gfx_task.bin", "wb")) {
             fwrite(&job->task, 1, sizeof(OSTask), f);
             for (uint32_t off = 0; off < 16u * 1024 * 1024; off += 65536) fwrite(job->rdram + off, 1, 65536, f);
             fclose(f);
@@ -171,7 +171,7 @@ public:
             // STORE_DEBUG.TXT: every draw of the frame 3 frames after each store.
             static int store_debug = -1;
             if (store_debug < 0) {
-                FILE* f = fopen("sdmc:/3ds/DK64/STORE_DEBUG.TXT", "r");
+                FILE* f = rt64_3ds::data_fopen("STORE_DEBUG.TXT", "r");
                 store_debug = f ? 1 : 0;
                 if (f) fclose(f);
             }
@@ -362,7 +362,7 @@ private:
         C3D_CullFace(GPU_CULL_NONE);
         ok_ = true;
         // GPU_DEBUG.TXT: "<start frame> <frame count> <sync 0/1> <every N frames>" (defaults 0, all, 1, 1).
-        if (FILE* f = fopen("sdmc:/3ds/DK64/GPU_DEBUG.TXT", "r")) {
+        if (FILE* f = rt64_3ds::data_fopen("GPU_DEBUG.TXT", "r")) {
             int a = 0, b = 1000000000, c = 1, d = 1;
             if (fscanf(f, "%d %d %d %d", &a, &b, &c, &d) < 1) { a = 0; }
             fclose(f);
@@ -370,7 +370,7 @@ private:
             debug_from_ = (uint32_t)a; debug_count_ = (uint32_t)b; debug_sync_ = c != 0; debug_step_ = d > 0 ? (uint32_t)d : 1;
             fprintf(stderr, "rt64-3ds: GPU debug mode from frame %u for %u frames, sync %d, every %u\n", debug_from_, debug_count_, (int)debug_sync_, debug_step_);
         }
-        if (FILE* f = fopen("sdmc:/3ds/DK64/PROFILE.TXT", "r")) { prof_on_ = true; fclose(f); }
+        if (FILE* f = rt64_3ds::data_fopen("PROFILE.TXT", "r")) { prof_on_ = true; fclose(f); }
         fprintf(stderr, "rt64-3ds: citro3d renderer up (linear free %u KB)\n", (unsigned)(linearSpaceFree() / 1024));
     }
 
@@ -599,7 +599,7 @@ private:
             // copy). Emulator only: the console faults on CPU writes to VRAM.
             static int cpu_copy = -1;
             if (cpu_copy < 0) {
-                FILE* f = fopen("sdmc:/3ds/DK64/SNAPSHOT_CPU.TXT", "r");
+                FILE* f = rt64_3ds::data_fopen("SNAPSHOT_CPU.TXT", "r");
                 cpu_copy = f ? 1 : 0;
                 if (f) fclose(f);
             }
@@ -819,7 +819,7 @@ private:
         // Scissor in N64 pixels -> target pixels (rotated framebuffer).
         // NO_SCISSOR.TXT disables it (to see draws a wrong clip would hide).
         static int no_scissor = -1;
-        if (no_scissor < 0) { FILE* f = fopen("sdmc:/3ds/DK64/NO_SCISSOR.TXT", "r"); no_scissor = f ? 1 : 0; if (f) fclose(f); }
+        if (no_scissor < 0) { FILE* f = rt64_3ds::data_fopen("NO_SCISSOR.TXT", "r"); no_scissor = f ? 1 : 0; if (f) fclose(f); }
         int x0 = d.scissor[0] + 40, y0 = d.scissor[1], x1 = d.scissor[2] + 40, y1 = d.scissor[3];
         if (no_scissor) { x0 = 0; y0 = 0; x1 = 400; y1 = 240; }
         // The original game's own 320-wide scissor is stretched to the wide
@@ -845,7 +845,7 @@ public:
         }
         if (want == -2) {
             want = -1;
-            if (FILE* f = fopen("sdmc:/3ds/DK64/GFX_CAPTURE.TXT", "r")) {
+            if (FILE* f = rt64_3ds::data_fopen("GFX_CAPTURE.TXT", "r")) {
                 char word[16] = {};
                 if (fscanf(f, "%15s", word) == 1) {
                     if (strcmp(word, "snap") == 0) capture_snapshot_frames_ = 3;   // the first three frames drawing from a snapshot
@@ -876,7 +876,7 @@ public:
         if (capture_copy_ == nullptr) {
             // No room for a copy: write RDRAM straight away (the game waits
             // on this display list meanwhile, so it holds still).
-            if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_task.bin", "wb")) {
+            if (FILE* f = rt64_3ds::data_fopen("gfx_task.bin", "wb")) {
                 fwrite(task, 1, sizeof(OSTask), f);
                 for (uint32_t off = 0; off < 16u * 1024 * 1024; off += 65536) fwrite(rdram_ + off, 1, 65536, f);
                 fclose(f);
@@ -920,7 +920,7 @@ public:
         if (g_readback_ready >= 0) {
             // In first person: the read-back buffer as a picture too, to check
             // its layout against the frame (gfx_readback.ppm, 400x240).
-            if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_readback.ppm", "wb")) {
+            if (FILE* f = rt64_3ds::data_fopen("gfx_readback.ppm", "wb")) {
                 fprintf(f, "P6\n400 240\n255\n");
                 const u16* src = g_readback[g_readback_ready];
                 for (int sy = 0; sy < 240; sy++) {
@@ -935,7 +935,10 @@ public:
         }
         static int frame_captures = 0;
         CaptureJob* job = new CaptureJob{};
-        snprintf(job->frame_name, sizeof(job->frame_name), frame_captures == 0 ? "sdmc:/3ds/DK64/gfx_frame.ppm" : "sdmc:/3ds/DK64/gfx_frame%d.ppm", frame_captures);
+        char name[32];
+        if (frame_captures == 0) snprintf(name, sizeof(name), "gfx_frame.ppm");
+        else snprintf(name, sizeof(name), "gfx_frame%d.ppm", frame_captures);
+        rt64_3ds::data_path(job->frame_name, sizeof(job->frame_name), name);
         frame_captures++;
         job->frame = frame;
         job->frame_bytes = frame_bytes;

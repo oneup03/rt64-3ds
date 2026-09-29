@@ -4,6 +4,7 @@
 // kept in linear memory keyed by their source and content.
 #include "rt64_3ds_texture.h"
 #include "rt64_3ds_texdecode.h"
+#include "rt64_3ds.h"
 
 #include <cstdio>
 #include <cstring>
@@ -185,13 +186,15 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
     // The file holds the frame number to start at (0 = from boot).
     static int dump_state = -1, dumped = 0, dump_from = 0;
     if (dump_state < 0) {
-        FILE* f = fopen("sdmc:/3ds/DK64/TEX_DUMP.TXT", "r");
+        FILE* f = rt64_3ds::data_fopen("TEX_DUMP.TXT", "r");
         dump_state = f ? 1 : 0;
         if (f) { if (fscanf(f, "%d", &dump_from) != 1) dump_from = 0; fclose(f); }
     }
     if (dump_state == 1 && dumped < 40 && (int)impl_->frame >= dump_from) {
         char path[96];
-        snprintf(path, sizeof(path), "sdmc:/3ds/DK64/tex_%02d.ppm", dumped);
+        char name[24];
+        snprintf(name, sizeof(name), "tex_%02d.ppm", dumped);
+        rt64_3ds::data_path(path, sizeof(path), name);
         FILE* f = fopen(path, "wb");
         if (f) {
             fprintf(f, "P6\n%u %u\n255\n", (unsigned)d.width, (unsigned)d.height);

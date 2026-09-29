@@ -581,6 +581,7 @@ int recomp3ds::run(const GameDesc& desc) {
 
     recomp3ds::audio_init();
     rt64_3ds::set_render_desc(desc.render);
+    rt64_3ds::set_data_dir(g_base_path);   // the renderer's debug switches and captures
 
     // The runtime looks for <config>/<game_id>.z64; put the ROM there by that name.
     recomp::register_game(desc.entry);

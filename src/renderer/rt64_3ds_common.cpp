@@ -2,12 +2,23 @@
 // every renderer implementation.
 #include "rt64_3ds.h"
 
+#include <cstdio>
+
 namespace {
 rt64_3ds::RenderDesc g_desc{};
 rt64_3ds::Settings g_settings{};
 rt64_3ds::FrameStats g_stats{};
 volatile bool g_first_person = false;
 volatile bool g_low_convergence = false;
+char g_data_dir[160] = "sdmc:/3ds";
+}
+
+void rt64_3ds::set_data_dir(const char* dir) { snprintf(g_data_dir, sizeof(g_data_dir), "%s", dir); }
+void rt64_3ds::data_path(char* out, size_t size, const char* name) { snprintf(out, size, "%s/%s", g_data_dir, name); }
+FILE* rt64_3ds::data_fopen(const char* name, const char* mode) {
+    char path[224];
+    data_path(path, sizeof(path), name);
+    return fopen(path, mode);
 }
 
 void rt64_3ds::set_render_desc(const RenderDesc& desc) { g_desc = desc; }

@@ -2,6 +2,7 @@
 #ifndef RT64_3DS_H
 #define RT64_3DS_H
 
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -56,6 +57,12 @@ struct RenderDesc {
 
 void set_render_desc(const RenderDesc& desc);
 const RenderDesc& render_desc();
+
+// The folder the renderer's debug switches (*.TXT) and captures live in:
+// the game's folder on the SD card, which the platform sets at start.
+void set_data_dir(const char* dir);
+void data_path(char* out, size_t size, const char* name);    // dir/name
+FILE* data_fopen(const char* name, const char* mode);
 
 // The ultramodern renderer callback. Runs on the runtime's gfx thread.
 std::unique_ptr<ultramodern::renderer::RendererContext>
