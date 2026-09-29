@@ -93,6 +93,10 @@ void apply_audio(int v) { recomp3ds::audio_set_enabled(v != 0); }
 // from the SD card. A row on no page: loaded and saved, never drawn.
 int g_rom_stream = 0;
 
+// Debugging, settings.ini only: 1 makes a SELECT hold save a frame capture
+// for the host tools (gfx_task.bin, gfx_frame.ppm) instead of a screenshot.
+int g_debug_capture = 0;
+
 // Stick deadzones in percent of the travel.
 int g_stick_dz = 5, g_cstick_dz = 20;
 void apply_deadzones(int) { recomp3ds::input_set_deadzones(g_stick_dz, g_cstick_dz); }
@@ -349,6 +353,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, PageControls, 1, nullptr });
     add_row({ "audio", "Audio", 0, 1, &g_audio_on, kAudioNames, false, nullptr, apply_audio, PageGame, 1, nullptr });
     add_row({ "rom_stream", "ROM stream", 0, 2, &g_rom_stream, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "debug_capture", "Debug capture", 0, 1, &g_debug_capture, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
     if (is_new_3ds) add_row({ "cpu_speed", "CPU speed", 0, 1, &g_cpu_new, kCpuNames, false, nullptr, apply_cpu, PageGame, 1, nullptr });
@@ -370,6 +375,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
 }
 
 int recomp3ds::settings_rom_stream() { return g_rom_stream; }
+bool recomp3ds::settings_debug_capture() { return g_debug_capture != 0; }
 
 void recomp3ds::settings_menu_toggle() {
     g_open = !g_open;

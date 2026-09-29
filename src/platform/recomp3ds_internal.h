@@ -69,6 +69,7 @@ namespace recomp3ds {
     void settings_menu_update();        // ~60 times a second, main thread
     void settings_menu_toggle();
     int settings_rom_stream();          // settings.ini's rom_stream: 0 auto, 1 in memory, 2 from the SD card
+    bool settings_debug_capture();      // settings.ini's debug_capture: a SELECT hold saves a frame capture
     void settings_menu_redraw();        // after something else wrote over the console
     u32  settings_menu_keys();          // 3DS keys the open menu keeps from the game
 

@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/stat.h>
+#include <ctime>
 #include <vector>
 
 #include "rt64_3ds.h"
@@ -106,6 +108,56 @@ void write_capture(void* arg) {
         fprintf(stderr, "rt64-3ds: capture written (gfx_task.bin, %s)\n", job->frame_name + 15);
         g_capture_state = 2;
     }
+    delete job;
+}
+
+// A screenshot on its way to the SD card (see maybe_screenshot): up to three
+// BMP files built in memory, written by a background thread.
+struct ShotJob {
+    uint8_t* file[3] = {};
+    size_t bytes[3] = {};
+    char path[3][224] = {};
+};
+volatile bool g_shot_request = false;
+volatile int g_shot_state = 0;       // 0 idle, 1 writing, 2 written, 3 failed
+char g_shot_name[48] = "";
+
+// A 24-bit BMP of w x h pixels, pixel(x, y) from the top left giving RGB.
+template <class F>
+uint8_t* make_bmp(int w, int h, size_t* bytes, F pixel) {
+    const uint32_t row = (uint32_t)w * 3, pad = (4 - row % 4) % 4, size = 54 + (row + pad) * (uint32_t)h;
+    uint8_t* b = (uint8_t*)calloc(1, size);
+    if (b == nullptr) return nullptr;
+    auto put32 = [&](int at, uint32_t v) { b[at] = v & 0xFF; b[at + 1] = (v >> 8) & 0xFF; b[at + 2] = (v >> 16) & 0xFF; b[at + 3] = v >> 24; };
+    b[0] = 'B'; b[1] = 'M'; put32(2, size); put32(10, 54);
+    put32(14, 40); put32(18, (uint32_t)w); put32(22, (uint32_t)h);
+    b[26] = 1; b[28] = 24; put32(34, size - 54);
+    uint8_t* o = b + 54;
+    for (int i = 0; i < h; i++) {       // bottom row first
+        const int y = h - 1 - i;
+        for (int x = 0; x < w; x++) {
+            uint8_t rgb[3];
+            pixel(x, y, rgb);
+            *o++ = rgb[2]; *o++ = rgb[1]; *o++ = rgb[0];
+        }
+        o += pad;
+    }
+    *bytes = size;
+    return b;
+}
+
+void write_shot(void* arg) {
+    ShotJob* job = static_cast<ShotJob*>(arg);
+    bool ok = true;
+    for (int i = 0; i < 3; i++) {
+        if (job->file[i] == nullptr) continue;
+        FILE* f = fopen(job->path[i], "wb");
+        ok = ok && f != nullptr && fwrite(job->file[i], 1, job->bytes[i], f) == job->bytes[i];
+        if (f != nullptr) fclose(f);
+        free(job->file[i]);
+    }
+    fprintf(stderr, "rt64-3ds: screenshot %s %s\n", g_shot_name, ok ? "written" : "FAILED");
+    g_shot_state = ok ? 2 : 3;
     delete job;
 }
 
@@ -406,6 +458,7 @@ private:
         if (readback) finish_readback();
         if (check_snapshot_) { verify_snapshot(); check_snapshot_ = false; }
         maybe_capture_framebuffer();
+        maybe_screenshot();
         const rt64_3ds::StereoFrame sf = begin_stereo_frame();
         {
             // The finished frame's depth, read once on a grid: the game's
@@ -957,6 +1010,79 @@ public:
         fprintf(stderr, "rt64-3ds: captured gfx frame\n");
     }
 
+    // After C3D_FrameBegin the eye targets still hold the finished frame and
+    // s3d_on_ still says whether it was drawn in 3D: the screenshot is made
+    // here, from VRAM (the CPU may read it) and the touch screen's
+    // framebuffer, and written by a background thread.
+    void maybe_screenshot() {
+        if (!g_shot_request) return;
+        g_shot_request = false;
+        char dir[224];
+        rt64_3ds::data_path(dir, sizeof(dir), "screenshots");
+        mkdir(dir, 0777);
+        // Named by date and time; a second one within the same second gets
+        // a number.
+        static time_t last_time = 0;
+        static int same_second = 0;
+        const time_t now = time(nullptr);
+        same_second = now == last_time ? same_second + 1 : 0;
+        last_time = now;
+        struct tm tm_now;
+        localtime_r(&now, &tm_now);
+        char stamp[32];
+        strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", &tm_now);
+        if (same_second > 0) snprintf(g_shot_name, sizeof(g_shot_name), "%s_%d", stamp, same_second + 1);
+        else snprintf(g_shot_name, sizeof(g_shot_name), "%s", stamp);
+
+        ShotJob* job = new ShotJob{};
+        // An eye target: RGBA8 in 8x8 tiles, 30 per tile row, Morton order
+        // inside; memory row r is screen x, column c is screen y from the
+        // bottom (the tilted 240x400 layout).
+        auto eye = [](C3D_RenderTarget* t) {
+            return [lin = (const uint32_t*)t->frameBuf.colorBuf](int x, int y, uint8_t* rgb) {
+                const uint32_t r = (uint32_t)x, c = 239u - (uint32_t)y;
+                const uint32_t tile = (r >> 3) * 30 + (c >> 3);
+                const uint32_t m = (c & 1) | ((r & 1) << 1) | ((c & 2) << 1) | ((r & 2) << 2) | ((c & 4) << 2) | ((r & 4) << 3);
+                const uint32_t p = lin[tile * 64 + m];
+                rgb[0] = (uint8_t)(p >> 24); rgb[1] = (uint8_t)(p >> 16); rgb[2] = (uint8_t)(p >> 8);
+            };
+        };
+        const char* suffix[3] = { "_top.bmp", "_top_right.bmp", "_bottom.bmp" };
+        job->file[0] = make_bmp(400, 240, &job->bytes[0], eye(top_));
+        if (s3d_on_ && top_r_ != nullptr) job->file[1] = make_bmp(400, 240, &job->bytes[1], eye(top_r_));
+        {
+            // The touch screen: libctru's framebuffer, linear, tilted like
+            // the top screen, RGB565 under the console (else BGR8).
+            u16 fb_w = 0, fb_h = 0;
+            const uint8_t* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fb_w, &fb_h);
+            const bool rgb565 = gfxGetScreenFormat(GFX_BOTTOM) == GSP_RGB565_OES;
+            if (fb != nullptr && fb_w == 240) {
+                job->file[2] = make_bmp(fb_h, 240, &job->bytes[2], [fb, rgb565](int x, int y, uint8_t* rgb) {
+                    const size_t i = (size_t)x * 240 + (239 - y);
+                    if (rgb565) {
+                        const u16 v = ((const u16*)fb)[i];
+                        rgb[0] = (uint8_t)(((v >> 11) & 31) * 255 / 31); rgb[1] = (uint8_t)(((v >> 5) & 63) * 255 / 63); rgb[2] = (uint8_t)((v & 31) * 255 / 31);
+                    }
+                    else { rgb[0] = fb[i * 3 + 2]; rgb[1] = fb[i * 3 + 1]; rgb[2] = fb[i * 3]; }
+                });
+            }
+        }
+        for (int i = 0; i < 3; i++) {
+            char name[96];
+            snprintf(name, sizeof(name), "screenshots/%s%s", g_shot_name, suffix[i]);
+            rt64_3ds::data_path(job->path[i], sizeof(job->path[i]), name);
+        }
+        if (job->file[0] == nullptr) {
+            fprintf(stderr, "rt64-3ds: screenshot: no memory for the image\n");
+            for (int i = 0; i < 3; i++) free(job->file[i]);
+            delete job;
+            g_shot_state = 3;
+            return;
+        }
+        g_shot_state = 1;
+        if (threadCreate(write_shot, job, 32 * 1024, 0x2F, -2, true) == nullptr) write_shot(job);
+    }
+
     static void describe_draw(uint32_t i, const rt64_3ds::DrawRecord& d) {
         fprintf(stderr, "rt64-3ds: draw %u: kind %d first %u count %u cc %06x %08x omh %06x oml %08x gm %06x prim %02x%02x%02x%02x env %02x%02x%02x%02x sc %d,%d-%d,%d",
                 i, (int)d.kind, d.first, d.count, d.cc_w0, d.cc_w1, d.othermode_h, d.othermode_l, d.geometry_mode,
@@ -1332,6 +1458,9 @@ void rt64_3ds::set_quitting() { g_quitting = true; }
 void rt64_3ds::set_paused(bool paused) { g_paused = paused; }
 void rt64_3ds::request_capture() { g_capture_request = true; }
 int rt64_3ds::capture_state() { return g_capture_state; }
+void rt64_3ds::request_screenshot() { g_shot_state = 0; g_shot_request = true; }
+int rt64_3ds::screenshot_state() { return g_shot_state; }
+const char* rt64_3ds::screenshot_name() { return g_shot_name; }
 
 bool rt64_3ds::read_back_frame(uint8_t* rdram, uint32_t fb_addr, uint32_t fb_width, int x, int y, int w, int h) {
     LightLock_Lock(&g_readback_lock);

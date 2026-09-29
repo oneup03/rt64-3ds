@@ -249,8 +249,9 @@ void update_gfx_inner() {
     }
     {
         // SELECT (the game has no use for it): a tap opens or closes the
-        // settings menu; held for a second it captures the next frame for
-        // the host tools instead, and says so on the touch screen.
+        // settings menu; held for a second it saves a screenshot (with
+        // debug_capture=1 in settings.ini, a frame capture for the host
+        // tools instead), and says so on the touch screen.
         static u64 select_since = 0;
         static bool fired = false;
         if ((hidKeysHeld() | recomp3ds::autotest_keys()) & KEY_SELECT) {
@@ -258,8 +259,14 @@ void update_gfx_inner() {
             if (select_since == 0) select_since = now;
             else if (!fired && now - select_since > SYSCLOCK_ARM11) {
                 fired = true;
-                rt64_3ds::request_capture();
-                printf("\x1b[28;0HSaving a frame capture...            ");
+                if (recomp3ds::settings_debug_capture()) {
+                    rt64_3ds::request_capture();
+                    printf("\x1b[28;0H%-39s", "Saving a frame capture...");
+                }
+                else {
+                    rt64_3ds::request_screenshot();
+                    printf("\x1b[28;0H%-39s", "Saving a screenshot...");
+                }
                 gfxFlushBuffers();
             }
         }
@@ -268,13 +275,22 @@ void update_gfx_inner() {
             select_since = 0;
             fired = false;
         }
-        static int shown_state = 0;
+        static int shown_state = 0, shown_shot = 0;
         const int state = rt64_3ds::capture_state();
         if (state == 2 && shown_state != 2) {
-            printf("\x1b[28;0HCapture saved: gfx_task.bin          ");
+            printf("\x1b[28;0H%-39s", "Capture saved: gfx_task.bin");
             gfxFlushBuffers();
         }
         shown_state = state;
+        const int shot = rt64_3ds::screenshot_state();
+        if (shot >= 2 && shown_shot != shot) {
+            char line[48];
+            if (shot == 2) snprintf(line, sizeof(line), "Screenshot %s", rt64_3ds::screenshot_name());
+            else snprintf(line, sizeof(line), "Screenshot failed");
+            printf("\x1b[28;0H%-39.39s", line);
+            gfxFlushBuffers();
+        }
+        shown_shot = shot;
     }
     // Once a second: frame rate and CPU load to the log and the touch screen.
     static u64 last_report = 0;
