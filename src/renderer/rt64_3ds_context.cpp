@@ -32,6 +32,18 @@ constexpr uint32_t kVboVerts = 65536;
 using GpuVertex = rt64_3ds::Vtx3ds;   // the record's vertex is the PICA's attribute layout
 
 #define g_stats rt64_3ds::mutable_stats()
+
+// Frame read-back (rt64_3ds::read_back_frame): while the game is in first
+// person, each finished left eye is converted by the GPU (a display
+// transfer: untiled, RGBA8 to RGB5A1, the N64's RGBA16 bit layout) into one
+// of two linear buffers in turn; the game thread reads the last complete one
+// under g_readback_lock, which also keeps the GPU from refilling it
+// meanwhile. Linear layout as the screen's: pixel (x, y) at x * 240 + 239 - y.
+u16* g_readback[2] = { nullptr, nullptr };
+int g_readback_ready = -1;              // the buffer holding the last finished frame
+LightLock g_readback_lock;
+
+
 int g_debug_gfx_delay_ms = 0;
 volatile bool g_quitting = false;
 
@@ -302,6 +314,8 @@ private:
         AttrInfo_AddLoader(ai, 2, GPU_UNSIGNED_BYTE, 4);
 
         for (int i = 0; i < 2; i++) vbo_[i] = (GpuVertex*)linearAlloc(kVboVerts * sizeof(GpuVertex));
+        LightLock_Init(&g_readback_lock);
+        for (int i = 0; i < 2; i++) g_readback[i] = (u16*)linearAlloc(240 * 400 * sizeof(u16));
         if (vbo_[0] == nullptr || vbo_[1] == nullptr) {
             fprintf(stderr, "rt64-3ds: vertex buffer allocation failed\n");
             return;
@@ -384,10 +398,12 @@ private:
             }
         }
         if (frame_.snapshot_request && snapshot_.data != nullptr) copy_snapshot();
+        const bool readback = start_readback();
         update_vi_blank();
         u64 tb0 = svcGetSystemTick();
         C3D_FrameBegin(0);
         acc_wait_ += svcGetSystemTick() - tb0;
+        if (readback) finish_readback();
         if (check_snapshot_) { verify_snapshot(); check_snapshot_ = false; }
         maybe_capture_framebuffer();
         const rt64_3ds::StereoFrame sf = begin_stereo_frame();
@@ -532,6 +548,38 @@ private:
         prev_m32_ = frame_.cam[14];
         last_uploads_ = textures_.uploads_this_frame();
         textures_.end_frame();
+    }
+
+    // Frame read-back (see read_back_frame): the previous frame's left eye
+    // into the buffer not holding the last finished one. Out of the frame,
+    // like the snapshot copy: citro3d waits for the frame's GPU work first,
+    // and C3D_FrameBegin for the transfer.
+    int readback_next_ = 0;
+    bool start_readback() {
+        if (!rt64_3ds::first_person_scene() || g_readback[0] == nullptr || frames_ < 2) {
+            if (g_readback_ready >= 0) {
+                LightLock_Lock(&g_readback_lock);
+                g_readback_ready = -1;
+                LightLock_Unlock(&g_readback_lock);
+            }
+            return false;
+        }
+        // Never the ready one, the only one a reader touches.
+        const int next = g_readback_ready == 0 ? 1 : 0;
+        constexpr u32 kFlags = GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
+                               GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB5A1) |
+                               GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO);
+        C3D_SyncDisplayTransfer((u32*)top_->frameBuf.colorBuf, GX_BUFFER_DIM(240, 400),
+                                (u32*)g_readback[next], GX_BUFFER_DIM(240, 400), kFlags);
+        readback_next_ = next;
+        return true;
+    }
+    void finish_readback() {
+        // Done now (C3D_FrameBegin waited); drop any stale cached lines.
+        GSPGPU_InvalidateDataCache(g_readback[readback_next_], 240 * 400 * sizeof(u16));
+        LightLock_Lock(&g_readback_lock);
+        g_readback_ready = readback_next_;
+        LightLock_Unlock(&g_readback_lock);
     }
 
     void copy_snapshot() {
@@ -864,6 +912,22 @@ public:
                     uint32_t p = lin[tile * 64 + m];
                     *o++ = (uint8_t)(p >> 24); *o++ = (uint8_t)(p >> 16); *o++ = (uint8_t)(p >> 8);
                 }
+            }
+        }
+        if (g_readback_ready >= 0) {
+            // In first person: the read-back buffer as a picture too, to check
+            // its layout against the frame (gfx_readback.ppm, 400x240).
+            if (FILE* f = fopen("sdmc:/3ds/DK64/gfx_readback.ppm", "wb")) {
+                fprintf(f, "P6\n400 240\n255\n");
+                const u16* src = g_readback[g_readback_ready];
+                for (int sy = 0; sy < 240; sy++) {
+                    for (int sx = 0; sx < 400; sx++) {
+                        const u16 p = src[sx * 240 + 239 - sy];
+                        const uint8_t rgb[3] = { (uint8_t)(((p >> 11) & 31) * 255 / 31), (uint8_t)(((p >> 6) & 31) * 255 / 31), (uint8_t)(((p >> 1) & 31) * 255 / 31) };
+                        fwrite(rgb, 1, 3, f);
+                    }
+                }
+                fclose(f);
             }
         }
         static int frame_captures = 0;
@@ -1261,3 +1325,28 @@ void rt64_3ds::set_quitting() { g_quitting = true; }
 void rt64_3ds::set_paused(bool paused) { g_paused = paused; }
 void rt64_3ds::request_capture() { g_capture_request = true; }
 int rt64_3ds::capture_state() { return g_capture_state; }
+
+bool rt64_3ds::read_back_frame(uint8_t* rdram, uint32_t fb_addr, uint32_t fb_width, int x, int y, int w, int h) {
+    LightLock_Lock(&g_readback_lock);
+    const int ready = g_readback_ready;
+    if (ready < 0) {
+        LightLock_Unlock(&g_readback_lock);
+        fprintf(stderr, "rt64-3ds: frame read-back asked for with no frame kept\n");
+        return false;
+    }
+    const u16* src = g_readback[ready];
+    for (int j = 0; j < h; j++) {
+        const int sy = y + j;
+        if (sy < 0 || sy >= 240) continue;
+        for (int i = 0; i < w; i++) {
+            const int sx = x + i + 40;           // N64 x -> the wide screen
+            if (sx < 0 || sx >= 400) continue;
+            const u16 p = src[sx * 240 + 239 - sy] | 1;
+            const uint32_t a = (fb_addr + ((uint32_t)sy * fb_width + (uint32_t)(x + i)) * 2) & 0xFFFFFE;
+            *(u16*)(rdram + (a ^ 2)) = p;       // RDRAM halfwords sit at address ^ 2
+        }
+    }
+    LightLock_Unlock(&g_readback_lock);
+    fprintf(stderr, "rt64-3ds: frame read back into %06x (%d,%d %dx%d)\n", fb_addr & 0xFFFFFF, x, y, w, h);
+    return true;
+}

@@ -20,8 +20,4 @@ void rt64_3ds::set_low_convergence_scene(bool on) { g_low_convergence = on; }
 bool rt64_3ds::first_person_scene() { return g_first_person; }
 bool rt64_3ds::low_convergence_scene() { return g_low_convergence; }
 
-void rt64_3ds::request_fb_readback(uint32_t fb_addr, int x, int y, int w, int h) {
-    // Nothing to read back until there is a GPU renderer.
-    (void)fb_addr; (void)x; (void)y; (void)w; (void)h;
-}
 

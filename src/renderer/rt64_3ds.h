@@ -87,9 +87,14 @@ void set_low_convergence_scene(bool on);
 bool first_person_scene();
 bool low_convergence_scene();
 
-// Copy a region of the last presented frame back into the game's framebuffer
-// in RDRAM (for effects whose CPU code reads pixels). Synchronous.
-void request_fb_readback(uint32_t fb_addr, int x, int y, int w, int h);
+// Copy a region of the last finished frame (the left eye) into the game's
+// RGBA16 framebuffer in RDRAM, for game code that reads pixels (DK64's fairy
+// camera). The rectangle is in N64 pixels (the 4:3 area; the wide screen
+// adds 40 px either side); fb_width is the framebuffer's width in pixels.
+// Returns immediately; false when no frame is available - frames are kept
+// only while first_person_scene() is set, where the games that need this
+// take their pictures.
+bool read_back_frame(uint8_t* rdram, uint32_t fb_addr, uint32_t fb_width, int x, int y, int w, int h);
 
 // Live progress of the gfx thread, for a watchdog on another thread: which
 // frame and draw it is on. `dump_progress` writes the current draw's state
