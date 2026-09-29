@@ -87,6 +87,12 @@ int g_audio_on = 1;
 const char* const kAudioNames[] = { "Off", "On" };
 void apply_audio(int v) { recomp3ds::audio_set_enabled(v != 0); }
 
+// Where the ROM lives, set in settings.ini only (it takes effect at start,
+// so the menu does not show it): 0 auto (read from the SD card as needed on
+// an Old 3DS, or when the heap is short; else in memory), 1 in memory, 2
+// from the SD card. A row on no page: loaded and saved, never drawn.
+int g_rom_stream = 0;
+
 // Stick deadzones in percent of the travel.
 int g_stick_dz = 5, g_cstick_dz = 20;
 void apply_deadzones(int) { recomp3ds::input_set_deadzones(g_stick_dz, g_cstick_dz); }
@@ -342,6 +348,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     // follows the game's camera settings.
     add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, PageControls, 1, nullptr });
     add_row({ "audio", "Audio", 0, 1, &g_audio_on, kAudioNames, false, nullptr, apply_audio, PageGame, 1, nullptr });
+    add_row({ "rom_stream", "ROM stream", 0, 2, &g_rom_stream, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
     if (is_new_3ds) add_row({ "cpu_speed", "CPU speed", 0, 1, &g_cpu_new, kCpuNames, false, nullptr, apply_cpu, PageGame, 1, nullptr });
@@ -361,6 +368,8 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     for (int i = 0; i < g_row_count; i++) fprintf(stderr, " %s %d", g_rows[i].key, *g_rows[i].value);
     fprintf(stderr, "\n");
 }
+
+int recomp3ds::settings_rom_stream() { return g_rom_stream; }
 
 void recomp3ds::settings_menu_toggle() {
     g_open = !g_open;

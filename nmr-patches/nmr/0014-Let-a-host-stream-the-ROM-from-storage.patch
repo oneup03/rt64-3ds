@@ -1,0 +1,177 @@
+From 6b1405e8c44605b376b1e14ce1f278ac495f2039 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Tue, 29 Sep 2026 14:59:49 -0500
+Subject: [PATCH] Let a host stream the ROM from storage
+
+A host with little memory (an Old 3DS: 64 MB, the ROM alone 32 MB) can
+set a RomStream before start: the stored ROM is then opened instead of
+loaded, and do_rom_read/do_rom_pio read through the stream's `read`.
+Unset, nothing changes.
+
+The stored ROM check now hashes the file in 64 KB pieces instead of
+reading it whole, so it no longer needs the ROM's size in free memory for
+a moment at start, and with a stream the load does not hash it a second
+time (the check at start just did).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/include/librecomp/game.hpp | 11 +++++++
+ librecomp/src/pi.cpp                 | 45 ++++++++++++++++++++++++++--
+ librecomp/src/recomp.cpp             | 34 +++++++++++++++++++--
+ 3 files changed, 85 insertions(+), 5 deletions(-)
+
+diff --git a/librecomp/include/librecomp/game.hpp b/librecomp/include/librecomp/game.hpp
+index 553bfed..17c8be4 100644
+--- a/librecomp/include/librecomp/game.hpp
++++ b/librecomp/include/librecomp/game.hpp
+@@ -96,6 +96,17 @@ namespace recomp {
+     std::span<const uint8_t> get_rom();
+     void do_rom_read(uint8_t* rdram, gpr ram_address, uint32_t physical_addr, size_t num_bytes);
+     void do_rom_pio(uint8_t* rdram, gpr ram_address, uint32_t physical_addr);
++    // A ROM read from storage as the game needs it instead of held in memory
++    // (a host with little memory): set before start. `open` opens the stored
++    // ROM and gives its size, `read` copies bytes out of it. Unset (the
++    // default), the ROM is loaded into memory whole.
++    struct RomStream {
++        bool (*open)(const std::filesystem::path& path, uint64_t* size);
++        void (*read)(uint64_t offset, uint8_t* dst, size_t size);
++    };
++    void set_rom_stream(const RomStream* stream);
++    const RomStream* get_rom_stream();
++    bool open_rom_stream(const std::filesystem::path& path);
+     const Version& get_project_version();
+ 
+     /// Specify the input configuration to the recomp runtime.
+diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
+index 3423ce4..7c8f2d2 100644
+--- a/librecomp/src/pi.cpp
++++ b/librecomp/src/pi.cpp
+@@ -1,4 +1,5 @@
+ #include <memory>
++#include <algorithm>
+ #include <fstream>
+ #include <array>
+ #include <cstring>
+@@ -12,9 +13,25 @@
+ #include <ultramodern/ultramodern.hpp>
+ 
+ static std::vector<uint8_t> rom;
++static const recomp::RomStream* rom_stream = nullptr;
++static bool rom_stream_open = false;
+ 
+ bool recomp::is_rom_loaded() {
+-    return !rom.empty();
++    return !rom.empty() || rom_stream_open;
++}
++
++void recomp::set_rom_stream(const RomStream* stream) {
++    rom_stream = stream;
++}
++
++const recomp::RomStream* recomp::get_rom_stream() {
++    return rom_stream;
++}
++
++bool recomp::open_rom_stream(const std::filesystem::path& path) {
++    uint64_t size = 0;
++    rom_stream_open = rom_stream != nullptr && rom_stream->open(path, &size) && size != 0;
++    return rom_stream_open;
+ }
+ 
+ void recomp::set_rom_contents(std::vector<uint8_t>&& new_rom) {
+@@ -67,6 +84,23 @@ void recomp::do_rom_read(uint8_t* rdram, gpr ram_address, uint32_t physical_addr
+     // TODO handle misaligned DMA
+     assert((physical_addr & 0x1) == 0 && "Only PI DMA from aligned ROM addresses is currently supported");
+     assert((ram_address & 0x7) == 0 && "Only PI DMA to aligned RDRAM addresses is currently supported");
++    if (rom_stream_open) {
++        // Through a buffer in pieces, then a byte at a time as below (RDRAM
++        // is byte-swizzled).
++        static uint8_t buf[0x4000];
++        static std::mutex buf_mutex;
++        std::lock_guard lock{ buf_mutex };
++        const uint64_t offset = physical_addr - recomp::rom_base;
++        for (size_t done = 0; done < num_bytes;) {
++            const size_t n = std::min(num_bytes - done, sizeof(buf));
++            rom_stream->read(offset + done, buf, n);
++            for (size_t i = 0; i < n; i++) {
++                MEM_B(done + i, ram_address) = buf[i];
++            }
++            done += n;
++        }
++        return;
++    }
+     uint8_t* rom_addr = rom.data() + physical_addr - recomp::rom_base;
+     for (size_t i = 0; i < num_bytes; i++) {
+         MEM_B(i, ram_address) = *rom_addr;
+@@ -77,7 +111,14 @@ void recomp::do_rom_read(uint8_t* rdram, gpr ram_address, uint32_t physical_addr
+ void recomp::do_rom_pio(uint8_t* rdram, gpr ram_address, uint32_t physical_addr) {
+     assert((physical_addr & 0x3) == 0 && "PIO not 4-byte aligned in device, currently unsupported");
+     assert((ram_address & 0x3) == 0 && "PIO not 4-byte aligned in RDRAM, currently unsupported");
+-    uint8_t* rom_addr = rom.data() + physical_addr - recomp::rom_base;
++    uint8_t word[4];
++    uint8_t* rom_addr = word;
++    if (rom_stream_open) {
++        rom_stream->read(physical_addr - recomp::rom_base, word, sizeof(word));
++    }
++    else {
++        rom_addr = rom.data() + physical_addr - recomp::rom_base;
++    }
+     MEM_B(0, ram_address) = *rom_addr++;
+     MEM_B(1, ram_address) = *rom_addr++;
+     MEM_B(2, ram_address) = *rom_addr++;
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 9838240..799b1b7 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -226,10 +226,32 @@ bool write_file(const std::filesystem::path& path, const std::vector<uint8_t>& d
+     return true;
+ }
+ 
+-bool check_stored_rom(const recomp::GameEntry& game_entry) {
+-    std::vector stored_rom_data = read_file(config_path / game_entry.stored_filename());
++// A file's hash, read in pieces: the ROM need not fit in memory whole (a ROM
++// kept on storage never does), and the check leaves nothing allocated.
++static bool check_file_hash(const std::filesystem::path& path, uint64_t expected_hash) {
++    std::ifstream file{ path, std::ios::binary };
++    if (!file.good()) {
++        return false;
++    }
++    XXH3_state_t* state = XXH3_createState();
++    XXH3_64bits_reset(state);
++    std::vector<char> buf(1 << 16);
++    size_t total = 0;
++    while (file) {
++        file.read(buf.data(), buf.size());
++        const std::streamsize got = file.gcount();
++        if (got > 0) {
++            XXH3_64bits_update(state, buf.data(), (size_t)got);
++            total += (size_t)got;
++        }
++    }
++    const uint64_t hash = XXH3_64bits_digest(state);
++    XXH3_freeState(state);
++    return total != 0 && hash == expected_hash;
++}
+ 
+-    if (!check_hash(stored_rom_data, game_entry.rom_hash)) {
++bool check_stored_rom(const recomp::GameEntry& game_entry) {
++    if (!check_file_hash(config_path / game_entry.stored_filename(), game_entry.rom_hash)) {
+         // Incorrect hash, remove the stored ROM file if it exists.
+         std::filesystem::remove(config_path / game_entry.stored_filename());
+         return false;
+@@ -258,6 +280,12 @@ bool recomp::load_stored_rom(const std::u8string& game_id) {
+     if (find_it == game_roms.end()) {
+         return false;
+     }
++
++    if (recomp::get_rom_stream() != nullptr) {
++        // Kept on storage: check_all_stored_roms hashed it at start, and
++        // hashing it again would read the whole file once more.
++        return valid_game_roms.contains(game_id) && recomp::open_rom_stream(config_path / find_it->second.stored_filename());
++    }
+     
+     std::vector<uint8_t> stored_rom_data = read_file(config_path / find_it->second.stored_filename());
+ 
+-- 
+2.53.0
+

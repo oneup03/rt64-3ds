@@ -41,6 +41,13 @@ namespace recomp3ds {
     void input_set_rumble(int controller_num, bool rumble);
     ultramodern::input::connected_device_info_t input_device_info(int controller_num);
 
+    // The ROM read from the SD card as the game needs it (rom_stream.cpp):
+    // installs the runtime's RomStream with a block cache of about
+    // cache_bytes, before start.
+    void rom_stream_install(size_t cache_bytes);
+    bool rom_stream_active();
+    void rom_stream_take_stats(uint32_t* misses, uint32_t* bytes);   // since the last call
+
     void log_init(const char* base_path);
 
     void log_start_writer();
@@ -61,6 +68,7 @@ namespace recomp3ds {
     void set_cpu_speed(bool new3ds);    // the New 3DS clock and L2 on or off (recomp3ds_run.cpp)
     void settings_menu_update();        // ~60 times a second, main thread
     void settings_menu_toggle();
+    int settings_rom_stream();          // settings.ini's rom_stream: 0 auto, 1 in memory, 2 from the SD card
     void settings_menu_redraw();        // after something else wrote over the console
     u32  settings_menu_keys();          // 3DS keys the open menu keeps from the game
 

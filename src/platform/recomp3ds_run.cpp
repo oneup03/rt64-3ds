@@ -1,6 +1,7 @@
 // The 3DS entry point: console services, the runtime's callbacks, and the
 // runtime itself. The game supplies a GameDesc; everything else is shared.
 #include <3ds.h>
+#include <malloc.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -8,6 +9,7 @@
 #include <string>
 #include <sys/stat.h>
 
+#include "librecomp/addresses.hpp"
 #include "librecomp/game.hpp"
 #include "librecomp/rsp.hpp"
 #include "ultramodern/ultramodern.hpp"
@@ -109,16 +111,18 @@ extern "C" void (*__system_retAddr)(void);   // libctru: set by aptExit to finis
 
 const recomp3ds::GameDesc* g_desc = nullptr;
 int g_sp_core = 2;
+int g_gfx_core = 2;                     // core 1 or 0 on an Old 3DS, which has no core 2
 
-// Thread placement: game code on core 0, renderer on core 2, the audio task
-// on g_sp_core (core 1 when the system grants time there), pacing threads
+// Thread placement: game code on core 0, renderer on core 2 (on an Old 3DS
+// core 1 when the system grants time there, else 0), the audio task on
+// g_sp_core (core 1 when the system grants time there), pacing threads
 // above the game so their sleeps wake it.
 ultramodern::HostThreadSpec host_thread_spec(ultramodern::HostThreadKind kind) {
     using K = ultramodern::HostThreadKind;
     switch (kind) {
         case K::GameStart:
         case K::Game:    return { 128 * 1024, 0x30, 0 };
-        case K::Gfx:     return { 256 * 1024, 0x2C, 2 };
+        case K::Gfx:     return { 256 * 1024, 0x2C, g_gfx_core };
         case K::SpTask:  return { 64 * 1024, 0x24, g_sp_core };
         case K::Vi:
         case K::Timer:   return { 32 * 1024, 0x28, 0 };
@@ -317,12 +321,20 @@ void update_gfx_inner() {
         if (g_desc != nullptr && g_desc->append_stats != nullptr && g_rdram != nullptr) {
             g_desc->append_stats(g_rdram, game_stats, sizeof(game_stats));
         }
-        fprintf(stderr, "stats: %d dl/s (late %d, max gap %.0f ms) core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu%s\n",
+        char rom_stats[64] = "";
+        if (recomp3ds::rom_stream_active()) {
+            uint32_t misses = 0, bytes = 0;
+            recomp3ds::rom_stream_take_stats(&misses, &bytes);
+            snprintf(rom_stats, sizeof(rom_stats), " rom %lu reads (%lu KB)", (unsigned long)misses, (unsigned long)(bytes / 1024));
+        }
+        fprintf(stderr, "stats: %d dl/s (late %d, max gap %.0f ms) core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu heap %lu KB%s%s\n",
                 st.dl_per_sec, st.late_frames, st.max_gap_ms, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_remaining(),
-                (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped, game_stats);
+                (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped,
+                (unsigned long)(mallinfo().arena / 1024), rom_stats, game_stats);
         // One 40-column row: the audio microcode's ms per second last.
         char line[64];
-        snprintf(line, sizeof(line), "%3d fps  cpu0 %3d%%  cpu2 %3d%%  audio %3u", st.dl_per_sec, busy0, busy2, ucode_ms);
+        if (busy2 >= 0) snprintf(line, sizeof(line), "%3d fps  cpu0 %3d%%  cpu2 %3d%%  audio %3u", st.dl_per_sec, busy0, busy2, ucode_ms);
+        else snprintf(line, sizeof(line), "%3d fps  cpu0 %3d%%  audio %3u", st.dl_per_sec, busy0, ucode_ms);   // an Old 3DS: no core 2
         printf("\x1b[2;0H%-39.39s\n", line);
     }
     // Watchdog: a frame that stays in the replay or the GPU wait for 4 s is
@@ -378,16 +390,47 @@ make_render_context(uint8_t* rdram, ultramodern::renderer::WindowHandle handle, 
     return rt64_3ds::create_render_context(rdram, handle, developer_mode);
 }
 
+// libctru splits the process's memory between the application heap and the
+// linear heap at start (a weak function, replaced here). Its default gives
+// the linear heap up to 32 MB and caps the application heap at 24 MB when
+// memory is short: on an Old 3DS (64 MB) that leaves no room for the N64's
+// RDRAM beside everything else. Here the linear heap (what does not fit in
+// VRAM, the draw lists, audio buffers: under 8 MB in use in DK64) gets
+// 32 MB when there is plenty, as before on a New 3DS, and 16 MB otherwise;
+// the application heap gets the rest.
+extern "C" char* fake_heap_start;
+extern "C" char* fake_heap_end;
+extern "C" u32 __ctru_heap, __ctru_heap_size, __ctru_linear_heap, __ctru_linear_heap_size;
+extern "C" void __system_allocateHeaps(void) {
+    Handle reslimit = 0;
+    if (R_FAILED(svcGetResourceLimit(&reslimit, CUR_PROCESS_HANDLE))) svcBreak(USERBREAK_PANIC);
+    s64 max_commit = 0, current_commit = 0;
+    ResourceLimitType type = RESLIMIT_COMMIT;
+    svcGetResourceLimitLimitValues(&max_commit, reslimit, &type, 1);
+    svcGetResourceLimitCurrentValues(&current_commit, reslimit, &type, 1);
+    svcCloseHandle(reslimit);
+    const u32 remaining = (u32)(max_commit - current_commit) & ~0xFFFu;
+    __ctru_linear_heap_size = remaining >= (96u << 20) ? (32u << 20) : (16u << 20);
+    __ctru_heap_size = remaining - __ctru_linear_heap_size;
+    if (R_FAILED(svcControlMemory(&__ctru_heap, OS_HEAP_AREA_BEGIN, 0x0, __ctru_heap_size, MEMOP_ALLOC, (MemPerm)(MEMPERM_READ | MEMPERM_WRITE)))) svcBreak(USERBREAK_PANIC);
+    if (R_FAILED(svcControlMemory(&__ctru_linear_heap, 0x0, 0x0, __ctru_linear_heap_size, MEMOP_ALLOC_LINEAR, (MemPerm)(MEMPERM_READ | MEMPERM_WRITE)))) svcBreak(USERBREAK_PANIC);
+    mappableInit(OS_MAP_AREA_BEGIN, OS_MAP_AREA_END);
+    fake_heap_start = (char*)__ctru_heap;
+    fake_heap_end = fake_heap_start + __ctru_heap_size;
+}
+
 void log_memory(const char* when) {
     // The memory the process got: libctru gives all of it, less the
     // executable, to the two heaps at start, so heap + linear heap + the
     // executable is the memory mode (64, 96, 124 MB...). The region's own
     // size says the same on the console (Azahar reports 96 MB there while
     // handing out 124 MB), and its free space reads 0 after the split.
-    fprintf(stderr, "recomp3ds: %s: heap %lu KB + linear heap %lu KB (%s; app region %lu KB), linear free %lu KB\n", when,
+    const struct mallinfo mi = mallinfo();
+    fprintf(stderr, "recomp3ds: %s: heap %lu KB + linear heap %lu KB (%s; app region %lu KB); heap in use %lu KB (%lu KB taken), linear free %lu KB\n", when,
             (unsigned long)(envGetHeapSize() / 1024), (unsigned long)(envGetLinearHeapSize() / 1024),
             envIsHomebrew() ? ".3dsx" : "title",
             (unsigned long)(osGetMemRegionSize(MEMREGION_APPLICATION) / 1024),
+            (unsigned long)(mi.uordblks / 1024), (unsigned long)(mi.arena / 1024),
             (unsigned long)(linearSpaceFree() / 1024));
 }
 
@@ -502,6 +545,23 @@ int recomp3ds::run(const GameDesc& desc) {
     // Before the settings: a loaded setting's on_change may pick another map.
     recomp3ds::input_set_map(desc.button_map, desc.button_map_count);
     recomp3ds::settings_menu_init(g_base_path, desc);
+    {
+        // The ROM in memory, or read from the SD card as the game needs it
+        // (settings.ini rom_stream: 0 auto, 1 in memory, 2 from the SD
+        // card). Auto reads it from the card on an Old 3DS, or when the heap
+        // could not hold it beside RDRAM and some room for the rest.
+        const int mode = recomp3ds::settings_rom_stream();
+        char rom_path[192];
+        snprintf(rom_path, sizeof(rom_path), "%s/%s.z64", g_base_path, (const char*)desc.game_id.c_str());
+        struct stat rom_st;
+        const uint64_t rom_bytes = stat(rom_path, &rom_st) == 0 ? (uint64_t)rom_st.st_size : (32u << 20);
+        constexpr uint64_t kRoomForTheRest = 24u << 20;
+        const bool heap_short = envGetHeapSize() < rom_bytes + recomp::mem_size + kRoomForTheRest;
+        const bool stream = mode == 2 || (mode == 0 && (!is_new_3ds || heap_short));
+        if (stream) recomp3ds::rom_stream_install(2u << 20);
+        fprintf(stderr, "recomp3ds: ROM %s (rom_stream %d%s)\n", stream ? "read from the SD card as needed" : "held in memory", mode,
+                mode != 0 ? "" : !is_new_3ds ? ", auto: an Old 3DS" : heap_short ? ", auto: the heap is short" : ", auto");
+    }
     u32 cpu_mhz = log_cpu("boot");
     g_clock_booted = true;
     if (is_new_3ds && g_speedup) {
@@ -600,8 +660,12 @@ int recomp3ds::run(const GameDesc& desc) {
         char path[192];
         snprintf(path, sizeof(path), "%s/AUDIO_CORE.TXT", g_base_path);
         if (FILE* f = fopen(path, "r")) { if (fscanf(f, "%d", &want) != 1) want = 1; fclose(f); }
-        g_sp_core = 2;
-        if (want == 1) {
+        // An Old 3DS has no core 2: what would go there shares core 1, or
+        // core 0 when the system grants no time on core 1.
+        const int no_core1 = is_new_3ds ? 2 : 0;
+        g_sp_core = no_core1;
+        g_gfx_core = is_new_3ds ? 2 : no_core1;
+        if (want == 1 || !is_new_3ds) {
             // PM refuses a limit above the exheader's MaxCpu (low 7 bits):
             // take the highest it accepts.
             u32 limit = 0;
@@ -617,8 +681,10 @@ int recomp3ds::run(const GameDesc& desc) {
                 threadJoin(probe, UINT64_MAX);
                 threadFree(probe);
                 g_sp_core = 1;
+                if (!is_new_3ds) g_gfx_core = 1;
             }
-            fprintf(stderr, "recomp3ds: core 1 time limit %lu%% (rc %08lx), audio task on core %d\n", (unsigned long)limit, (unsigned long)rc, g_sp_core);
+            fprintf(stderr, "recomp3ds: core 1 time limit %lu%% (rc %08lx), audio task on core %d, renderer on core %d\n",
+                    (unsigned long)limit, (unsigned long)rc, g_sp_core, g_gfx_core);
         }
         else {
             fprintf(stderr, "recomp3ds: audio task on core 2\n");
