@@ -8,8 +8,9 @@
 //
 // The 3D page holds the stereo rows: the 3D slider sets the strength, these
 // its shape (the owner's desktop settings, same units and defaults). The
-// stick deadzones start the Controls page; the game's own options
-// (GameDesc::menu_options) go on the pages they name.
+// stick deadzones start the Controls page and C-Stick up ends the Camera
+// page; the game's own options (GameDesc::menu_options) go on the pages
+// they name.
 #include <3ds.h>
 #include <cstdio>
 #include <cstring>
@@ -243,11 +244,13 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "stereo_ghost_black_floor", "Black floor", 0, 20, &st.ghost_black_floor, nullptr, false, "%", nullptr, Page3D, 1, nullptr });
     add_row({ "stick_deadzone", "Circle Pad dz", 0, 50, &g_stick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
     add_row({ "cstick_deadzone", "C-Stick dz", 0, 50, &g_cstick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
-    add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, PageControls, 1, nullptr });
     for (size_t i = 0; i < desc.menu_option_count; i++) {
         const MenuOption& o = desc.menu_options[i];
         add_row({ o.key, o.label, o.lo, o.hi, o.value, o.names, false, o.suffix, o.on_change, o.page, o.step > 0 ? o.step : 1, o.zero_text });
     }
+    // After the game's camera rows: in a game where C-Up is a camera
+    // (DK64's first person), this is a camera setting.
+    add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, PageCamera, 1, nullptr });
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
     if (is_new_3ds) add_row({ "cpu_speed", "CPU speed", 0, 1, &g_cpu_new, kCpuNames, false, nullptr, apply_cpu, PageGame, 1, nullptr });
