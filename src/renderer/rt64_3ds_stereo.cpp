@@ -116,7 +116,11 @@ float view_depth(float zp, float m22, float m32) {
 }
 
 float AutoConvergence::update(float nearest_z, float manual_conv, float sep, int comfort_thousandths, bool low_convergence_scene) {
-    if (nearest_z <= 0.0f || sep <= 0.0f || manual_conv <= 0.0f) return manual_conv;
+    if (sep <= 0.0f || manual_conv <= 0.0f) return manual_conv;
+    // No near depth this frame (a sky, a menu): keep the last convergence.
+    // Returning the manual value instead made a sky with a few birds in it
+    // flap between the two, frame by frame, as the birds came and went.
+    if (nearest_z <= 0.0f) return last_conv > 0.0f ? std::min(last_conv, manual_conv) : manual_conv;
 
     history[cursor] = nearest_z;
     cursor = (cursor + 1) % kHistory;
@@ -164,7 +168,8 @@ float AutoConvergence::update(float nearest_z, float manual_conv, float sep, int
     const float target_inv = 1.0f / conv;
     if (inv_conv <= 0.0f) inv_conv = target_inv;
     else inv_conv += (target_inv - inv_conv) * (target_inv > inv_conv ? 0.14f : 0.06f);
-    return std::min(1.0f / inv_conv, manual_conv);
+    last_conv = std::min(1.0f / inv_conv, manual_conv);
+    return last_conv;
 }
 
 float near_depth_statistic(const float* grid, int cols, int rows) {
@@ -190,7 +195,10 @@ float near_depth_statistic(const float* grid, int cols, int rows) {
             nears[n++] = samples[m / 4];
         }
     }
-    if (n == 0) return -1.0f;
+    // Fewer than 3 patches with depth is no scene to converge on: a sky with
+    // a bird or two in it. (A 3DS patch is about 16 samples of 8x8 pixels,
+    // so a small object fills one easily; the desktop's are finer.)
+    if (n < 3) return -1.0f;
     // The second nearest patch, so one small object is not the whole story.
     const int k = n >= 4 ? 1 : 0;
     std::nth_element(nears, nears + k, nears + n);

@@ -53,7 +53,9 @@ float view_depth(float zp, float m22, float m32);
 
 // Depth-driven auto-convergence (the desktop's StereoAutoConvergence): keeps
 // the nearest significant object's pop-out within the comfort budget by
-// pulling convergence in, never beyond the manual value.
+// pulling convergence in, never beyond the manual value. A frame without a
+// near depth (nearest_z <= 0) keeps the last convergence, as the desktop
+// does by not updating then.
 struct AutoConvergence {
     static constexpr int kHistory = 9;
     float history[kHistory] = {};
@@ -61,15 +63,16 @@ struct AutoConvergence {
     float z_ema = -1.0f;
     float inv_conv = -1.0f;
     int cut_frames = 0;
+    float last_conv = -1.0f;
     // Returns the convergence to apply, world units.
     float update(float nearest_z, float manual_conv, float sep, int comfort_thousandths, bool low_convergence_scene);
-    void reset() { count = cursor = cut_frames = 0; z_ema = inv_conv = -1.0f; }
+    void reset() { count = cursor = cut_frames = 0; z_ema = inv_conv = last_conv = -1.0f; }
 };
 
 // The near statistic over a grid of depth samples z' (0 < z' < 1 valid): a
 // 9x5 patch layout inside the frame minus margins (5% sides and top, 25%
 // bottom), the 25th percentile within each patch, then the second nearest
-// patch. Returns z' or -1.
+// patch. Returns z' or -1, also when fewer than 3 patches have depth.
 float near_depth_statistic(const float* grid, int cols, int rows);
 
 }   // namespace rt64_3ds
