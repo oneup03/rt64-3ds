@@ -12,7 +12,7 @@ Two libraries:
   citro3d: an F3DEX2 display-list interpreter with CPU vertex transform and
   lighting, texture combiner planning, TMEM decoding and per-eye replay.
   The stereo code (draw classification, per-eye shift, aim-depth sampling)
-  is ported from the owner's RT64 stereo fork (MIT, see `LICENSE.rt64`).
+  is ported from the owner's RT64 stereo fork.
 - `recomp_3ds` — the 3DS entry point a game links: libctru services, audio
   (ndsp), input (hid), save/config paths on the SD card, the bottom-screen
   panel, and a small patch series for N64ModernRuntime (`nmr-patches/`).
@@ -22,3 +22,5 @@ the game's own N64ModernRuntime, and GamepadMotionHelpers (a submodule; clone
 with `--recursive` or run `git submodule update --init`).
 
 Status: under construction. First target is Donkey Kong 64 (New 3DS only).
+
+Licence: MIT, the same licence as RT64 (`LICENSE`).
