@@ -134,10 +134,12 @@ while :; do
     now=$(( $(date +%s) - start ))
     if ! kill -0 $FPID 2>/dev/null; then echo "emulator exited early"; rc=2; break; fi
     # screenshots requested by the game itself ("AUTOTEST shot <name>" on stderr)
-    n=$(grep -c "AUTOTEST shot" "$GLOG" 2>/dev/null); n=${n:-0}
+    # (games that keep their own log elsewhere still reach the emulator log)
+    MLOG=$GLOG; [ -f "$MLOG" ] || MLOG=$LOG
+    n=$(grep -c "AUTOTEST shot" "$MLOG" 2>/dev/null); n=${n:-0}
     while [ "$n" -gt "$markers" ]; do
         markers=$((markers + 1))
-        name=$(grep "AUTOTEST shot" "$GLOG" | sed -n "${markers}p" | sed -E 's/.*AUTOTEST shot ([A-Za-z0-9_.-]+).*/\1/')
+        name=$(grep "AUTOTEST shot" "$MLOG" | sed -n "${markers}p" | sed -E 's/.*AUTOTEST shot ([A-Za-z0-9_.-]+).*/\1/')
         sleep 0.3; shoot "mark-$(printf %02d $markers)-$name"
     done
     if [ -n "$UNTIL" ] && { grep -Eq "$UNTIL" "$GLOG" 2>/dev/null || grep -Eq "$UNTIL" "$LOG" 2>/dev/null; }; then
