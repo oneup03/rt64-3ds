@@ -178,13 +178,13 @@ u32 prompt_keys() {
 void draw_home_prompt(bool show) {
     constexpr int kRow = 23;
     if (show) {
-        printf("\x1b[%d;0H----------------------------------------", kRow);
-        printf("\x1b[%d;0H  Quit %-33s", kRow + 1, g_desc != nullptr ? g_desc->render.game_name : "the game");
-        printf("\x1b[%d;0H  A: quit   B: resume   HOME: HOME Menu ", kRow + 2);
-        printf("\x1b[%d;0H----------------------------------------", kRow + 3);
+        recomp3ds::screen_printf("\x1b[%d;0H----------------------------------------", kRow);
+        recomp3ds::screen_printf("\x1b[%d;0H  Quit %-33s", kRow + 1, g_desc != nullptr ? g_desc->render.game_name : "the game");
+        recomp3ds::screen_printf("\x1b[%d;0H  A: quit   B: resume   HOME: HOME Menu ", kRow + 2);
+        recomp3ds::screen_printf("\x1b[%d;0H----------------------------------------", kRow + 3);
     }
     else {
-        for (int r = kRow; r < kRow + 4; r++) printf("\x1b[%d;0H%40s", r, "");
+        for (int r = kRow; r < kRow + 4; r++) recomp3ds::screen_printf("\x1b[%d;0H%40s", r, "");
     }
     // The console writes through the CPU cache; with the game (and so the
     // renderer's frame flushes) paused, flush them to the screen here.
@@ -263,11 +263,11 @@ void update_gfx_inner() {
                 fired = true;
                 if (recomp3ds::settings_debug_capture()) {
                     rt64_3ds::request_capture();
-                    printf("\x1b[28;0H%-39s", "Saving a frame capture...");
+                    recomp3ds::screen_printf("\x1b[28;0H%-39s", "Saving a frame capture...");
                 }
                 else {
                     rt64_3ds::request_screenshot();
-                    printf("\x1b[28;0H%-39s", "Saving a screenshot...");
+                    recomp3ds::screen_printf("\x1b[28;0H%-39s", "Saving a screenshot...");
                 }
                 gfxFlushBuffers();
             }
@@ -280,7 +280,7 @@ void update_gfx_inner() {
         static int shown_state = 0, shown_shot = 0;
         const int state = rt64_3ds::capture_state();
         if (state == 2 && shown_state != 2) {
-            printf("\x1b[28;0H%-39s", "Capture saved: gfx_task.bin");
+            recomp3ds::screen_printf("\x1b[28;0H%-39s", "Capture saved: gfx_task.bin");
             gfxFlushBuffers();
         }
         shown_state = state;
@@ -289,7 +289,7 @@ void update_gfx_inner() {
             char line[48];
             if (shot == 2) snprintf(line, sizeof(line), "Screenshot %s", rt64_3ds::screenshot_name());
             else snprintf(line, sizeof(line), "Screenshot failed");
-            printf("\x1b[28;0H%-39.39s", line);
+            recomp3ds::screen_printf("\x1b[28;0H%-39.39s", line);
             gfxFlushBuffers();
         }
         shown_shot = shot;
@@ -364,7 +364,7 @@ void update_gfx_inner() {
         char line[64];
         if (busy2 >= 0) snprintf(line, sizeof(line), "%3d fps  cpu0 %3d%%  cpu2 %3d%%  audio %3u", st.dl_per_sec, busy0, busy2, ucode_ms);
         else snprintf(line, sizeof(line), "%3d fps  cpu0 %3d%%  audio %3u", st.dl_per_sec, busy0, ucode_ms);   // an Old 3DS: no core 2
-        printf("\x1b[2;0H%-39.39s\n", line);
+        recomp3ds::screen_printf("\x1b[2;0H%-39.39s\n", line);
     }
     // Watchdog: a frame that stays in the replay or the GPU wait for 4 s is
     // a hung GPU; say which draw it was on, once.
@@ -403,7 +403,7 @@ void update_gfx_inner() {
 // goes onto the card now: the exit that follows may not get that far.
 void message_box(const char* msg) {
     fprintf(stderr, "[message] %s\n", msg);
-    printf("\n%s\n", msg);
+    recomp3ds::screen_printf("\n%s\n", msg);
     recomp3ds::log_flush();
 }
 
@@ -547,7 +547,8 @@ int recomp3ds::run(const GameDesc& desc) {
     g_desc = &desc;
 
     gfxInitDefault();
-    consoleInit(GFX_BOTTOM, nullptr);          // stdout: status text on the touch screen
+    consoleInit(GFX_BOTTOM, nullptr);          // status text on the touch screen (screen_printf)
+    recomp3ds::screen_init();
     if (__3dslink_host.s_addr != 0) {
         link3dsStdio();
     }
@@ -572,7 +573,7 @@ int recomp3ds::run(const GameDesc& desc) {
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
     fprintf(stderr, "recomp3ds: %s starting on %s 3DS\n", desc.render.game_name, is_new_3ds ? "a New" : "an Old");
-    printf("%s\n", desc.render.game_name);
+    recomp3ds::screen_printf("%s\n", desc.render.game_name);
     log_memory("boot");
     // Before the settings: a loaded setting's on_change may pick another map.
     recomp3ds::input_set_map(desc.button_map, desc.button_map_count);
@@ -673,7 +674,7 @@ int recomp3ds::run(const GameDesc& desc) {
     cfg.message_queue_control.requeue_timer = false;
 
     if (!recomp::is_rom_valid(desc.game_id)) {
-        printf("\nROM not found or wrong hash.\nPut it at %s/%s.z64\n\nPress START to exit.\n",
+        recomp3ds::screen_printf("\nROM not found or wrong hash.\nPut it at %s/%s.z64\n\nPress START to exit.\n",
                g_base_path, (const char*)desc.game_id.c_str());
         fprintf(stderr, "recomp3ds: no valid ROM at %s/%s.z64\n", g_base_path, (const char*)desc.game_id.c_str());
         while (aptMainLoop()) {

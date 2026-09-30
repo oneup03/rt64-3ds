@@ -55,6 +55,14 @@ namespace recomp3ds {
     bool rom_stream_active();
     void rom_stream_take_stats(uint32_t* misses, uint32_t* bytes);   // since the last call
 
+    // The bottom screen's text console is the platform's own (status panel,
+    // settings menu, picker, messages): screen_init takes libctru's console
+    // right after consoleInit, and screen_printf writes to it. stdout goes to
+    // the log with stderr (log_init), so the runtime's diagnostic printf
+    // lines ("Opening mod ...") don't stay on the screen.
+    void screen_init();
+    void screen_printf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+
     void log_init(const char* base_path);
 
     void log_start_writer();

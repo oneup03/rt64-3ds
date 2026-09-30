@@ -1,6 +1,8 @@
-// stderr as whole lines to svcOutputDebugString (the emulator's log, 3dslink)
-// and to sdmc:/3ds/<Game>/log.txt. newlib hands an unbuffered stream to
-// write() one fragment at a time, so lines are assembled here first.
+// stderr (and stdout: the runtime's printf is diagnostics too) as whole lines
+// to svcOutputDebugString (the emulator's log, 3dslink) and to
+// sdmc:/3ds/<Game>/log.txt. newlib hands an unbuffered stream to write() one
+// fragment at a time, so lines are assembled here first. The bottom screen's
+// console is written directly (screen_printf).
 //
 // The SD writes happen on a writer thread fed through a ring
 // buffer: flushing each line from the thread that logged it stalled the
@@ -8,8 +10,10 @@
 // card within ~50 ms, so a crash loses at most that tail; before the writer
 // starts and on exit (log_flush) the writes are synchronous.
 #include <3ds.h>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <sys/reent.h>
 #include <sys/iosupport.h>
 
 #include "recomp3ds_internal.h"
@@ -120,6 +124,10 @@ ssize_t stderr_write(struct _reent* r, void* fd, const char* ptr, size_t len) {
     return (ssize_t)len;
 }
 
+// libctru's console device, taken before stdout is pointed at the log.
+const devoptab_t* g_screen = nullptr;
+LightLock g_screen_lock;
+
 const devoptab_t g_errtab = {
     .name = "recomp3ds_stderr",
     .structSize = 0,
@@ -134,11 +142,34 @@ void recomp3ds::log_init(const char* base_path) {
     char path[192];
     snprintf(path, sizeof(path), "%s/log.txt", base_path);
     g_file = fopen(path, "w");
-    // 3dslink owns stderr through its own socket devoptab; leave that alone.
+    // 3dslink owns stdout and stderr through its own socket devoptab; leave
+    // that alone.
     if (__3dslink_host.s_addr == 0) {
         devoptab_list[STD_ERR] = &g_errtab;
+        devoptab_list[STD_OUT] = &g_errtab;
         setvbuf(stderr, nullptr, _IONBF, 0);
+        setvbuf(stdout, nullptr, _IONBF, 0);
     }
+}
+
+void recomp3ds::screen_init() {
+    LightLock_Init(&g_screen_lock);
+    g_screen = devoptab_list[STD_OUT];
+}
+
+// One call's text reaches the console whole (escape sequences included),
+// whichever thread writes.
+void recomp3ds::screen_printf(const char* fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0 || g_screen == nullptr) return;
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+    LightLock_Lock(&g_screen_lock);
+    g_screen->write_r(_REENT, nullptr, buf, (size_t)n);
+    LightLock_Unlock(&g_screen_lock);
 }
 
 void recomp3ds::log_line(const char* s) {

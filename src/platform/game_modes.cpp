@@ -38,7 +38,7 @@ void memory_read(void* ctx, uint64_t offset, uint8_t* dst, size_t n) {
 }
 
 void show_progress(void*, uint64_t done, uint64_t total) {
-    printf("\x1b[12;0H  %3u%% of %u MB", (unsigned)(total ? done * 100 / total : 0), (unsigned)(total >> 20));
+    recomp3ds::screen_printf("\x1b[12;0H  %3u%% of %u MB", (unsigned)(total ? done * 100 / total : 0), (unsigned)(total >> 20));
     gfxFlushBuffers();
 }
 
@@ -71,7 +71,7 @@ bool apply_rom_patch(const std::string& mod_id, std::span<const uint8_t> patch) 
         if (src == nullptr) return false;
         fseek(src, 0, SEEK_END);
         const uint64_t size = (uint64_t)ftell(src);
-        printf("\x1b[10;0HPreparing the game mode's ROM\x1b[11;0H(once; it takes a while):");
+        recomp3ds::screen_printf("\x1b[10;0HPreparing the game mode's ROM\x1b[11;0H(once; it takes a while):");
         fprintf(stderr, "recomp3ds: applying %s's ROM patch to %s\n", mod_id.c_str(), rom.c_str());
         const u64 t0 = svcGetSystemTick();
         // The source in memory if it fits (one read instead of thousands),
@@ -87,7 +87,7 @@ bool apply_rom_patch(const std::string& mod_id, std::span<const uint8_t> patch) 
         const recomp3ds::BpsResult r = recomp3ds::bps_apply_to_file(patch, from, rom.c_str(), show_progress, nullptr);
         fclose(src);
         fprintf(stderr, "recomp3ds: ROM patch %s in %.1f s\n", recomp3ds::bps_result_string(r), (double)(svcGetSystemTick() - t0) / SYSCLOCK_ARM11);
-        printf("\x1b[10;0H%40s\x1b[11;0H%40s\x1b[12;0H%40s", "", "", "");
+        recomp3ds::screen_printf("\x1b[10;0H%40s\x1b[11;0H%40s\x1b[12;0H%40s", "", "", "");
         if (r != recomp3ds::BpsResult::Ok) {
             fprintf(stderr, "recomp3ds: %s's ROM patch: %s\n", mod_id.c_str(), recomp3ds::bps_result_string(r));
             return false;
@@ -161,15 +161,15 @@ std::string recomp3ds::pick_game_mode(const GameDesc& desc) {
     int sel = 0;
     for (int i = 1; i < count; i++) if (choices[i].id == last && choices[i].note.empty()) sel = i;
     auto draw = [&]() {
-        printf("\x1b[8;0H%-40s", "Play:");
+        recomp3ds::screen_printf("\x1b[8;0H%-40s", "Play:");
         int row = 10;
         for (int i = 0; i < count && row < 23; i++) {
             const Choice& c = choices[i];
             const char* colour = i == sel ? "\x1b[33m" : !c.note.empty() ? "\x1b[31m" : "";
-            printf("\x1b[%d;0H%s%s %-37.37s\x1b[0m", row++, colour, i == sel ? ">" : " ", c.name.c_str());
-            if (!c.note.empty() && row < 23) printf("\x1b[%d;0H\x1b[31m   %-37.37s\x1b[0m", row++, c.note.c_str());
+            recomp3ds::screen_printf("\x1b[%d;0H%s%s %-37.37s\x1b[0m", row++, colour, i == sel ? ">" : " ", c.name.c_str());
+            if (!c.note.empty() && row < 23) recomp3ds::screen_printf("\x1b[%d;0H\x1b[31m   %-37.37s\x1b[0m", row++, c.note.c_str());
         }
-        printf("\x1b[24;0H%-40s", "D-Pad: choose   A: start");
+        recomp3ds::screen_printf("\x1b[24;0H%-40s", "D-Pad: choose   A: start");
     };
     auto step = [&](int dir) {
         // Only what can be played.
@@ -190,7 +190,7 @@ std::string recomp3ds::pick_game_mode(const GameDesc& desc) {
         if (down & KEY_DDOWN) { step(+1); draw(); }
         gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     }
-    for (int r = 8; r <= 24; r++) printf("\x1b[%d;0H%40s", r, "");
+    for (int r = 8; r <= 24; r++) recomp3ds::screen_printf("\x1b[%d;0H%40s", r, "");
     fprintf(stderr, "recomp3ds: playing %s\n", sel == 0 ? "the game" : choices[sel].id.c_str());
     return choices[sel].id;
 }

@@ -2,9 +2,9 @@
 // (holding SELECT takes a frame capture instead, see recomp3ds_run.cpp).
 // While it is open the D-pad works it and the game does not see the D-pad:
 // up/down chooses a row, left/right changes it (held to repeat); on the tab
-// row at the top left/right changes the page. Tabs, rows and the [-]/[+]
-// buttons work by touch as well. Values go to <base>/settings.ini a second
-// after the last change.
+// row at the top left/right changes the page. A tap chooses a tab or a row
+// (values change with the D-pad only, which leaves the row's width to its
+// label). Values go to <base>/settings.ini a second after the last change.
 //
 // The 3D page holds the stereo rows: the 3D slider sets the strength, these
 // its shape (the owner's desktop settings, same units and defaults). The
@@ -57,7 +57,9 @@ constexpr int kTouchPad = 3;
 // Contact must be gone this many updates (~60 a second) to count as lifted:
 // the panel drops it for a frame now and then, which read as a second tap.
 constexpr int kLiftFrames = 4;
-constexpr int kMinusCol = 16, kValueWidth = 11, kPlusCol = 35;
+// A row: the selection marker, the label, the value. Values change with the
+// D-pad; a tap on a row selects it.
+constexpr int kLabelWidth = 25, kValueWidth = 12;
 
 const char* const kPageNames[recomp3ds::PageCount] = { "3D", "Controls", "Camera", "Game", "Mods" };
 int g_tab_col[recomp3ds::PageCount];
@@ -154,50 +156,47 @@ void draw_row(int slot) {
     else if (*r.value == 0 && r.zero_text != nullptr) snprintf(val, sizeof(val), "%s", r.zero_text);
     else if (r.tenths) snprintf(val, sizeof(val), "%d.%d", *r.value / 10, *r.value % 10);
     else snprintf(val, sizeof(val), "%d%s", *r.value, r.suffix != nullptr ? r.suffix : "");
-    // Centred in its field.
-    const int len = (int)strlen(val) < kValueWidth ? (int)strlen(val) : kValueWidth;
-    const int left = (kValueWidth - len) / 2;
     const bool sel = slot == g_sel;
-    printf("\x1b[%d;0H%s%s %-13s\x1b[0m [ - ] %*s%-*s  [ + ]", slot_line(slot), sel ? "\x1b[33m" : "", sel ? ">" : " ", r.label,
-           left + len, val, kValueWidth - left - len, "");
+    recomp3ds::screen_printf("\x1b[%d;0H%s%s %-*.*s %-*.*s\x1b[0m", slot_line(slot), sel ? "\x1b[33m" : "", sel ? ">" : " ",
+           kLabelWidth, kLabelWidth, r.label, kValueWidth, kValueWidth, val);
 }
 
 void draw_tabs() {
     // "[3D]  Controls  Camera  Game  Mods": the current page in brackets,
     // yellow while the tab row is chosen. Each tab is its name plus two
     // columns, one apart, so five fit the 40 columns.
-    printf("\x1b[%d;0H%40s\x1b[%d;0H", kTabRow, "", kTabRow);
+    recomp3ds::screen_printf("\x1b[%d;0H%40s\x1b[%d;0H", kTabRow, "", kTabRow);
     int col = 0;
     for (int p = 0; p < recomp3ds::PageCount; p++) {
         g_tab_col[p] = -1;
         if (page_count(p) == 0) continue;
-        if (col > 0) { printf(" "); col++; }
+        if (col > 0) { recomp3ds::screen_printf(" "); col++; }
         g_tab_col[p] = col;
         const bool cur = p == g_page;
-        if (cur && g_sel < 0) printf("\x1b[33m[%s]\x1b[0m", kPageNames[p]);
-        else if (cur) printf("[%s]", kPageNames[p]);
-        else printf(" %s ", kPageNames[p]);
+        if (cur && g_sel < 0) recomp3ds::screen_printf("\x1b[33m[%s]\x1b[0m", kPageNames[p]);
+        else if (cur) recomp3ds::screen_printf("[%s]", kPageNames[p]);
+        else recomp3ds::screen_printf(" %s ", kPageNames[p]);
         col += (int)strlen(kPageNames[p]) + 2;
     }
 }
 
 void blank_rows(int from, int to) {
-    for (int r = from; r <= to; r++) printf("\x1b[%d;0H%40s", r, "");
+    for (int r = from; r <= to; r++) recomp3ds::screen_printf("\x1b[%d;0H%40s", r, "");
 }
 
 void draw_hint() {
-    printf("\x1b[%d;0H%-40s", kHintRow, g_open ? "SELECT: close   D-Pad: choose, change" : "SELECT: settings");
+    recomp3ds::screen_printf("\x1b[%d;0H%-40s", kHintRow, g_open ? "SELECT: close   D-Pad: choose, change" : "SELECT: settings");
 }
 
 void draw_page() {
     blank_rows(kFirstRow - 1, kLastRow);
     const int n = page_count(g_page);
     for (int s = 0; s < n; s++) draw_row(s);
-    if (g_top > 0) printf("\x1b[%d;%dH^ more", kMoreRow, kMoreUpCol);
-    if (g_top + kSlots < n) printf("\x1b[%d;%dHv more", kMoreRow, kMoreDownCol);
-    if (g_page == recomp3ds::Page3D) printf("\x1b[%d;0H3D slider: strength.  HUD 50: on screen.", kLastRow);
+    if (g_top > 0) recomp3ds::screen_printf("\x1b[%d;%dH^ more", kMoreRow, kMoreUpCol);
+    if (g_top + kSlots < n) recomp3ds::screen_printf("\x1b[%d;%dHv more", kMoreRow, kMoreDownCol);
+    if (g_page == recomp3ds::Page3D) recomp3ds::screen_printf("\x1b[%d;0H3D slider: strength.  HUD 50: on screen.", kLastRow);
     else if (g_page == recomp3ds::PageMods && g_top + kSlots >= n && g_top == 0 && mods_listed())
-        printf("\x1b[%d;0HMods on/off: at the next start.", kLastRow);
+        recomp3ds::screen_printf("\x1b[%d;0HMods on/off: at the next start.", kLastRow);
 }
 
 // Scrolls so that the first visible row is `top`.
@@ -297,7 +296,7 @@ void turn_page(int d) {
 }
 
 // What a touch at (x, y) lands on.
-enum TouchKind { TouchNone, TouchTab, TouchMinus, TouchPlus, TouchLabel, TouchUp, TouchDown };
+enum TouchKind { TouchNone, TouchTab, TouchLabel, TouchUp, TouchDown };
 struct TouchTarget {
     TouchKind kind = TouchNone;
     int arg = 0;                        // the page of a tab, the row of the others
@@ -322,10 +321,7 @@ TouchTarget touch_target(int x, int y) {
         if (!on_line(kFirstRow + v * kRowStep)) continue;
         const int s = g_top + v;
         if (s >= page_count(g_page)) return {};
-        if (col >= kMinusCol - 1 && col <= kMinusCol + 5) return { TouchMinus, s };
-        if (col >= kPlusCol - 1 && col <= kPlusCol + 5) return { TouchPlus, s };
-        if (col < kMinusCol - 1) return { TouchLabel, s };
-        return {};
+        return { TouchLabel, s };
     }
     return {};
 }
@@ -333,7 +329,6 @@ TouchTarget touch_target(int x, int y) {
 void touch_act(const TouchTarget& t) {
     switch (t.kind) {
         case TouchTab: set_page(t.arg); select_slot(-1); break;
-        case TouchMinus: case TouchPlus: select_slot(t.arg); step(t.arg, t.kind == TouchPlus ? 1 : -1); break;
         case TouchLabel: select_slot(t.arg); break;
         case TouchUp: scroll_to(g_top - 1); break;
         case TouchDown: scroll_to(g_top + 1); break;
@@ -341,12 +336,9 @@ void touch_act(const TouchTarget& t) {
     }
 }
 
-// Held, these repeat: the scroll markers and [-]/[+] on number rows.
+// Held, these repeat: the scroll markers.
 bool touch_repeats(const TouchTarget& t) {
-    if (t.kind == TouchUp || t.kind == TouchDown) return true;
-    if (t.kind != TouchMinus && t.kind != TouchPlus) return false;
-    int idx[kMaxRows];
-    return t.arg < page_rows(g_page, idx) && g_rows[idx[t.arg]].names == nullptr;
+    return t.kind == TouchUp || t.kind == TouchDown;
 }
 
 // ---- The mods built into the executable (RECOMP_STATIC_MODS).
@@ -398,7 +390,7 @@ void add_mod_rows() {
         if (d.custom_gamemode) continue;    // chosen at start, not toggled
         ModRow toggle;
         toggle.mod_id = d.mod_id;
-        toggle.label = clip(d.display_name, 13);
+        toggle.label = clip(d.display_name, kLabelWidth);
         toggle.value = recomp::mods::is_mod_enabled(d.mod_id) ? 1 : 0;
         add(std::move(toggle), 0, 1, kModOffOn);
         const recomp::config::ConfigSchema& schema = recomp::mods::get_mod_config_schema(d.mod_id);
@@ -407,14 +399,14 @@ void add_mod_rows() {
             ModRow m;
             m.mod_id = d.mod_id;
             m.option_id = o.id;
-            m.label = " " + clip(o.name, 12);
+            m.label = " " + clip(o.name, kLabelWidth - 1);
             recomp::config::ConfigValueVariant cur = recomp::mods::get_mod_config_value(d.mod_id, o.id);
             if (o.type == recomp::config::ConfigOptionType::Enum) {
                 const auto& e = std::get<recomp::config::ConfigOptionEnum>(o.variant);
                 if (e.options.empty()) continue;
                 m.kind = ModRow::Enum;
                 for (size_t i = 0; i < e.options.size(); i++) {
-                    m.names.push_back(clip(e.options[i].name.empty() ? e.options[i].key : e.options[i].name, 11));
+                    m.names.push_back(clip(e.options[i].name.empty() ? e.options[i].key : e.options[i].name, kValueWidth));
                     m.enum_values.push_back(e.options[i].value);
                     if (std::holds_alternative<uint32_t>(cur) && std::get<uint32_t>(cur) == e.options[i].value) m.value = (int)i;
                 }
@@ -455,13 +447,13 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "separation", "3D depth", 0, 100, &st.sep_slider, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
     add_row({ "convergence_tenths", "Convergence", 1, 200, &g_conv_tenths, nullptr, true, nullptr, apply_conv, Page3D, 1, nullptr });
     add_row({ "hud_depth", "HUD depth", 0, 100, &st.hud_depth, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
-    add_row({ "auto_convergence", "Auto conv.", 0, 1, &g_auto, kOffOn, false, nullptr, apply_auto, Page3D, 1, nullptr });
-    add_row({ "comfort_target", "Comfort", -20, 30, &st.comfort_target, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
+    add_row({ "auto_convergence", "Auto convergence", 0, 1, &g_auto, kOffOn, false, nullptr, apply_auto, Page3D, 1, nullptr });
+    add_row({ "comfort_target", "Comfort target", -20, 30, &st.comfort_target, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
     // The desktop's ghost reduction: 100% contrast and a 0% floor are off.
-    add_row({ "stereo_ghost_contrast", "Ghost contr.", 50, 100, &st.ghost_contrast, nullptr, false, "%", nullptr, Page3D, 1, nullptr });
-    add_row({ "stereo_ghost_black_floor", "Black floor", 0, 20, &st.ghost_black_floor, nullptr, false, "%", nullptr, Page3D, 1, nullptr });
-    add_row({ "stick_deadzone", "Circle Pad dz", 0, 50, &g_stick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
-    add_row({ "cstick_deadzone", "C-Stick dz", 0, 50, &g_cstick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
+    add_row({ "stereo_ghost_contrast", "Ghost reduction: contrast", 50, 100, &st.ghost_contrast, nullptr, false, "%", nullptr, Page3D, 1, nullptr });
+    add_row({ "stereo_ghost_black_floor", "Ghost black floor", 0, 20, &st.ghost_black_floor, nullptr, false, "%", nullptr, Page3D, 1, nullptr });
+    add_row({ "stick_deadzone", "Circle Pad deadzone", 0, 50, &g_stick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
+    add_row({ "cstick_deadzone", "C-Stick deadzone", 0, 50, &g_cstick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
     for (size_t i = 0; i < desc.menu_option_count; i++) {
         const MenuOption& o = desc.menu_options[i];
         add_row({ o.key, o.label, o.lo, o.hi, o.value, o.names, false, o.suffix, o.on_change, o.page, o.step > 0 ? o.step : 1, o.zero_text });
@@ -545,8 +537,7 @@ void recomp3ds::settings_menu_update() {
             }
         }
 
-        // Touch: a tab, [-]/[+] on a row, the row's label to choose it, or
-        // a scroll marker. A touch acts once its position has settled (its
+        // Touch: a tab, a row to choose it, or a scroll marker. A touch acts once its position has settled (its
         // second update), on what it landed on, and after that only on that
         // same target until it lifts: held on a repeating one, and while
         // still on it.
