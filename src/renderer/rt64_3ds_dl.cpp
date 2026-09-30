@@ -257,6 +257,51 @@ struct Interpreter::Impl {
     uint32_t snapshot_base = 0;         // storage buffer that holds the snapshot
     bool snapshot_valid = false;
 
+    // Render to texture (RenderDesc::render_to_texture): a colour image that
+    // is neither a presented framebuffer nor the depth buffer is drawn into
+    // a GPU texture of its own, which later loads from that image sample.
+    bool rtt_enabled = false;
+    RttImage rtt_images[kMaxRtt];
+    int rtt_count = 0, rtt_next = 0;
+    int cur_rtt = -1;                   // the image the current colour image draws into, or -1
+    bool is_presented_fb(uint32_t a) const {
+        for (uint32_t fb : vi_fbs) if (fb != 0 && a == fb) return true;
+        return false;
+    }
+    int rtt_for_cimg(uint32_t a, uint32_t width) {
+        if (!rtt_enabled || a == zimg) return -1;
+        // Known once two framebuffers have been presented (a double-buffered
+        // game's second one is drawn before it is ever shown).
+        const bool known = vi_fbs[0] != 0 && vi_fbs[1] != 0;
+        if (!(a >= 0x800000 || (known && !is_presented_fb(a)))) return -1;
+        for (int i = 0; i < rtt_count; i++) {
+            if (rtt_images[i].addr == a) {
+                if (rtt_images[i].width != width) {   // re-used at another width: a new texture
+                    rtt_images[i].width = (uint16_t)width;
+                    rtt_images[i].pot_w = pot16(width);
+                }
+                return i;
+            }
+        }
+        int i = rtt_count < kMaxRtt ? rtt_count++ : (rtt_next++ % kMaxRtt);
+        rtt_images[i].addr = a;
+        rtt_images[i].width = (uint16_t)width;
+        rtt_images[i].pot_w = pot16(width);
+        rtt_images[i].pot_h = pot16((uint32_t)screen_h);
+        return i;
+    }
+    static uint16_t pot16(uint32_t v) { uint32_t p = 8; while (p < v && p < 1024) p <<= 1; return (uint16_t)p; }
+    // Texel coordinates relative to a tile that reads an off-screen image ->
+    // texels of its render texture (rows counted from the texture's bottom,
+    // where the PICA puts t = 0).
+    void rtt_uv(const TexDesc& d, float& u, float& v) const {
+        const RttImage& img = rtt_images[d.rtt];
+        uint32_t texel = (d.addr - img.addr) / 2;
+        float x0 = (float)(texel % img.width), y0 = (float)(texel / img.width);
+        u = x0 + u;
+        v = (float)img.pot_h - (y0 + v);
+    }
+
     bool is_vi_framebuffer(uint32_t a) const {
         for (uint32_t fb : vi_fbs) if (fb != 0 && a >= fb && a < fb + (uint32_t)(screen_w * screen_h * 2)) return true;
         return false;
@@ -341,7 +386,7 @@ struct Interpreter::Impl {
         // Model -> clip -> screen in one matrix: the viewport is a scale and
         // translate of x/w and y/w (y negated: screen y grows downward) and
         // z' = (z + w) / 2, all linear in homogeneous coordinates.
-        const bool stretch = proj_stretch();
+        const bool stretch = proj_stretch() && cur_rtt < 0;   // an off-screen image is drawn 1:1
         const float sx = stretch ? vp.scale[0] * stretch_k() : vp.scale[0], sy = -vp.scale[1];
         const float tx = stretch ? stretch_x(vp.trans_stretch) : vp.trans[0], ty = vp.trans[1];
         float m[4][4];
@@ -463,6 +508,16 @@ struct Interpreter::Impl {
         // texture data (the storage may be heap memory the game reuses later).
         d.snapshot = snapshot_valid && d.addr >= snapshot_base && d.addr < snapshot_base + (uint32_t)(screen_w * screen_h * 2) &&
                      !best->block && best->pitch == (uint32_t)screen_w * 2 && tl.siz == 2;
+        d.rtt = -1;
+        if (rtt_enabled && !d.snapshot && !best->block && tl.siz == 2) {
+            for (int i = 0; i < rtt_count; i++) {
+                const RttImage& img = rtt_images[i];
+                if (d.addr >= img.addr && d.addr < img.addr + (uint32_t)img.width * 2 * img.pot_h && best->pitch == (uint32_t)img.width * 2) {
+                    d.rtt = (int8_t)i;
+                    break;
+                }
+            }
+        }
         d.fmt = tl.fmt;
         d.siz = tl.siz;
         d.width = (uint16_t)w;
@@ -507,6 +562,7 @@ struct Interpreter::Impl {
         r.prim_lod_frac = prim_lod_frac;
         effective_scissor(r.scissor, r.kind == DrawRecord::Tris && proj_stretch());
         r.proj_id = proj_id;
+        r.rtt = (int8_t)cur_rtt;
         r.perspective = proj.m[2][3] != 0.0f || proj.m[3][3] == 0.0f;
         r.mv_auto = mv_groups[mv_group_depth] == kIdAuto;
         r.mv_seq = mv_seq;
@@ -531,15 +587,16 @@ struct Interpreter::Impl {
 
     bool offscreen_target() const {
         // Draws into buffers the game keeps in patch RAM (frame copies for
-        // effects) are not part of the visible frame.
-        return cimg >= 0x800000;
+        // effects) are not part of the visible frame; with render to texture,
+        // every off-screen image is.
+        return rtt_enabled ? cur_rtt >= 0 : cimg >= 0x800000;
     }
 
     void emit_tri(int i0, int i1, int i2) {
 #ifdef DL_BENCH_SKIP_TRI
         return;
 #endif
-        if (offscreen_target()) return;
+        if (offscreen_target() && cur_rtt < 0) return;
         if (i0 >= kMaxVerts || i1 >= kMaxVerts || i2 >= kMaxVerts) return;
         DrawRecord* r = nullptr;
         if (!out->draws.empty()) {
@@ -610,6 +667,7 @@ struct Interpreter::Impl {
             t.u = v.u * ss - uls;
             t.v = v.v * st - ult;
             if (snap) snapshot_uv(r->tex[0], t.u, t.v, t.u, t.v, proj_stretch());
+            else if (r->tex[0].rtt >= 0) rtt_uv(r->tex[0], t.u, t.v);
             t.r = v.r; t.g = v.g; t.b = v.b; t.a = v.a;
         }
         stats->tris++;
@@ -706,14 +764,14 @@ struct Interpreter::Impl {
         if (!a.valid) return true;
         return a.addr == b.addr && a.pitch == b.pitch && a.fmt == b.fmt && a.siz == b.siz && a.width == b.width && a.height == b.height &&
                a.masks == b.masks && a.maskt == b.maskt && a.cms == b.cms && a.cmt == b.cmt && a.palette == b.palette &&
-               a.nibble == b.nibble && a.tlut_hash == b.tlut_hash && a.tlut_mode == b.tlut_mode && a.bilerp == b.bilerp && a.snapshot == b.snapshot &&
+               a.nibble == b.nibble && a.tlut_hash == b.tlut_hash && a.tlut_mode == b.tlut_mode && a.bilerp == b.bilerp && a.snapshot == b.snapshot && a.rtt == b.rtt &&
                a.block == b.block && a.dxt == b.dxt && a.load_word == b.load_word;
     }
     static bool same_draw_state(const DrawRecord& a, const DrawRecord& b) {
         return a.cc_w0 == b.cc_w0 && a.cc_w1 == b.cc_w1 && a.othermode_h == b.othermode_h && a.othermode_l == b.othermode_l &&
                a.geometry_mode == b.geometry_mode && memcmp(a.prim, b.prim, 4) == 0 && memcmp(a.env, b.env, 4) == 0 &&
                memcmp(a.blend, b.blend, 4) == 0 && memcmp(a.fog, b.fog, 4) == 0 && a.prim_lod_frac == b.prim_lod_frac &&
-               memcmp(a.scissor, b.scissor, sizeof(a.scissor)) == 0 && a.proj_id == b.proj_id && a.perspective == b.perspective &&
+               memcmp(a.scissor, b.scissor, sizeof(a.scissor)) == 0 && a.proj_id == b.proj_id && a.perspective == b.perspective && a.rtt == b.rtt &&
                memcmp(a.uv1, b.uv1, sizeof(a.uv1)) == 0 &&
                same_tex(a.tex[0], b.tex[0]) && same_tex(a.tex[1], b.tex[1]);
     }
@@ -722,7 +780,7 @@ struct Interpreter::Impl {
     // compares, without building a probe record).
     bool same_as_last(const DrawRecord& a, const TexDesc* tex) const {
         if (a.cc_w0 != cc_w0 || a.cc_w1 != cc_w1 || a.othermode_h != othermode_h || a.othermode_l != othermode_l ||
-            a.geometry_mode != geometry_mode || a.prim_lod_frac != prim_lod_frac || a.proj_id != proj_id) return false;
+            a.geometry_mode != geometry_mode || a.prim_lod_frac != prim_lod_frac || a.proj_id != proj_id || a.rtt != cur_rtt) return false;
         if (a.mv_auto != (mv_groups[mv_group_depth] == kIdAuto)) return false;
         if (memcmp(a.prim, prim, 4) != 0 || memcmp(a.env, env, 4) != 0 || memcmp(a.blend, blend, 4) != 0 || memcmp(a.fog, fog, 4) != 0) return false;
         int16_t sc[4];
@@ -763,9 +821,10 @@ struct Interpreter::Impl {
                     snapshot_base = cimg;
                     snapshot_valid = true;
                     tex_seq++;
+                    return;
                 }
             }
-            return;
+            if (cur_rtt < 0) return;
         }
         uint32_t cyc = (othermode_h >> 20) & 3;
         if (!textured && zimg != 0 && cimg == zimg) return;   // depth clear: the target is cleared per frame
@@ -797,7 +856,7 @@ struct Interpreter::Impl {
         // frame copy, spans the full width with plain origins (full-screen
         // fills and tints), or is tagged STRETCH, unless it is tagged ADJUST.
         const bool stretch = ((textured && r.tex[0].snapshot) || (plain_origins && ulx <= 0.0f && lrx >= (float)screen_w) ||
-                              rect_aspect == kAspectStretch) && rect_aspect != kAspectAdjust;
+                              rect_aspect == kAspectStretch) && rect_aspect != kAspectAdjust && cur_rtt < 0;
         if (stretch) {
             ulx = stretch_x(ulx);
             lrx = stretch_x(lrx);
@@ -810,6 +869,7 @@ struct Interpreter::Impl {
             q[i].x = xs[i]; q[i].y = ys[i]; q[i].z = (othermode_l & G_ZS_PRIM) ? prim_z() : 0.0f; q[i].w = 1.0f;
             q[i].u = us[i]; q[i].v = vs[i];
             if (r.tex[0].snapshot) snapshot_uv(r.tex[0], q[i].u, q[i].v, q[i].u, q[i].v, stretch);
+            else if (r.tex[0].rtt >= 0) rtt_uv(r.tex[0], q[i].u, q[i].v);
             q[i].r = q[i].g = q[i].b = q[i].a = 0;   // rectangles have no shade: SHADE reads as 0 (as RT64)
         }
         Vtx3ds* o = out->verts.append(6);
@@ -832,7 +892,8 @@ struct Interpreter::Impl {
         switch (sub) {
             case EX_SETRDRAMEXTENDED: extended_rdram = (w1 & 1) != 0; return 0;
             case EX_SETRECTASPECT: rect_aspect = w1 & 3; return 0;
-            case EX_SETREFRESHRATE: case EX_SETNEARCLIPPING: case EX_SETTEXCOORDWRAPPOINT:
+            case EX_SETREFRESHRATE: stats->refresh_rate = w1 & 0xFFFF; return 0;
+            case EX_SETNEARCLIPPING: case EX_SETTEXCOORDWRAPPOINT:
             case EX_FORCEUPSCALE2D: case EX_FORCETRUEBILERP: case EX_FORCESCALELOD: case EX_FORCEBRANCH:
             case EX_SETRENDERTORAM: case EX_SETDITHERNOISESTRENGTH: case EX_VERTEXZTEST: case EX_ENDVERTEXZTEST:
                 return 0;
@@ -1497,6 +1558,8 @@ struct Interpreter::Impl {
                 case G_SETZIMG: zimg = seg(w1); break;
                 case G_SETCIMG:
                     cimg = seg(w1); cimg_width = (w0 & 0xFFF) + 1;
+                    cur_rtt = rtt_for_cimg(cimg, cimg_width);
+                    if (cur_rtt >= 0) out->rtts[cur_rtt] = rtt_images[cur_rtt];
                     out->color_image = cimg; out->color_width = cimg_width; out->depth_image = zimg;
                     break;
                 default:
@@ -1518,6 +1581,12 @@ Interpreter::Interpreter(uint8_t* rdram) : impl_(new Impl()) {
 
 void Interpreter::note_presented_framebuffer(uint32_t addr) {
     for (uint32_t fb : impl_->vi_fbs) if (fb == addr) return;
+    // A frame that ends on an off-screen image (Banjo's jiggy transition
+    // leaves its image current) did not present it.
+    if (impl_->rtt_enabled) {
+        for (int i = 0; i < impl_->rtt_count; i++) if (impl_->rtt_images[i].addr == addr) return;
+        if (addr >= 0x800000) return;
+    }
     impl_->vi_fbs[impl_->vi_fb_next++ & 3] = addr;
 }
 
@@ -1541,6 +1610,7 @@ bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
     for (int& d : impl_->color_depth) d = 0;
     impl_->load_count = 0;
     impl_->tlut_frame_hash = 0;
+    for (int i = 0; i < kMaxRtt; i++) out.rtts[i] = impl_->rtt_images[i];
     for (auto& L : impl_->loads) L.valid = false;
     return impl_->run(data_ptr);
 }
@@ -1551,6 +1621,7 @@ void Interpreter::set_world_proj_ids(const uint32_t* ids, int count) {
 void Interpreter::set_split_untagged_ortho(bool on) { impl_->split_untagged_ortho = on; }
 void Interpreter::set_force_branch_z(bool on) { impl_->force_branch_z = on; }
 void Interpreter::set_gbi(Gbi gbi) { impl_->gbi = gbi; }
+void Interpreter::set_render_to_texture(bool on) { impl_->rtt_enabled = on; }
 void Interpreter::set_screen(const ScreenGeometry& geo) {
     impl_->geo = geo;
     impl_->screen_w = geo.w;

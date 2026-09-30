@@ -58,6 +58,12 @@ struct RenderDesc {
     // level-of-detail pair: what the recomp frontends set (RT64's
     // enhancementConfig.f3dex.forceBranch).
     bool force_lod_branch = true;
+    // Draw colour images the game renders off screen (neither a presented
+    // framebuffer nor the depth buffer) into GPU textures, and sample those
+    // where the game loads textures from them: Banjo's jiggy transition and
+    // picture puzzles render the world into such an image. Off, off-screen
+    // draws are dropped (copies of the presented frame use the snapshot).
+    bool render_to_texture = false;
 };
 
 void set_render_desc(const RenderDesc& desc);
@@ -132,6 +138,7 @@ struct FrameStats {
     int dl_per_sec = 0;               // display lists received per second
     int late_frames = 0;              // gaps of more than 50 ms between display lists, last second
     float max_gap_ms = 0;             // the longest such gap, last second
+    int game_fps = 0;                 // the rate the game asks for (gEXSetRefreshRate), 0 = not given
 };
 const FrameStats& stats();
 FrameStats& mutable_stats();   // for the renderer implementations

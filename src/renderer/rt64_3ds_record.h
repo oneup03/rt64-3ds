@@ -69,6 +69,7 @@ struct TexDesc {
     uint16_t tlut_mode = 0; // G_TT_* (0 none, 2 RGBA16, 3 IA16)
     bool bilerp = false;
     bool snapshot = false;  // samples the stored copy of a previous frame instead of RDRAM
+    int8_t rtt = -1;        // samples the off-screen image FrameRecord::rtts[rtt] rendered on the GPU
     // LOADBLOCK row step: the RDP swaps the 32-bit halves of each 64-bit
     // TMEM word on rows its dxt counter calls odd, and the sampler swaps
     // them back on odd tile rows. Where the two disagree (dxt 0: data
@@ -94,6 +95,7 @@ struct DrawRecord {
     // TEXEL1's texel coordinates from TEXEL0's: u1 = u0 * uv1[0] + uv1[2],
     // v1 = v0 * uv1[1] + uv1[3] (the two tiles' shifts and origins differ).
     float uv1[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
+    int8_t rtt = -1;                    // drawn into FrameRecord::rtts[rtt] instead of the screen
     uint32_t proj_id = 0;               // projection group id in force (gEXMatrixGroup), for stereo
     bool perspective = true;
     bool mv_auto = false;               // the modelview group is untagged (G_EX_ID_AUTO): reticle candidates
@@ -102,6 +104,17 @@ struct DrawRecord {
     float dbg_vp[4] = {};               // viewport scale x/y, translate x/y (debug logging)
     float dbg_proj[4] = {};             // projection m[1][1], m[3][1], m[2][3], m[3][3]
 };
+
+// An off-screen colour image the game draws into and later samples (Banjo's
+// jiggy transition and picture puzzles). The backend renders it into a
+// texture of pot_w x pot_h; texel coordinates that sample it arrive already
+// in that texture's texels, rows counted from its bottom.
+struct RttImage {
+    uint32_t addr = 0;
+    uint16_t width = 0;
+    uint16_t pot_w = 0, pot_h = 0;
+};
+constexpr int kMaxRtt = 4;
 
 struct FrameRecord {
     VtxArray verts;
@@ -113,6 +126,7 @@ struct FrameRecord {
     bool has_cam = false;               // a perspective projection was loaded this frame
     bool cam_is_world = false;          // ... under the world projection group (stereo depth terms)
     float cam[16] = {};
+    RttImage rtts[kMaxRtt];             // indexed by DrawRecord::rtt and TexDesc::rtt
 
     void clear() {
         verts.clear();

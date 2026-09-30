@@ -217,6 +217,22 @@ public:
         // In first person the reticle's quads must stay one per record.
         interp_.set_split_untagged_ortho(rt64_3ds::first_person_scene());
         bool present = interp_.run(task->t.data_ptr, frame_);
+        if (seq_rtt_count_ > 0 && frames_ > 10) {
+            for (const rt64_3ds::DrawRecord& d : frame_.draws) {
+                if (d.rtt >= 0) { seq_first_ = (int)frames_ + 1; seq_count_ = seq_rtt_count_; seq_rtt_count_ = 0; break; }
+            }
+        }
+        if (rtt_capture_armed_ && frames_ > 10 && capture_copy_ != nullptr) {
+            for (const rt64_3ds::DrawRecord& d : frame_.draws) {
+                if (d.rtt >= 0) {
+                    rtt_capture_armed_ = false;
+                    capture_task_ = rtt_capture_task_;
+                    fb_capture_pending_ = true;
+                    fprintf(stderr, "rt64-3ds: captured gfx task of frame %u (it draws off screen)\n", frames_);
+                    break;
+                }
+            }
+        }
         if (frame_.snapshot_request) {
             fprintf(stderr, "rt64-3ds: frame %u stores the screen (cimg %06x)\n", frames_, frame_.color_image);
             if (store_delay_ >= 0 && capture_want_ < 0) { capture_want_ = (int)frames_ + store_delay_; store_delay_ = -1; }
@@ -261,6 +277,7 @@ public:
         if (window_start_ == 0) window_start_ = t0;
         else if (t2 - window_start_ >= SYSCLOCK_ARM11) {
             g_stats.dl_per_sec = (int)dl_count_;
+            g_stats.game_fps = (int)interp_.stats().refresh_rate;
             g_stats.late_frames = (int)late_;
             g_stats.max_gap_ms = max_gap_;
             late_ = 0;
@@ -413,6 +430,7 @@ private:
             interp_.set_world_proj_ids(ids, n);
             interp_.set_force_branch_z(desc.force_lod_branch);
             interp_.set_gbi(desc.gbi);
+            interp_.set_render_to_texture(desc.render_to_texture);
         }
 
         // The game's frame sits centred on the 400 px wide screen, scaled to
@@ -501,8 +519,17 @@ private:
                 break;
             }
         }
-        C3D_RenderTargetClear(top_, C3D_CLEAR_ALL, 0x000000FF, 0);
-        C3D_FrameDrawOn(top_);
+        // A frame that ends on an off-screen image draws only for that image
+        // (Banjo's jiggy transition renders the scene into its own image
+        // and presents nothing): fill the texture, leave the screen with the
+        // previous frame, as the VI would.
+        bool offscreen_frame = false;
+        for (const rt64_3ds::RttImage& img : frame_.rtts) if (img.addr != 0 && img.addr == frame_.color_image) offscreen_frame = true;
+        if (!offscreen_frame) {
+            C3D_RenderTargetClear(top_, C3D_CLEAR_ALL, 0x000000FF, 0);
+            C3D_FrameDrawOn(top_);
+        }
+        cur_target_ = offscreen_frame ? -2 : -1;
         C3D_BindProgram(&prog_);
         C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &proj_);
         C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -531,7 +558,7 @@ private:
 
         int fallbacks = 0;
         u64 tl0 = svcGetSystemTick(), tl_split = 0;
-        const int eyes = sfd.on ? 2 : 1;
+        const int eyes = (sfd.on && !offscreen_frame) ? 2 : 1;
         for (int pass = 0; pass < eyes; pass++) {
         const int eye = pass == 0 ? 1 : -1;       // +1 left, -1 right
         if (pass == 1) {
@@ -539,6 +566,7 @@ private:
             tl_split = svcGetSystemTick();
             C3D_RenderTargetClear(top_r_, C3D_CLEAR_ALL, 0x000000FF, 0);
             C3D_FrameDrawOn(top_r_);
+            cur_target_ = -1;
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &proj_);
         }
         for (size_t i = 0; i < frame_.draws.size(); i++) {
@@ -547,10 +575,27 @@ private:
             g_progress_draw = &d;
             if (d.count < 3 || d.first + d.count > n) continue;
             if ((int)i < draw_lo_ || (int)i > draw_hi_) continue;
+            // Off-screen images are drawn once (in the first pass, unshifted).
+            if (d.rtt >= 0 && pass != 0) continue;
+            if (offscreen_frame && d.rtt < 0) continue;
+            if (d.rtt != cur_target_) {
+                if (d.rtt >= 0) {
+                    RttTarget* t = ensure_rtt(d.rtt);
+                    if (t == nullptr) continue;
+                    C3D_FrameDrawOn(t->rt);
+                    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &t->proj);
+                }
+                else {
+                    C3D_FrameDrawOn(pass == 0 ? top_ : top_r_);
+                    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &proj_);
+                }
+                cur_target_ = d.rtt;
+                last_misc_ = ~0ull;        // the scissor belongs to the target
+            }
             apply_state(d, pass == 0 ? &fallbacks : nullptr);
             {
                 float sa = 0.0f, sb = 0.0f;
-                if (sfd.on) {
+                if (sfd.on && d.rtt < 0) {
                     if (classes_[i] == kReticle) sa = -(float)eye * sfd.aim_ndc * 200.0f;
                     else rt64_3ds::stereo_shift(sfd, (rt64_3ds::StereoClass)classes_[i], d, eye, &sa, &sb);
                 }
@@ -585,14 +630,20 @@ private:
                 BufInfo_Add(bi, vb, sizeof(GpuVertex), 3, 0x210);
             }
         }
-        if (ghost && sfd.on) ghost_pass((uint32_t)n);
+        if (cur_target_ >= 0 && !offscreen_frame) {
+            C3D_FrameDrawOn(pass == 0 ? top_ : top_r_);
+            C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &proj_);
+            cur_target_ = -1;
+            last_misc_ = ~0ull;
+        }
+        if (ghost && sfd.on && !offscreen_frame) ghost_pass((uint32_t)n);
         }   // eye passes
         {
             u64 tl1 = svcGetSystemTick();
             if (tl_split != 0) { acc_left_ += tl_split - tl0; acc_right_ += tl1 - tl_split; }
             else acc_left_ += tl1 - tl0;
         }
-        if (vi_blanked_ && black_ != nullptr) {
+        if (vi_blanked_ && black_ != nullptr && !offscreen_frame) {
             // The frame is drawn (the game may store it for an effect) but
             // the screen gets the black target, as the VI would show.
             C3D_RenderTargetClear(black_, C3D_CLEAR_COLOR, 0x000000FF, 0);
@@ -771,6 +822,19 @@ private:
                 else { us1 = 1.0f / 256.0f; vs1 = 1.0f / 512.0f; }
                 bound = true;
             }
+            else if (d.tex[t].valid && d.tex[t].rtt >= 0) {
+                // An off-screen image drawn on the GPU (this frame or earlier).
+                RttTarget& rt = rtt_[d.tex[t].rtt];
+                if (rt.rt != nullptr) {
+                    if (&rt.tex != last_tex_[t]) {
+                        C3D_TexBind(t, &rt.tex);
+                        last_tex_[t] = &rt.tex; last_tex_param_[t] = 0xFFFFFFFEu;
+                    }
+                    if (t == 0) { us = 1.0f / (float)rt.w; vs = 1.0f / (float)rt.h; }
+                    else { us1 = 1.0f / (float)rt.w; vs1 = 1.0f / (float)rt.h; }
+                    bound = true;
+                }
+            }
             else if (d.tex[t].valid) {
                 const uint16_t* pal = (d.tex[t].fmt == 2 && d.tex[t].tlut_index + 256 <= frame_.tlut.size()) ? &frame_.tlut[d.tex[t].tlut_index] : nullptr;
                 rt64_3ds::BoundTex b = textures_.get(d.tex[t], pal);
@@ -891,6 +955,12 @@ private:
         // NO_SCISSOR.TXT disables it (to see draws a wrong clip would hide).
         static int no_scissor = -1;
         if (no_scissor < 0) { FILE* f = rt64_3ds::data_fopen("NO_SCISSOR.TXT", "r"); no_scissor = f ? 1 : 0; if (f) fclose(f); }
+        if (d.rtt >= 0) {
+            // An off-screen image: the texture is its own clip.
+            C3D_SetScissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
+            prof_[2] += tick() - tp2;
+            return;
+        }
         int x0 = (int)lroundf(geo_.screen_x((float)d.scissor[0])), y0 = (int)lroundf(geo_.screen_y((float)d.scissor[1]));
         int x1 = (int)lroundf(geo_.screen_x((float)d.scissor[2])), y1 = (int)lroundf(geo_.screen_y((float)d.scissor[3]));
         if (no_scissor) { x0 = 0; y0 = 0; x1 = 400; y1 = 240; }
@@ -921,6 +991,11 @@ public:
                 char word[16] = {};
                 if (fscanf(f, "%15s", word) == 1) {
                     if (strcmp(word, "snap") == 0) capture_snapshot_frames_ = 3;   // the first three frames drawing from a snapshot
+                    else if (strcmp(word, "rtt") == 0) rtt_capture_armed_ = true;  // the first frame (after boot) drawing off screen
+                    else if (strcmp(word, "seqrtt") == 0) {
+                        // "seqrtt <count>": the rendered frames from the first one (after boot) drawing off screen
+                        if (fscanf(f, "%d", &seq_rtt_count_) != 1) seq_rtt_count_ = 30;
+                    }
                     else if (strcmp(word, "cam") == 0) {
                         // "cam <first frame> <count>": log the camera projection per frame
                         if (fscanf(f, "%d %d", &cam_log_first_, &cam_log_count_) != 2) cam_log_count_ = 0;
@@ -940,6 +1015,12 @@ public:
         }
         if (seq_count_ > 0 && (int)frames_ >= seq_first_ && (int)frames_ < seq_first_ + seq_count_) fb_capture_pending_ = true;
         if (cam_log_count_ > 0 && (int)frames_ >= cam_log_first_ && (int)frames_ < cam_log_first_ + cam_log_count_) cam_log_now_ = true;
+        if (rtt_capture_armed_ && frames_ > 10) {
+            // Keep this frame's RDRAM and task; send_dl keeps them if the
+            // frame turns out to draw into an off-screen image.
+            if (capture_copy_ == nullptr) capture_copy_ = (uint8_t*)malloc(16u * 1024 * 1024);
+            if (capture_copy_ != nullptr) { memcpy(capture_copy_, rdram_, 16u * 1024 * 1024); rtt_capture_task_ = *task; }
+        }
         if (want < 0 || (int)frames_ != want) return;
         want = -1;
         // Snapshot RDRAM and the task now; the slow SD write happens after
@@ -1394,6 +1475,55 @@ public:
     rt64_3ds::ScreenGeometry geo_ = rt64_3ds::ScreenGeometry::make(320, 240);
     int grid_cols_ = 40, grid_rows_ = 30;
     int draw_lo_ = 0, draw_hi_ = 1 << 30;       // DRAW_RANGE.TXT
+
+    // Render to texture: one target per off-screen image slot
+    // (FrameRecord::rtts), a VRAM texture with its own depth buffer, drawn
+    // in the image's N64 pixels (y down) and sampled as a texture.
+    struct RttTarget {
+        C3D_Tex tex{};
+        C3D_RenderTarget* rt = nullptr;
+        uint16_t w = 0, h = 0;
+        C3D_Mtx proj{};
+        uint32_t clear_frame = ~0u;
+    };
+    RttTarget rtt_[rt64_3ds::kMaxRtt];
+    int cur_target_ = -1;                        // the RTT slot drawn into, -1 = the eye
+    RttTarget* ensure_rtt(int i) {
+        const rt64_3ds::RttImage& img = frame_.rtts[i];
+        RttTarget& t = rtt_[i];
+        if (t.rt == nullptr || t.w != img.pot_w || t.h != img.pot_h) {
+            if (t.rt != nullptr) { C3D_RenderTargetDelete(t.rt); C3D_TexDelete(&t.tex); t.rt = nullptr; }
+            if (img.pot_w == 0 || img.pot_h == 0) return nullptr;
+            if (!C3D_TexInitVRAM(&t.tex, img.pot_w, img.pot_h, GPU_RGBA8)) {
+                fprintf(stderr, "rt64-3ds: no VRAM for a %ux%u render texture\n", (unsigned)img.pot_w, (unsigned)img.pot_h);
+                return nullptr;
+            }
+            t.rt = C3D_RenderTargetCreateFromTex(&t.tex, GPU_TEXFACE_2D, 0, GPU_RB_DEPTH24_STENCIL8);
+            if (t.rt == nullptr) {
+                C3D_TexDelete(&t.tex);
+                fprintf(stderr, "rt64-3ds: render target for a %ux%u texture failed\n", (unsigned)img.pot_w, (unsigned)img.pot_h);
+                return nullptr;
+            }
+            t.w = img.pot_w; t.h = img.pot_h;
+            C3D_TexSetFilter(&t.tex, GPU_LINEAR, GPU_LINEAR);
+            C3D_TexSetWrap(&t.tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+            // N64 image pixels, y down: the image's top row lands at the
+            // texture's top (t = 1), where the interpreter's texel
+            // coordinates count from (pot_h - y).
+            Mtx_Ortho(&t.proj, 0.0f, (float)t.w, (float)t.h, 0.0f, 0.0f, 1.0f, true);
+            fprintf(stderr, "rt64-3ds: render texture %d for image %06x (%u wide): %ux%u (frame %u)\n", i, img.addr & 0xFFFFFF,
+                    (unsigned)img.width, (unsigned)t.w, (unsigned)t.h, frames_);
+        }
+        if (t.clear_frame != frames_) {
+            static int logged = 0;
+            if (logged < 60) { logged++; fprintf(stderr, "rt64-3ds: frame %u draws into render texture %d\n", frames_, i); }
+            // First draw into it this frame: a fresh depth buffer (the
+            // colour is the game's own fill).
+            C3D_RenderTargetClear(t.rt, C3D_CLEAR_ALL, 0x000000FF, 0);
+            t.clear_frame = frames_;
+        }
+        return &t;
+    }
     C3D_RenderTarget* top_r_ = nullptr;
     C3D_RenderTarget* black_ = nullptr;
     bool vi_blanked_ = false;
@@ -1414,6 +1544,9 @@ public:
     bool aim_have_prev_ = false;
     int capture_snapshot_frames_ = 0;
     int capture_want_ = -2, store_delay_ = -1;
+    bool rtt_capture_armed_ = false;            // GFX_CAPTURE.TXT "rtt"
+    int seq_rtt_count_ = 0;                     // GFX_CAPTURE.TXT "seqrtt <count>"
+    OSTask rtt_capture_task_{};
     int seq_first_ = 0, seq_count_ = 0;
     int cam_log_first_ = 0, cam_log_count_ = 0;
     bool cam_log_now_ = false;

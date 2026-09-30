@@ -19,6 +19,7 @@ struct InterpreterStats {
     uint32_t op_hist[256] = {};    // commands run per opcode
     uint32_t mtx_loads = 0, vtx_loaded = 0, draws_merged = 0, probes = 0, clipped = 0;
     uint32_t branch_z_taken = 0, branch_z_not = 0, cull_dl = 0;   // level-of-detail branches, cull tests
+    uint32_t refresh_rate = 0;     // the game's intended frame rate (gEXSetRefreshRate), 0 = not given
 };
 
 class Interpreter {
@@ -42,6 +43,9 @@ public:
     void set_force_branch_z(bool on);
     // The display-list encoding the game's lists use (F3DEX2 by default).
     void set_gbi(Gbi gbi);
+    // Draw off-screen colour images into textures of their own instead of
+    // dropping them (see FrameRecord::rtts).
+    void set_render_to_texture(bool on);
     // Where the game's frame sits on the top screen (RenderDesc::vi_width
     // and vi_height): origins, stretching, clipping and frame copies follow it.
     void set_screen(const ScreenGeometry& geo);

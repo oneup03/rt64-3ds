@@ -343,8 +343,10 @@ void update_gfx_inner() {
             recomp3ds::rom_stream_take_stats(&misses, &bytes);
             snprintf(rom_stats, sizeof(rom_stats), " rom %lu reads (%lu KB)", (unsigned long)misses, (unsigned long)(bytes / 1024));
         }
-        fprintf(stderr, "stats: %d dl/s (late %d, max gap %.0f ms) core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu heap %lu KB%s%s\n",
-                st.dl_per_sec, st.late_frames, st.max_gap_ms, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_remaining(),
+        char want_fps[24] = "";
+        if (st.game_fps > 0) snprintf(want_fps, sizeof(want_fps), ", game asks %d", st.game_fps);
+        fprintf(stderr, "stats: %d dl/s%s (late %d, max gap %.0f ms) core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu heap %lu KB%s%s\n",
+                st.dl_per_sec, want_fps, st.late_frames, st.max_gap_ms, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_remaining(),
                 (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped,
                 (unsigned long)(mallinfo().arena / 1024), rom_stats, game_stats);
         // One 40-column row: the audio microcode's ms per second last.
