@@ -35,7 +35,9 @@ float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 // The PICA: each stage's result is clamped before the next reads it.
 V4 run_tev(const rt64_3ds::TevPlan& p, int stages, V4 shade, V4 t0, V4 t1, bool* odd) {
     V4 prev = { 0, 0, 0, 0 };
-    const V4 buf = rgba8(p.buffer_color);
+    // The buffer reads zero in the first stage and its colour from the
+    // second on (the PICA updates it one stage late; Azahar models this).
+    const V4 buf_color = rgba8(p.buffer_color);
     for (int i = 0; i < stages; i++) {
         const rt64_3ds::TevStage& st = p.stage[i];
         const V4 k = rgba8(st.constant);
@@ -46,7 +48,7 @@ V4 run_tev(const rt64_3ds::TevPlan& p, int stages, V4 shade, V4 t0, V4 t1, bool*
                 case GPU_TEXTURE1: return t1;
                 case GPU_CONSTANT: return k;
                 case GPU_PREVIOUS: if (i == 0) *odd = true; return prev;
-                case GPU_PREVIOUS_BUFFER: return buf;
+                case GPU_PREVIOUS_BUFFER: return i == 0 ? V4{ 0, 0, 0, 0 } : buf_color;
                 default: *odd = true; return { 0, 0, 0, 0 };
             }
         };
@@ -163,9 +165,27 @@ int main(int argc, char** argv) {
     }
     fclose(f);
     rt64_3ds::Interpreter interp(rdram.data());
+    // The game's display-list encoding and frame size, as dl_test takes them.
+    if (const char* e = getenv("DL_GBI")) if (strcmp(e, "f3dex") == 0) interp.set_gbi(rt64_3ds::Gbi::F3DEX);
+    if (const char* e = getenv("DL_SCREEN")) { int w = 0, h = 0; if (sscanf(e, "%dx%d", &w, &h) == 2) interp.set_screen(rt64_3ds::ScreenGeometry::make(w, h)); }
     rt64_3ds::FrameRecord frame;
     interp.run(task.t.data_ptr, frame);
 
+    if (const char* e = getenv("TEV_SHOW")) {
+        // TEV_SHOW=<draw>: that draw's plan, stage by stage (citro3d enums).
+        const size_t i = (size_t)atoi(e);
+        if (i < frame.draws.size()) {
+            rt64_3ds::TevPlan plan;
+            rt64_3ds::plan_tev(frame.draws[i], plan);
+            printf("draw %zu: %d stages (%d combiner), buffer %08x, fallbacks %d\n", i, plan.stages, plan.combiner_stages, plan.buffer_color, plan.fallbacks);
+            for (int k = 0; k < plan.stages; k++) {
+                const rt64_3ds::TevStage& st = plan.stage[k];
+                printf("  stage %d: rgb func %d src %02x %02x %02x op %x %x %x | a func %d src %02x %02x %02x op %x %x %x | const %08x\n", k,
+                       (int)st.func_rgb, (int)st.src_rgb[0], (int)st.src_rgb[1], (int)st.src_rgb[2], (int)st.op_rgb[0], (int)st.op_rgb[1], (int)st.op_rgb[2],
+                       (int)st.func_a, (int)st.src_a[0], (int)st.src_a[1], (int)st.src_a[2], (int)st.op_a[0], (int)st.op_a[1], (int)st.op_a[2], st.constant);
+            }
+        }
+    }
     static const V4 kInputs[] = {
         { 0, 0, 0, 0 }, { 1, 1, 1, 1 }, { 1, 0, 0, 1 }, { 0, 1, 0, 0.5f }, { 0.25f, 0.5f, 0.75f, 0.25f },
         { 0.9f, 0.1f, 0.4f, 0.8f }, { 0.5f, 0.5f, 0.5f, 0 }, { 0.2f, 0.7f, 0.1f, 1 },

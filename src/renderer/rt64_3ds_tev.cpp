@@ -6,7 +6,9 @@
 // + ENV, a common text and HUD combiner, needs both in one stage. Common
 // forms map to one stage; the general form takes two (SUBTRACT then
 // MULTIPLY_ADD on PREVIOUS). Sources the PICA lacks (noise, LOD fractions,
-// key/convert constants) become constants.
+// key/convert constants) become constants. The buffer only reads as its
+// colour from the second stage on (the first stage's PREVIOUS_BUFFER is
+// zero), so a plan whose first stage needs it starts one stage later.
 #include "rt64_3ds_tev.h"
 
 #include <cstring>
@@ -67,6 +69,7 @@ int plan_channel(Src a, Src b, Src c, Src d, Op* ops) {
         return 1;
     }
     if (b == S_ZERO) {
+        if (c == S_ONE && d == S_ZERO) { ops[0] = { GPU_REPLACE, { a, a, a }, 1 }; return 1; }
         if (d == S_ZERO) { ops[0] = { GPU_MODULATE, { a, c, c }, 2 }; return 1; }
         if (c == S_ONE) { ops[0] = { GPU_ADD, { a, d, d }, 2 }; return 1; }
         ops[0] = { GPU_MULTIPLY_ADD, { a, c, d }, 3 };
@@ -87,6 +90,25 @@ struct Consts { uint32_t prim, env, lod, primlod; };
 uint32_t const_value(int id, const Consts& k) {
     switch (id) { case 1: return k.prim; case 2: return k.env; case 3: return 0xFFFFFFFFu; case 4: return 0x00000000u;
                   case 5: return k.lod; case 6: return k.primlod; case 7: return 0x80808080u; default: return 0; }
+}
+
+// A primitive or environment input whose value is all zero or all one in
+// the channels it is read as becomes the plain ZERO or ONE: fewer constants
+// per stage (often none), and simpler ops.
+Src fold_const(Src s, bool alpha_channel, const Consts& k) {
+    uint32_t v;
+    bool alpha_part;
+    switch (s) {
+        case S_PRIM: v = k.prim; alpha_part = alpha_channel; break;
+        case S_ENV: v = k.env; alpha_part = alpha_channel; break;
+        case S_PRIM_A: v = k.prim; alpha_part = true; break;
+        case S_ENV_A: v = k.env; alpha_part = true; break;
+        default: return s;
+    }
+    const uint32_t part = alpha_part ? (v >> 24) : (v & 0x00FFFFFFu);
+    if (part == 0) return S_ZERO;
+    if (part == (alpha_part ? 0xFFu : 0x00FFFFFFu)) return S_ONE;
+    return s;
 }
 
 GPU_TEVSRC tev_src(Src s, bool& alpha_operand) {
@@ -202,8 +224,10 @@ void plan_tev(const DrawRecord& d, TevPlan& plan) {
     int cycles = (cyc == 1) ? 2 : 1;
     for (int cy = 0; cy < cycles; cy++) {
         Op rgb[2], alpha[2];
-        int nr = plan_channel(cy ? a1 : a0, cy ? b1 : b0, cy ? c1 : c0, cy ? d1 : d0, rgb);
-        int na = plan_channel(cy ? Aa1 : Aa0, cy ? Ab1 : Ab0, cy ? Ac1 : Ac0, cy ? Ad1 : Ad0, alpha);
+        auto fr = [&](Src s) { return fold_const(s, false, k); };
+        auto fa = [&](Src s) { return fold_const(s, true, k); };
+        int nr = plan_channel(fr(cy ? a1 : a0), fr(cy ? b1 : b0), fr(cy ? c1 : c0), fr(cy ? d1 : d0), rgb);
+        int na = plan_channel(fa(cy ? Aa1 : Aa0), fa(cy ? Ab1 : Ab0), fa(cy ? Ac1 : Ac0), fa(cy ? Ad1 : Ad0), alpha);
         // In cycle 0 there is no PREVIOUS: a COMBINED input reads as zero on
         // real hardware; the PICA's stage-0 PREVIOUS is undefined, so map it
         // to the constant black.
@@ -219,6 +243,26 @@ void plan_tev(const DrawRecord& d, TevPlan& plan) {
             // When one channel finishes early its later stages pass PREVIOUS.
             build_stage(st, r, a, k, buf, plan.fallbacks);
         }
+    }
+
+    // The first stage's PREVIOUS_BUFFER reads zero, not the buffer colour
+    // (the buffer takes the colour one stage late): move the plan down a
+    // stage behind one that does nothing the plan reads.
+    auto reads_buffer = [](const TevStage& st) {
+        for (int i = 0; i < 3; i++) if (st.src_rgb[i] == GPU_PREVIOUS_BUFFER || st.src_a[i] == GPU_PREVIOUS_BUFFER) return true;
+        return false;
+    };
+    if (plan.stages > 0 && reads_buffer(plan.stage[0])) {
+        if (plan.stages < 6) {
+            for (int i = plan.stages; i > 0; i--) plan.stage[i] = plan.stage[i - 1];
+            plan.stages++;
+            TevStage& st = plan.stage[0];
+            Op pass = { GPU_REPLACE, { S_SHADE, S_SHADE, S_SHADE }, 1 };
+            Op pass_a = { GPU_REPLACE, { S_SHADE_A, S_SHADE_A, S_SHADE_A }, 1 };
+            ConstSlot none;
+            build_stage(st, &pass, &pass_a, k, none, plan.fallbacks);
+        }
+        else plan.fallbacks++;
     }
 
     plan.combiner_stages = plan.stages;
