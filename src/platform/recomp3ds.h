@@ -35,10 +35,10 @@ enum MenuPage : uint8_t { Page3D, PageControls, PageCamera, PageGame, PageMods, 
 // A game setting on the touch-screen menu, saved to settings.ini under `key`.
 struct MenuOption {
     const char* key;
-    const char* label;                  // up to 13 characters
+    const char* label;                  // up to 25 characters
     int lo, hi;
     int* value;                         // holds the default until settings.ini is read
-    const char* const* names = nullptr; // hi - lo + 1 names (up to 11 characters) instead of the number
+    const char* const* names = nullptr; // hi - lo + 1 names (up to 12 characters) instead of the number
     void (*on_change)(int value) = nullptr;   // also called once after loading
     MenuPage page = PageGame;
     int step = 1;
@@ -107,6 +107,10 @@ const char* base_path();
 // Whether the C-Stick also presses the C buttons (on by default). A game
 // that reads the C-Stick as an analog camera turns it off.
 void input_set_cstick_buttons(bool on);
+// N64 buttons (N64_DUP ... N64_L) to offer on the touch screen while the
+// settings menu is closed, for mods that read buttons the game's own map
+// leaves out; 0 hides them. Any thread.
+void touch_pad_set(uint16_t n64_buttons);
 
 // Swap the button map while running (a setting that repurposes buttons).
 // The array must stay alive; GameDesc.button_map is the one at start.

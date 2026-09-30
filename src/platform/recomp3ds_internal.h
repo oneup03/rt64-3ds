@@ -91,6 +91,11 @@ namespace recomp3ds {
     // The built-in mods' saved state (settings.ini "mod.*") into the runtime,
     // before the mods load; and the game mode the picker chose last.
     void settings_apply_mods();
+    // The touch-screen buttons (touch_pad.cpp): update from the main thread
+    // with the touch point (shown: the settings menu is closed; redraw: the
+    // console was cleared); the game thread reads what is held.
+    void touch_pad_update(bool shown, bool contact, int x, int y, bool redraw);
+    uint16_t touch_pad_held();
     std::string settings_game_mode();
     void settings_set_game_mode(const std::string& mod_id);
     bool settings_debug_capture();      // settings.ini's debug_capture: a SELECT hold saves a frame capture

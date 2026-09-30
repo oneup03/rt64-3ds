@@ -125,9 +125,10 @@ fed from tables compiled into the executable.
   must also be on the SD card in `mods/`: they only run when their file is
   present.
 - **`GameDesc.on_mod_switched`**: told when a mod is switched on or off, for
-  a game that gives a mod buttons it otherwise doesn't map (Banjo turns the
-  D-pad into the N64 D-pad, and ZL into N64 L, while mods that read them
-  are on).
+  a game whose map leaves out buttons a mod reads. `recomp3ds::touch_pad_set`
+  then offers those N64 buttons (the D-pad's directions, L) on the touch
+  screen while the settings are closed; a touch holds one. Banjo does that
+  by default, and can remap the D-pad and ZL instead ("Mod buttons").
 - **`GameDesc.project_version`**: set it to the desktop's version. Mods
   refuse to load against an older one.
 

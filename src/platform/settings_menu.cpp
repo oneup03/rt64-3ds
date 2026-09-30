@@ -212,7 +212,10 @@ void scroll_to(int top) {
     draw_page();
 }
 
+bool g_pad_redraw = true;              // the touch pad's rows were cleared
+
 void draw() {
+    g_pad_redraw = true;
     blank_rows(kHintRow - 1, kLastRow);
     draw_hint();
     if (!g_open) return;
@@ -645,6 +648,20 @@ void recomp3ds::settings_menu_update() {
             next_touch = now + SYSCLOCK_ARM11 / 12;
         }
     }
+    else {
+        // The touch pad's buttons while the menu is closed.
+        int tx = 0, ty = 0;
+        bool contact = autotest_touch(&tx, &ty);
+        if (!contact && (hidKeysHeld() & KEY_TOUCH)) {
+            touchPosition tp;
+            hidTouchRead(&tp);
+            tx = tp.px; ty = tp.py;
+            contact = true;
+        }
+        touch_pad_update(true, contact, tx, ty, g_pad_redraw);
+        g_pad_redraw = false;
+    }
+    if (g_open) touch_pad_update(false, false, 0, 0, false);
     prev = keys;
     // Written a second after the last change, not on every step.
     if (g_dirty && now - g_changed_at > SYSCLOCK_ARM11) { save(); g_dirty = false; }

@@ -205,6 +205,7 @@ bool recomp3ds::input_get(int controller_num, uint16_t* buttons, float* x, float
         if (cx < -CSTICK_BUTTON) b |= N64_CLEFT;
         if (cx > CSTICK_BUTTON) b |= N64_CRIGHT;
     }
+    b |= touch_pad_held();
     *buttons = b;
     stick_value(g_cpad, g_stick_dz, x, y);
     return true;
