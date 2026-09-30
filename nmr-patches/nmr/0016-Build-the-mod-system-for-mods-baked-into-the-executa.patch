@@ -1,0 +1,740 @@
+From 75f7afe7b1d052b80c570809667e32ee357ecacd Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Wed, 30 Sep 2026 05:06:23 -0500
+Subject: [PATCH] Build the mod system for mods baked into the executable
+ (RECOMP_STATIC_MODS)
+
+For targets that cannot generate or patch code at runtime (the 3DS): mods
+are recompiled to C at build time (rt64-3ds tools/mod_bake) and linked in,
+each exposing a recomp_static_mod (librecomp/static_mods.h), and every base
+function a baked mod replaces or hooks is instrumented by the recompiler
+with a check of its dispatch slot at the entry.
+
+With RECOMP_STATIC_MODS the mod system is built as usual (manifests,
+config, dependencies, events, section loading, embedded mods), without the
+live recompiler, sljit or native code patching:
+- StaticCodeHandle stands in for the dynamic-library handle: the same
+  pointers, from the baked table, for the mod whose id and mod_binary.bin
+  hash it was built from;
+- a replacement sets its function's dispatch slot, and hooks are run by
+  the slot (recomp_static_dispatch: entry hooks, the replacement or the
+  original re-entered once, return hooks), not by regenerating code;
+- base exports that take an extra argument go through the baked mod's
+  per-import shims instead of generated trampolines;
+- the unmet-dependency argument is packed to fit a 32-bit pointer;
+- on the 3DS the mods' sections go where the heap would start and the heap
+  follows them (the 512 MB model's 0x81000000 is past its 16 MB RDRAM),
+  and there are no dynamic libraries.
+
+Only N64Recomp's mod symbol parser is compiled in.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/CMakeLists.txt                  |   8 +-
+ librecomp/include/librecomp/addresses.hpp |   5 +-
+ librecomp/include/librecomp/mods.hpp      |  41 ++++
+ librecomp/include/librecomp/static_mods.h |  67 +++++++
+ librecomp/src/mod_manifest.cpp            |   6 +
+ librecomp/src/mods.cpp                    | 234 +++++++++++++++++++++-
+ librecomp/src/recomp.cpp                  |  13 +-
+ 7 files changed, 362 insertions(+), 12 deletions(-)
+ create mode 100644 librecomp/include/librecomp/static_mods.h
+
+diff --git a/librecomp/CMakeLists.txt b/librecomp/CMakeLists.txt
+index 2a71291..a00cb2d 100644
+--- a/librecomp/CMakeLists.txt
++++ b/librecomp/CMakeLists.txt
+@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
+ set(CMAKE_CXX_EXTENSIONS OFF)
+ 
+ option(RECOMP_NO_MODS "Build without the mod system (no live recompiler, mod loading or hot patching)" OFF)
++option(RECOMP_STATIC_MODS "Mod system for mods baked into the executable at build time (librecomp/static_mods.h), without the live recompiler or native code patching" OFF)
+ 
+ # Define the library
+ add_library(librecomp STATIC
+@@ -46,6 +47,11 @@ else()
+         "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_config_api.cpp"
+         "${CMAKE_CURRENT_SOURCE_DIR}/src/patcher.cpp"
+     )
++    if (RECOMP_STATIC_MODS)
++        # Only the mod symbol parser from the recompiler.
++        target_sources(librecomp PRIVATE "${PROJECT_SOURCE_DIR}/../N64Recomp/src/mod_symbols.cpp")
++        target_compile_definitions(librecomp PUBLIC RECOMP_STATIC_MODS)
++    endif()
+ endif()
+ 
+ target_include_directories(librecomp PUBLIC
+@@ -71,7 +77,7 @@ if (WIN32)
+ endif()
+ 
+ add_subdirectory(${PROJECT_SOURCE_DIR}/../thirdparty/miniz ${CMAKE_CURRENT_BINARY_DIR}/miniz)
+-if (RECOMP_NO_MODS)
++if (RECOMP_NO_MODS OR RECOMP_STATIC_MODS)
+     # Only the recompiler's headers are needed (overlays.cpp uses a constant
+     # from recompiler/context.h, and game.hpp includes recomp.h, so consumers
+     # need the path too); the live recompiler is not built.
+diff --git a/librecomp/include/librecomp/addresses.hpp b/librecomp/include/librecomp/addresses.hpp
+index e7f1f3b..2e8efa6 100644
+--- a/librecomp/include/librecomp/addresses.hpp
++++ b/librecomp/include/librecomp/addresses.hpp
+@@ -28,7 +28,6 @@ namespace recomp {
+     constexpr int32_t flash_handle_end = (int32_t)(flash_handle + sizeof(OSPiHandle));
+     constexpr int32_t patch_rdram_start = 0x80801000;
+     static_assert(patch_rdram_start >= flash_handle_end);
+-    constexpr int32_t mod_rdram_start = 0x81000000;
+ #if defined(__3DS__)
+     // Where the recomp heap starts when there are no mods: just past the
+     // patches' RAM. RECOMP_HEAP_START overrides it per game (it must sit above
+@@ -38,6 +37,10 @@ namespace recomp {
+ #   endif
+     constexpr int32_t heap_rdram_start = (int32_t)RECOMP_HEAP_START;
+     static_assert((uint32_t)heap_rdram_start - 0x80000000u < mem_size, "heap start outside RDRAM");
++    // Baked mods' sections (RECOMP_STATIC_MODS) go there, and the heap after them.
++    constexpr int32_t mod_rdram_start = heap_rdram_start;
++#else
++    constexpr int32_t mod_rdram_start = 0x81000000;
+ #endif
+ 
+     // Flashram occupies the same physical address as sram, but that issue is avoided because libultra exposes
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index 18df095..3594eb1 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -28,6 +28,7 @@
+ #include "librecomp/sections.h"
+ #include "librecomp/overlays.hpp"
+ #include "librecomp/config.hpp"
++#include "librecomp/static_mods.h"
+ 
+ namespace N64Recomp {
+     class Context;
+@@ -134,6 +135,9 @@ namespace recomp {
+             OfflineModHooked,
+             NoSpecifiedApiVersion,
+             UnsupportedApiVersion,
++            NotBuiltIn,
++            BuiltInVersionMismatch,
++            NotInstrumented,
+         };
+ 
+         std::string error_to_string(CodeModLoadError);
+@@ -430,17 +434,21 @@ namespace recomp {
+             std::filesystem::path mod_config_directory;
+             mutable std::mutex mod_config_storage_mutex;
+             std::vector<size_t> loaded_code_mods;
++#ifndef RECOMP_STATIC_MODS
+             // Code handle for vanilla code that was regenerated to add hooks.
+             std::unique_ptr<LiveRecompilerCodeHandle> regenerated_code_handle;
+             // Code handle for base patched code that was regenerated to add hooks.
+             std::unique_ptr<LiveRecompilerCodeHandle> base_patched_code_handle;
++#endif
+             // Map of hook definition to the entry hook slot's index.
+             std::unordered_map<HookDefinition, size_t> hook_slots;
+             // Tracks which hook slots have already been processed. Used to regenerate vanilla functions as needed
+             // to add hooks to any functions that weren't already replaced by a mod.
+             std::vector<bool> processed_hook_slots;
++#ifndef RECOMP_STATIC_MODS
+             // Generated shim functions to use for implementing shim exports.
+             std::vector<std::unique_ptr<N64Recomp::ShimFunction>> shim_functions;
++#endif
+             config::ConfigSchema empty_schema;
+             std::vector<char> empty_bytes;
+             size_t num_events = 0;
+@@ -579,6 +587,32 @@ namespace recomp {
+             int32_t* section_addresses;
+         };
+ 
++#ifdef RECOMP_STATIC_MODS
++        // A mod baked into the executable at build time (static_mods.h): the
++        // same pointers a DynamicLibraryCodeHandle finds by name, from a table.
++        class StaticCodeHandle : public ModCodeHandle {
++        public:
++            StaticCodeHandle(const recomp_static_mod* mod, const N64Recomp::Context& context, const ModCodeHandleInputs& inputs);
++            bool good() final { return is_good; }
++            uint32_t get_api_version() final { return 1; }
++            void set_imported_function(size_t import_index, GenericFunction func) final;
++            // A base export taking an extra argument: returns the mod's shim for the import, now calling func(arg).
++            recomp_func_t* bind_ext_import(size_t import_index, recomp_func_ext_t* func, uintptr_t arg);
++            CodeModLoadError populate_reference_symbols(const N64Recomp::Context& context, std::string& error_param) final;
++            uint32_t get_base_event_index() final {
++                return *mod->base_event_index;
++            }
++            void set_local_section_address(size_t section_index, int32_t address) final {
++                mod->section_addresses[section_index] = address;
++            }
++            GenericFunction get_function_handle(size_t func_index) final {
++                return GenericFunction{ mod->functions[func_index] };
++            }
++        private:
++            const recomp_static_mod* mod;
++            bool is_good = false;
++        };
++#else
+         class LiveRecompilerCodeHandle : public ModCodeHandle {
+         public:
+             LiveRecompilerCodeHandle(const N64Recomp::Context& context, const ModCodeHandleInputs& inputs,
+@@ -608,6 +642,7 @@ namespace recomp {
+             bool is_good = false;
+             std::unique_ptr<int32_t[]> section_addresses;
+         };
++#endif
+ 
+         void setup_events(size_t num_events);
+         void register_event_callback(size_t event_index, size_t mod_index, GenericFunction callback);
+@@ -627,6 +662,12 @@ namespace recomp {
+ 
+         void initialize_mods();
+         void register_embedded_mod(const std::string& mod_id, std::span<const uint8_t> mod_bytes);
++#ifdef RECOMP_STATIC_MODS
++        // Baked mods (static_mods.h), before recomp::start: their code, and the
++        // base functions instrumented for them.
++        void register_static_mod(const recomp_static_mod* mod);
++        void register_static_dispatch(const recomp_static_dispatch_entry* entries, size_t count, unsigned char* active);
++#endif
+         void register_deprecated_mod(const std::string& mod_id, DeprecationStatus deprecation_status, const Version &maximum_version);
+         void scan_mods();
+         void close_mods();
+diff --git a/librecomp/include/librecomp/static_mods.h b/librecomp/include/librecomp/static_mods.h
+new file mode 100644
+index 0000000..906933e
+--- /dev/null
++++ b/librecomp/include/librecomp/static_mods.h
+@@ -0,0 +1,67 @@
++#ifndef __RECOMP_STATIC_MODS_H__
++#define __RECOMP_STATIC_MODS_H__
++
++// Mods recompiled at build time and linked into the executable (RECOMP_STATIC_MODS),
++// for targets that cannot generate or patch code at runtime. A build tool
++// (rt64-3ds tools/mod_bake) turns each mod's .nrm into C that defines one
++// recomp_static_mod, and instruments every base function a baked mod replaces
++// or hooks with a check of its dispatch slot at the function's entry.
++
++#include <stdint.h>
++#include "recomp.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// A base export that takes an extra argument (recomp_func_ext_t, e.g. the
++// calling mod's index for recomp_get_config_*): the runtime sets the target,
++// and the mod calls it through a generated shim.
++typedef struct {
++    recomp_func_ext_t* func;
++    uintptr_t arg;
++} recomp_static_mod_ext_import;
++
++typedef struct {
++    const char* mod_id;                     // the manifest's id
++    uint64_t binary_hash;                   // recomp_static_mod_hash of the mod_binary.bin it was built from
++    uint32_t num_functions;
++    recomp_func_t* const* functions;        // by function index in the mod's symbol file
++    uint32_t num_imports;
++    recomp_func_t** imported_funcs;         // filled by the runtime
++    recomp_func_t* const* ext_import_shims; // per import: calls ext_imports[i]
++    recomp_static_mod_ext_import* ext_imports;
++    uint32_t num_reference_symbols;
++    recomp_func_t** reference_symbol_funcs; // filled by the runtime, one per R_MIPS_26 reference reloc
++    uint32_t* base_event_index;             // filled by the runtime
++    uint32_t num_sections;
++    int32_t* section_addresses;             // filled by the runtime: where the mod's sections were placed
++} recomp_static_mod;
++
++// A base function that baked mods replace or hook, by the ROM address of its
++// section and its vram.
++typedef struct {
++    uint32_t section_rom;
++    uint32_t function_vram;
++} recomp_static_dispatch_entry;
++
++// Called from the entry of an instrumented function while its slot is active:
++// runs the slot's hooks and replacement, or the original (re-entered once
++// with the slot bypassed). Returns non-zero when it handled the call.
++int recomp_static_dispatch(uint8_t* rdram, recomp_context* ctx, uint32_t slot);
++
++// FNV-1a, 64 bits: identifies the mod binary a baked mod was built from.
++static inline uint64_t recomp_static_mod_hash(const uint8_t* data, size_t size) {
++    uint64_t h = 0xCBF29CE484222325ull;
++    for (size_t i = 0; i < size; i++) {
++        h ^= data[i];
++        h *= 0x100000001B3ull;
++    }
++    return h;
++}
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/librecomp/src/mod_manifest.cpp b/librecomp/src/mod_manifest.cpp
+index 04b67e3..1f3afc5 100644
+--- a/librecomp/src/mod_manifest.cpp
++++ b/librecomp/src/mod_manifest.cpp
+@@ -1129,5 +1129,11 @@ std::string recomp::mods::error_to_string(CodeModLoadError error) {
+             return "Mod DLL does not specify an API version";
+         case CodeModLoadError::UnsupportedApiVersion:
+             return "Mod DLL has an unsupported API version";
++        case CodeModLoadError::NotBuiltIn:
++            return "Mod code is not built into this executable";
++        case CodeModLoadError::BuiltInVersionMismatch:
++            return "Mod file is a different version than the one built into this executable";
++        case CodeModLoadError::NotInstrumented:
++            return "Function the mod replaces or hooks was not prepared for mods in this build";
+     }
+ }
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
+index 0f7de83..c80523d 100644
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -9,7 +9,9 @@
+ #include "librecomp/game.hpp"
+ #include "librecomp/patcher.hpp"
+ #include "recompiler/context.h"
++#ifndef RECOMP_STATIC_MODS
+ #include "recompiler/live_recompiler.h"
++#endif
+ 
+ static bool read_json(std::ifstream input_file, nlohmann::json &json_out) {
+     if (!input_file.good()) {
+@@ -74,7 +76,7 @@ bool get_to_vec(const nlohmann::json& val, std::vector<T2>& out) {
+ // MSVC/GCC/Clang ARM64
+ #elif defined(__ARM_ARCH_ISA_A64)
+ #   define IS_ARM64
+-#else
++#elif !defined(RECOMP_STATIC_MODS)
+ #   error "Unsupported architecture!"
+ #endif
+ 
+@@ -165,6 +167,18 @@ void protect(void* target_func, uint64_t old_flags) {
+         &dummy_old_flags);
+     (void)result;
+ }
++#elif defined(__3DS__)
++// No dynamic libraries: mod code is baked into the executable (RECOMP_STATIC_MODS).
++class recomp::mods::DynamicLibrary {
++public:
++    static constexpr std::string_view PlatformExtension = ".so";
++    DynamicLibrary() = default;
++    DynamicLibrary(const std::filesystem::path&) {}
++    bool good() const { return false; }
++    template <typename T>
++    bool get_dll_symbol(T& out, const char*) const { out = nullptr; return false; }
++    uint32_t get_api_version() { return (uint32_t)-1; }
++};
+ #else
+ #  include <unistd.h>
+ #  include <dlfcn.h>
+@@ -476,6 +490,7 @@ recomp::mods::CodeModLoadError recomp::mods::DynamicLibraryCodeHandle::populate_
+     return CodeModLoadError::Good;
+ }
+ 
++#ifndef RECOMP_STATIC_MODS
+ recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
+     const N64Recomp::Context& context, const ModCodeHandleInputs& inputs,
+     std::unordered_map<size_t, size_t>&& entry_func_hooks, std::unordered_map<size_t, size_t>&& return_func_hooks, std::vector<size_t>&& original_section_indices, bool regenerated)
+@@ -598,6 +613,132 @@ void unpatch_func(void* target_func, const recomp::mods::PatchData& data) {
+     memcpy(target_func, data.replaced_bytes.data(), data.replaced_bytes.size());
+     protect(target_func, old_flags);
+ }
++#else // RECOMP_STATIC_MODS
++
++// ---- Baked mods (static_mods.h): code built into the executable, and the base
++// functions instrumented for them. Replacements and hooks take effect through
++// the dispatch slot checked at the instrumented function's entry.
++
++namespace {
++    std::unordered_map<std::string, const recomp_static_mod*> static_mods_by_id;
++
++    struct StaticDispatchSlot {
++        recomp_func_t* original = nullptr;
++        recomp_func_t* replacement = nullptr;
++        size_t entry_hook = (size_t)-1;
++        size_t return_hook = (size_t)-1;
++        bool bypass = false;
++    };
++    const recomp_static_dispatch_entry* static_dispatch_entries = nullptr;
++    unsigned char* static_dispatch_active = nullptr;
++    std::vector<StaticDispatchSlot> static_dispatch_slots;
++
++    // The slot of an instrumented base function, now active, or null if the
++    // build did not instrument that function.
++    StaticDispatchSlot* claim_static_dispatch_slot(uint32_t section_rom, uint32_t vram) {
++        for (size_t i = 0; i < static_dispatch_slots.size(); i++) {
++            if (static_dispatch_entries[i].section_rom != section_rom || static_dispatch_entries[i].function_vram != vram) {
++                continue;
++            }
++            StaticDispatchSlot& slot = static_dispatch_slots[i];
++            if (slot.original == nullptr) {
++                slot.original = recomp::overlays::get_func_by_section_rom_function_vram(section_rom, vram);
++                if (slot.original == nullptr) {
++                    return nullptr;
++                }
++            }
++            static_dispatch_active[i] = 1;
++            return &slot;
++        }
++        return nullptr;
++    }
++
++    void reset_static_dispatch() {
++        for (size_t i = 0; i < static_dispatch_slots.size(); i++) {
++            static_dispatch_active[i] = 0;
++        }
++        static_dispatch_slots.assign(static_dispatch_slots.size(), StaticDispatchSlot{});
++    }
++}
++
++void recomp::mods::register_static_mod(const recomp_static_mod* mod) {
++    static_mods_by_id[mod->mod_id] = mod;
++}
++
++void recomp::mods::register_static_dispatch(const recomp_static_dispatch_entry* entries, size_t count, unsigned char* active) {
++    static_dispatch_entries = entries;
++    static_dispatch_active = active;
++    static_dispatch_slots.assign(count, StaticDispatchSlot{});
++}
++
++extern "C" int recomp_static_dispatch(uint8_t* rdram, recomp_context* ctx, uint32_t slot_index) {
++    StaticDispatchSlot& slot = static_dispatch_slots[slot_index];
++    // The original re-entered from below: let its body run.
++    if (slot.bypass) {
++        slot.bypass = false;
++        return 0;
++    }
++    if (slot.entry_hook != (size_t)-1) {
++        recomp::mods::run_hook(rdram, ctx, slot.entry_hook);
++    }
++    if (slot.replacement != nullptr) {
++        slot.replacement(rdram, ctx);
++    }
++    else {
++        slot.bypass = true;
++        slot.original(rdram, ctx);
++        slot.bypass = false;
++    }
++    if (slot.return_hook != (size_t)-1) {
++        recomp::mods::run_hook(rdram, ctx, slot.return_hook);
++    }
++    return 1;
++}
++
++recomp::mods::StaticCodeHandle::StaticCodeHandle(const recomp_static_mod* mod, const N64Recomp::Context& context, const ModCodeHandleInputs& inputs) : mod(mod) {
++    // The layout must match the mod file's (a different build of the mod would not).
++    is_good = mod->num_functions == context.functions.size() && mod->num_imports == context.import_symbols.size() &&
++              mod->num_sections == context.sections.size();
++    if (is_good) {
++        *mod->base_event_index = inputs.base_event_index;
++    }
++}
++
++void recomp::mods::StaticCodeHandle::set_imported_function(size_t import_index, GenericFunction func) {
++    std::visit(overloaded {
++        [this, import_index](recomp_func_t* native_func) {
++            mod->imported_funcs[import_index] = native_func;
++        }
++    }, func);
++}
++
++recomp_func_t* recomp::mods::StaticCodeHandle::bind_ext_import(size_t import_index, recomp_func_ext_t* func, uintptr_t arg) {
++    mod->ext_imports[import_index] = recomp_static_mod_ext_import{ func, arg };
++    return mod->ext_import_shims[import_index];
++}
++
++recomp::mods::CodeModLoadError recomp::mods::StaticCodeHandle::populate_reference_symbols(const N64Recomp::Context& context, std::string& error_param) {
++    size_t reference_symbol_index = 0;
++    for (const auto& section : context.sections) {
++        for (const auto& reloc : section.relocs) {
++            if (reloc.type == N64Recomp::RelocType::R_MIPS_26 && reloc.reference_symbol && context.is_regular_reference_section(reloc.target_section)) {
++                recomp_func_t* cur_func = recomp::overlays::get_func_by_section_index_function_offset(reloc.target_section, reloc.target_section_offset);
++                if (cur_func == nullptr || reference_symbol_index >= mod->num_reference_symbols) {
++                    std::stringstream error_param_stream{};
++                    error_param_stream << std::hex <<
++                        "section: " << reloc.target_section <<
++                        " func offset: 0x" << reloc.target_section_offset;
++                    error_param = error_param_stream.str();
++                    return CodeModLoadError::InvalidReferenceSymbol;
++                }
++                mod->reference_symbol_funcs[reference_symbol_index] = cur_func;
++                reference_symbol_index++;
++            }
++        }
++    }
++    return CodeModLoadError::Good;
++}
++#endif // RECOMP_STATIC_MODS
+ 
+ void recomp::mods::ModContext::add_opened_mod(ModManifest&& manifest, config::Config&& config, std::vector<size_t>&& game_indices, std::vector<ModContentTypeId>&& detected_content_types, std::vector<char>&& thumbnail) {
+     std::unique_lock lock(opened_mods_mutex);
+@@ -1296,6 +1437,7 @@ std::string recomp::mods::ModContext::get_mod_id(size_t mod_index) {
+     return opened_mods[mod_index].manifest.mod_id;
+ }
+ 
++#ifndef RECOMP_STATIC_MODS
+ struct RegeneratedSection {
+     uint32_t rom_addr;
+     uint32_t ram_addr;
+@@ -1422,6 +1564,7 @@ N64Recomp::Context context_from_regenerated_list(const RegeneratedList& regenlis
+ 
+     return ret;
+ }
++#endif // !RECOMP_STATIC_MODS
+ 
+ void recomp::mods::ModContext::set_mod_index(const std::string &mod_game_id, const std::string &mod_id, size_t index) {
+     std::unique_lock lock(opened_mods_mutex);
+@@ -1579,6 +1722,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+ 
+     std::span<const uint8_t> decompressed_rom{};
+ 
++#ifndef RECOMP_STATIC_MODS
+     // Decompress the rom if needed.
+     std::vector<uint8_t> decompressed_rom_data{};
+     if (game_entry.has_compressed_code) {
+@@ -1591,6 +1735,12 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+     else {
+         decompressed_rom = recomp::get_rom();
+     }
++    const bool hooks_available = !decompressed_rom.empty();
++#else
++    // Hooks run from the dispatch slots of instrumented functions: nothing is
++    // recompiled, so the decompressed ROM is not needed.
++    const bool hooks_available = true;
++#endif
+ 
+     // Collect the set of functions patched by the base recomp.
+     std::unordered_map<recomp_func_t*, recomp::overlays::BasePatchedFunction> base_patched_funcs = recomp::overlays::get_base_patched_funcs();
+@@ -1711,7 +1861,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+         auto& mod = opened_mods[mod_index];
+         std::string cur_error_param;
+         size_t base_event_index = num_events;
+-        CodeModLoadError cur_error = init_mod_code(rdram, section_vrom_map, mod, load_address, !decompressed_rom.empty(), cur_ram_used, cur_error_param);
++        CodeModLoadError cur_error = init_mod_code(rdram, section_vrom_map, mod, load_address, hooks_available, cur_ram_used, cur_error_param);
+         if (cur_error != CodeModLoadError::Good) {
+             if (cur_error_param.empty()) {
+                 ret.emplace_back(mod.manifest.mod_id, ModLoadError::FailedToLoadCode, error_to_string(cur_error));
+@@ -1788,6 +1938,12 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+         return ret;
+     }
+ 
++#ifdef RECOMP_STATIC_MODS
++    // Hooks were bound to their functions' dispatch slots with the mods' code.
++    for (const auto& [def, index] : hook_slots) {
++        recomp::mods::set_hook_type(index, def.at_return);
++    }
++#else
+     // Regenerate any remaining hook slots that weren't handled during mod recompilation.
+ 
+     // List of unprocessed hooks and their hook index. Also set up which hooks are return hooks.
+@@ -1820,6 +1976,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+             return ret;
+         }
+     }
++#endif
+ 
+     finish_event_setup(*this);
+     finish_hook_setup(*this);
+@@ -1828,6 +1985,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+     return ret;
+ }
+ 
++#ifndef RECOMP_STATIC_MODS
+ template <bool patched_regenlist>
+ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
+     const std::vector<std::pair<recomp::mods::HookDefinition, size_t>>& sorted_unprocessed_hooks,
+@@ -2143,6 +2301,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
+ 
+     return ret;
+ }
++#endif // !RECOMP_STATIC_MODS
+ 
+ void recomp::mods::ModContext::check_dependencies(recomp::mods::ModHandle& mod, std::vector<std::pair<recomp::mods::ModLoadError, std::string>>& errors) {
+     errors.clear();
+@@ -2367,6 +2526,28 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t*
+         .reference_section_addresses = section_addresses,
+     };
+ 
++#ifdef RECOMP_STATIC_MODS
++    // The code baked into the executable for this mod, built from this very mod binary.
++    (void)entry_func_hooks; (void)return_func_hooks;
++    {
++        auto find_it = static_mods_by_id.find(mod.manifest.mod_id);
++        if (find_it == static_mods_by_id.end()) {
++            error_param = mod.manifest.mod_id;
++            return CodeModLoadError::NotBuiltIn;
++        }
++        const std::vector<uint8_t>& binary = mod.recompiler_context->rom;
++        if (recomp_static_mod_hash(binary.data(), binary.size()) != find_it->second->binary_hash) {
++            error_param = mod.manifest.mod_id;
++            return CodeModLoadError::BuiltInVersionMismatch;
++        }
++        mod.code_handle = std::make_unique<StaticCodeHandle>(find_it->second, *mod.recompiler_context, handle_inputs);
++        if (!mod.code_handle->good()) {
++            mod.code_handle.reset();
++            error_param = mod.manifest.mod_id;
++            return CodeModLoadError::BuiltInVersionMismatch;
++        }
++    }
++#else
+     // Use a dynamic library code handle. This feature isn't meant to be used by end users, but provides a more debuggable
+     // experience than the live recompiler for mod developers.
+     // Enabled if the mod's filename ends with ".offline.nrm".
+@@ -2408,6 +2589,7 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t*
+             return CodeModLoadError::FailedToRecompile;
+         }
+     }
++#endif
+ 
+     // Load any native libraries specified by the mod and validate/register the expors.
+     std::filesystem::path parent_path = mod.manifest.mod_root_path.parent_path();
+@@ -2475,7 +2657,11 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
+                 recomp_func_ext_t* func_ext_ptr = recomp::overlays::get_ext_base_export(imported_func.base.name);
+                 did_find_func = func_ext_ptr != nullptr;
+                 if (did_find_func) {
++#ifdef RECOMP_STATIC_MODS
++                    func_ptr = static_cast<StaticCodeHandle*>(mod.code_handle.get())->bind_ext_import(import_index, func_ext_ptr, mod_index);
++#else
+                     func_ptr = shim_functions.emplace_back(std::make_unique<N64Recomp::ShimFunction>(func_ext_ptr, mod_index)).get()->get_func();
++#endif
+                 }
+             }
+             func_handle = func_ptr;
+@@ -2492,8 +2678,16 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
+             else {
+                 auto find_optional_it = mod.manifest.dependencies_by_id.find(dependency_id);
+                 if (find_optional_it != mod.manifest.dependencies_by_id.end()) {
++#if UINTPTR_MAX > 0xFFFFFFFFu
+                     uintptr_t shim_argument = ((import_index & 0xFFFFFFFFu) << 32) | (mod_index & 0xFFFFFFFFu);
++#else
++                    uintptr_t shim_argument = ((import_index & 0xFFFFu) << 16) | (mod_index & 0xFFFFu);
++#endif
++#ifdef RECOMP_STATIC_MODS
++                    func_handle = static_cast<StaticCodeHandle*>(mod.code_handle.get())->bind_ext_import(import_index, unmet_dependency_handler, shim_argument);
++#else
+                     func_handle = shim_functions.emplace_back(std::make_unique<N64Recomp::ShimFunction>(unmet_dependency_handler, shim_argument)).get()->get_func();
++#endif
+                     did_find_func = true;
+                 }
+                 else {
+@@ -2588,6 +2782,18 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
+         // Register the function handle for this hook slot.
+         GenericFunction func = mod.code_handle->get_function_handle(cur_hook.func_index);
+         recomp::mods::register_hook(find_it->second, mod_index, func);
++
++#ifdef RECOMP_STATIC_MODS
++        // The hooked function's dispatch slot runs the hook slot.
++        StaticDispatchSlot* slot = claim_static_dispatch_slot(def.section_rom, def.function_vram);
++        if (slot == nullptr) {
++            std::stringstream error_param_stream{};
++            error_param_stream << std::hex << "section: 0x" << def.section_rom << " func: 0x" << std::setfill('0') << std::setw(8) << def.function_vram;
++            error_param = error_param_stream.str();
++            return CodeModLoadError::NotInstrumented;
++        }
++        (def.at_return ? slot->return_hook : slot->entry_hook) = find_it->second;
++#endif
+     }
+ 
+     // Populate the relocated section addresses for the mod.
+@@ -2628,6 +2834,18 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
+             return CodeModLoadError::ModConflict;
+         }
+ 
++#ifdef RECOMP_STATIC_MODS
++        // Redirect the function through its dispatch slot.
++        StaticDispatchSlot* slot = claim_static_dispatch_slot(replacement.original_section_vrom, replacement.original_vram);
++        if (slot == nullptr) {
++            std::stringstream error_param_stream{};
++            error_param_stream << std::hex << "section: 0x" << replacement.original_section_vrom << " func: 0x" << std::setfill('0') << std::setw(8) << replacement.original_vram;
++            error_param = error_param_stream.str();
++            return CodeModLoadError::NotInstrumented;
++        }
++        slot->replacement = std::get<recomp_func_t*>(mod.code_handle->get_function_handle(replacement.func_index));
++        patched_funcs[to_replace].mod_id = mod.manifest.mod_id;
++#else
+         // Copy the original bytes so they can be restored later after the mod is unloaded.
+         PatchData& cur_replacement_data = patched_funcs[to_replace];
+         memcpy(cur_replacement_data.replaced_bytes.data(), reinterpret_cast<void*>(to_replace), cur_replacement_data.replaced_bytes.size());
+@@ -2635,20 +2853,27 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
+ 
+         // Patch the function to redirect it to the replacement.
+         patch_func(to_replace, mod.code_handle->get_function_handle(replacement.func_index));
++#endif
+     }
+ 
+     return CodeModLoadError::Good;
+ }
+ 
+ void recomp::mods::ModContext::unload_mods() {
++#ifdef RECOMP_STATIC_MODS
++    reset_static_dispatch();
++#else
+     for (auto& [replacement_func, replacement_data] : patched_funcs) {
+         unpatch_func(reinterpret_cast<void*>(replacement_func), replacement_data);
+     }
++#endif
+     patched_funcs.clear();
+     loaded_mods_by_id.clear();
+     hook_slots.clear();
+     processed_hook_slots.clear();
++#ifndef RECOMP_STATIC_MODS
+     shim_functions.clear();
++#endif
+     recomp::mods::reset_events();
+     recomp::mods::reset_hooks();
+     num_events = recomp::overlays::num_base_events();
+@@ -2656,8 +2881,13 @@ void recomp::mods::ModContext::unload_mods() {
+ }
+ 
+ void recomp::mods::unmet_dependency_handler(uint8_t* rdram, recomp_context* ctx, uintptr_t arg) {
++#if UINTPTR_MAX > 0xFFFFFFFFu
+     size_t caller_mod_index = (arg >>  0) & uint64_t(0xFFFFFFFF);
+     size_t import_index =     (arg >> 32) & uint64_t(0xFFFFFFFF);
++#else
++    size_t caller_mod_index = (arg >>  0) & 0xFFFFu;
++    size_t import_index =     (arg >> 16) & 0xFFFFu;
++#endif
+ 
+     std::string mod_name = recomp::mods::get_mod_display_name(caller_mod_index);
+     std::pair<std::string, std::string> import_info = recomp::mods::get_mod_import_info(caller_mod_index, import_index);
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index b446496..7a7567e 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -23,7 +23,7 @@
+ #include "ultramodern/error_handling.hpp"
+ #include "librecomp/addresses.hpp"
+ #include "librecomp/mods.hpp"
+-#ifndef RECOMP_NO_MODS
++#if !defined(RECOMP_NO_MODS) && !defined(RECOMP_STATIC_MODS)
+ #include "recompiler/live_recompiler.h"
+ #endif
+ 
+@@ -101,7 +101,9 @@ bool recomp::register_game(const recomp::GameEntry& entry) {
+ 
+ #ifndef RECOMP_NO_MODS
+ void recomp::mods::initialize_mods() {
++#ifndef RECOMP_STATIC_MODS
+     N64Recomp::live_recompiler_init();
++#endif
+     std::filesystem::create_directories(config_path / mods_directory);
+     std::filesystem::create_directories(config_path / mod_config_directory);
+     mod_context->set_mods_config_path(config_path / "mods.json");
+@@ -860,14 +862,9 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+                 }
+ 
+ #endif
+-#if defined(__3DS__)
+-                // No mods: the heap goes straight after the patches' RAM instead
+-                // of after a 16 MB mod region the console cannot afford.
+-                (void)mod_ram_used;
+-                recomp::init_heap(rdram, recomp::heap_rdram_start);
+-#else
++                // On the 3DS the mods' sections start where the heap would
++                // (addresses.hpp), not in a region past 16 MB it cannot afford.
+                 recomp::init_heap(rdram, recomp::mod_rdram_start + mod_ram_used);
+-#endif
+ 
+                 save_type = game_entry.save_type;
+                 ultramodern::init_saving(rdram);
+-- 
+2.53.0
+

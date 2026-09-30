@@ -1,0 +1,33 @@
+From b2e1ee5535af917300d39ac5e9fbf40cba4a7c69 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Wed, 30 Sep 2026 04:38:49 -0500
+Subject: [PATCH] Allow function hooks at the entry (no before_vram)
+
+A [[patches.hook]] without before_vram means the function's entry, but
+the range check still compared the absent address (0) against the
+function's vram, which as a signed KSEG0 address is negative, so every
+entry hook was rejected as outside its function.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/main.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/main.cpp b/src/main.cpp
+index f79580f..e06c7b5 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -563,8 +563,8 @@ int main(int argc, char** argv) {
+         N64Recomp::Function& func = context.functions[func_find->second];
+         int32_t func_vram = func.vram;
+ 
+-        // Check that the function actually contains this vram address.
+-        if (patch.before_vram < func_vram || patch.before_vram >= func_vram + func.words.size() * sizeof(func.words[0])) {
++        // Check that the function actually contains this vram address (none: the function's entry).
++        if (patch.before_vram != 0 && (patch.before_vram < func_vram || patch.before_vram >= func_vram + func.words.size() * sizeof(func.words[0]))) {
+             exit_failure(fmt::format("Function {} has a function hook for vram 0x{:08X} but doesn't contain that vram address!", patch.func_name, (uint32_t)patch.before_vram));
+         }
+ 
+-- 
+2.53.0
+

@@ -2,12 +2,21 @@ cmake_minimum_required(VERSION 3.20)
 project(rt64_3ds LANGUAGES C CXX ASM)
 
 # Consumers set RT64_3DS_NMR_DIR to their N64ModernRuntime checkout (with the
-# nmr-patches applied) before adding this directory; it is built here with
-# the mod system off.
+# nmr-patches applied) before adding this directory. The runtime is built
+# without the mod system, or, with RT64_3DS_STATIC_MODS, with it for mods
+# baked into the executable (tools/mod_bake; the console cannot generate or
+# patch code at runtime).
 if(NOT DEFINED RT64_3DS_NMR_DIR)
     message(FATAL_ERROR "Set RT64_3DS_NMR_DIR to the game's N64ModernRuntime directory")
 endif()
-set(RECOMP_NO_MODS ON CACHE BOOL "rt64-3ds builds the runtime without mods" FORCE)
+option(RT64_3DS_STATIC_MODS "Build the runtime's mod system for baked mods" OFF)
+if(RT64_3DS_STATIC_MODS)
+    set(RECOMP_NO_MODS OFF CACHE BOOL "rt64-3ds builds the runtime for baked mods" FORCE)
+    set(RECOMP_STATIC_MODS ON CACHE BOOL "rt64-3ds builds the runtime for baked mods" FORCE)
+else()
+    set(RECOMP_NO_MODS ON CACHE BOOL "rt64-3ds builds the runtime without mods" FORCE)
+    set(RECOMP_STATIC_MODS OFF CACHE BOOL "rt64-3ds builds the runtime without mods" FORCE)
+endif()
 add_subdirectory("${RT64_3DS_NMR_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/nmr")
 
 # The RDRAM model (librecomp/addresses.hpp, nmr patch 0003). A game whose
