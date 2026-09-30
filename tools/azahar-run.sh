@@ -111,7 +111,10 @@ ARGS=(-w)
 [ -n "$GDB" ] && ARGS+=(-g "$GDB")
 [ -n "$MOVIE" ] && ARGS+=(-p "$(readlink -f "$MOVIE")")
 export DISPLAY=${DISPLAY:-:0}
-flatpak run --env=QT_QPA_PLATFORM=xcb "$APP" "${ARGS[@]}" "$FILE" >"$OUT/azahar.stdout" 2>&1 &
+# X11 only: the app has wayland + fallback-x11, and in a Wayland session
+# flatpak gives it no X display; screenshots and the window search need the
+# X11 window.
+flatpak run --nosocket=wayland --socket=x11 --env=QT_QPA_PLATFORM=xcb "$APP" "${ARGS[@]}" "$FILE" >"$OUT/azahar.stdout" 2>&1 &
 FPID=$!
 echo "azahar pid $FPID, output in $OUT"
 
