@@ -1,0 +1,82 @@
+From fae9db485535da607535365072fcfa83e07b1bb9 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Wed, 30 Sep 2026 05:46:39 -0500
+Subject: [PATCH] Let the host apply a game mode's ROM patch
+
+set_rom_patch_handler: a host that cannot hold the patched ROM in memory
+(the 3DS, where ROM hacks make 64 MB ROMs) gets the mod id and patch.bps
+instead of the runtime patching the ROM in memory, and can write the
+result to a file and stream the ROM from it. Without a handler nothing
+changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/include/librecomp/mods.hpp |  6 ++++++
+ librecomp/src/mods.cpp               | 25 ++++++++++++++++++++-----
+ 2 files changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index 3594eb1..7466de5 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -661,6 +661,12 @@ namespace recomp {
+         CodeModLoadError validate_api_version(uint32_t api_version, std::string& error_param);
+ 
+         void initialize_mods();
++        // A game mode's ROM patch (patch.bps) is applied to the ROM in memory,
++        // unless the host takes it over: one that cannot hold the patched ROM
++        // (the 3DS; ROM hacks make 64 MB ROMs) applies it itself, e.g. to a
++        // file it then streams the ROM from. Returning false fails the load.
++        using RomPatchHandler = bool (*)(const std::string& mod_id, std::span<const uint8_t> patch);
++        void set_rom_patch_handler(RomPatchHandler handler);
+         void register_embedded_mod(const std::string& mod_id, std::span<const uint8_t> mod_bytes);
+ #ifdef RECOMP_STATIC_MODS
+         // Baked mods (static_mods.h), before recomp::start: their code, and the
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
+index c80523d..02d7608 100644
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -263,6 +263,12 @@ void protect(void* target_func, uint64_t old_flags) {
+ }
+ #endif
+ 
++static recomp::mods::RomPatchHandler rom_patch_handler = nullptr;
++
++void recomp::mods::set_rom_patch_handler(RomPatchHandler handler) {
++    rom_patch_handler = handler;
++}
++
+ namespace modpaths {
+     constexpr std::string_view default_mod_extension = "nrm";
+     constexpr std::string_view binary_path = "mod_binary.bin";
+@@ -1824,13 +1830,22 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+             return ret;
+         }
+         
+-        auto patch_result = recomp::patcher::patch_rom(recomp::get_rom(), std::span{ reinterpret_cast<const uint8_t*>(patch_data.data()), patch_data.size() }, patched_rom);
+-        if (patch_result != recomp::patcher::PatcherResult::Success) {
+-            ret.emplace_back(mod.manifest.mod_id, ModLoadError::FailedToLoadPatch, std::string{});
+-            return ret;
++        const std::span<const uint8_t> patch_span{ reinterpret_cast<const uint8_t*>(patch_data.data()), patch_data.size() };
++        if (rom_patch_handler != nullptr) {
++            if (!rom_patch_handler(mod.manifest.mod_id, patch_span)) {
++                ret.emplace_back(mod.manifest.mod_id, ModLoadError::FailedToLoadPatch, std::string{});
++                return ret;
++            }
+         }
++        else {
++            auto patch_result = recomp::patcher::patch_rom(recomp::get_rom(), patch_span, patched_rom);
++            if (patch_result != recomp::patcher::PatcherResult::Success) {
++                ret.emplace_back(mod.manifest.mod_id, ModLoadError::FailedToLoadPatch, std::string{});
++                return ret;
++            }
+ 
+-        recomp::set_rom_contents(std::move(patched_rom));
++            recomp::set_rom_contents(std::move(patched_rom));
++        }
+     }
+ 
+     // Check that mod dependencies are met.
+-- 
+2.53.0
+

@@ -732,7 +732,14 @@ int recomp3ds::run(const GameDesc& desc) {
         if (t) { threadJoin(t, UINT64_MAX); threadFree(t); }
         fprintf(stderr, "recomp3ds: FPSCR main %08lx, new thread %08lx\n", (unsigned long)main_fpscr, (unsigned long)thread_fpscr);
     }
-    recomp::start_game(desc.game_id, "");
+    // The game or one of its game modes (with the mod system).
+    recomp3ds::game_modes_init(g_base_path, desc);
+    const std::string game_mode = recomp3ds::pick_game_mode(desc);
+    if (!game_mode.empty() && recomp::get_rom_stream() == nullptr) {
+        // The mode's ROM is streamed from the card; the game's needs no room either.
+        recomp3ds::rom_stream_install(2u << 20);
+    }
+    recomp::start_game(desc.game_id, game_mode);
     recomp3ds::loadmon_start(is_new_3ds);
     log_memory("before start");
     recomp3ds::log_start_writer();

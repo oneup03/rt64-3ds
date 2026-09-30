@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 extern "C" {
 #include <3ds/types.h>
 #include <3ds/svc.h>
@@ -12,6 +13,7 @@ extern "C" {
 #include "ultramodern/input.hpp"
 
 namespace recomp3ds {
+    struct GameDesc;
     // Milliseconds on the ARM11 system tick (268 MHz whatever the CPU clock).
     // Not libctru's osGetTime: ultramodern's N64 osGetTime shadows that name.
     inline uint64_t wall_ms() { return svcGetSystemTick() / 268123ull; }
@@ -45,6 +47,11 @@ namespace recomp3ds {
     // installs the runtime's RomStream with a block cache of about
     // cache_bytes, before start.
     void rom_stream_install(size_t cache_bytes);
+    // Game modes (game_modes.cpp; nothing without RT64_3DS_STATIC_MODS): the
+    // ROM patch handler, and the picker before the game starts (returns the
+    // chosen mode's id, empty for the game itself).
+    void game_modes_init(const char* base_path, const GameDesc& desc);
+    std::string pick_game_mode(const GameDesc& desc);
     bool rom_stream_active();
     void rom_stream_take_stats(uint32_t* misses, uint32_t* bytes);   // since the last call
 
