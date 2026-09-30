@@ -1,0 +1,71 @@
+From 056734da28074f9c6af03036f41dada0fb1034f2 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Tue, 29 Sep 2026 22:33:21 -0500
+Subject: [PATCH] Align RDRAM for the recomp heap on the 3DS
+
+newlib's calloc only guarantees 8-byte alignment. The recomp heap is an
+o1heap arena at an offset into RDRAM, and o1heapInit refuses a base that
+isn't 16-byte aligned. The unchecked NULL left every recomp::alloc
+returning NULL, so a game using object extension data (Banjo) crashed at
+boot whenever the block landed on an odd 8 bytes: on hardware yes, in
+Azahar by luck no.
+
+Allocate RDRAM page-aligned and zero it, and stop with a message when the
+heap can't be initialized instead of failing on the first allocation.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/src/heap.cpp   | 8 +++++++-
+ librecomp/src/recomp.cpp | 8 +++++++-
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/librecomp/src/heap.cpp b/librecomp/src/heap.cpp
+index 3c50484..50d151a 100644
+--- a/librecomp/src/heap.cpp
++++ b/librecomp/src/heap.cpp
+@@ -4,6 +4,7 @@
+ #include "librecomp/addresses.hpp"
+ #include "librecomp/overlays.hpp"
+ #include "librecomp/helpers.hpp"
++#include "ultramodern/error_handling.hpp"
+ 
+ static uint32_t heap_offset;
+ 
+@@ -41,7 +42,12 @@ void recomp::init_heap(uint8_t* rdram, uint32_t address) {
+ 
+     printf("Initializing recomp heap at offset 0x%08X with size 0x%08X\n", heap_offset, static_cast<uint32_t>(heap_size));
+ 
+-    o1heapInit(&rdram[heap_offset], heap_size);
++    // o1heap refuses an arena that isn't aligned to O1HEAP_ALIGNMENT; every
++    // allocation would then return NULL.
++    if (o1heapInit(&rdram[heap_offset], heap_size) == nullptr) {
++        ultramodern::error_handling::message_box("Failed to initialize the recomp heap (misaligned RDRAM?).");
++        ULTRAMODERN_QUICK_EXIT();
++    }
+ }
+ 
+ void* recomp::alloc(uint8_t* rdram, size_t size) {
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 799b1b7..b446496 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -1068,9 +1068,15 @@ void recomp::start(const recomp::Configuration& cfg) {
+ #elif defined(__3DS__)
+     // No virtual memory tricks on the 3DS: one zero-filled block the size of
+     // the (reduced) RDRAM region. Wild accesses corrupt instead of faulting.
++    // Page-aligned, because malloc only guarantees 8 bytes and the recomp heap
++    // (o1heap) needs its arena, an offset into RDRAM, aligned to 16.
+     static_assert(allocation_size == mem_size, "the 3DS commits the whole RDRAM region");
+-    rdram = reinterpret_cast<uint8_t*>(calloc(mem_size, 1));
++    static_assert(mem_size % 0x1000 == 0, "aligned_alloc needs a multiple of the alignment");
++    rdram = reinterpret_cast<uint8_t*>(std::aligned_alloc(0x1000, mem_size));
+     alloc_failed = (rdram == nullptr);
++    if (!alloc_failed) {
++        std::memset(rdram, 0, mem_size);
++    }
+ #else
+     rdram = (uint8_t*)mmap(NULL, allocation_size, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+     alloc_failed = rdram == reinterpret_cast<uint8_t*>(MAP_FAILED);
+-- 
+2.53.0
+
