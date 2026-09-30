@@ -108,9 +108,7 @@ Settings& settings();
 
 // Fed by the game's patches through host functions.
 void set_first_person(bool on);
-void set_low_convergence_scene(bool on);
 bool first_person_scene();
-bool low_convergence_scene();
 
 // Copy a region of the last finished frame (the left eye) into the game's
 // RGBA16 framebuffer in RDRAM, for game code that reads pixels (DK64's fairy

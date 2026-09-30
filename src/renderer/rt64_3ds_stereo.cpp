@@ -115,7 +115,7 @@ float view_depth(float zp, float m22, float m32) {
     return z > 0.0f ? z : -z;
 }
 
-float AutoConvergence::update(float nearest_z, float manual_conv, float sep, int comfort_thousandths, bool low_convergence_scene) {
+float AutoConvergence::update(float nearest_z, float manual_conv, float sep, int comfort_thousandths) {
     if (sep <= 0.0f || manual_conv <= 0.0f) return manual_conv;
     // No near depth this frame (a sky, a menu): keep the last convergence.
     // Returning the manual value instead made a sky with a few birds in it
@@ -155,7 +155,6 @@ float AutoConvergence::update(float nearest_z, float manual_conv, float sep, int
     }
 
     float target = (float)std::max(-50, std::min(60, comfort_thousandths)) * 0.001f;
-    if (low_convergence_scene) target *= 0.45f;
     constexpr float kNearClamp = 4.0f;
     const float at_manual = sep * 0.5f * (manual_conv / z_ema - 1.0f);
     float conv = manual_conv;

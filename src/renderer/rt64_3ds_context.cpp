@@ -1332,7 +1332,7 @@ public:
                 const float zp = rt64_3ds::near_depth_statistic(depth_grid_, grid_cols_, grid_rows_);
                 near_z_ = zp > 0.0f ? rt64_3ds::view_depth(zp, prev_m22_, prev_m32_) : -1.0f;
             }
-            sf.conv = autoconv_.update(near_z_, manual, sf.sep, st.comfort_target, rt64_3ds::low_convergence_scene());
+            sf.conv = autoconv_.update(near_z_, manual, sf.sep, st.comfort_target);
         }
         else {
             autoconv_.reset();
@@ -1352,7 +1352,7 @@ public:
             sf.hud_offset = -centered * 0.04f * (sf.sep / 0.10f);
             sf.rect_ndc = -centered * 0.04f * 2.75f * slider_ * st.slider_gain;
         }
-        sf.reticle = sf.on && rt64_3ds::first_person_scene() && !rt64_3ds::low_convergence_scene();
+        sf.reticle = sf.on && rt64_3ds::first_person_scene();
         aim_z_ = -1.0f;
         if (!sf.reticle) aim_have_prev_ = false;
         if (sf.reticle) {

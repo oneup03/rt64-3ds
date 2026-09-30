@@ -9,7 +9,6 @@ rt64_3ds::RenderDesc g_desc{};
 rt64_3ds::Settings g_settings{};
 rt64_3ds::FrameStats g_stats{};
 volatile bool g_first_person = false;
-volatile bool g_low_convergence = false;
 char g_data_dir[160] = "sdmc:/3ds";
 }
 
@@ -28,8 +27,6 @@ rt64_3ds::Settings& rt64_3ds::settings() { return g_settings; }
 const rt64_3ds::FrameStats& rt64_3ds::stats() { return g_stats; }
 rt64_3ds::FrameStats& rt64_3ds::mutable_stats() { return g_stats; }
 void rt64_3ds::set_first_person(bool on) { g_first_person = on; }
-void rt64_3ds::set_low_convergence_scene(bool on) { g_low_convergence = on; }
 bool rt64_3ds::first_person_scene() { return g_first_person; }
-bool rt64_3ds::low_convergence_scene() { return g_low_convergence; }
 
 

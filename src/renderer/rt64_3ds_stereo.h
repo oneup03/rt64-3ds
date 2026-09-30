@@ -65,7 +65,7 @@ struct AutoConvergence {
     int cut_frames = 0;
     float last_conv = -1.0f;
     // Returns the convergence to apply, world units.
-    float update(float nearest_z, float manual_conv, float sep, int comfort_thousandths, bool low_convergence_scene);
+    float update(float nearest_z, float manual_conv, float sep, int comfort_thousandths);
     void reset() { count = cursor = cut_frames = 0; z_ema = inv_conv = last_conv = -1.0f; }
 };
 
