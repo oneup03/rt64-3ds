@@ -19,6 +19,7 @@
 #include "rt64_3ds_tev.h"
 #include "rt64_3ds_stereo.h"
 #include "rt64_3ds_shbin.h"
+#include "ultramodern/extensions.h"
 
 extern "C" void C3Di_UpdateContext(void);
 
@@ -217,6 +218,11 @@ public:
         // In first person the reticle's quads must stay one per record.
         interp_.set_split_untagged_ortho(rt64_3ds::first_person_scene());
         bool present = interp_.run(task->t.data_ptr, frame_);
+        // Everything the replay reads from RDRAM is read by now once the
+        // textures are decoded: let a game waiting on "parsed" (Banjo's
+        // game_draw) go on while the GPU work is submitted.
+        prefetch_textures();
+        ultramodern::extensions::on_displaylist_parsed(task->t.data_ptr);
         if (seq_rtt_count_ > 0 && frames_ > 10) {
             for (const rt64_3ds::DrawRecord& d : frame_.draws) {
                 if (d.rtt >= 0) { seq_first_ = (int)frames_ + 1; seq_count_ = seq_rtt_count_; seq_rtt_count_ = 0; break; }
@@ -1475,6 +1481,19 @@ public:
     rt64_3ds::ScreenGeometry geo_ = rt64_3ds::ScreenGeometry::make(320, 240);
     int grid_cols_ = 40, grid_rows_ = 30;
     int draw_lo_ = 0, draw_hi_ = 1 << 30;       // DRAW_RANGE.TXT
+
+    // Decode (or find in the cache) every RDRAM texture the frame's draws
+    // use, so the replay reads nothing more from RDRAM.
+    void prefetch_textures() {
+        for (const rt64_3ds::DrawRecord& d : frame_.draws) {
+            for (int t = 0; t < 2; t++) {
+                const rt64_3ds::TexDesc& td = d.tex[t];
+                if (!td.valid || td.snapshot || td.rtt >= 0) continue;
+                const uint16_t* pal = (td.fmt == 2 && td.tlut_index + 256 <= frame_.tlut.size()) ? &frame_.tlut[td.tlut_index] : nullptr;
+                textures_.get(td, pal);
+            }
+        }
+    }
 
     // Render to texture: one target per off-screen image slot
     // (FrameRecord::rtts), a VRAM texture with its own depth buffer, drawn
