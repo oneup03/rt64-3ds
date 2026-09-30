@@ -65,15 +65,16 @@ struct AutoConvergence {
     int cut_frames = 0;
     float last_conv = -1.0f;
     // Returns the convergence to apply, world units.
-    float update(float nearest_z, float manual_conv, float sep, int comfort_thousandths);
+    float update(float nearest_z, float manual_conv, float sep, int comfort_thousandths, const AutoConvTuning& tune);
     void reset() { count = cursor = cut_frames = 0; z_ema = inv_conv = last_conv = -1.0f; }
 };
 
 // The near statistic over a grid of depth samples z' (0 < z' < 1 valid): a
-// 9x5 patch layout inside the frame minus margins (5% sides and top, 25%
-// bottom), the 25th percentile within each patch, then the second nearest
-// patch. Returns z' or -1, also when fewer than 3 patches have depth.
-float near_depth_statistic(const float* grid, int cols, int rows);
+// 9x5 patch layout inside the frame minus margins (5% sides and top, the
+// frame below region_bottom), the 25th percentile within each patch, then
+// the second nearest patch. Returns z' or -1, also when fewer than 3
+// patches have depth.
+float near_depth_statistic(const float* grid, int cols, int rows, float region_bottom = 0.75f);
 
 }   // namespace rt64_3ds
 

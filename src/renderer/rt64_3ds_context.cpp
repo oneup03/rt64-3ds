@@ -1329,10 +1329,10 @@ public:
         near_z_ = -1.0f;
         if (sf.on && st.auto_convergence) {
             if (prev_cam_world_) {
-                const float zp = rt64_3ds::near_depth_statistic(depth_grid_, grid_cols_, grid_rows_);
+                const float zp = rt64_3ds::near_depth_statistic(depth_grid_, grid_cols_, grid_rows_, rt64_3ds::render_desc().autoconv.region_bottom);
                 near_z_ = zp > 0.0f ? rt64_3ds::view_depth(zp, prev_m22_, prev_m32_) : -1.0f;
             }
-            sf.conv = autoconv_.update(near_z_, manual, sf.sep, st.comfort_target);
+            sf.conv = autoconv_.update(near_z_, manual, sf.sep, st.comfort_target, rt64_3ds::render_desc().autoconv);
         }
         else {
             autoconv_.reset();

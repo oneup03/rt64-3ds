@@ -28,6 +28,18 @@ struct StereoRule {
     StereoClass cls;
 };
 
+// How auto-convergence finds and follows the nearest object. The defaults
+// are DK64's: a chase camera always has ground close under it at the bottom
+// of the frame, so that strip is left out, and the answer is smoothed hard.
+struct AutoConvTuning {
+    float region_bottom = 0.75f;    // the near statistic samples the frame down to here (fraction of its height)
+    int history = 9;                // frames in the median filter (1..9)
+    float approach = 0.25f;         // per-frame pull toward a nearer depth (the retreat is slower)
+    float retreat = 0.05f;          // ... and toward a farther one
+    float cut_ratio = 2.5f;         // this much nearer for 2 frames is a camera cut: jump there
+    float ease_in = 0.14f, ease_out = 0.06f;   // convergence easing toward the target, nearer / farther
+};
+
 struct RenderDesc {
     const char* game_name = "";
     Gbi gbi = Gbi::F3DEX2;
@@ -64,6 +76,7 @@ struct RenderDesc {
     // picture puzzles render the world into such an image. Off, off-screen
     // draws are dropped (copies of the presented frame use the snapshot).
     bool render_to_texture = false;
+    AutoConvTuning autoconv{};
 };
 
 void set_render_desc(const RenderDesc& desc);

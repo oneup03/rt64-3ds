@@ -115,18 +115,19 @@ float view_depth(float zp, float m22, float m32) {
     return z > 0.0f ? z : -z;
 }
 
-float AutoConvergence::update(float nearest_z, float manual_conv, float sep, int comfort_thousandths) {
+float AutoConvergence::update(float nearest_z, float manual_conv, float sep, int comfort_thousandths, const AutoConvTuning& tune) {
     if (sep <= 0.0f || manual_conv <= 0.0f) return manual_conv;
     // No near depth this frame (a sky, a menu): keep the last convergence.
     // Returning the manual value instead made a sky with a few birds in it
     // flap between the two, frame by frame, as the birds came and went.
     if (nearest_z <= 0.0f) return last_conv > 0.0f ? std::min(last_conv, manual_conv) : manual_conv;
 
+    const int len = std::max(1, std::min(kHistory, tune.history));
     history[cursor] = nearest_z;
     cursor = (cursor + 1) % kHistory;
-    count = count < kHistory ? count + 1 : kHistory;
+    count = count < len ? count + 1 : len;
     float sorted[kHistory];
-    for (int i = 0; i < count; i++) sorted[i] = history[i];
+    for (int i = 0; i < count; i++) sorted[i] = history[(cursor + kHistory - 1 - i) % kHistory];   // the newest `count`
     std::sort(sorted, sorted + count);
     const float z_median = sorted[count / 2];
 
@@ -138,7 +139,7 @@ float AutoConvergence::update(float nearest_z, float manual_conv, float sep, int
         // A camera cut stays changed; a small object flickering in and out of
         // a patch does not, so the snap waits for two frames of it.
         const float approach = nearest_z < z_ema ? z_ema / nearest_z : 1.0f;
-        cut_frames = approach > 2.5f ? cut_frames + 1 : 0;
+        cut_frames = approach > tune.cut_ratio ? cut_frames + 1 : 0;
         if (cut_frames >= 2) {
             float recent[3];
             for (int i = 0; i < 3; i++) recent[i] = history[(cursor + kHistory - 1 - i) % kHistory];
@@ -149,7 +150,7 @@ float AutoConvergence::update(float nearest_z, float manual_conv, float sep, int
         }
         else if (rel > 0.02f) {
             // Quick to pull in as something approaches, slow to let go.
-            const float alpha = z_median < z_ema ? 0.25f : 0.05f;
+            const float alpha = z_median < z_ema ? tune.approach : tune.retreat;
             z_ema += (z_median - z_ema) * alpha;
         }
     }
@@ -166,14 +167,14 @@ float AutoConvergence::update(float nearest_z, float manual_conv, float sep, int
 
     const float target_inv = 1.0f / conv;
     if (inv_conv <= 0.0f) inv_conv = target_inv;
-    else inv_conv += (target_inv - inv_conv) * (target_inv > inv_conv ? 0.14f : 0.06f);
+    else inv_conv += (target_inv - inv_conv) * (target_inv > inv_conv ? tune.ease_in : tune.ease_out);
     last_conv = std::min(1.0f / inv_conv, manual_conv);
     return last_conv;
 }
 
-float near_depth_statistic(const float* grid, int cols, int rows) {
+float near_depth_statistic(const float* grid, int cols, int rows, float region_bottom) {
     constexpr int kCols = 9, kRows = 5;
-    const float x0 = cols * 0.05f, x1 = cols * 0.95f, y0 = rows * 0.05f, y1 = rows * 0.75f;
+    const float x0 = cols * 0.05f, x1 = cols * 0.95f, y0 = rows * 0.05f, y1 = rows * std::max(0.3f, std::min(1.0f, region_bottom));
     float nears[kCols * kRows];
     int n = 0;
     float samples[64];
