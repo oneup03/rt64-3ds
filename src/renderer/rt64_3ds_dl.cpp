@@ -518,7 +518,11 @@ struct Interpreter::Impl {
                 }
             }
         }
-        d.fmt = tl.fmt;
+        d.tlut_mode = (othermode_h >> 14) & 3;
+        // With the TLUT on, the RDP looks every 4- and 8-bit texel up in the
+        // palette whatever the tile's format says (Banjo's HUD sprites are
+        // RGBA 4-bit tiles with a palette): read them as CI.
+        d.fmt = (d.tlut_mode >= 2 && tl.siz <= 1) ? 2 : tl.fmt;
         d.siz = tl.siz;
         d.width = (uint16_t)w;
         d.height = (uint16_t)h;
@@ -528,10 +532,9 @@ struct Interpreter::Impl {
         d.block = best->block;
         d.dxt = best->dxt;
         d.load_word = (uint16_t)(tl.tmem - best->tmem);
-        d.tlut_mode = (othermode_h >> 14) & 3;
-        d.tlut_hash = (tl.fmt == 2) ? tlut_hash : 0;
+        d.tlut_hash = (d.fmt == 2) ? tlut_hash : 0;
         d.tlut_index = 0;
-        if (tl.fmt == 2) {
+        if (d.fmt == 2) {
             // Palettes change within a frame: keep the one this draw uses.
             if (tlut_frame_hash != tlut_hash) {
                 tlut_frame_hash = tlut_hash;
@@ -588,8 +591,10 @@ struct Interpreter::Impl {
     bool offscreen_target() const {
         // Draws into buffers the game keeps in patch RAM (frame copies for
         // effects) are not part of the visible frame; with render to texture,
-        // every off-screen image is.
-        return rtt_enabled ? cur_rtt >= 0 : cimg >= 0x800000;
+        // every off-screen image is, and so is colour drawn into the depth
+        // buffer's memory (Banjo stores the paused frame there): its copy
+        // of the front buffer becomes a snapshot.
+        return rtt_enabled ? (cur_rtt >= 0 || (zimg != 0 && cimg == zimg)) : cimg >= 0x800000;
     }
 
     void emit_tri(int i0, int i1, int i2) {
