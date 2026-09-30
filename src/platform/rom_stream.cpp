@@ -49,15 +49,23 @@ const Block& block_for(uint32_t index) {
 }
 
 bool stream_open(const std::filesystem::path& path, uint64_t* size) {
+    LightLock_Lock(&g_lock);
+    // Another file (a game mode's ROM replacing the game's): what the cache
+    // holds came from the old one.
+    for (uint32_t i = 0; i < g_block_count; i++) g_blocks[i].index = UINT32_MAX;
     if (g_file != nullptr) fclose(g_file);
     g_file = fopen(path.string().c_str(), "rb");
+    g_size = 0;
+    if (g_file != nullptr) {
+        setvbuf(g_file, nullptr, _IONBF, 0);
+        fseek(g_file, 0, SEEK_END);
+        g_size = (uint64_t)ftell(g_file);
+    }
+    LightLock_Unlock(&g_lock);
     if (g_file == nullptr) {
         fprintf(stderr, "recomp3ds: ROM stream: cannot open %s\n", path.string().c_str());
         return false;
     }
-    setvbuf(g_file, nullptr, _IONBF, 0);
-    fseek(g_file, 0, SEEK_END);
-    g_size = (uint64_t)ftell(g_file);
     *size = g_size;
     fprintf(stderr, "recomp3ds: ROM stream: %s, %llu KB, cache %lu x %lu KB\n", path.string().c_str(),
             (unsigned long long)(g_size / 1024), (unsigned long)g_block_count, (unsigned long)(kBlockBytes / 1024));
