@@ -76,6 +76,12 @@ void recomp3ds::touch_pad_update(bool shown, bool contact, int x, int y, bool re
         g_drawn = false;
         return;
     }
+    // Nothing offered and nothing on screen: leave the console alone (DK64,
+    // Banjo without those mods, a message the runtime printed there).
+    if (offered == 0 && g_drawn_offered == 0) {
+        g_drawn = true;
+        return;
+    }
     if (redraw || !g_drawn || offered != g_drawn_offered || held != g_drawn_held) {
         draw(offered, held);
         g_drawn = true;
