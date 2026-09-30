@@ -650,6 +650,7 @@ int recomp3ds::run(const GameDesc& desc) {
     threads_callbacks.get_game_thread_name = game_thread_name;
 
     recomp::Configuration cfg{};
+    cfg.project_version = desc.project_version;
     cfg.rsp_callbacks = desc.rsp;
     // Time the audio microcode: the game's callback hands back the ucode
     // function and this trampoline runs it under the tick counter.

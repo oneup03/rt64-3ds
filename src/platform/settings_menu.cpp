@@ -12,13 +12,24 @@
 // game's rows there; the game's own options (GameDesc::menu_options) go on
 // the pages they name, and GameDesc::menu_defaults can change any row's
 // default. A page with more rows than fit scrolls.
+//
+// With the runtime's mod system (RECOMP_STATIC_MODS), the Mods page lists
+// the mods built into the executable once the game has started: an on/off
+// row per mod (the runtime keeps it, and it applies at the next start),
+// followed by the mod's options (applied at once).
 #include <3ds.h>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <string>
+#include <vector>
 
 #include "rt64_3ds.h"
 #include "recomp3ds.h"
 #include "recomp3ds_internal.h"
+#ifdef RECOMP_STATIC_MODS
+#include "librecomp/mods.hpp"
+#endif
 
 namespace {
 
@@ -62,8 +73,13 @@ struct Row {
     void (*on_change)(int value);
     int page, step;
     const char* zero_text;          // shown for 0 ("Off")
+    // Rows kept elsewhere (the mods' state): not in settings.ini, and told
+    // of changes with their context.
+    bool no_save;
+    void (*on_change_ctx)(void* ctx, int value);
+    void* ctx;
 };
-constexpr int kMaxRows = 32;
+constexpr int kMaxRows = 128;
 Row g_rows[kMaxRows];
 int g_row_count = 0;
 
@@ -124,6 +140,8 @@ int page_count(int page) {
     return page_rows(page, idx);
 }
 
+bool mods_listed();
+
 bool visible(int slot) { return slot >= g_top && slot < g_top + kSlots; }
 int slot_line(int slot) { return kFirstRow + (slot - g_top) * kRowStep; }
 
@@ -178,6 +196,8 @@ void draw_page() {
     if (g_top > 0) printf("\x1b[%d;%dH^ more", kMoreRow, kMoreUpCol);
     if (g_top + kSlots < n) printf("\x1b[%d;%dHv more", kMoreRow, kMoreDownCol);
     if (g_page == recomp3ds::Page3D) printf("\x1b[%d;0H3D slider: strength.  HUD 50: on screen.", kLastRow);
+    else if (g_page == recomp3ds::PageMods && g_top + kSlots >= n && g_top == 0 && mods_listed())
+        printf("\x1b[%d;0HMods on/off: at the next start.", kLastRow);
 }
 
 // Scrolls so that the first visible row is `top`.
@@ -201,7 +221,9 @@ void draw() {
 void save() {
     FILE* f = fopen(g_path, "w");
     if (f == nullptr) return;
-    for (int i = 0; i < g_row_count; i++) fprintf(f, "%s=%d\n", g_rows[i].key, *g_rows[i].value);
+    for (int i = 0; i < g_row_count; i++) {
+        if (!g_rows[i].no_save) fprintf(f, "%s=%d\n", g_rows[i].key, *g_rows[i].value);
+    }
     fclose(f);
 }
 
@@ -215,7 +237,7 @@ void load() {
         if (sscanf(line, "%47[^=]=%d", key, &v) != 2) continue;
         for (int i = 0; i < g_row_count; i++) {
             const Row& r = g_rows[i];
-            if (strcmp(key, r.key) == 0) *r.value = v < r.lo ? r.lo : v > r.hi ? r.hi : v;
+            if (!r.no_save && strcmp(key, r.key) == 0) *r.value = v < r.lo ? r.lo : v > r.hi ? r.hi : v;
         }
     }
     fclose(f);
@@ -236,7 +258,8 @@ void step(int slot, int d) {
     if (v == *r.value) return;
     *r.value = v;
     if (r.on_change != nullptr) r.on_change(v);
-    changed();
+    if (r.on_change_ctx != nullptr) r.on_change_ctx(r.ctx, v);
+    if (!r.no_save) changed();
     draw_row(slot);
 }
 
@@ -326,6 +349,100 @@ bool touch_repeats(const TouchTarget& t) {
     return t.arg < page_rows(g_page, idx) && g_rows[idx[t.arg]].names == nullptr;
 }
 
+// ---- The mods built into the executable (RECOMP_STATIC_MODS).
+
+std::string g_mod_game_id;
+#ifdef RECOMP_STATIC_MODS
+struct ModRow {
+    std::string mod_id, option_id;      // option_id empty: the mod's on/off row
+    std::string label;
+    std::vector<std::string> names;
+    std::vector<const char*> name_ptrs;
+    std::vector<uint32_t> enum_values;  // an enum option's values, by row value
+    enum Kind { Toggle, Enum, Bool, Number } kind = Toggle;
+    double num_step = 1.0;
+    int value = 0;
+};
+std::deque<ModRow> g_mod_rows;          // stable addresses: rows point into them
+bool g_mods_added = false;
+const char* const kModOffOn[] = { "Off", "On" };
+
+void apply_mod_row(void* ctx, int v) {
+    const ModRow& m = *static_cast<const ModRow*>(ctx);
+    switch (m.kind) {
+        case ModRow::Toggle: recomp::mods::enable_mod(m.mod_id, v != 0); break;
+        case ModRow::Enum: recomp::mods::set_mod_config_value(m.mod_id, m.option_id, m.enum_values[v]); break;
+        case ModRow::Bool: recomp::mods::set_mod_config_value(m.mod_id, m.option_id, v != 0); break;
+        case ModRow::Number: recomp::mods::set_mod_config_value(m.mod_id, m.option_id, (double)v * m.num_step); break;
+    }
+}
+
+std::string clip(const std::string& s, size_t n) { return s.size() <= n ? s : s.substr(0, n); }
+
+// The mods' rows, once the runtime has scanned them (after the game starts).
+void add_mod_rows() {
+    if (g_mods_added || g_mod_game_id.empty()) return;
+    std::vector<recomp::mods::ModDetails> mods = recomp::mods::get_all_mod_details(g_mod_game_id);
+    if (mods.empty()) return;
+    g_mods_added = true;
+    auto add = [](ModRow&& m, int lo, int hi, const char* const* names) {
+        ModRow& row = g_mod_rows.emplace_back(std::move(m));
+        if (!row.names.empty()) {
+            for (const std::string& s : row.names) row.name_ptrs.push_back(s.c_str());
+            names = row.name_ptrs.data();
+        }
+        add_row({ row.mod_id.c_str(), row.label.c_str(), lo, hi, &row.value, names, false, nullptr, nullptr, recomp3ds::PageMods, 1, nullptr,
+                  true, apply_mod_row, &row });
+    };
+    for (const recomp::mods::ModDetails& d : mods) {
+        if (d.custom_gamemode) continue;    // chosen at start, not toggled
+        ModRow toggle;
+        toggle.mod_id = d.mod_id;
+        toggle.label = clip(d.display_name, 13);
+        toggle.value = recomp::mods::is_mod_enabled(d.mod_id) ? 1 : 0;
+        add(std::move(toggle), 0, 1, kModOffOn);
+        const recomp::config::ConfigSchema& schema = recomp::mods::get_mod_config_schema(d.mod_id);
+        for (const recomp::config::ConfigOption& o : schema.options) {
+            if (o.hidden) continue;
+            ModRow m;
+            m.mod_id = d.mod_id;
+            m.option_id = o.id;
+            m.label = " " + clip(o.name, 12);
+            recomp::config::ConfigValueVariant cur = recomp::mods::get_mod_config_value(d.mod_id, o.id);
+            if (o.type == recomp::config::ConfigOptionType::Enum) {
+                const auto& e = std::get<recomp::config::ConfigOptionEnum>(o.variant);
+                if (e.options.empty()) continue;
+                m.kind = ModRow::Enum;
+                for (size_t i = 0; i < e.options.size(); i++) {
+                    m.names.push_back(clip(e.options[i].name.empty() ? e.options[i].key : e.options[i].name, 11));
+                    m.enum_values.push_back(e.options[i].value);
+                    if (std::holds_alternative<uint32_t>(cur) && std::get<uint32_t>(cur) == e.options[i].value) m.value = (int)i;
+                }
+                const int hi = (int)e.options.size() - 1;
+                add(std::move(m), 0, hi, nullptr);
+            }
+            else if (o.type == recomp::config::ConfigOptionType::Bool) {
+                m.kind = ModRow::Bool;
+                m.value = std::holds_alternative<bool>(cur) && std::get<bool>(cur) ? 1 : 0;
+                add(std::move(m), 0, 1, kModOffOn);
+            }
+            else if (o.type == recomp::config::ConfigOptionType::Number) {
+                const auto& num = std::get<recomp::config::ConfigOptionNumber>(o.variant);
+                m.kind = ModRow::Number;
+                m.num_step = num.step > 0.0 ? num.step : 1.0;
+                m.value = std::holds_alternative<double>(cur) ? (int)(std::get<double>(cur) / m.num_step + 0.5) : 0;
+                add(std::move(m), (int)(num.min / m.num_step), (int)(num.max / m.num_step), nullptr);
+            }
+            // Strings keep their values: no text entry here.
+        }
+    }
+}
+bool mods_listed() { return !g_mod_rows.empty(); }
+#else
+void add_mod_rows() {}
+bool mods_listed() { return false; }
+#endif
+
 }   // namespace
 
 void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) {
@@ -334,6 +451,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     g_conv_tenths = st.convergence_hundredths / 10;
     g_auto = st.auto_convergence ? 1 : 0;
     g_row_count = 0;
+    g_mod_game_id = desc.entry.mod_game_id;
     add_row({ "separation", "3D depth", 0, 100, &st.sep_slider, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
     add_row({ "convergence_tenths", "Convergence", 1, 200, &g_conv_tenths, nullptr, true, nullptr, apply_conv, Page3D, 1, nullptr });
     add_row({ "hud_depth", "HUD depth", 0, 100, &st.hud_depth, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
@@ -379,6 +497,7 @@ bool recomp3ds::settings_debug_capture() { return g_debug_capture != 0; }
 
 void recomp3ds::settings_menu_toggle() {
     g_open = !g_open;
+    if (g_open) add_mod_rows();
     g_redraw = true;
 }
 
