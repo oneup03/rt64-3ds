@@ -14,7 +14,8 @@
 //                      recomp_static_mod descriptor
 //   static_dispatch.c  the base functions baked mods replace or hook
 //   static_mods.cpp    recomp_register_static_mods(): registers the above and
-//                      the .nrm files marked :embed (built into the executable)
+//                      the .nrm files marked :embed (built into the executable,
+//                      without thumbnails, and disabled until turned on)
 //   static_mods_data.c those .nrm files' bytes
 //   game_hooks.toml    [[patches.hook]] entries for the game's recompilation,
 //   patch_hooks.toml   and for the patches' (functions they replace): a check
@@ -197,11 +198,15 @@ bool read_nrm(Nrm& n) {
 }
 
 // The .nrm reduced to what the runtime reads (no thumbnail), for embedding.
+// A mod built into the executable starts disabled: the player turns it on.
 std::vector<uint8_t> stripped_nrm(const Nrm& n) {
     mz_zip_archive zip{};
     std::vector<uint8_t> out;
+    nlohmann::json j = nlohmann::json::parse(n.manifest.begin(), n.manifest.end());
+    j["enabled_by_default"] = false;
+    const std::string manifest = j.dump(4);
     if (!mz_zip_writer_init_heap(&zip, 0, 0)) return out;
-    bool ok = mz_zip_writer_add_mem(&zip, "mod.json", n.manifest.data(), n.manifest.size(), MZ_BEST_COMPRESSION) &&
+    bool ok = mz_zip_writer_add_mem(&zip, "mod.json", manifest.data(), manifest.size(), MZ_BEST_COMPRESSION) &&
               mz_zip_writer_add_mem(&zip, "mod_syms.bin", n.syms.data(), n.syms.size(), MZ_BEST_COMPRESSION) &&
               mz_zip_writer_add_mem(&zip, "mod_binary.bin", n.binary.data(), n.binary.size(), MZ_BEST_COMPRESSION);
     void* buf = nullptr;
