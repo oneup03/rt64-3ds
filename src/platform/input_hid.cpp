@@ -176,10 +176,14 @@ void recomp3ds::input_poll() {
     g_held = hidKeysHeld() | scripted;
     hidCircleRead(&g_cpad);
     hidCstickRead(&g_cstick);
-    // Scripted stick directions (AUTOTEST STICK_*): full deflection.
+    // Scripted stick directions (AUTOTEST STICK_*, CSTICK_*): full deflection.
     if (scripted & (KEY_CPAD_UP | KEY_CPAD_DOWN | KEY_CPAD_LEFT | KEY_CPAD_RIGHT)) {
         g_cpad.dx = (scripted & KEY_CPAD_RIGHT) ? CPAD_MAX : ((scripted & KEY_CPAD_LEFT) ? -CPAD_MAX : 0);
         g_cpad.dy = (scripted & KEY_CPAD_UP) ? CPAD_MAX : ((scripted & KEY_CPAD_DOWN) ? -CPAD_MAX : 0);
+    }
+    if (scripted & (KEY_CSTICK_UP | KEY_CSTICK_DOWN | KEY_CSTICK_LEFT | KEY_CSTICK_RIGHT)) {
+        g_cstick.dx = (scripted & KEY_CSTICK_RIGHT) ? CPAD_MAX : ((scripted & KEY_CSTICK_LEFT) ? -CPAD_MAX : 0);
+        g_cstick.dy = (scripted & KEY_CSTICK_UP) ? CPAD_MAX : ((scripted & KEY_CSTICK_DOWN) ? -CPAD_MAX : 0);
     }
 }
 
