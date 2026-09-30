@@ -8,6 +8,7 @@
 #include <memory>
 
 #include "ultramodern/renderer_context.hpp"
+#include "rt64_3ds_types.h"
 
 namespace rt64_3ds {
 
@@ -17,6 +18,7 @@ namespace rt64_3ds {
 // fixed screen-relative offset.
 enum class StereoClass : uint8_t { None, World, Infinity, ScreenOverlay, Hud, HudBubble, Rect };
 enum class ProjKind : uint8_t { Any, Perspective, Ortho };
+
 
 // A rule matches a projection-group id range (gEXMatrixGroup ids) and a
 // projection kind. The first matching rule wins.
@@ -28,6 +30,7 @@ struct StereoRule {
 
 struct RenderDesc {
     const char* game_name = "";
+    Gbi gbi = Gbi::F3DEX2;
     const StereoRule* rules = nullptr;
     size_t rule_count = 0;
     StereoClass unclassified_persp = StereoClass::None;
@@ -36,6 +39,8 @@ struct RenderDesc {
     uint32_t hud_id_lo = 0, hud_id_hi = 0;  // perspective draws in this id range are HUD
     uint32_t bubble_id_lo = 0;              // ... and from here up, the "bubble" HUD variant
     float hud_k_ortho = 2.75f, hud_k_bubble = 1.3f, hud_k_persp = 1.35799f;
+    // The game's frame, in N64 pixels (its framebuffer's size: DK64 320x240,
+    // Banjo 292x216). It is placed as RT64 places it: see ScreenGeometry.
     uint32_t vi_width = 320, vi_height = 240;
     bool hud_on_bottom_supported = false;
     const uint32_t* snapshot_buffers = nullptr;   // RDRAM addresses the game copies frames into
@@ -57,6 +62,8 @@ struct RenderDesc {
 
 void set_render_desc(const RenderDesc& desc);
 const RenderDesc& render_desc();
+// ScreenGeometry::make of render_desc()'s vi_width x vi_height.
+ScreenGeometry screen_geometry();
 
 // The folder the renderer's debug switches (*.TXT) and captures live in:
 // the game's folder on the SD card, which the platform sets at start.

@@ -390,7 +390,15 @@ private:
         }
         C3D_TexSetFilter(&snapshot_, GPU_LINEAR, GPU_LINEAR);
         C3D_TexSetWrap(&snapshot_, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
-        interp_.set_snapshot_layout(40);
+        {
+            // The game's frame on the screen, as RT64 would place it (see
+            // rt64_3ds::ScreenGeometry).
+            geo_ = rt64_3ds::screen_geometry();
+            grid_cols_ = std::min((geo_.w + 7) / 8, kGridColsMax);
+            grid_rows_ = std::min((geo_.h + 7) / 8, kGridRowsMax);
+            interp_.set_screen(geo_);
+            fprintf(stderr, "rt64-3ds: game frame %dx%d, x%.3f, %.1f-unit margins\n", geo_.w, geo_.h, geo_.scale, geo_.x0);
+        }
         {
             // The perspective groups the game's rules place as world: their
             // projection turns the depth buffer into distances.
@@ -404,12 +412,13 @@ private:
             if (n == 0) ids[n++] = desc.frame_head_proj_id;
             interp_.set_world_proj_ids(ids, n);
             interp_.set_force_branch_z(desc.force_lod_branch);
+            interp_.set_gbi(desc.gbi);
         }
 
-        // The N64's 320x240 sits centred on the 400 px wide screen for now.
-        // Everything arrives in N64 screen pixels with y growing downward:
-        // bottom edge = 240, top edge = 0.
-        Mtx_OrthoTilt(&proj_, -40.0f, 360.0f, 240.0f, 0.0f, 0.0f, 1.0f, true);
+        // The game's frame sits centred on the 400 px wide screen, scaled to
+        // its height (DK64's 320x240: x -40..360). Everything arrives in N64
+        // screen pixels with y growing downward: bottom edge = h, top = 0.
+        Mtx_OrthoTilt(&proj_, -geo_.x0, (float)geo_.w + geo_.x0, (float)geo_.h, 0.0f, 0.0f, 1.0f, true);
         C3D_DepthMap(true, -1.0f, 0.0f);
         C3D_CullFace(GPU_CULL_NONE);
         ok_ = true;
@@ -423,6 +432,13 @@ private:
             fprintf(stderr, "rt64-3ds: GPU debug mode from frame %u for %u frames, sync %d, every %u\n", debug_from_, debug_count_, (int)debug_sync_, debug_step_);
         }
         if (FILE* f = rt64_3ds::data_fopen("PROFILE.TXT", "r")) { prof_on_ = true; fclose(f); }
+        // DRAW_RANGE.TXT: "<first> <last>": replay only those draws of every
+        // frame (to find which draw goes wrong against the host reference).
+        if (FILE* f = rt64_3ds::data_fopen("DRAW_RANGE.TXT", "r")) {
+            if (fscanf(f, "%d %d", &draw_lo_, &draw_hi_) != 2) { draw_lo_ = 0; draw_hi_ = 1 << 30; }
+            fclose(f);
+            fprintf(stderr, "rt64-3ds: replaying draws %d..%d only\n", draw_lo_, draw_hi_);
+        }
         fprintf(stderr, "rt64-3ds: citro3d renderer up (linear free %u KB)\n", (unsigned)(linearSpaceFree() / 1024));
     }
 
@@ -530,6 +546,7 @@ private:
             g_progress.draw_index = (uint32_t)i;
             g_progress_draw = &d;
             if (d.count < 3 || d.first + d.count > n) continue;
+            if ((int)i < draw_lo_ || (int)i > draw_hi_) continue;
             apply_state(d, pass == 0 ? &fallbacks : nullptr);
             {
                 float sa = 0.0f, sb = 0.0f;
@@ -589,7 +606,7 @@ private:
         C3D_FrameEnd(0);
         acc_end_ += svcGetSystemTick() - te0;
         interp_.note_presented_framebuffer(frame_.color_image);
-        prev_depth_image_ = (frame_.color_width == 320) ? frame_.depth_image : 0;
+        prev_depth_image_ = (frame_.color_width == (uint32_t)geo_.w) ? frame_.depth_image : 0;
         // The depth grid read at the next frame start is this frame's: keep
         // the world projection terms that turn it into distances.
         prev_cam_world_ = frame_.cam_is_world;
@@ -708,7 +725,8 @@ private:
         ghost_a_ = c * (1.0f - f);
         const float b = (0.5f - 0.5f * c) * (1.0f - f) + f;
         const uint8_t bb = (uint8_t)(b * 255.0f + 0.5f);
-        const float xs[6] = { -40, 360, 360, -40, 360, -40 }, ys[6] = { 0, 0, 240, 0, 240, 240 };
+        const float l = -geo_.x0, r = (float)geo_.w + geo_.x0, bot = (float)geo_.h;
+        const float xs[6] = { l, r, r, l, r, l }, ys[6] = { 0, 0, bot, 0, bot, bot };
         for (int i = 0; i < 6; i++) {
             q[i] = GpuVertex{ xs[i], ys[i], 0.0f, 1.0f, 0.0f, 0.0f, bb, bb, bb, 255 };
         }
@@ -873,11 +891,12 @@ private:
         // NO_SCISSOR.TXT disables it (to see draws a wrong clip would hide).
         static int no_scissor = -1;
         if (no_scissor < 0) { FILE* f = rt64_3ds::data_fopen("NO_SCISSOR.TXT", "r"); no_scissor = f ? 1 : 0; if (f) fclose(f); }
-        int x0 = d.scissor[0] + 40, y0 = d.scissor[1], x1 = d.scissor[2] + 40, y1 = d.scissor[3];
+        int x0 = (int)lroundf(geo_.screen_x((float)d.scissor[0])), y0 = (int)lroundf(geo_.screen_y((float)d.scissor[1]));
+        int x1 = (int)lroundf(geo_.screen_x((float)d.scissor[2])), y1 = (int)lroundf(geo_.screen_y((float)d.scissor[3]));
         if (no_scissor) { x0 = 0; y0 = 0; x1 = 400; y1 = 240; }
-        // The original game's own 320-wide scissor is stretched to the wide
+        // The original game's own full-width scissor is stretched to the wide
         // screen: the patched projection already fills it.
-        if (d.scissor[0] <= 0 && d.scissor[2] >= 320) { x0 = 0; x1 = 400; }
+        if (d.scissor[0] <= 0 && d.scissor[2] >= geo_.w) { x0 = 0; x1 = 400; }
         if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > 400) x1 = 400; if (y1 > 240) y1 = 240;
         // Mtx_OrthoTilt maps screen y = 0 to framebuffer x = 240 and the
         // screen's left edge to framebuffer y = 400: both axes run backwards.
@@ -1115,7 +1134,7 @@ public:
     uint32_t prev_depth_image_ = 0;
 
     // The finished frame's depth (the GPU is idle after C3D_FrameBegin) into
-    // the game's 320x240 RDRAM depth buffer in the RDP's format: one sample
+    // the game's screen-sized RDRAM depth buffer in the RDP's format: one sample
     // per 4x4 block, read straight from VRAM (8x8 Morton tiles, the target
     // rotated: row = screen x, column = 239 - screen y). Stored depth is
     // 1 - z' with z' = (clip z / w + 1) / 2; the RDP's 18-bit z is
@@ -1149,29 +1168,31 @@ public:
         const uint32_t d = db[tile * 64 + mo] & 0xFFFFFF;
         return 1.0f - (float)d * (1.0f / 16777215.0f);
     }
-    // The grid: one texel per 8x8 block of the N64's 320x240, at the block
+    // The grid: one texel per 8x8 block of the game's frame, at the block
     // centre (VRAM reads by the CPU are slow on the console).
     void read_depth_grid() {
-        for (int gy = 0; gy < kGridRows; gy++) {
-            for (int gx = 0; gx < kGridCols; gx++) {
-                depth_grid_[gy * kGridCols + gx] = read_depth_zp(gx * 8 + 4 + 40, gy * 8 + 4);
+        for (int gy = 0; gy < grid_rows_; gy++) {
+            for (int gx = 0; gx < grid_cols_; gx++) {
+                const float nx = (float)(gx * 8 + 4), ny = (float)(gy * 8 + 4);
+                depth_grid_[gy * grid_cols_ + gx] = read_depth_zp((int)geo_.screen_x(nx), (int)geo_.screen_y(ny));
             }
         }
     }
     void depth_to_rdram(uint32_t zimg) {
-        if ((zimg & 0xFFFFFF) + 320 * 240 * 2 > 16u * 1024 * 1024) return;
+        const uint32_t pitch = (uint32_t)geo_.w * 2;
+        if ((zimg & 0xFFFFFF) + pitch * (uint32_t)geo_.h > 16u * 1024 * 1024) return;
         uint8_t* z = rdram_ + (zimg & 0xFFFFFF);
-        for (int gy = 0; gy < kGridRows; gy++) {
-            for (int gx = 0; gx < kGridCols; gx++) {
+        for (int gy = 0; gy < grid_rows_; gy++) {
+            for (int gx = 0; gx < grid_cols_; gx++) {
                 // Nothing drawn there: the RDP's clear value (0xFFFC), which
                 // the game reads as "nothing here" (its camera and the sun's
                 // visibility test compare against it); the far plane itself
                 // encodes lower (0xF800).
-                const float zp = depth_grid_[gy * kGridCols + gx];
+                const float zp = depth_grid_[gy * grid_cols_ + gx];
                 const uint16_t v = zp >= 1.0f ? 0xFFFC : n64_depth(zp);
-                for (int y = gy * 8; y < gy * 8 + 8; y++) {
-                    uint8_t* row = z + (uint32_t)y * 640;
-                    for (int x = gx * 8; x < gx * 8 + 8; x++) *(uint16_t*)(row + ((x * 2) ^ 2)) = v;
+                for (int y = gy * 8; y < gy * 8 + 8 && y < geo_.h; y++) {
+                    uint8_t* row = z + (uint32_t)y * pitch;
+                    for (int x = gx * 8; x < gx * 8 + 8 && x < geo_.w; x++) *(uint16_t*)(row + ((x * 2) ^ 2)) = v;
                 }
             }
         }
@@ -1221,7 +1242,7 @@ public:
         near_z_ = -1.0f;
         if (sf.on && st.auto_convergence) {
             if (prev_cam_world_) {
-                const float zp = rt64_3ds::near_depth_statistic(depth_grid_, kGridCols, kGridRows);
+                const float zp = rt64_3ds::near_depth_statistic(depth_grid_, grid_cols_, grid_rows_);
                 near_z_ = zp > 0.0f ? rt64_3ds::view_depth(zp, prev_m22_, prev_m32_) : -1.0f;
             }
             sf.conv = autoconv_.update(near_z_, manual, sf.sep, st.comfort_target, rt64_3ds::low_convergence_scene());
@@ -1232,7 +1253,7 @@ public:
         applied_conv_ = sf.conv;
         if (sf.on) {
             bool any = false;
-            for (int i = 0; i < kGridCols * kGridRows && !any; i++) any = depth_grid_[i] > 0.0f && depth_grid_[i] < 1.0f;
+            for (int i = 0; i < grid_cols_ * grid_rows_ && !any; i++) any = depth_grid_[i] > 0.0f && depth_grid_[i] < 1.0f;
             sf.world_empty = !any;
         }
         if (sf.on && st.hud_depth != 50) {
@@ -1290,7 +1311,7 @@ public:
         const float lo = shifted ? -s_px : 0.0f, hi = shifted ? 2.0f * s_px : 0.0f;
         const float spacing = (hi - lo) / (float)(kCandidates - 1);
         const float tolerance = std::max(spacing, (float)kPatch * 0.5f);
-        const int cx = (int)lroundf(reticle_cx_ + 40.0f), cy = (int)lroundf(reticle_cy_);
+        const int cx = (int)lroundf(geo_.screen_x(reticle_cx_)), cy = (int)lroundf(geo_.screen_y(reticle_cy_));
         float aim_inv = -1.0f, best_res = 1e9f, best_inv = -1.0f;
         for (int i = 0; i < (shifted ? kCandidates : 1); i++) {
             const float o = lo + spacing * (float)i;
@@ -1364,11 +1385,15 @@ public:
             class_count_[c == kReticle ? 7 : (c < 7 ? c : 0)]++;
         }
         if (any) { reticle_cx_ = (x0 + x1) * 0.5f; reticle_cy_ = (y0 + y1) * 0.5f; }
-        else { reticle_cx_ = 160.0f; reticle_cy_ = 120.0f; }
+        else { reticle_cx_ = (float)geo_.w * 0.5f; reticle_cy_ = (float)geo_.h * 0.5f; }
     }
 
     static constexpr uint8_t kReticle = 0xFF;
-    static constexpr int kGridCols = 40, kGridRows = 30;
+    // The depth grid: 8x8 blocks of the game's frame (40x30 for 320x240).
+    static constexpr int kGridColsMax = 50, kGridRowsMax = 30;
+    rt64_3ds::ScreenGeometry geo_ = rt64_3ds::ScreenGeometry::make(320, 240);
+    int grid_cols_ = 40, grid_rows_ = 30;
+    int draw_lo_ = 0, draw_hi_ = 1 << 30;       // DRAW_RANGE.TXT
     C3D_RenderTarget* top_r_ = nullptr;
     C3D_RenderTarget* black_ = nullptr;
     bool vi_blanked_ = false;
@@ -1379,7 +1404,7 @@ public:
     float last_sa_ = 0.0f, last_sb_ = 0.0f;
     u64 acc_left_ = 0, acc_right_ = 0;
     rt64_3ds::AutoConvergence autoconv_;
-    float depth_grid_[kGridCols * kGridRows] = {};
+    float depth_grid_[kGridColsMax * kGridRowsMax] = {};
     bool prev_cam_world_ = false;
     float prev_m22_ = 0.0f, prev_m32_ = 0.0f;
     float reticle_cx_ = 160.0f, reticle_cy_ = 120.0f;
@@ -1471,14 +1496,16 @@ bool rt64_3ds::read_back_frame(uint8_t* rdram, uint32_t fb_addr, uint32_t fb_wid
         return false;
     }
     const u16* src = g_readback[ready];
+    const rt64_3ds::ScreenGeometry geo = rt64_3ds::screen_geometry();
     for (int j = 0; j < h; j++) {
-        const int sy = y + j;
+        const int ny = y + j;                                      // N64 pixel
+        const int sy = (int)geo.screen_y((float)ny + 0.5f);        // the screen pixel under its centre
         if (sy < 0 || sy >= 240) continue;
         for (int i = 0; i < w; i++) {
-            const int sx = x + i + 40;           // N64 x -> the wide screen
+            const int sx = (int)geo.screen_x((float)(x + i) + 0.5f);
             if (sx < 0 || sx >= 400) continue;
             const u16 p = src[sx * 240 + 239 - sy] | 1;
-            const uint32_t a = (fb_addr + ((uint32_t)sy * fb_width + (uint32_t)(x + i)) * 2) & 0xFFFFFE;
+            const uint32_t a = (fb_addr + ((uint32_t)ny * fb_width + (uint32_t)(x + i)) * 2) & 0xFFFFFE;
             *(u16*)(rdram + (a ^ 2)) = p;       // RDRAM halfwords sit at address ^ 2
         }
     }

@@ -1,4 +1,4 @@
-// F3DEX2 (+ RT64 extended GBI) display-list interpreter producing a
+// F3DEX2 or F3DEX (+ RT64 extended GBI) display-list interpreter producing a
 // FrameRecord. CPU only; the vertex transform, lighting and RDP state
 // tracking happen here so the backend only replays draws.
 #ifndef RT64_3DS_DL_H
@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "rt64_3ds_record.h"
+#include "rt64_3ds_types.h"
 
 namespace rt64_3ds {
 
@@ -31,8 +32,6 @@ public:
     // The colour image a presented frame was drawn to: reads from it by a
     // later list are the game copying the screen (framebuffer effects).
     void note_presented_framebuffer(uint32_t addr);
-    // Snapshot texture geometry the interpreter maps texel coordinates to.
-    void set_snapshot_layout(int screen_x_offset);
     // Stereo support: the projection group id of the world camera (its
     // projection is recorded in FrameRecord::cam), and whether orthographic
     // draws with an untagged modelview start a new record at every modelview
@@ -41,6 +40,11 @@ public:
     void set_split_untagged_ortho(bool on);
     // Always take G_BRANCH_Z (the near model), as the recomp frontends do.
     void set_force_branch_z(bool on);
+    // The display-list encoding the game's lists use (F3DEX2 by default).
+    void set_gbi(Gbi gbi);
+    // Where the game's frame sits on the top screen (RenderDesc::vi_width
+    // and vi_height): origins, stretching, clipping and frame copies follow it.
+    void set_screen(const ScreenGeometry& geo);
 
 private:
     struct Impl;

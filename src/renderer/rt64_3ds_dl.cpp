@@ -1,4 +1,4 @@
-// F3DEX2 + extended GBI interpreter. See rt64_3ds_dl.h.
+// F3DEX2 / F3DEX + extended GBI interpreter. See rt64_3ds_dl.h.
 //
 // RDRAM is the recompiled runtime's byte-swapped image: byte a lives at
 // [a ^ 3], halfword a at [a ^ 2], aligned words in host order.
@@ -29,6 +29,33 @@ enum : uint8_t {
     G_SETFOGCOLOR = 0xF8, G_SETBLENDCOLOR = 0xF9, G_SETPRIMCOLOR = 0xFA, G_SETENVCOLOR = 0xFB,
     G_SETCOMBINE = 0xFC, G_SETTIMG = 0xFD, G_SETZIMG = 0xFE, G_SETCIMG = 0xFF,
 };
+
+// ---- F3DEX 1.x (GBI1) RSP opcodes, the ones whose number or encoding
+// differs from F3DEX2's. translate_f3dex() turns each into its F3DEX2 form
+// (or runs it) so one decoder serves both; the RDP opcodes are shared.
+enum : uint8_t {
+    F3DEX_G_SPNOOP = 0x00, F3DEX_G_MTX = 0x01, F3DEX_G_MOVEMEM = 0x03, F3DEX_G_VTX = 0x04, F3DEX_G_DL = 0x06,
+    F3DEX_G_SPRITE2D_BASE = 0x09,
+    F3DEX_G_LOAD_UCODE = 0xAF, F3DEX_G_BRANCH_Z = 0xB0, F3DEX_G_TRI2 = 0xB1, F3DEX_G_MODIFYVTX = 0xB2,
+    F3DEX_G_RDPHALF_2 = 0xB3, F3DEX_G_RDPHALF_1 = 0xB4, F3DEX_G_QUAD = 0xB5, F3DEX_G_CLEARGEOMETRYMODE = 0xB6,
+    F3DEX_G_SETGEOMETRYMODE = 0xB7, F3DEX_G_ENDDL = 0xB8, F3DEX_G_SETOTHERMODE_L = 0xB9, F3DEX_G_SETOTHERMODE_H = 0xBA,
+    F3DEX_G_TEXTURE = 0xBB, F3DEX_G_MOVEWORD = 0xBC, F3DEX_G_POPMTX = 0xBD, F3DEX_G_CULLDL = 0xBE, F3DEX_G_TRI1 = 0xBF,
+    G_RDPNOOP = 0xC0,
+};
+// GBI1 G_MOVEMEM indices and G_MOVEWORD's vertex-modify index.
+enum : uint8_t {
+    F3DEX_G_MV_VIEWPORT = 0x80, F3DEX_G_MV_LOOKATY = 0x82, F3DEX_G_MV_LOOKATX = 0x84, F3DEX_G_MV_L0 = 0x86,
+    F3DEX_G_MV_L7 = 0x94, F3DEX_G_MV_MATRIX_1 = 0x9E,
+    F3DEX_G_MW_POINTS = 0x0C,
+};
+// GBI1 geometry-mode bits that sit elsewhere in F3DEX2 (the rest agree).
+enum : uint32_t {
+    F3DEX_G_SHADING_SMOOTH = 0x00000200, F3DEX_G_CULL_FRONT = 0x00001000, F3DEX_G_CULL_BACK = 0x00002000,
+    G_SHADING_SMOOTH = 0x00200000,
+};
+
+// othermode L: the depth source (pixel or the primitive depth)
+constexpr uint32_t G_ZS_PRIM = 0x00000004;
 
 enum : uint32_t {
     G_ZBUFFER = 0x00000001, G_SHADE = 0x00000004, G_CULL_FRONT = 0x00000200, G_CULL_BACK = 0x00000400,
@@ -127,6 +154,11 @@ struct Interpreter::Impl {
     uint32_t geometry_mode = 0;
     // trans_stretch: the x translate without the origin's shift to the wide
     // screen's edge, for STRETCH content (see stretch_x).
+    // The game's frame on the top screen (RenderDesc::vi_width/vi_height,
+    // see ScreenGeometry). Everything here is in its N64 units; the
+    // backend's projection scales them to the screen.
+    ScreenGeometry geo = ScreenGeometry::make(320, 240);
+    int screen_w = 320, screen_h = 240;
     struct Viewport { float scale[3], trans[3]; float trans_stretch = 160.0f; };
     Viewport vp{ { 160, -120, 511 }, { 160, 120, 511 }, 160.0f };
     Viewport vp_stack[8]{};
@@ -158,6 +190,7 @@ struct Interpreter::Impl {
     }
     bool split_untagged_ortho = false;
     bool force_branch_z = true;        // RenderDesc::force_lod_branch, or gEXForceBranch
+    Gbi gbi = Gbi::F3DEX2;
     // Loaded vertices, already in N64 screen homogeneous space (the RSP
     // applies the viewport at load time): x/w, y/w are pixels (y down),
     // z/w in [0, 1]; u/v are texel coordinates after the G_TEXTURE scale.
@@ -178,6 +211,17 @@ struct Interpreter::Impl {
     int16_t scissor[4] = { 0, 0, 320, 240 };
     int16_t scissor_stack[8][4]{};
     int scissor_depth = 0;
+    // gEXPush*/gEXPop* state stacks.
+    static constexpr int kStateStack = 8;
+    struct { uint32_t h, l; } othermode_stack[kStateStack]{};
+    struct { uint32_t w0, w1; } combine_stack[kStateStack]{};
+    uint32_t geometry_stack[kStateStack]{};
+    Mtx proj_stack[kStateStack]{};
+    uint8_t color_stack[5][kStateStack][4]{};   // env, blend, fog, fill, prim
+    int othermode_depth = 0, combine_depth = 0, geometry_depth = 0, proj_depth = 0, color_depth[5] = {};
+    uint16_t prim_depth_z = 0;       // gDPSetPrimDepth (G_ZS_PRIM draws take it as their depth)
+    // The primitive depth as z' (0 near .. 1 far): the RDP's 15-bit screen z.
+    float prim_z() const { return (float)(prim_depth_z > 0x7FFF ? 0x7FFF : prim_depth_z) / 32767.0f; }
     uint16_t tlut[256]{};
     uint32_t tlut_hash = 1;
     uint32_t tlut_frame_hash = 0, tlut_frame_index = 0;
@@ -212,10 +256,9 @@ struct Interpreter::Impl {
     int vi_fb_next = 0;
     uint32_t snapshot_base = 0;         // storage buffer that holds the snapshot
     bool snapshot_valid = false;
-    int snapshot_x_offset = 40;         // where N64 x = 0 sits on the 400 px screen
 
     bool is_vi_framebuffer(uint32_t a) const {
-        for (uint32_t fb : vi_fbs) if (fb != 0 && a >= fb && a < fb + 320 * 240 * 2) return true;
+        for (uint32_t fb : vi_fbs) if (fb != 0 && a >= fb && a < fb + (uint32_t)(screen_w * screen_h * 2)) return true;
         return false;
     }
 
@@ -299,7 +342,7 @@ struct Interpreter::Impl {
         // translate of x/w and y/w (y negated: screen y grows downward) and
         // z' = (z + w) / 2, all linear in homogeneous coordinates.
         const bool stretch = proj_stretch();
-        const float sx = stretch ? vp.scale[0] * 1.25f : vp.scale[0], sy = -vp.scale[1];
+        const float sx = stretch ? vp.scale[0] * stretch_k() : vp.scale[0], sy = -vp.scale[1];
         const float tx = stretch ? stretch_x(vp.trans_stretch) : vp.trans[0], ty = vp.trans[1];
         float m[4][4];
         for (int i = 0; i < 4; i++) {
@@ -415,11 +458,11 @@ struct Interpreter::Impl {
         d.valid = true;
         d.addr = best->addr + (tl.tmem - best->tmem) * 8;
         d.pitch = pitch;
-        // Reads of the stored frame are 16-bit tile loads out of a 320-wide
-        // image; anything else at that address is ordinary texture data
-        // (the storage may be heap memory the game reuses later).
-        d.snapshot = snapshot_valid && d.addr >= snapshot_base && d.addr < snapshot_base + 320 * 240 * 2 &&
-                     !best->block && best->pitch == 320 * 2 && tl.siz == 2;
+        // Reads of the stored frame are 16-bit tile loads out of a
+        // screen-wide image; anything else at that address is ordinary
+        // texture data (the storage may be heap memory the game reuses later).
+        d.snapshot = snapshot_valid && d.addr >= snapshot_base && d.addr < snapshot_base + (uint32_t)(screen_w * screen_h * 2) &&
+                     !best->block && best->pitch == (uint32_t)screen_w * 2 && tl.siz == 2;
         d.fmt = tl.fmt;
         d.siz = tl.siz;
         d.width = (uint16_t)w;
@@ -558,11 +601,12 @@ struct Interpreter::Impl {
         const float uls = (float)(tl.uls >> 2), ult = (float)(tl.ult >> 2);
         const float ss = shift_scale(tl.shifts), st = shift_scale(tl.shiftt);
         const bool snap = r->tex[0].snapshot;
+        const bool zprim = (othermode_l & G_ZS_PRIM) != 0;
         Vtx3ds tri[3];
         for (int k = 0; k < 3; k++) {
             const auto& v = k == 0 ? a : (k == 1 ? b : c);
             Vtx3ds& t = tri[k];
-            t.x = v.x; t.y = v.y; t.z = v.z; t.w = v.w;
+            t.x = v.x; t.y = v.y; t.z = zprim ? prim_z() * v.w : v.z; t.w = v.w;
             t.u = v.u * ss - uls;
             t.v = v.v * st - ult;
             if (snap) snapshot_uv(r->tex[0], t.u, t.v, t.u, t.v, proj_stretch());
@@ -585,10 +629,10 @@ struct Interpreter::Impl {
     // guard band around the screen and to the near plane (z' >= 0), in
     // homogeneous screen space, then drawn as a fan.
     static constexpr float kGuard = 1024.0f;   // pixels beyond the screen centre, each axis
-    static bool inside_guard_band(const Vtx3ds& v) {
+    bool inside_guard_band(const Vtx3ds& v) const {
         if (!(v.w > 0.0f) || v.z < 0.0f) return false;
         const float gx = kGuard * v.w;
-        const float dx = v.x - 160.0f * v.w, dy = v.y - 120.0f * v.w;
+        const float dx = v.x - (float)screen_w * 0.5f * v.w, dy = v.y - (float)screen_h * 0.5f * v.w;
         return dx <= gx && dx >= -gx && dy <= gx && dy >= -gx;
     }
     static Vtx3ds lerp_vtx(const Vtx3ds& p, const Vtx3ds& q, float t) {
@@ -607,14 +651,15 @@ struct Interpreter::Impl {
         Vtx3ds* outp = buf_b;
         // Planes as f(v) >= 0: near (z' >= 0), then the four guard band edges.
         for (int plane = 0; plane < 5 && n >= 3; plane++) {
-            auto f = [plane](const Vtx3ds& v) {
+            const float cx = (float)screen_w * 0.5f, cy = (float)screen_h * 0.5f;
+            auto f = [plane, cx, cy](const Vtx3ds& v) {
                 const float g = kGuard * v.w;
                 switch (plane) {
                     case 0: return v.z - 1e-5f * v.w;
-                    case 1: return g - (v.x - 160.0f * v.w);
-                    case 2: return g + (v.x - 160.0f * v.w);
-                    case 3: return g - (v.y - 120.0f * v.w);
-                    default: return g + (v.y - 120.0f * v.w);
+                    case 1: return g - (v.x - cx * v.w);
+                    case 2: return g + (v.x - cx * v.w);
+                    case 3: return g - (v.y - cy * v.w);
+                    default: return g + (v.y - cy * v.w);
                 }
             };
             int m = 0;
@@ -642,14 +687,16 @@ struct Interpreter::Impl {
     // (bottom row first), its v axis along screen x.
     // The stored frame covers the 4:3 centre of the screen for squeezed
     // draws and the whole wide screen for stretched ones (what RT64's frame
-    // copies are). The copy keeps the colour buffer's memory order, row =
-    // screen x, and the PICA puts t = 0 at the LAST row (normal textures are
-    // stored flipped for that), so t counts back from 512.
+    // copies are), in N64 pixels scaled to the screen. The copy keeps the
+    // colour buffer's memory order, row = screen x, and the PICA puts t = 0
+    // at the LAST row (normal textures are stored flipped for that), so t
+    // counts back from 512.
     void snapshot_uv(const TexDesc& d, float u, float v, float& su, float& sv, bool stretch) const {
         uint32_t texel = (d.addr - snapshot_base) / 2;
-        float x0 = (float)(texel % 320), y0 = (float)(texel / 320);
-        float sx = stretch ? (x0 + u) * 1.25f : x0 + u + (float)snapshot_x_offset;   // screen pixel, 0..400
-        float sy = y0 + v;
+        float x0 = (float)(texel % (uint32_t)screen_w), y0 = (float)(texel / (uint32_t)screen_w);
+        float nx = stretch ? (x0 + u) * stretch_k() - geo.x0 : x0 + u;   // N64 x on the wide screen
+        float sx = geo.screen_x(nx);                                       // screen pixel, 0..400
+        float sy = geo.screen_y(y0 + v);
         su = 240.0f - sy;
         sv = 512.0f - sx;
     }
@@ -749,7 +796,7 @@ struct Interpreter::Impl {
         // RT64 spreads a rectangle over the whole wide screen when it reads a
         // frame copy, spans the full width with plain origins (full-screen
         // fills and tints), or is tagged STRETCH, unless it is tagged ADJUST.
-        const bool stretch = ((textured && r.tex[0].snapshot) || (plain_origins && ulx <= 0.0f && lrx >= 320.0f) ||
+        const bool stretch = ((textured && r.tex[0].snapshot) || (plain_origins && ulx <= 0.0f && lrx >= (float)screen_w) ||
                               rect_aspect == kAspectStretch) && rect_aspect != kAspectAdjust;
         if (stretch) {
             ulx = stretch_x(ulx);
@@ -760,7 +807,7 @@ struct Interpreter::Impl {
         float us[4] = { u0, u1, u1, u0 }, vs[4] = { v0, v0, v1, v1 };
         if (flip) { us[1] = u0; vs[1] = v1; us[3] = u1; vs[3] = v0; }
         for (int i = 0; i < 4; i++) {
-            q[i].x = xs[i]; q[i].y = ys[i]; q[i].z = 0.0f; q[i].w = 1.0f;
+            q[i].x = xs[i]; q[i].y = ys[i]; q[i].z = (othermode_l & G_ZS_PRIM) ? prim_z() : 0.0f; q[i].w = 1.0f;
             q[i].u = us[i]; q[i].v = vs[i];
             if (r.tex[0].snapshot) snapshot_uv(r.tex[0], q[i].u, q[i].v, q[i].u, q[i].v, stretch);
             q[i].r = q[i].g = q[i].b = q[i].a = 0;   // rectangles have no shade: SHADE reads as 0 (as RT64)
@@ -833,8 +880,8 @@ struct Interpreter::Impl {
                 // of the N64 screen, or absolute).
                 uint32_t lorigin = (w1 >> 2) & 0xFFF, rorigin = (w1 >> 14) & 0xFFF;
                 uint32_t a = r32(pc + 8), b = r32(pc + 12);
-                scissor[0] = (int16_t)(a >> 16) / 4 + origin_x(lorigin); scissor[1] = (int16_t)(a & 0xFFFF) / 4;
-                scissor[2] = (int16_t)(b >> 16) / 4 + origin_x(rorigin); scissor[3] = (int16_t)(b & 0xFFFF) / 4;
+                scissor[0] = (int16_t)lroundf((float)((int16_t)(a >> 16) / 4) + origin_x(lorigin)); scissor[1] = (int16_t)(a & 0xFFFF) / 4;
+                scissor[2] = (int16_t)lroundf((float)((int16_t)(b >> 16) / 4) + origin_x(rorigin)); scissor[3] = (int16_t)(b & 0xFFFF) / 4;
                 return 1;
             }
             case EX_SETSCISSORALIGN: return 2;
@@ -878,12 +925,52 @@ struct Interpreter::Impl {
                 return 1;
             }
             case EX_VERTEX: return 1;
-            case EX_MATRIX_FLOAT: case EX_SETVERTEXSEGMENT: return 1;
-            case EX_PUSHOTHERMODE: case EX_POPOTHERMODE: case EX_PUSHCOMBINE: case EX_POPCOMBINE:
-            case EX_PUSHPROJMATRIX: case EX_POPPROJMATRIX: case EX_PUSHENVCOLOR: case EX_POPENVCOLOR:
-            case EX_PUSHBLENDCOLOR: case EX_POPBLENDCOLOR: case EX_PUSHFOGCOLOR: case EX_POPFOGCOLOR:
-            case EX_PUSHFILLCOLOR: case EX_POPFILLCOLOR: case EX_PUSHPRIMCOLOR: case EX_POPPRIMCOLOR:
-            case EX_PUSHGEOMETRYMODE: case EX_POPGEOMETRYMODE: case EX_SETPROJMATRIXFLOAT: case EX_SETVIEWMATRIXFLOAT:
+            case EX_MATRIX_FLOAT:
+                matrix_float(seg(r32(pc + 12)), w1);
+                return 1;
+            case EX_SETVERTEXSEGMENT: return 1;
+            // State stacks, as RT64 keeps them: a push saves, a pop restores.
+            case EX_PUSHOTHERMODE:
+                if (othermode_depth < kStateStack) othermode_stack[othermode_depth++] = { othermode_h, othermode_l };
+                return 0;
+            case EX_POPOTHERMODE:
+                if (othermode_depth > 0) { othermode_depth--; othermode_h = othermode_stack[othermode_depth].h; othermode_l = othermode_stack[othermode_depth].l; tex_seq++; }
+                return 0;
+            case EX_PUSHCOMBINE:
+                if (combine_depth < kStateStack) combine_stack[combine_depth++] = { cc_w0, cc_w1 };
+                return 0;
+            case EX_POPCOMBINE:
+                if (combine_depth > 0) { combine_depth--; cc_w0 = combine_stack[combine_depth].w0; cc_w1 = combine_stack[combine_depth].w1; tex_seq++; }
+                return 0;
+            case EX_PUSHGEOMETRYMODE:
+                if (geometry_depth < kStateStack) geometry_stack[geometry_depth++] = geometry_mode;
+                return 0;
+            case EX_POPGEOMETRYMODE:
+                if (geometry_depth > 0) { geometry_mode = geometry_stack[--geometry_depth]; ldir_dirty = true; }
+                return 0;
+            case EX_PUSHPROJMATRIX:
+                if (proj_depth < kStateStack) proj_stack[proj_depth++] = proj;
+                return 0;
+            case EX_POPPROJMATRIX:
+                if (proj_depth > 0) { proj = proj_stack[--proj_depth]; mvp_dirty = true; }
+                return 0;
+            case EX_PUSHENVCOLOR: case EX_PUSHBLENDCOLOR: case EX_PUSHFOGCOLOR: case EX_PUSHFILLCOLOR: case EX_PUSHPRIMCOLOR:
+            case EX_POPENVCOLOR: case EX_POPBLENDCOLOR: case EX_POPFOGCOLOR: case EX_POPFILLCOLOR: case EX_POPPRIMCOLOR: {
+                const bool push = sub == EX_PUSHENVCOLOR || sub == EX_PUSHBLENDCOLOR || sub == EX_PUSHFOGCOLOR ||
+                                  sub == EX_PUSHFILLCOLOR || sub == EX_PUSHPRIMCOLOR;
+                const int which = sub == EX_PUSHENVCOLOR || sub == EX_POPENVCOLOR ? 0 :
+                                  sub == EX_PUSHBLENDCOLOR || sub == EX_POPBLENDCOLOR ? 1 :
+                                  sub == EX_PUSHFOGCOLOR || sub == EX_POPFOGCOLOR ? 2 :
+                                  sub == EX_PUSHFILLCOLOR || sub == EX_POPFILLCOLOR ? 3 : 4;
+                uint8_t* colors[5] = { env, blend, fog, fill, prim };
+                int& d = color_depth[which];
+                if (push) { if (d < kStateStack) memcpy(color_stack[which][d++], colors[which], 4); }
+                else if (d > 0) memcpy(colors[which], color_stack[which][--d], 4);
+                return 0;
+            }
+            // RT64 keeps these for its own interpolation and stereo; the 3DS
+            // shifts the eyes in clip space and needs neither.
+            case EX_SETPROJMATRIXFLOAT: case EX_SETVIEWMATRIXFLOAT:
                 return 0;
             default:
                 stats->ex_unknown++;
@@ -892,14 +979,15 @@ struct Interpreter::Impl {
     }
 
     // gEX origins: 0 left, 0x200 centre, 0x400 right, 0x800 none. A
-    // coordinate is relative to the origin's N64 position (0/160/320), and
+    // coordinate is relative to the origin's N64 position (0, w/2, w), and
     // the origin itself sits on the matching edge of the wide screen, whose
-    // N64 x range is -40..360 here; "none" keeps the 4:3 placement.
-    static int origin_x(uint32_t origin) {
-        switch (origin) { case 0x000: return -40; case 0x200: return 160; case 0x400: return 360; default: return 0; }
+    // N64 x range is -x0..w+x0 (-40..360 for DK64's 320); "none" keeps the
+    // 4:3 placement.
+    float origin_x(uint32_t origin) const {
+        switch (origin) { case 0x000: return -geo.x0; case 0x200: return (float)screen_w * 0.5f; case 0x400: return (float)screen_w + geo.x0; default: return 0.0f; }
     }
-    static int origin_shift(uint32_t origin) {
-        switch (origin) { case 0x000: return -40; case 0x400: return 40; default: return 0; }
+    float origin_shift(uint32_t origin) const {
+        switch (origin) { case 0x000: return -geo.x0; case 0x400: return geo.x0; default: return 0.0f; }
     }
 
     float raw_vtrans_x = 640.0f;   // quarter pixels, as loaded
@@ -918,26 +1006,183 @@ struct Interpreter::Impl {
         // shifted by an offset (quarter pixels); the origin then sits on the
         // wide screen's edge.
         float x = raw_vtrans_x;
-        if (vp_origin < 0x800) x += (float)vp_origin * 320.0f * 4.0f / 1024.0f;
+        if (vp_origin < 0x800) x += (float)vp_origin * (float)screen_w * 4.0f / 1024.0f;
         vp.trans[0] = (x + (float)vp_align_x) / 4.0f + (float)origin_shift(vp_origin);
         vp.trans_stretch = (x + (float)vp_align_x) / 4.0f;
     }
 
     // Widescreen, as RT64 does it: its native mapping spreads the N64's
-    // 0..320 across the whole wide screen and ADJUST squeezes content back to
-    // 4:3; here the default is the squeezed 4:3 placement (0..320 centred,
-    // the screen spanning -40..360) and STRETCH content is spread out. Origins
+    // 0..w across the whole wide screen and ADJUST squeezes content back to
+    // 4:3; here the default is the squeezed placement (0..w centred, the
+    // screen spanning -x0..w+x0) and STRETCH content is spread out. Origins
     // only anchor squeezed content, so stretched content ignores them.
-    static float stretch_x(float x) { return x * 1.25f - 40.0f; }
+    float stretch_k() const { return geo.wide_w / (float)screen_w; }
+    float stretch_x(float x) const { return x * stretch_k() - geo.x0; }
     static constexpr uint8_t kAspectStretch = 1, kAspectAdjust = 2;
     bool proj_stretch() const { return proj_aspects[proj_group_depth] == kAspectStretch; }
     // A scissor still in 4:3 space goes wide with stretched content; one set
     // through origins already is.
     void effective_scissor(int16_t* out, bool stretch) const {
         memcpy(out, scissor, sizeof(scissor));
-        if (stretch && scissor[0] >= 0 && scissor[2] <= 320) {
+        if (stretch && scissor[0] >= 0 && scissor[2] <= screen_w) {
             out[0] = (int16_t)stretch_x((float)scissor[0]);
             out[2] = (int16_t)stretch_x((float)scissor[2]);
+        }
+    }
+
+    // A matrix command's effect; p holds F3DEX2's flags with the push bit as
+    // meant (4 projection, 2 load, 1 push).
+    void apply_matrix(const Mtx& m, uint8_t p) {
+        if (p & 4) {
+            if (p & 2) proj = m; else mul(proj, m, proj);
+            if (proj.m[2][3] != 0.0f) {
+                bool world = is_world_proj(proj_id);
+                if (!out->has_cam || (world && !out->cam_is_world)) {
+                    out->has_cam = true;
+                    out->cam_is_world = world;
+                    memcpy(out->cam, &proj, sizeof(out->cam));
+                }
+            }
+        }
+        else {
+            mv_seq++;
+            if (p & 1) {
+                if (mv_depth + 1 < kMaxMtxStack) { mv_stack[mv_depth + 1] = mv_stack[mv_depth]; mv_depth++; }
+            }
+            if (p & 2) mv_stack[mv_depth] = m; else mul(mv_stack[mv_depth], m, mv_stack[mv_depth]);
+            ldir_dirty = true;
+        }
+        mvp_dirty = true;
+    }
+
+    // gEXMatrixFloat: a matrix of 16 floats, row by row, with the game's own
+    // G_MTX flags (not inverted, in its GBI's encoding).
+    void matrix_float(uint32_t addr, uint32_t flags) {
+        Mtx m;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                uint32_t bits = r32(addr + (uint32_t)(i * 4 + j) * 4);
+                memcpy(&m.m[i][j], &bits, 4);
+            }
+        }
+        uint8_t p = flags & 0xFF;
+        if (gbi == Gbi::F3DEX) p = (uint8_t)(((p & 1) ? 4 : 0) | (p & 2) | ((p & 4) ? 1 : 0));   // GBI1: projection 1, push 4
+        apply_matrix(m, p);
+    }
+
+    // ---- F3DEX 1.x
+    // GBI1 geometry-mode bits -> F3DEX2's (only the shading and culling bits move).
+    static uint32_t f3dex_geometry_bits(uint32_t g) {
+        uint32_t out = g & ~(F3DEX_G_SHADING_SMOOTH | F3DEX_G_CULL_FRONT | F3DEX_G_CULL_BACK);
+        if (g & F3DEX_G_SHADING_SMOOTH) out |= G_SHADING_SMOOTH;
+        if (g & F3DEX_G_CULL_FRONT) out |= G_CULL_FRONT;
+        if (g & F3DEX_G_CULL_BACK) out |= G_CULL_BACK;
+        return out;
+    }
+
+    // Rewrites an F3DEX command in place as the F3DEX2 command that does the
+    // same (the RDP commands are shared). Returns false when the command was
+    // carried out here and the F3DEX2 decoder must skip it.
+    bool translate_f3dex(uint8_t& op, uint32_t& w0, uint32_t& w1) {
+        switch (op) {
+            case F3DEX_G_SPNOOP:
+                // The RT64 hook rides on GBI1's no-op (RT64_HOOK_OPCODE 0x00).
+                op = G_SPNOOP; w0 = ((uint32_t)G_SPNOOP << 24) | (w0 & 0xFFFFFF);
+                return true;
+            case F3DEX_G_MTX: {
+                // GBI1 flags: projection 1, load 2, push 4. F3DEX2 stores
+                // projection 4, load 2, push 1, the push bit inverted.
+                uint32_t p = (w0 >> 16) & 0xFF;
+                uint32_t p2 = ((p & 1) ? 4u : 0u) | (p & 2) | ((p & 4) ? 1u : 0u);
+                op = G_MTX; w0 = ((uint32_t)G_MTX << 24) | (p2 ^ 1);
+                return true;
+            }
+            case F3DEX_G_MOVEMEM: {
+                uint8_t index = (w0 >> 16) & 0xFF;
+                uint32_t offset;   // F3DEX2 G_MV_LIGHT offset: look-at X, Y, then the lights
+                if (index == F3DEX_G_MV_VIEWPORT) { op = G_MOVEMEM; w0 = ((uint32_t)G_MOVEMEM << 24) | 8; return true; }
+                if (index == F3DEX_G_MV_LOOKATX) offset = 0;
+                else if (index == F3DEX_G_MV_LOOKATY) offset = 0x18;
+                else if (index >= F3DEX_G_MV_L0 && index <= F3DEX_G_MV_L7) offset = 0x30 + (uint32_t)((index - F3DEX_G_MV_L0) / 2) * 0x18;
+                else { stats->unknown++; return false; }   // G_MV_MATRIX_* (forced matrices), G_MV_TXTATT
+                op = G_MOVEMEM; w0 = ((uint32_t)G_MOVEMEM << 24) | ((offset / 8) << 8) | 10;
+                return true;
+            }
+            case F3DEX_G_VTX: {
+                uint32_t n = (w0 >> 10) & 0x3F, v0 = (w0 >> 17) & 0x7F;
+                op = G_VTX; w0 = ((uint32_t)G_VTX << 24) | (n << 12) | (((v0 + n) & 0x7F) << 1);
+                return true;
+            }
+            case F3DEX_G_DL: op = G_DL; w0 = ((uint32_t)G_DL << 24) | (w0 & 0xFFFFFF); return true;
+            case F3DEX_G_SPRITE2D_BASE: stats->unknown++; return false;
+            case F3DEX_G_LOAD_UCODE: op = G_LOAD_UCODE; return true;
+            case F3DEX_G_BRANCH_Z: op = G_BRANCH_Z; w0 = ((uint32_t)G_BRANCH_Z << 24) | (w0 & 0xFFFFFF); return true;
+            case F3DEX_G_TRI2: op = G_TRI2; return true;             // same layout: two index triples (x2)
+            case F3DEX_G_MODIFYVTX: op = G_MODIFYVTX; return true;   // same layout
+            case F3DEX_G_RDPHALF_1: op = G_RDPHALF_1; return true;
+            case F3DEX_G_RDPHALF_2: op = G_RDPHALF_2; return true;
+            case F3DEX_G_QUAD:
+                // gSP1Quadrangle: four indices (x2) in w1, drawn as a, b, c and a, c, d.
+                // (L3DEX's G_LINE3D shares this number; Banjo draws no lines.)
+                emit_tri(((w1 >> 24) & 0xFF) / 2, ((w1 >> 16) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2);
+                emit_tri(((w1 >> 24) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2, (w1 & 0xFF) / 2);
+                return false;
+            case F3DEX_G_CLEARGEOMETRYMODE:
+                geometry_mode &= ~f3dex_geometry_bits(w1);
+                state_seq++;
+                return false;
+            case F3DEX_G_SETGEOMETRYMODE:
+                geometry_mode |= f3dex_geometry_bits(w1);
+                state_seq++;
+                return false;
+            case F3DEX_G_ENDDL: op = G_ENDDL; return true;
+            case F3DEX_G_SETOTHERMODE_L: case F3DEX_G_SETOTHERMODE_H: {
+                // GBI1 gives the shift and length; F3DEX2 32 - shift - len and len - 1.
+                uint32_t shift = (w0 >> 8) & 0xFF, len = w0 & 0xFF;
+                op = op == F3DEX_G_SETOTHERMODE_L ? G_SETOTHERMODE_L : G_SETOTHERMODE_H;
+                w0 = ((uint32_t)op << 24) | (((32 - shift - len) & 0xFF) << 8) | ((len - 1) & 0xFF);
+                return true;
+            }
+            case F3DEX_G_TEXTURE: op = G_TEXTURE; return true;       // same fields
+            case F3DEX_G_MOVEWORD: {
+                uint8_t index = w0 & 0xFF;
+                uint32_t offset = (w0 >> 8) & 0xFFFF;
+                if (index == 0x02) {
+                    // NUMLIGHT: 0x80000000 + 32 * (lights + 1) -> F3DEX2's lights * 24.
+                    int n = (int)((w1 - 0x80000000u) >> 5) - 1;
+                    w1 = (uint32_t)(n < 0 ? 0 : n) * 24;
+                }
+                else if (index == 0x0A) {
+                    // LIGHTCOL: GBI1 lights are 32 bytes apart in DMEM, F3DEX2's 24.
+                    offset = (offset / 32) * 24 + (offset % 32);
+                }
+                else if (index == F3DEX_G_MW_POINTS) {
+                    // gSPModifyVertex through G_MOVEWORD: offset = vertex * 40 + where.
+                    uint32_t v = offset / 40, where = offset % 40;
+                    op = G_MODIFYVTX; w0 = ((uint32_t)G_MODIFYVTX << 24) | (where << 16) | ((v * 2) & 0xFFFF);
+                    return true;
+                }
+                op = G_MOVEWORD; w0 = ((uint32_t)G_MOVEWORD << 24) | ((uint32_t)index << 16) | (offset & 0xFFFF);
+                return true;
+            }
+            case F3DEX_G_POPMTX:
+                // Only the modelview stack pops (w1 = G_MTX_MODELVIEW), one level.
+                if (w1 != 0) return false;
+                op = G_POPMTX; w1 = 64;
+                return true;
+            case F3DEX_G_CULLDL: op = G_CULLDL; return true;
+            case F3DEX_G_TRI1:
+                // GBI1 carries the indices (x2) in w1; F3DEX2 in w0.
+                op = G_TRI1; w0 = ((uint32_t)G_TRI1 << 24) | (w1 & 0xFFFFFF);
+                return true;
+            case G_RDPNOOP: return false;
+            case G_EXTENDED: return true;   // RT64_EXTENDED_OPCODE is the same in both
+            default:
+                // 0x07, 0x02, 0x05 and 0xD6..0xE3 mean F3DEX2 commands only, which a
+                // GBI1 list never holds; everything else is an RDP command.
+                if (op < 0xC0) { stats->unknown++; return false; }
+                if (op >= G_DMA_IO && op <= G_SETOTHERMODE_H) { stats->unknown++; return false; }
+                return true;
         }
     }
 
@@ -953,6 +1198,10 @@ struct Interpreter::Impl {
             uint8_t op = w0 >> 24;
             stats->commands++;
             stats->op_hist[op]++;
+            if (gbi == Gbi::F3DEX && !translate_f3dex(op, w0, w1)) {
+                pc += 8;
+                continue;
+            }
 #ifndef __3DS__
             // Host tools: DL_TRACE=<first draw>,<last draw> prints the commands
             // that run while the frame has that many draws.
@@ -982,7 +1231,7 @@ struct Interpreter::Impl {
             state_seq += kStateOp[op];
             tex_seq += kTexOpTable.v[op];
             switch (op) {
-                case G_NOOP: break;
+                case G_NOOP: case G_RDPNOOP: break;
                 case G_SPNOOP:
                     if ((w0 & 0xFFFFFF) == kHookMagic) {
                         uint32_t hop = w1 >> 28;
@@ -1068,29 +1317,9 @@ struct Interpreter::Impl {
                     geometry_mode = (geometry_mode & (w0 & 0xFFFFFF)) | w1;
                     break;
                 case G_MTX: {
-                    uint8_t p = (w0 & 0xFF) ^ 1;   // F3DEX2 inverts the push bit
                     Mtx m;
                     load_mtx(m, seg(w1));
-                    if (p & 4) {
-                        if (p & 2) proj = m; else mul(proj, m, proj);
-                        if (proj.m[2][3] != 0.0f) {
-                            bool world = is_world_proj(proj_id);
-                            if (!out->has_cam || (world && !out->cam_is_world)) {
-                                out->has_cam = true;
-                                out->cam_is_world = world;
-                                memcpy(out->cam, &proj, sizeof(out->cam));
-                            }
-                        }
-                    }
-                    else {
-                        mv_seq++;
-                        if (p & 1) {
-                            if (mv_depth + 1 < kMaxMtxStack) { mv_stack[mv_depth + 1] = mv_stack[mv_depth]; mv_depth++; }
-                        }
-                        if (p & 2) mv_stack[mv_depth] = m; else mul(mv_stack[mv_depth], m, mv_stack[mv_depth]);
-                        ldir_dirty = true;
-                    }
-                    mvp_dirty = true;
+                    apply_matrix(m, (w0 & 0xFF) ^ 1);   // F3DEX2 inverts the push bit
                     break;
                 }
                 case G_MOVEWORD: {
@@ -1166,12 +1395,15 @@ struct Interpreter::Impl {
                     scissor[0] = ((w0 >> 12) & 0xFFF) / 4; scissor[1] = (w0 & 0xFFF) / 4;
                     scissor[2] = ((w1 >> 12) & 0xFFF) / 4; scissor[3] = (w1 & 0xFFF) / 4;
                     break;
-                case G_SETPRIMDEPTH: break;
+                case G_SETPRIMDEPTH: prim_depth_z = (uint16_t)(w1 >> 16); break;
                 case G_LOADTLUT: {
                     int tile = (w1 >> 24) & 7;
                     int count = ((w1 >> 14) & 0x3FF) + 1;
                     const Tile& tl = tiles[tile];
-                    int base = ((int)tl.tmem * 8 - 0x800) / 2;
+                    // Palettes sit in TMEM's upper half, one entry per 64-bit
+                    // word (quadrupled): entry = word - 256. A 16-colour
+                    // palette p is loaded at word 256 + 16p.
+                    int base = (int)tl.tmem - 256;
                     uint32_t src = timg.addr + ((tl.uls >> 2) * 2);
                     uint32_t h = 2166136261u;
                     for (int i = 0; i < count; i++) {
@@ -1289,9 +1521,6 @@ void Interpreter::note_presented_framebuffer(uint32_t addr) {
     impl_->vi_fbs[impl_->vi_fb_next++ & 3] = addr;
 }
 
-void Interpreter::set_snapshot_layout(int screen_x_offset) {
-    impl_->snapshot_x_offset = screen_x_offset;
-}
 
 bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
     impl_->out = &out;
@@ -1308,6 +1537,8 @@ bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
     impl_->mv_seq = 0;
     impl_->vp_depth = 0;
     impl_->scissor_depth = 0;
+    impl_->othermode_depth = impl_->combine_depth = impl_->geometry_depth = impl_->proj_depth = 0;
+    for (int& d : impl_->color_depth) d = 0;
     impl_->load_count = 0;
     impl_->tlut_frame_hash = 0;
     for (auto& L : impl_->loads) L.valid = false;
@@ -1319,5 +1550,15 @@ void Interpreter::set_world_proj_ids(const uint32_t* ids, int count) {
 }
 void Interpreter::set_split_untagged_ortho(bool on) { impl_->split_untagged_ortho = on; }
 void Interpreter::set_force_branch_z(bool on) { impl_->force_branch_z = on; }
+void Interpreter::set_gbi(Gbi gbi) { impl_->gbi = gbi; }
+void Interpreter::set_screen(const ScreenGeometry& geo) {
+    impl_->geo = geo;
+    impl_->screen_w = geo.w;
+    impl_->screen_h = geo.h;
+    const int16_t full[4] = { 0, 0, (int16_t)geo.w, (int16_t)geo.h };
+    memcpy(impl_->scissor, full, sizeof(full));
+    const float cx = (float)geo.w * 0.5f, cy = (float)geo.h * 0.5f;
+    impl_->vp = Impl::Viewport{ { cx, -cy, 511 }, { cx, cy, 511 }, cx };
+}
 
 }   // namespace rt64_3ds

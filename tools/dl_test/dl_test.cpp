@@ -24,6 +24,12 @@ int main(int argc, char** argv) {
     int iterations = argc > 2 ? atoi(argv[2]) : 20;
 
     rt64_3ds::Interpreter interp(rdram.data());
+    // The game's display-list encoding and frame size, as its RenderDesc has
+    // them: DL_GBI=f3dex (default F3DEX2), DL_SCREEN=292x216 (default 320x240).
+    if (const char* e = getenv("DL_GBI")) if (strcmp(e, "f3dex") == 0) interp.set_gbi(rt64_3ds::Gbi::F3DEX);
+    rt64_3ds::ScreenGeometry geo = rt64_3ds::ScreenGeometry::make(320, 240);
+    if (const char* e = getenv("DL_SCREEN")) { int w = 0, h = 0; if (sscanf(e, "%dx%d", &w, &h) == 2) geo = rt64_3ds::ScreenGeometry::make(w, h); }
+    interp.set_screen(geo);
     rt64_3ds::FrameRecord frame;
     bool present = interp.run(task.t.data_ptr, frame);
     const rt64_3ds::InterpreterStats& st = interp.stats();
@@ -85,9 +91,24 @@ int main(int argc, char** argv) {
         printf("%zu block-loaded draws, %zu need odd-row swaps\n", block, swapped);
     }
 
+    if (getenv("DL_ZRANGE")) {
+        // Draws with vertices outside the depth range (z' = z/w beyond 0..1).
+        for (size_t i = 0; i < frame.draws.size(); i++) {
+            const auto& d = frame.draws[i];
+            float zmin = 1e9f, zmax = -1e9f;
+            for (uint32_t k = d.first; k < d.first + d.count; k++) {
+                const auto& v = frame.verts[k];
+                if (v.w <= 0) continue;
+                float z = v.z / v.w;
+                if (z < zmin) zmin = z; if (z > zmax) zmax = z;
+            }
+            if (d.count && (zmin < 0.0f || zmax > 0.999f)) printf("draw %zu: z' %.3f..%.3f (%u verts)\n", i, zmin, zmax, d.count);
+        }
+    }
     if (const char* out = getenv("DL_RENDER")) {
         // Reference render; DL_MAX / DL_ONLY limit the draws, DL_LOD sets LOD_FRACTION.
         RefOptions o;
+        o.geo = geo;
         if (const char* e = getenv("DL_MAX")) o.max_draw = atoi(e);
         if (const char* e = getenv("DL_ONLY")) o.only_draw = atoi(e);
         if (const char* e = getenv("DL_LOD")) o.lod_fraction = atoi(e);

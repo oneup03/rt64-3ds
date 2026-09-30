@@ -183,14 +183,16 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
 
     // TEX_DUMP.TXT next to the executable: write the first decoded textures
     // as PPM files with their descriptions, to check the decoder by eye.
-    // The file holds the frame number to start at (0 = from boot).
+    // The file holds the frame number to start at (0 = from boot), and
+    // optionally an RDRAM address (hex) to dump only that texture's decodes.
     static int dump_state = -1, dumped = 0, dump_from = 0;
+    static unsigned dump_addr = 0;
     if (dump_state < 0) {
         FILE* f = rt64_3ds::data_fopen("TEX_DUMP.TXT", "r");
         dump_state = f ? 1 : 0;
-        if (f) { if (fscanf(f, "%d", &dump_from) != 1) dump_from = 0; fclose(f); }
+        if (f) { if (fscanf(f, "%d %x", &dump_from, &dump_addr) < 1) dump_from = 0; fclose(f); }
     }
-    if (dump_state == 1 && dumped < 40 && (int)impl_->frame >= dump_from) {
+    if (dump_state == 1 && dumped < 40 && (int)impl_->frame >= dump_from && (dump_addr == 0 || (d.addr & 0xFFFFFF) == (dump_addr & 0xFFFFFF))) {
         char path[96];
         char name[24];
         snprintf(name, sizeof(name), "tex_%02d.ppm", dumped);

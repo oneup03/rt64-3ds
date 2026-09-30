@@ -23,6 +23,7 @@ FILE* rt64_3ds::data_fopen(const char* name, const char* mode) {
 
 void rt64_3ds::set_render_desc(const RenderDesc& desc) { g_desc = desc; }
 const rt64_3ds::RenderDesc& rt64_3ds::render_desc() { return g_desc; }
+rt64_3ds::ScreenGeometry rt64_3ds::screen_geometry() { return ScreenGeometry::make((int)g_desc.vi_width, (int)g_desc.vi_height); }
 rt64_3ds::Settings& rt64_3ds::settings() { return g_settings; }
 const rt64_3ds::FrameStats& rt64_3ds::stats() { return g_stats; }
 rt64_3ds::FrameStats& rt64_3ds::mutable_stats() { return g_stats; }

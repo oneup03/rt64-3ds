@@ -5,12 +5,15 @@
 #include <cstdint>
 
 #include "rt64_3ds_record.h"
+#include "rt64_3ds_types.h"
 
 struct RefOptions {
     int only_draw = -1;          // render just this draw
     int max_draw = -1;           // stop after this draw
     int lod_fraction = 0;        // LOD_FRACTION combiner input (mipmap blend)
     bool rect_shade_white = false;
+    // Where the game's frame sits on the 400x240 output (DK64's 320x240 by default).
+    rt64_3ds::ScreenGeometry geo = rt64_3ds::ScreenGeometry::make(320, 240);
 };
 
 bool ref_render(const uint8_t* rdram, const rt64_3ds::FrameRecord& frame, const RefOptions& opt, const char* ppm_path);

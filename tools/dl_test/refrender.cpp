@@ -1,7 +1,8 @@
 // Host reference renderer: rasterises a FrameRecord with the RDP's own
 // combiner and blender formulas (point sampling, no anti-aliasing), so a
 // frame can be checked against what the N64 would show independently of
-// the PICA mapping. Output is 400x240, N64 x = 0 at column 40.
+// the PICA mapping. Output is 400x240, the game's frame placed by RefOptions::geo
+// (DK64's 320x240: N64 x = 0 at column 40).
 #include "refrender.h"
 
 #include <cmath>
@@ -195,8 +196,10 @@ private:
         uint32_t cyc = (d.othermode_h >> 20) & 3;
         const Tex* t0 = texture(d.tex[0]);
         const Tex* t1 = texture(d.tex[1]);
-        int sx0 = d.scissor[0] + 40, sy0 = d.scissor[1], sx1 = d.scissor[2] + 40, sy1 = d.scissor[3];
-        if (d.scissor[0] <= 0 && d.scissor[2] >= 320) { sx0 = 0; sx1 = 400; }
+        const rt64_3ds::ScreenGeometry& g = opt_.geo;
+        int sx0 = (int)lroundf(g.screen_x((float)d.scissor[0])), sy0 = (int)lroundf(g.screen_y((float)d.scissor[1]));
+        int sx1 = (int)lroundf(g.screen_x((float)d.scissor[2])), sy1 = (int)lroundf(g.screen_y((float)d.scissor[3]));
+        if (d.scissor[0] <= 0 && d.scissor[2] >= g.w) { sx0 = 0; sx1 = 400; }
         if (sx0 < 0) sx0 = 0; if (sy0 < 0) sy0 = 0; if (sx1 > 400) sx1 = 400; if (sy1 > 240) sy1 = 240;
         uint32_t l = d.othermode_l;
         bool is_rect = d.kind != DrawRecord::Tris;
@@ -218,7 +221,7 @@ private:
                 int sx0, int sy0, int sx1, int sy1, bool zcmp, bool zupd, uint32_t zmode) {
         const V* vs[3] = { &a, &b, &c };
         float X[3], Y[3], IW[3];
-        for (int i = 0; i < 3; i++) { IW[i] = 1.0f / vs[i]->w; X[i] = vs[i]->x * IW[i] + 40.0f; Y[i] = vs[i]->y * IW[i]; }
+        for (int i = 0; i < 3; i++) { IW[i] = 1.0f / vs[i]->w; X[i] = opt_.geo.screen_x(vs[i]->x * IW[i]); Y[i] = opt_.geo.screen_y(vs[i]->y * IW[i]); }
         float area = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
         if (fabsf(area) < 1e-6f) return;
         int minx = (int)floorf(fminf(X[0], fminf(X[1], X[2]))), maxx = (int)ceilf(fmaxf(X[0], fmaxf(X[1], X[2])));
