@@ -52,6 +52,10 @@ namespace recomp3ds {
     // chosen mode's id, empty for the game itself).
     void game_modes_init(const char* base_path, const GameDesc& desc);
     std::string pick_game_mode(const GameDesc& desc);
+    // Before the game starts: with a game mode chosen, leaves out the mods
+    // GameDesc::mods_not_in_game_modes names, for this session only.
+    void game_mode_begin(const GameDesc& desc, const std::string& game_mode);
+    bool mod_left_out(const std::string& mod_id);
     bool rom_stream_active();
     void rom_stream_take_stats(uint32_t* misses, uint32_t* bytes);   // since the last call
 

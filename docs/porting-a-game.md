@@ -138,3 +138,9 @@ handles these on its own when the game is built with static mods:
   CRCs (about 10 s). Later starts reuse that file, and the game streams its
   ROM from it.
 - Saves go to `saves/<mod id>/`.
+- Check each built-in code mod against each mode (`mod_bake inspect`): a
+  mod that replaces a function a mode also replaces makes that mode fail to
+  load, and some mods only make sense on the original game's maps. List
+  those in `GameDesc::mods_not_in_game_modes`: they're left out of game
+  modes (the player's choice stays for the game) and hidden from the Mods
+  page there.

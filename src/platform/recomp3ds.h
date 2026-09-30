@@ -60,6 +60,12 @@ struct GameDesc {
     const char* sd_dir = "";            // folder under sdmc:/3ds/ holding the ROM, saves and settings
     recomp::GameEntry entry;            // hash, save type, entrypoint, on_init_callback
     recomp::Version project_version{};  // the game's version, which mods check (minimum_recomp_version)
+    // Built-in mods (RT64_3DS_STATIC_MODS) left out when a game mode is
+    // played, whatever is enabled: ones that replace a function the game
+    // modes replace too (the mode would not load), or that assume the
+    // original game's maps. The Mods page hides them during a game mode.
+    const char* const* mods_not_in_game_modes = nullptr;
+    size_t mods_not_in_game_modes_count = 0;
     recomp::rsp::callbacks_t rsp{};     // get_rsp_microcode
     void (*register_overlays)() = nullptr;
     void (*register_patches)() = nullptr;

@@ -388,6 +388,7 @@ void add_mod_rows() {
     };
     for (const recomp::mods::ModDetails& d : mods) {
         if (d.custom_gamemode) continue;    // chosen at start, not toggled
+        if (recomp3ds::mod_left_out(d.mod_id)) continue;   // not with this game mode
         ModRow toggle;
         toggle.mod_id = d.mod_id;
         toggle.label = clip(d.display_name, kLabelWidth);

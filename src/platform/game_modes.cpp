@@ -14,6 +14,7 @@
 #include <new>
 #include <string>
 #include <sys/stat.h>
+#include <unordered_set>
 #include <vector>
 
 #include "recomp3ds.h"
@@ -195,9 +196,27 @@ std::string recomp3ds::pick_game_mode(const GameDesc& desc) {
     return choices[sel].id;
 }
 
+namespace {
+std::unordered_set<std::string> g_left_out;
+}
+
+void recomp3ds::game_mode_begin(const GameDesc& desc, const std::string& game_mode) {
+    g_left_out.clear();
+    if (game_mode.empty()) return;
+    for (size_t i = 0; i < desc.mods_not_in_game_modes_count; i++) g_left_out.insert(desc.mods_not_in_game_modes[i]);
+    recomp::mods::set_session_excluded_mods(g_left_out);
+    for (const std::string& id : g_left_out) {
+        if (recomp::mods::is_mod_enabled(id)) fprintf(stderr, "recomp3ds: %s stays off in game modes\n", id.c_str());
+    }
+}
+
+bool recomp3ds::mod_left_out(const std::string& mod_id) { return g_left_out.contains(mod_id); }
+
 #else
 
 void recomp3ds::game_modes_init(const char*, const GameDesc&) {}
 std::string recomp3ds::pick_game_mode(const GameDesc&) { return {}; }
+void recomp3ds::game_mode_begin(const GameDesc&, const std::string&) {}
+bool recomp3ds::mod_left_out(const std::string&) { return false; }
 
 #endif

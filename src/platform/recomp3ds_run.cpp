@@ -739,6 +739,7 @@ int recomp3ds::run(const GameDesc& desc) {
     // The game or one of its game modes (with the mod system).
     recomp3ds::game_modes_init(g_base_path, desc);
     const std::string game_mode = recomp3ds::pick_game_mode(desc);
+    recomp3ds::game_mode_begin(desc, game_mode);
     if (!game_mode.empty() && recomp::get_rom_stream() == nullptr) {
         // The mode's ROM is streamed from the card; the game's needs no room either.
         recomp3ds::rom_stream_install(2u << 20);

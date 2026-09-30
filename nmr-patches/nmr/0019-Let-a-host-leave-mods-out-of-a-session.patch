@@ -1,0 +1,94 @@
+From 726c41bd2c95bab22a2b2108caa65390375c1000 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Wed, 30 Sep 2026 12:22:16 -0500
+Subject: [PATCH] Let a host leave mods out of a session
+
+set_session_excluded_mods: mods the next load leaves out whatever is
+enabled, without touching the saved list. A host that knows some mods
+don't go with a game mode (one replacing a function the mode replaces
+too makes the load fail) keeps them out of that mode while the player's
+choice stays for the game.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/include/librecomp/mods.hpp | 5 +++++
+ librecomp/src/mods.cpp               | 7 ++++++-
+ librecomp/src/recomp.cpp             | 7 +++++++
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index 7466de5..b43f61b 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -383,6 +383,7 @@ namespace recomp {
+             void set_mod_config_directory(const std::filesystem::path &path);
+             std::string get_latest_game_mode_id() const;
+             void set_latest_game_mode_id(const std::string& game_mode_id);
++            void set_session_excluded_mods(const std::unordered_set<std::string>& mod_ids);
+             ModContentTypeId register_content_type(const ModContentType& type);
+             bool register_container_type(const std::string& extension, const std::vector<ModContentTypeId>& content_types, bool requires_manifest);
+             ModContentTypeId get_code_content_type() const { return code_content_type_id; }
+@@ -425,6 +426,7 @@ namespace recomp {
+             std::unordered_set<std::string> mod_ids;
+             std::unordered_set<std::string> enabled_mods;
+             std::unordered_set<std::string> auto_enabled_mods;
++            std::unordered_set<std::string> session_excluded_mods;
+             std::unordered_map<std::string, DeprecatedMod> deprecated_mods;
+             std::unordered_map<recomp_func_t*, PatchData> patched_funcs;
+             std::unordered_map<std::string, size_t> loaded_mods_by_id;
+@@ -699,6 +701,9 @@ namespace recomp {
+         config::ConfigValueVariant get_mod_config_value(const std::string &mod_id, const std::string &option_id);
+         std::string get_latest_game_mode_id();
+         void set_latest_game_mode_id(const std::string& game_mode_id);
++        // Mods left out of this session's load whatever is enabled, and not
++        // saved: for a host that knows some mods don't go with a game mode.
++        void set_session_excluded_mods(const std::unordered_set<std::string>& mod_ids);
+         std::string get_mod_id_from_filename(const std::filesystem::path& mod_filename);
+         std::filesystem::path get_mod_filename(const std::string& mod_id);
+         size_t get_mod_order_index(const std::string& mod_id);
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
+index 02d7608..e5047a1 100644
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -1715,6 +1715,10 @@ std::string recomp::mods::ModContext::get_latest_game_mode_id() const {
+     return latest_game_mode;
+ }
+ 
++void recomp::mods::ModContext::set_session_excluded_mods(const std::unordered_set<std::string>& mod_ids) {
++    session_excluded_mods = mod_ids;
++}
++
+ void recomp::mods::ModContext::set_latest_game_mode_id(const std::string& game_mode_id) {
+     latest_game_mode = game_mode_id;
+     mod_configuration_thread_queue.enqueue(ModConfigSetLatestGamemode());
+@@ -1771,7 +1775,8 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+     // Find and load active mods.
+     for (size_t mod_index = 0; mod_index < opened_mods.size(); mod_index++) {
+         auto& mod = opened_mods[mod_index];
+-        if (mod.is_for_game(mod_game_index) && (enabled_mods.contains(mod.manifest.mod_id) || auto_enabled_mods.contains(mod.manifest.mod_id))) {
++        if (mod.is_for_game(mod_game_index) && (enabled_mods.contains(mod.manifest.mod_id) || auto_enabled_mods.contains(mod.manifest.mod_id)) &&
++            !session_excluded_mods.contains(mod.manifest.mod_id)) {
+             // Only load gamemode mods if the current gamemode matches the mod id.
+             if (!mod.manifest.custom_gamemode || game_mode_id == mod.manifest.mod_id) {
+                 active_mods.push_back(mod_index);
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 7a7567e..a914980 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -740,6 +740,13 @@ void recomp::mods::set_latest_game_mode_id(const std::string& game_mode_id) {
+ }
+ #endif
+ 
++#ifndef RECOMP_NO_MODS
++void recomp::mods::set_session_excluded_mods(const std::unordered_set<std::string>& mod_ids) {
++    std::lock_guard lock{ mod_context_mutex };
++    mod_context->set_session_excluded_mods(mod_ids);
++}
++#endif
++
+ #ifndef RECOMP_NO_MODS
+ std::string recomp::mods::get_mod_id_from_filename(const std::filesystem::path& mod_filename) {
+     std::lock_guard lock { mod_context_mutex };
+-- 
+2.53.0
+
