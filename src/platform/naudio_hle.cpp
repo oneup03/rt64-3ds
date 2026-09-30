@@ -555,7 +555,18 @@ void run_command(uint8_t* rdram, uint32_t w0, uint32_t w1) {
             dhw(kState + 0x44, w1 & 0xFFFF);
             break;
         case 15: cmd_setloop(w1); break;
-        default: g_stats.unknown_opcodes++; break;
+        default: {
+            // A command this interpreter lacks: count it, and name each
+            // opcode once in the log.
+            g_stats.unknown_opcodes++;
+            static uint32_t seen[8] = {};
+            const uint32_t op = w0 >> 24;
+            if (!(seen[op >> 5] & (1u << (op & 31)))) {
+                seen[op >> 5] |= 1u << (op & 31);
+                fprintf(stderr, "naudio-hle: unknown command %u (%08lx %08lx)\n", (unsigned)op, (unsigned long)w0, (unsigned long)w1);
+            }
+            break;
+        }
     }
 }
 

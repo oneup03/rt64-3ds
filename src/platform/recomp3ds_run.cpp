@@ -343,12 +343,21 @@ void update_gfx_inner() {
             recomp3ds::rom_stream_take_stats(&misses, &bytes);
             snprintf(rom_stats, sizeof(rom_stats), " rom %lu reads (%lu KB)", (unsigned long)misses, (unsigned long)(bytes / 1024));
         }
+        // The audio interpreter's unknown commands and, with AUDIO_DIFF.TXT,
+        // its mismatches against the recompiled microcode: shown when non-zero.
+        char hle_stats[64] = "";
+        {
+            const recomp3ds::NaudioHleStats& hs = recomp3ds::naudio_hle_stats();
+            if (hs.unknown_opcodes != 0 || hs.diff_mismatches != 0)
+                snprintf(hle_stats, sizeof(hle_stats), " audio-hle unknown %lu mismatches %lu/%lu", (unsigned long)hs.unknown_opcodes,
+                         (unsigned long)hs.diff_mismatches, (unsigned long)hs.diff_tasks);
+        }
         char want_fps[24] = "";
         if (st.game_fps > 0) snprintf(want_fps, sizeof(want_fps), ", game asks %d", st.game_fps);
-        fprintf(stderr, "stats: %d dl/s%s (late %d, max gap %.0f ms) core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu heap %lu KB%s%s\n",
+        fprintf(stderr, "stats: %d dl/s%s (late %d, max gap %.0f ms) core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu heap %lu KB%s%s%s\n",
                 st.dl_per_sec, want_fps, st.late_frames, st.max_gap_ms, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_remaining(),
                 (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped,
-                (unsigned long)(mallinfo().arena / 1024), rom_stats, game_stats);
+                (unsigned long)(mallinfo().arena / 1024), hle_stats, rom_stats, game_stats);
         // One 40-column row: the audio microcode's ms per second last.
         char line[64];
         if (busy2 >= 0) snprintf(line, sizeof(line), "%3d fps  cpu0 %3d%%  cpu2 %3d%%  audio %3u", st.dl_per_sec, busy0, busy2, ucode_ms);
