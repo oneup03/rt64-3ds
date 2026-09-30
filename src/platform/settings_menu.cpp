@@ -15,11 +15,17 @@
 //
 // With the runtime's mod system (RECOMP_STATIC_MODS), the Mods page lists
 // the mods built into the executable once the game has started: an on/off
-// row per mod (the runtime keeps it, and it applies at the next start),
-// followed by the mod's options (applied at once).
+// row per mod (a baked code mod switches at once, nmr patch 0020), followed
+// by the mod's options (applied at once). Their state is kept in
+// settings.ini with everything else and handed to the runtime before the
+// mods load (settings_apply_mods): the runtime's own mods.json and
+// mod_config/ are never written on the 3DS (its writer thread is created
+// before main and never runs). The game hears of a switch
+// (GameDesc::on_mod_switched).
 #include <3ds.h>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <deque>
 #include <string>
 #include <vector>
@@ -142,7 +148,6 @@ int page_count(int page) {
     return page_rows(page, idx);
 }
 
-bool mods_listed();
 
 bool visible(int slot) { return slot >= g_top && slot < g_top + kSlots; }
 int slot_line(int slot) { return kFirstRow + (slot - g_top) * kRowStep; }
@@ -195,8 +200,6 @@ void draw_page() {
     if (g_top > 0) recomp3ds::screen_printf("\x1b[%d;%dH^ more", kMoreRow, kMoreUpCol);
     if (g_top + kSlots < n) recomp3ds::screen_printf("\x1b[%d;%dHv more", kMoreRow, kMoreDownCol);
     if (g_page == recomp3ds::Page3D) recomp3ds::screen_printf("\x1b[%d;0H3D slider: strength.  HUD 50: on screen.", kLastRow);
-    else if (g_page == recomp3ds::PageMods && g_top + kSlots >= n && g_top == 0 && mods_listed())
-        recomp3ds::screen_printf("\x1b[%d;0HMods on/off: at the next start.", kLastRow);
 }
 
 // Scrolls so that the first visible row is `top`.
@@ -217,23 +220,37 @@ void draw() {
     draw_page();
 }
 
+// The built-in mods' state, also in settings.ini: "mod.<id>" on or off and
+// "mod.<id>.<option>" the option's row value, whether or not a row shows it
+// now (the Mods page is built once the game has started, and hides some
+// mods in game modes); and "game_mode", the picker's last choice.
+std::map<std::string, int> g_mod_values;
+std::string g_game_mode;
+LightLock g_file_lock;
+
 void save() {
-    FILE* f = fopen(g_path, "w");
-    if (f == nullptr) return;
-    for (int i = 0; i < g_row_count; i++) {
-        if (!g_rows[i].no_save) fprintf(f, "%s=%d\n", g_rows[i].key, *g_rows[i].value);
+    LightLock_Lock(&g_file_lock);
+    if (FILE* f = fopen(g_path, "w")) {
+        for (int i = 0; i < g_row_count; i++) {
+            if (!g_rows[i].no_save) fprintf(f, "%s=%d\n", g_rows[i].key, *g_rows[i].value);
+        }
+        for (const auto& [key, v] : g_mod_values) fprintf(f, "%s=%d\n", key.c_str(), v);
+        if (!g_game_mode.empty()) fprintf(f, "game_mode=%s\n", g_game_mode.c_str());
+        fclose(f);
     }
-    fclose(f);
+    LightLock_Unlock(&g_file_lock);
 }
 
 void load() {
     FILE* f = fopen(g_path, "r");
     if (f == nullptr) return;
-    char line[96];
+    char line[192];
     while (fgets(line, sizeof(line), f)) {
-        char key[48];
+        char key[128], text[64];
         int v;
-        if (sscanf(line, "%47[^=]=%d", key, &v) != 2) continue;
+        if (sscanf(line, "game_mode=%63s", text) == 1) { g_game_mode = text; continue; }
+        if (sscanf(line, "%127[^=]=%d", key, &v) != 2) continue;
+        if (strncmp(key, "mod.", 4) == 0) { g_mod_values[key] = v; continue; }
         for (int i = 0; i < g_row_count; i++) {
             const Row& r = g_rows[i];
             if (!r.no_save && strcmp(key, r.key) == 0) *r.value = v < r.lo ? r.lo : v > r.hi ? r.hi : v;
@@ -344,9 +361,11 @@ bool touch_repeats(const TouchTarget& t) {
 // ---- The mods built into the executable (RECOMP_STATIC_MODS).
 
 std::string g_mod_game_id;
+void (*g_on_mod_switched)(const char* mod_id, bool on) = nullptr;
 #ifdef RECOMP_STATIC_MODS
 struct ModRow {
     std::string mod_id, option_id;      // option_id empty: the mod's on/off row
+    std::string key;                    // in settings.ini (g_mod_values)
     std::string label;
     std::vector<std::string> names;
     std::vector<const char*> name_ptrs;
@@ -359,14 +378,36 @@ std::deque<ModRow> g_mod_rows;          // stable addresses: rows point into the
 bool g_mods_added = false;
 const char* const kModOffOn[] = { "Off", "On" };
 
+// An option's row value as the mod's config value (enum rows count the
+// options; number rows count steps).
+recomp::config::ConfigValueVariant mod_option_value(const recomp::config::ConfigOption& o, int v) {
+    switch (o.type) {
+        case recomp::config::ConfigOptionType::Enum: {
+            const auto& e = std::get<recomp::config::ConfigOptionEnum>(o.variant);
+            return e.options[v < 0 ? 0 : (size_t)v < e.options.size() ? (size_t)v : e.options.size() - 1].value;
+        }
+        case recomp::config::ConfigOptionType::Bool: return v != 0;
+        case recomp::config::ConfigOptionType::Number: {
+            const auto& num = std::get<recomp::config::ConfigOptionNumber>(o.variant);
+            return (double)v * (num.step > 0.0 ? num.step : 1.0);
+        }
+        default: return std::monostate{};
+    }
+}
+
 void apply_mod_row(void* ctx, int v) {
     const ModRow& m = *static_cast<const ModRow*>(ctx);
     switch (m.kind) {
-        case ModRow::Toggle: recomp::mods::enable_mod(m.mod_id, v != 0); break;
+        case ModRow::Toggle:
+            recomp::mods::enable_mod(m.mod_id, v != 0);
+            if (g_on_mod_switched != nullptr) g_on_mod_switched(m.mod_id.c_str(), v != 0);
+            break;
         case ModRow::Enum: recomp::mods::set_mod_config_value(m.mod_id, m.option_id, m.enum_values[v]); break;
         case ModRow::Bool: recomp::mods::set_mod_config_value(m.mod_id, m.option_id, v != 0); break;
         case ModRow::Number: recomp::mods::set_mod_config_value(m.mod_id, m.option_id, (double)v * m.num_step); break;
     }
+    g_mod_values[m.key] = v;
+    changed();
 }
 
 std::string clip(const std::string& s, size_t n) { return s.size() <= n ? s : s.substr(0, n); }
@@ -391,6 +432,7 @@ void add_mod_rows() {
         if (recomp3ds::mod_left_out(d.mod_id)) continue;   // not with this game mode
         ModRow toggle;
         toggle.mod_id = d.mod_id;
+        toggle.key = "mod." + d.mod_id;
         toggle.label = clip(d.display_name, kLabelWidth);
         toggle.value = recomp::mods::is_mod_enabled(d.mod_id) ? 1 : 0;
         add(std::move(toggle), 0, 1, kModOffOn);
@@ -400,6 +442,7 @@ void add_mod_rows() {
             ModRow m;
             m.mod_id = d.mod_id;
             m.option_id = o.id;
+            m.key = "mod." + d.mod_id + "." + o.id;
             m.label = " " + clip(o.name, kLabelWidth - 1);
             recomp::config::ConfigValueVariant cur = recomp::mods::get_mod_config_value(d.mod_id, o.id);
             if (o.type == recomp::config::ConfigOptionType::Enum) {
@@ -430,21 +473,50 @@ void add_mod_rows() {
         }
     }
 }
-bool mods_listed() { return !g_mod_rows.empty(); }
 #else
 void add_mod_rows() {}
-bool mods_listed() { return false; }
 #endif
 
 }   // namespace
 
+#ifdef RECOMP_STATIC_MODS
+// Before the mods load (the game's init, after the runtime's scan): every
+// built-in code mod as settings.ini has it, off unless saved on.
+void recomp3ds::settings_apply_mods() {
+    for (const recomp::mods::ModDetails& d : recomp::mods::get_all_mod_details(g_mod_game_id)) {
+        if (d.custom_gamemode) continue;
+        const auto on = g_mod_values.find("mod." + d.mod_id);
+        recomp::mods::enable_mod(d.mod_id, on != g_mod_values.end() && on->second != 0);
+        const recomp::config::ConfigSchema& schema = recomp::mods::get_mod_config_schema(d.mod_id);
+        for (const recomp::config::ConfigOption& o : schema.options) {
+            const auto saved = g_mod_values.find("mod." + d.mod_id + "." + o.id);
+            if (saved == g_mod_values.end()) continue;
+            const recomp::config::ConfigValueVariant value = mod_option_value(o, saved->second);
+            if (!std::holds_alternative<std::monostate>(value)) recomp::mods::set_mod_config_value(d.mod_id, o.id, value);
+        }
+    }
+}
+#else
+void recomp3ds::settings_apply_mods() {}
+#endif
+
+std::string recomp3ds::settings_game_mode() { return g_game_mode; }
+
+void recomp3ds::settings_set_game_mode(const std::string& mod_id) {
+    if (mod_id == g_game_mode) return;
+    g_game_mode = mod_id;
+    save();
+}
+
 void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) {
+    LightLock_Init(&g_file_lock);
     snprintf(g_path, sizeof(g_path), "%s/settings.ini", base_path);
     rt64_3ds::Settings& st = rt64_3ds::settings();
     g_conv_tenths = st.convergence_hundredths / 10;
     g_auto = st.auto_convergence ? 1 : 0;
     g_row_count = 0;
     g_mod_game_id = desc.entry.mod_game_id;
+    g_on_mod_switched = desc.on_mod_switched;
     add_row({ "separation", "3D depth", 0, 100, &st.sep_slider, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
     add_row({ "convergence_tenths", "Convergence", 1, 200, &g_conv_tenths, nullptr, true, nullptr, apply_conv, Page3D, 1, nullptr });
     add_row({ "hud_depth", "HUD depth", 0, 100, &st.hud_depth, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });

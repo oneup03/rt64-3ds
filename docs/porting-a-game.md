@@ -117,9 +117,17 @@ fed from tables compiled into the executable.
   `recomp_register_static_mods()` in `main` before `recomp3ds::run`.
   Banjo's `platform/3ds/Makefile` and `CMakeLists.txt` do all of this.
 - **`:embed`** puts the `.nrm` itself into the executable (code mods). The
-  player can toggle it and set its options on the settings menu's Mods page.
-  Embedded mods start disabled. Mods without `:embed` must also be on the SD
-  card in `mods/`: they only run when their file is present.
+  player switches it and sets its options on the settings menu's Mods page,
+  and a switch takes effect at once (every baked code mod is loaded at start,
+  each hook and replacement checks its mod's on/off state). The state is
+  kept in `settings.ini` (`mod.<id>`, `mod.<id>.<option>`), off until
+  switched on; the runtime's `mods.json` is not used. Mods without `:embed`
+  must also be on the SD card in `mods/`: they only run when their file is
+  present.
+- **`GameDesc.on_mod_switched`**: told when a mod is switched on or off, for
+  a game that gives a mod buttons it otherwise doesn't map (Banjo turns the
+  D-pad into the N64 D-pad, and ZL into N64 L, while mods that read them
+  are on).
 - **`GameDesc.project_version`**: set it to the desktop's version. Mods
   refuse to load against an older one.
 

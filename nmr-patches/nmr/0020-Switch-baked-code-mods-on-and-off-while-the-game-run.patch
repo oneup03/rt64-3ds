@@ -1,0 +1,166 @@
+From 17c5edd04978afe5ce758783d613db46b727b72c Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Wed, 30 Sep 2026 15:21:42 -0500
+Subject: [PATCH] Switch baked code mods on and off while the game runs
+
+With RECOMP_STATIC_MODS every baked code mod is in the executable, so the
+game's start loads them all, enabled or not, and each has an on/off flag
+its hooks and replacements check. enable_mod on one while the game runs
+flips that flag, where it used to do nothing: a host whose only mod menu
+is in the game (the 3DS) could not switch a code mod at all. Where the
+state is kept between runs is the host's business. Game modes still load
+only when chosen.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/include/librecomp/mods.hpp |  6 +++++
+ librecomp/src/mod_hooks.cpp          | 24 ++++++++++++++++++++
+ librecomp/src/mods.cpp               | 34 ++++++++++++++++++++++++++--
+ 3 files changed, 62 insertions(+), 2 deletions(-)
+
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index b43f61b..a0c9465 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -658,6 +658,12 @@ namespace recomp {
+         void reset_hooks();
+         void register_hook_exports();
+         void run_hook(uint8_t* rdram, recomp_context* ctx, size_t hook_slot_index);
++#ifdef RECOMP_STATIC_MODS
++        // Baked code mods stay loaded when switched off: their hooks and
++        // replacements skip while inactive (by opened mod index).
++        void set_code_mod_active(size_t mod_index, bool active);
++        bool code_mod_active(size_t mod_index);
++#endif
+ 
+         ModOpenError parse_manifest(ModManifest &ret, const std::vector<char> &manifest_data, std::string &error_param, recomp::config::Config *config = nullptr);
+         CodeModLoadError validate_api_version(uint32_t api_version, std::string& error_param);
+diff --git a/librecomp/src/mod_hooks.cpp b/librecomp/src/mod_hooks.cpp
+index 596b6e8..a4c0cc4 100644
+--- a/librecomp/src/mod_hooks.cpp
++++ b/librecomp/src/mod_hooks.cpp
+@@ -1,3 +1,4 @@
++#include <atomic>
+ #include <vector>
+ #include "librecomp/mods.hpp"
+ #include "librecomp/overlays.hpp"
+@@ -25,6 +26,24 @@ std::vector<HookTableEntry> hook_table{};
+ // so this acts as a stack of contexts to handle that recursion.
+ thread_local std::vector<recomp_context> hook_contexts = { recomp_context{} };
+ 
++#ifdef RECOMP_STATIC_MODS
++namespace {
++    // Written by whichever thread switches a mod, read by the game's.
++    constexpr size_t max_code_mods = 1024;
++    std::atomic<bool> code_mod_off[max_code_mods];
++}
++
++void recomp::mods::set_code_mod_active(size_t mod_index, bool active) {
++    if (mod_index < max_code_mods) {
++        code_mod_off[mod_index].store(!active, std::memory_order_relaxed);
++    }
++}
++
++bool recomp::mods::code_mod_active(size_t mod_index) {
++    return mod_index >= max_code_mods || !code_mod_off[mod_index].load(std::memory_order_relaxed);
++}
++#endif
++
+ void recomp::mods::run_hook(uint8_t* rdram, recomp_context* ctx, size_t hook_slot_index) {
+     // Sanity check the hook slot index.
+     if (hook_slot_index >= hook_table.size()) {
+@@ -40,6 +59,11 @@ void recomp::mods::run_hook(uint8_t* rdram, recomp_context* ctx, size_t hook_slo
+     // Call every hook attached to the hook slot.
+     const std::vector<HookEntry>& hooks = hook_table[hook_slot_index].hooks;
+     for (HookEntry hook : hooks) {
++#ifdef RECOMP_STATIC_MODS
++        if (!recomp::mods::code_mod_active(hook.mod_index)) {
++            continue;
++        }
++#endif
+         // Run the hook.
+         std::visit(overloaded {
+             [rdram, ctx](recomp_func_t* native_func) {
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
+index e5047a1..0652800 100644
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -631,6 +631,7 @@ namespace {
+     struct StaticDispatchSlot {
+         recomp_func_t* original = nullptr;
+         recomp_func_t* replacement = nullptr;
++        size_t replacement_mod = (size_t)-1;   // the replacing mod's index, for its on/off state
+         size_t entry_hook = (size_t)-1;
+         size_t return_hook = (size_t)-1;
+         bool bypass = false;
+@@ -687,7 +688,7 @@ extern "C" int recomp_static_dispatch(uint8_t* rdram, recomp_context* ctx, uint3
+     if (slot.entry_hook != (size_t)-1) {
+         recomp::mods::run_hook(rdram, ctx, slot.entry_hook);
+     }
+-    if (slot.replacement != nullptr) {
++    if (slot.replacement != nullptr && recomp::mods::code_mod_active(slot.replacement_mod)) {
+         slot.replacement(rdram, ctx);
+     }
+     else {
+@@ -1181,6 +1182,22 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
+ 
+     // Do nothing if mods have already been loaded and this mod isn't runtime toggleable.
+     if (!mod.is_runtime_toggleable() && mods_loaded) {
++#ifdef RECOMP_STATIC_MODS
++        // A baked code mod loaded for this session switches at once.
++        auto loaded_it = loaded_mods_by_id.find(mod_id);
++        if (loaded_it != loaded_mods_by_id.end() && !mod.manifest.custom_gamemode && static_mods_by_id.contains(mod_id)) {
++            if (enabled) {
++                enabled_mods.emplace(mod_id);
++            }
++            else {
++                enabled_mods.erase(mod_id);
++            }
++            recomp::mods::set_code_mod_active(loaded_it->second, enabled);
++            if (trigger_save) {
++                mod_configuration_thread_queue.enqueue(ModConfigQueueSave());
++            }
++        }
++#endif
+         return;
+     }
+ 
+@@ -1775,7 +1792,14 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+     // Find and load active mods.
+     for (size_t mod_index = 0; mod_index < opened_mods.size(); mod_index++) {
+         auto& mod = opened_mods[mod_index];
+-        if (mod.is_for_game(mod_game_index) && (enabled_mods.contains(mod.manifest.mod_id) || auto_enabled_mods.contains(mod.manifest.mod_id)) &&
++#ifdef RECOMP_STATIC_MODS
++        // Baked code mods load whether enabled or not, and switch on and off
++        // while the game runs (enable_mod): their code is in the executable.
++        const bool resident = !mod.manifest.custom_gamemode && static_mods_by_id.contains(mod.manifest.mod_id);
++#else
++        const bool resident = false;
++#endif
++        if (mod.is_for_game(mod_game_index) && (enabled_mods.contains(mod.manifest.mod_id) || auto_enabled_mods.contains(mod.manifest.mod_id) || resident) &&
+             !session_excluded_mods.contains(mod.manifest.mod_id)) {
+             // Only load gamemode mods if the current gamemode matches the mod id.
+             if (!mod.manifest.custom_gamemode || game_mode_id == mod.manifest.mod_id) {
+@@ -1959,6 +1983,11 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+     }
+ 
+ #ifdef RECOMP_STATIC_MODS
++    // Loaded code mods start in their enabled state.
++    for (size_t mod_index : loaded_code_mods) {
++        const std::string& id = opened_mods[mod_index].manifest.mod_id;
++        recomp::mods::set_code_mod_active(mod_index, enabled_mods.contains(id) || auto_enabled_mods.contains(id) || opened_mods[mod_index].manifest.custom_gamemode);
++    }
+     // Hooks were bound to their functions' dispatch slots with the mods' code.
+     for (const auto& [def, index] : hook_slots) {
+         recomp::mods::set_hook_type(index, def.at_return);
+@@ -2864,6 +2893,7 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
+             return CodeModLoadError::NotInstrumented;
+         }
+         slot->replacement = std::get<recomp_func_t*>(mod.code_handle->get_function_handle(replacement.func_index));
++        slot->replacement_mod = mod_index;
+         patched_funcs[to_replace].mod_id = mod.manifest.mod_id;
+ #else
+         // Copy the original bytes so they can be restored later after the mod is unloaded.
+-- 
+2.53.0
+

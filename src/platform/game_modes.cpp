@@ -157,7 +157,7 @@ std::string recomp3ds::pick_game_mode(const GameDesc& desc) {
     if (choices.size() == 1) return {};
 
     // The game first, or the last mode played if it can be played.
-    const std::string last = recomp::mods::get_latest_game_mode_id();
+    const std::string last = recomp3ds::settings_game_mode();
     const int count = (int)choices.size();
     int sel = 0;
     for (int i = 1; i < count; i++) if (choices[i].id == last && choices[i].note.empty()) sel = i;
@@ -193,6 +193,7 @@ std::string recomp3ds::pick_game_mode(const GameDesc& desc) {
     }
     for (int r = 8; r <= 24; r++) recomp3ds::screen_printf("\x1b[%d;0H%40s", r, "");
     fprintf(stderr, "recomp3ds: playing %s\n", sel == 0 ? "the game" : choices[sel].id.c_str());
+    recomp3ds::settings_set_game_mode(choices[sel].id);
     return choices[sel].id;
 }
 

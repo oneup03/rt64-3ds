@@ -132,6 +132,7 @@ ultramodern::HostThreadSpec host_thread_spec(ultramodern::HostThreadKind kind) {
     }
 }
 volatile bool g_exit_requested = false;
+void (*g_game_on_init)(uint8_t* rdram, recomp_context* ctx) = nullptr;
 
 void* create_gfx() { return nullptr; }
 
@@ -617,7 +618,17 @@ int recomp3ds::run(const GameDesc& desc) {
     rt64_3ds::set_data_dir(g_base_path);   // the renderer's debug switches and captures
 
     // The runtime looks for <config>/<game_id>.z64; put the ROM there by that name.
-    recomp::register_game(desc.entry);
+    // The game's init runs after the runtime's last mod scan and just before
+    // the mods load: the built-in mods' saved state goes in there first.
+    {
+        recomp::GameEntry entry = desc.entry;
+        g_game_on_init = entry.on_init_callback;
+        entry.on_init_callback = [](uint8_t* rdram, recomp_context* ctx) {
+            recomp3ds::settings_apply_mods();
+            if (g_game_on_init != nullptr) g_game_on_init(rdram, ctx);
+        };
+        recomp::register_game(entry);
+    }
     if (desc.register_overlays) {
         desc.register_overlays();
     }

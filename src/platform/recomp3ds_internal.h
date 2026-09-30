@@ -88,6 +88,11 @@ namespace recomp3ds {
     void settings_menu_update();        // ~60 times a second, main thread
     void settings_menu_toggle();
     int settings_rom_stream();          // settings.ini's rom_stream: 0 auto, 1 in memory, 2 from the SD card
+    // The built-in mods' saved state (settings.ini "mod.*") into the runtime,
+    // before the mods load; and the game mode the picker chose last.
+    void settings_apply_mods();
+    std::string settings_game_mode();
+    void settings_set_game_mode(const std::string& mod_id);
     bool settings_debug_capture();      // settings.ini's debug_capture: a SELECT hold saves a frame capture
     void settings_menu_redraw();        // after something else wrote over the console
     u32  settings_menu_keys();          // 3DS keys the open menu keeps from the game

@@ -66,6 +66,9 @@ struct GameDesc {
     // original game's maps. The Mods page hides them during a game mode.
     const char* const* mods_not_in_game_modes = nullptr;
     size_t mods_not_in_game_modes_count = 0;
+    // Optional: a mod was switched on or off on the Mods page (it takes
+    // effect at once), e.g. to give a mod's key a button.
+    void (*on_mod_switched)(const char* mod_id, bool on) = nullptr;
     recomp::rsp::callbacks_t rsp{};     // get_rsp_microcode
     void (*register_overlays)() = nullptr;
     void (*register_patches)() = nullptr;
