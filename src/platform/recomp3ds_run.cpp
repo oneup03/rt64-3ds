@@ -399,9 +399,12 @@ void update_gfx_inner() {
     }
 }
 
+// The runtime shows a message box just before it quits, so everything logged
+// goes onto the card now: the exit that follows may not get that far.
 void message_box(const char* msg) {
     fprintf(stderr, "[message] %s\n", msg);
     printf("\n%s\n", msg);
+    recomp3ds::log_flush();
 }
 
 std::string game_thread_name(const OSThread* t) {

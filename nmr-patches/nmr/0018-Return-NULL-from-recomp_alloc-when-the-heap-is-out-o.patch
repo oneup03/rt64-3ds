@@ -1,0 +1,57 @@
+From f825c67df51b299f9627ce9593143d969bdea277 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Wed, 30 Sep 2026 07:40:27 -0500
+Subject: [PATCH] Return NULL from recomp_alloc when the heap is out of room
+
+recomp_alloc turned a failed allocation into "0 - rdram", an address
+below RDRAM that a caller's NULL check cannot catch; it now returns
+NULL. A failed allocation also logs the request and the heap's use, the
+first thing to look at when a smaller heap (the 3DS) runs out.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/src/heap.cpp | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/librecomp/src/heap.cpp b/librecomp/src/heap.cpp
+index 50d151a..35618aa 100644
+--- a/librecomp/src/heap.cpp
++++ b/librecomp/src/heap.cpp
+@@ -1,4 +1,5 @@
+ #include <cassert>
++#include <cstdio>
+ #include "o1heap/o1heap.h"
+ 
+ #include "librecomp/addresses.hpp"
+@@ -13,8 +14,9 @@ static inline O1HeapInstance* get_heap(uint8_t* rdram) {
+ }
+ 
+ extern "C" void recomp_alloc(uint8_t* rdram, recomp_context* ctx) {
+-    uint32_t offset = reinterpret_cast<uint8_t*>(recomp::alloc(rdram, ctx->r4)) - rdram;
+-    ctx->r2 = offset + 0xFFFFFFFF80000000ULL;
++    uint8_t* mem = reinterpret_cast<uint8_t*>(recomp::alloc(rdram, ctx->r4));
++    // NULL for NULL, which the caller can check (not an address below RDRAM).
++    ctx->r2 = mem == nullptr ? 0 : (uint32_t)(mem - rdram) + 0xFFFFFFFF80000000ULL;
+ }
+ 
+ extern "C" void recomp_free(uint8_t* rdram, recomp_context* ctx) {
+@@ -51,7 +53,15 @@ void recomp::init_heap(uint8_t* rdram, uint32_t address) {
+ }
+ 
+ void* recomp::alloc(uint8_t* rdram, size_t size) {
+-    return o1heapAllocate(get_heap(rdram), size);
++    void* ret = o1heapAllocate(get_heap(rdram), size);
++    if (ret == nullptr && size != 0) {
++        // Worth a line in the log: a caller that uses the block unchecked
++        // writes through a null pointer next.
++        const O1HeapDiagnostics d = o1heapGetDiagnostics(get_heap(rdram));
++        fprintf(stderr, "recomp heap: %u bytes not available, %u of %u in use (peak %u)\n", (unsigned)size,
++                (unsigned)d.allocated, (unsigned)d.capacity, (unsigned)d.peak_allocated);
++    }
++    return ret;
+ }
+ 
+ void recomp::free(uint8_t* rdram, void* mem) {
+-- 
+2.53.0
+
