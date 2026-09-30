@@ -10,6 +10,34 @@ endif()
 set(RECOMP_NO_MODS ON CACHE BOOL "rt64-3ds builds the runtime without mods" FORCE)
 add_subdirectory("${RT64_3DS_NMR_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/nmr")
 
+# The RDRAM model (librecomp/addresses.hpp, nmr patch 0003). A game whose
+# patches' RAM runs past the default heap start (0x80A00000) sets
+# RT64_3DS_HEAP_START above the end of its patches' .bss, and
+# RT64_3DS_MEM_SIZE_MB if 16 MB is not enough; rt64_3ds_check_patch_ram()
+# below turns an overlap into a build error.
+if(DEFINED RT64_3DS_HEAP_START)
+    target_compile_definitions(librecomp PUBLIC RECOMP_HEAP_START=${RT64_3DS_HEAP_START})
+endif()
+if(DEFINED RT64_3DS_MEM_SIZE_MB)
+    target_compile_definitions(librecomp PUBLIC RECOMP_MEM_SIZE_MB=${RT64_3DS_MEM_SIZE_MB})
+endif()
+
+# rt64_3ds_check_patch_ram(<target> <patches.map>): before <target> links,
+# fail if the patches' sections end above the recomp heap's start.
+function(rt64_3ds_check_patch_ram target map_file)
+    if(DEFINED RT64_3DS_HEAP_START)
+        set(heap_start ${RT64_3DS_HEAP_START})
+    else()
+        set(heap_start 0x80A00000)
+    endif()
+    add_custom_target(${target}_patch_ram
+        COMMAND ${CMAKE_COMMAND} -DMAP=${map_file} -DHEAP_START=${heap_start}
+                -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/cmake/CheckPatchRam.cmake"
+        COMMENT "Checking the patches' RAM against the heap start ${heap_start}"
+        VERBATIM)
+    add_dependencies(${target} ${target}_patch_ram)
+endfunction()
+
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/Pica.cmake")
 
 add_library(rt64_3ds STATIC
