@@ -15,7 +15,9 @@
 //   static_dispatch.c  the base functions baked mods replace or hook
 //   static_mods.cpp    recomp_register_static_mods(): registers the above and
 //                      the .nrm files marked :embed (built into the executable,
-//                      without thumbnails, and disabled until turned on)
+//                      without thumbnails, and disabled until turned on); and
+//                      recomp_baked_game_modes[], the game modes whose .nrm the
+//                      player brings (id, name, version, file), for a picker
 //   static_mods_data.c those .nrm files' bytes
 //   game_hooks.toml    [[patches.hook]] entries for the game's recompilation,
 //   patch_hooks.toml   and for the patches' (functions they replace): a check
@@ -154,10 +156,22 @@ int inspect(const char* syms_path, const char* binary_path, const char* game_sym
 
 // ---------------------------------------------------------------- bake
 
+// A C string literal holding s.
+std::string c_string(const std::string& s) {
+    std::string out = "\"";
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') { out += '\\'; out += (char)c; }
+        else if (c < 0x20 || c >= 0x7F) { char b[8]; snprintf(b, sizeof(b), "\\%03o", c); out += b; }
+        else out += (char)c;
+    }
+    return out + "\"";
+}
+
 struct Nrm {
     fs::path path;
     bool embed = false;
-    std::string id, version;
+    std::string id, version, display_name;
+    bool game_mode = false;     // custom_gamemode: a ROM hack, its .nrm brought by the player
     std::vector<uint8_t> manifest, syms, binary;
     std::string ident;      // C identifier derived from the id
 };
@@ -188,6 +202,8 @@ bool read_nrm(Nrm& n) {
         nlohmann::json j = nlohmann::json::parse(manifest.begin(), manifest.end());
         n.id = j.at("id").get<std::string>();
         n.version = j.value("version", std::string{});
+        n.display_name = j.value("display_name", n.id);
+        n.game_mode = j.value("custom_gamemode", false);
     }
     catch (const std::exception& e) {
         fprintf(stderr, "mod_bake: %s: mod.json: %s\n", n.path.string().c_str(), e.what());
@@ -447,6 +463,18 @@ int bake(int argc, char** argv) {
             }
         }
         o << "}\n";
+        // The game modes (their .nrm comes from the SD card, with the ROM
+        // patch), for the platform's picker: which it can offer, and the
+        // version and file each needs. Null-terminated.
+        o << "\n// The baked game modes, for a picker.\nextern \"C\" {\n"
+          << "struct recomp_baked_game_mode { const char* mod_id; const char* display_name; const char* version; const char* file_name; };\n"
+          << "extern const recomp_baked_game_mode recomp_baked_game_modes[] = {\n";
+        for (const auto& n : mods) {
+            if (!n.game_mode || n.embed) continue;
+            o << "    { " << c_string(n.id) << ", " << c_string(n.display_name) << ", " << c_string(n.version) << ", "
+              << c_string(n.path.filename().string()) << " },\n";
+        }
+        o << "    { nullptr, nullptr, nullptr, nullptr },\n};\n}\n";
     }
     printf("mod_bake: %zu mods, %zu dispatch slots (%zu in the patches)\n", mods.size(), slots.size(),
            (size_t)std::count_if(slots.begin(), slots.end(), [&](const DispatchTarget& t) { return patch_funcs.contains(t.name); }));
