@@ -7,6 +7,7 @@
 
 #include "librecomp/game.hpp"
 #include "librecomp/rsp.hpp"
+#include "naudio_hle.h"
 #include "rt64_3ds.h"
 
 namespace recomp3ds {
@@ -65,6 +66,7 @@ struct GameDesc {
     rt64_3ds::RenderDesc render;
     bool null_renderer = false;         // bring-up: accept display lists, draw nothing
     bool audio_hle = false;             // run the naudio audio task on the CPU (naudio_hle.cpp) instead of the recompiled RSP code
+    recomp3ds::NaudioVariant audio_hle_variant = recomp3ds::NaudioVariant::Dk64;   // which build of n_aspMain the game has
     // Called once when audio tasks stop arriving for 2 s after having run:
     // the game can log its scheduler/audio state (debugging lost wake-ups).
     void (*on_audio_stall)(uint8_t* rdram) = nullptr;

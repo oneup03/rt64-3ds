@@ -13,10 +13,18 @@ namespace recomp3ds {
 // Drop-in RspUcodeFunc: reads the OSTask that librecomp copied to DMEM 0xFC0.
 RspExitReason naudio_hle_run(uint8_t* rdram, uint32_t ucode_addr);
 
+// Builds of n_aspMain differ in small ways. DK64's envelope mixer inverts a
+// voice's left input when the dry volume's low bit is set and the right one
+// on the wet volume's; Banjo-Kazooie's (an older build) has no inversion.
+enum class NaudioVariant : uint8_t { Dk64, BanjoKazooie };
+void naudio_hle_set_variant(NaudioVariant variant);
+
 // Differential mode: every task is also run through `reference` (the
 // recompiled microcode) on the same inputs, and every RDRAM range the task
 // writes is compared. Mismatches are logged; the reference's output is kept.
 void naudio_hle_set_reference(RspUcodeFunc* reference);
+// Host tools: dump the next `mismatches` differential mismatches in full.
+void naudio_hle_set_diff_verbose(int mismatches);
 
 struct NaudioHleStats {
     uint32_t tasks;
@@ -29,7 +37,8 @@ const NaudioHleStats& naudio_hle_stats();
 
 }   // namespace recomp3ds
 
-// Capture mode (see naudio_hle.cpp): directory that receives audio_task_N.bin.
-void recomp3ds_naudio_capture_dir(const char* dir);
+// Capture mode (see naudio_hle.cpp): directory that receives audio_task_N.bin,
+// and the first task captured (<= 0: task 200).
+void recomp3ds_naudio_capture_dir(const char* dir, int first_task);
 
 #endif

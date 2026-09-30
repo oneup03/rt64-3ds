@@ -61,6 +61,8 @@ int main(int argc, char** argv) {
     if (fread(base.data(), 1, mem, f) != mem) { fprintf(stderr, "short rdram\n"); return 2; }
     fclose(f);
     recomp::rsp::constants_init();
+    // NAUDIO_VARIANT=bk: Banjo-Kazooie's build of the microcode (DK64's by default).
+    if (const char* v = getenv("NAUDIO_VARIANT")) if (strcmp(v, "bk") == 0) recomp3ds::naudio_hle_set_variant(recomp3ds::NaudioVariant::BanjoKazooie);
 
     printf("task: data_ptr %08x size %u (%u cmds) ucode_data %08x\n", task.t.data_ptr, task.t.data_size, task.t.data_size / 8, task.t.ucode_data);
     if (argc > 3 && strcmp(argv[2], "--bench") == 0) {
@@ -122,6 +124,7 @@ int main(int argc, char** argv) {
     // the recompiled microcode as reference (as on the 3DS with AUDIO_DIFF.TXT).
     if (argc > 2 && strcmp(argv[2], "--lockstep") == 0) {
         recomp3ds::naudio_hle_set_reference(n_aspMain);
+        if (argc > 3) recomp3ds::naudio_hle_set_diff_verbose(atoi(argv[3]));   // --lockstep N: dump N mismatches in full
         std::vector<uint8_t> work = base;
         run_hle(work.data(), task);
         const recomp3ds::NaudioHleStats& st = recomp3ds::naudio_hle_stats();

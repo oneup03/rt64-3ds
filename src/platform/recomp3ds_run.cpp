@@ -74,8 +74,10 @@ RspUcodeFunc* timed_get_ucode(const OSTask* task) {
             snprintf(path, sizeof(path), "%s/AUDIO_DIFF.TXT", g_base_path);
             snprintf(path, sizeof(path), "%s/AUDIO_CAPTURE.TXT", g_base_path);
             if (FILE* c = fopen(path, "r")) {
+                int first = 0;
+                if (fscanf(c, "%d", &first) != 1) first = 0;   // the first task to capture
                 fclose(c);
-                recomp3ds_naudio_capture_dir(g_base_path);
+                recomp3ds_naudio_capture_dir(g_base_path, first);
             }
             snprintf(path, sizeof(path), "%s/AUDIO_RSP.TXT", g_base_path);
             if (FILE* r = fopen(path, "r")) {
@@ -653,6 +655,7 @@ int recomp3ds::run(const GameDesc& desc) {
     // function and this trampoline runs it under the tick counter.
     g_game_get_ucode = desc.rsp.get_rsp_microcode;
     g_audio_hle = desc.audio_hle;
+    recomp3ds::naudio_hle_set_variant(desc.audio_hle_variant);
     if (g_game_get_ucode != nullptr) {
         cfg.rsp_callbacks.get_rsp_microcode = timed_get_ucode;
     }

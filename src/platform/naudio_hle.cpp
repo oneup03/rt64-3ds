@@ -108,6 +108,7 @@ void dma_write(uint8_t* rdram, uint32_t dmem, uint32_t dram, uint32_t len) {
 
 recomp3ds::NaudioHleStats g_stats{};
 RspUcodeFunc* g_reference = nullptr;
+bool g_phase_invert = true;     // NaudioVariant::Dk64
 
 // ---------------------------------------------------------------- commands
 
@@ -421,8 +422,10 @@ void cmd_envmixer(uint8_t* rdram, uint32_t w0, uint32_t w1) {
     uint32_t rratl = (uint16_t)dh(kState + 0x4A);
     int32_t dry = dh(kState + 0x4C), wet = dh(kState + 0x4E);
     int32_t cvolL = dh(kState + 0x50);
-    int32_t maskL = (dry & 1) ? -1 : 0;     // v9: dry LSB inverts the left input
-    int32_t maskR = (wet & 1) ? -1 : 0;     // v8 ^ v9 ^ v9: wet LSB inverts the right input
+    // DK64's build: v9, the dry LSB, inverts the left input; v8 ^ v9 ^ v9,
+    // the wet LSB, the right one. Banjo's build inverts neither.
+    int32_t maskL = (g_phase_invert && (dry & 1)) ? -1 : 0;
+    int32_t maskR = (g_phase_invert && (wet & 1)) ? -1 : 0;
 
     static const uint32_t kFrac[8] = { 0x2000, 0x4000, 0x6000, 0x8000, 0xA000, 0xC000, 0xE000, 0xFFFF };
 
@@ -610,6 +613,7 @@ bool command_range(uint32_t w0, uint32_t w1, Range& r) {
 }
 
 int g_reports_by_op[16];
+int g_diff_verbose = 0;     // mismatches still to dump in full (host tools)
 
 // Every command runs through the reference (the recompiled microcode, on a
 // one-command task) and this implementation from the same DMEM state; DMEM
@@ -621,7 +625,7 @@ void run_task_lockstep(uint8_t* rdram, const OSTask& task, uint32_t ucode_addr) 
     uint32_t list = task.t.data_ptr & 0xFFFFFF;
     uint32_t n = task.t.data_size / 8;
     static uint8_t ref_dm[0x1000];
-    static uint8_t before[0x1000], ref[0x1000];
+    static uint8_t before[0x1000], ref[0x1000], pre_dm[0x1000];
     for (uint32_t i = 0; i < n; i++) {
         uint32_t w0 = rw(rdram, list + i * 8), w1 = rw(rdram, list + i * 8 + 4);
         uint32_t op = w0 >> 24;
@@ -629,6 +633,7 @@ void run_task_lockstep(uint8_t* rdram, const OSTask& task, uint32_t ucode_addr) 
         bool has_range = command_range(w0, w1, r);
 
         // Reference on a one-command task, from this implementation's DMEM.
+        if (g_diff_verbose > 0) memcpy(pre_dm, g_dm, 0x1000);
         memcpy(dmem, g_dm, 0x1000);
         uint32_t one_ptr = task.t.data_ptr + i * 8, one_size = 8;
         memcpy(&dmem[0xFC0 + 0x30], &one_ptr, 4);
@@ -674,6 +679,32 @@ void run_task_lockstep(uint8_t* rdram, const OSTask& task, uint32_t ucode_addr) 
                 }
             }
         }
+        if (bad_dmem >= 0 && g_diff_verbose > 0) {
+            // The whole picture: the volume block going in, and per output
+            // buffer how many samples differ and the first ones.
+            g_diff_verbose--;
+            auto h = [](const uint8_t* m, uint32_t a) { return (int16_t)((m[a ^ 3] << 8) | m[(a + 1) ^ 3]); };
+            fprintf(stderr, "  cmd %u %08x %08x, state 40..50 before:", i, w0, w1);
+            for (uint32_t a = 0x40; a <= 0x50; a += 2) fprintf(stderr, " %04x", (uint16_t)h(pre_dm, kState + a));
+            fprintf(stderr, "\n");
+            static const uint32_t bufs[4] = { kMainL, kMainR, kAuxL, kAuxR };
+            static const char* names[4] = { "mainL", "mainR", "auxL", "auxR" };
+            for (int b = 0; b < 4; b++) {
+                int nd = 0, neg = 0;
+                for (uint32_t k = 0; k < kCount; k += 2) {
+                    int16_t m = h(g_dm, bufs[b] + k), r = h(ref_dm, bufs[b] + k);
+                    if (m != r) { nd++; if (m == -r || m + r == -1) neg++; }
+                }
+                fprintf(stderr, "  %s: %d/%u differ (%d negated); mine/ref/before:", names[b], nd, kCount / 2, neg);
+                for (uint32_t k = 0; k < 16; k += 2) fprintf(stderr, " %d/%d/%d", h(g_dm, bufs[b] + k), h(ref_dm, bufs[b] + k), h(pre_dm, bufs[b] + k));
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "  input:");
+            for (uint32_t k = 0; k < 16; k += 2) fprintf(stderr, " %d", h(pre_dm, kBufBase + k));
+            fprintf(stderr, "\n  state 00..50 after mine/ref:");
+            for (uint32_t a = 0; a < 0x50; a += 2) if (h(g_dm, kState + a) != h(ref_dm, kState + a)) fprintf(stderr, " %02x:%04x/%04x", a, (uint16_t)h(g_dm, kState + a), (uint16_t)h(ref_dm, kState + a));
+            fprintf(stderr, "\n");
+        }
         // Continue from the reference's state.
         memcpy(g_dm, ref_dm, 0x1000);
         if (has_range) for (uint32_t k = 0; k < r.len; k++) rbw(rdram, r.addr + k, ref[k]);
@@ -684,21 +715,24 @@ void run_task_lockstep(uint8_t* rdram, const OSTask& task, uint32_t ucode_addr) 
 
 }   // namespace
 
-// Capture support: AUDIO_CAPTURE.TXT next to the executable makes tasks
-// 200-207 write the whole RDRAM plus their OSTask to audio_task_N.bin, for
-// the host-side test (tools/naudio_test).
+// Capture support: AUDIO_CAPTURE.TXT next to the executable makes 8 tasks
+// from the one it names (200 when it names none) write the whole RDRAM plus
+// their OSTask to audio_task_N.bin, for the host-side test (tools/naudio_test).
 const char* g_capture_dir = nullptr;
-void recomp3ds_naudio_capture_dir(const char* dir);
+int g_capture_first = 200;
 
-void recomp3ds_naudio_capture_dir(const char* dir) { g_capture_dir = dir; }
+void recomp3ds_naudio_capture_dir(const char* dir, int first_task) {
+    g_capture_dir = dir;
+    if (first_task > 0) g_capture_first = first_task;
+}
 
 void maybe_capture(const uint8_t* rdram, const OSTask& task) {
     static int seen = 0;
     if (g_capture_dir == nullptr) return;
     seen++;
-    if (seen < 200 || seen >= 208) return;
+    if (seen < g_capture_first || seen >= g_capture_first + 8) return;
     char path[192];
-    snprintf(path, sizeof(path), "%s/audio_task_%d.bin", g_capture_dir, seen - 200);
+    snprintf(path, sizeof(path), "%s/audio_task_%d.bin", g_capture_dir, seen - g_capture_first);
     FILE* f = fopen(path, "wb");
     if (f == nullptr) { fprintf(stderr, "naudio-hle: capture failed to open %s\n", path); return; }
     fwrite(&task, 1, sizeof(OSTask), f);
@@ -722,6 +756,14 @@ RspExitReason recomp3ds::naudio_hle_run(uint8_t* rdram, uint32_t ucode_addr) {
 
 void recomp3ds::naudio_hle_set_reference(RspUcodeFunc* reference) {
     g_reference = reference;
+}
+
+void recomp3ds::naudio_hle_set_variant(NaudioVariant variant) {
+    g_phase_invert = variant == NaudioVariant::Dk64;
+}
+
+void recomp3ds::naudio_hle_set_diff_verbose(int mismatches) {
+    g_diff_verbose = mismatches;
 }
 
 const recomp3ds::NaudioHleStats& recomp3ds::naudio_hle_stats() {
