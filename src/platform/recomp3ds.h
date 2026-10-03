@@ -7,7 +7,9 @@
 
 #include "librecomp/game.hpp"
 #include "librecomp/rsp.hpp"
+#include "ultramodern/input.hpp"
 #include "naudio_hle.h"
+#include "aspmain_hle.h"
 #include "rt64_3ds.h"
 
 namespace recomp3ds {
@@ -27,6 +29,12 @@ struct ButtonMap {
     uint32_t keys;
     uint16_t n64;
 };
+
+// Which audio microcode the game's audio task is, for GameDesc::audio_hle:
+// the naudio family (n_aspMain: DK64, Banjo; naudio_hle.cpp) or libaudio's
+// ABI 1 aspMain (Goemon; aspmain_hle.cpp). They differ in their command
+// numbers and DMEM layout, so the wrong one garbles every sound.
+enum class AudioHle : uint8_t { Naudio, Aspmain };
 
 // The settings menu's pages; the stereo rows are on Page3D and the stick
 // deadzones on PageControls. Empty pages are skipped.
@@ -75,8 +83,22 @@ struct GameDesc {
     std::string (*get_game_thread_name)(const OSThread* t) = nullptr;   // optional
     rt64_3ds::RenderDesc render;
     bool null_renderer = false;         // bring-up: accept display lists, draw nothing
-    bool audio_hle = false;             // run the naudio audio task on the CPU (naudio_hle.cpp) instead of the recompiled RSP code
-    recomp3ds::NaudioVariant audio_hle_variant = recomp3ds::NaudioVariant::Dk64;   // which build of n_aspMain the game has
+    bool audio_hle = false;             // run the audio task on the CPU (audio_hle_family) instead of the recompiled RSP code
+    recomp3ds::AudioHle audio_hle_family = recomp3ds::AudioHle::Naudio;           // which microcode the audio task is
+    // How many video frames of audio the game is told are queued fewer than
+    // really are, so it keeps that much more in reserve (more latency). A game
+    // that sizes its audio from the queue, with little slack of its own, lets
+    // the DSP run dry between buffers otherwise: short gaps heard as a constant
+    // crackle, and the frames it submits per second fall short of the rate.
+    int audio_margin_frames = 1;
+    // The audio task's completion is reported at once and its samples are
+    // passed on when it has really run (ultramodern::set_async_audio_tasks):
+    // for a game with an SDK-style audio manager, whose next task waits for
+    // the previous one's completion and so falls to every other retrace when
+    // the interpreter takes most of one. Needs every task's output to reach
+    // the host through osAiSetNextBuffer alone.
+    bool audio_async = false;
+    recomp3ds::NaudioVariant audio_hle_variant = recomp3ds::NaudioVariant::Dk64;   // naudio: which build of n_aspMain the game has
     // Called once when audio tasks stop arriving for 2 s after having run:
     // the game can log its scheduler/audio state (debugging lost wake-ups).
     void (*on_audio_stall)(uint8_t* rdram) = nullptr;
@@ -92,6 +114,24 @@ struct GameDesc {
     // Optional: the game's defaults for rows, the library's included.
     const MenuDefault* menu_defaults = nullptr;
     size_t menu_default_count = 0;
+    // What the runtime reports plugged into controller 1. Goemon saves to
+    // the Controller Pak and refuses to start a game unless one is reported
+    // at boot (the desktop frontends report a Rumble Pak).
+    ultramodern::input::Pak controller_pak = ultramodern::input::Pak::None;
+    // Optional: the C-Stick as the game's own button camera, for games whose
+    // camera turns while a button is held and C buttons are pressed, one
+    // step a press (Goemon: hold R, C-Left/Right turn 45 degrees, C-Up/Down
+    // zoom; the camera eases back behind the player once the presses stop).
+    // While the C-Stick points a way (its stronger axis), it holds these N64
+    // buttons and, once they have been held cstick_camera_lead_ms (the game
+    // must see them first), presses that way's C button for
+    // cstick_camera_press_ms every cstick_camera_period_ms, so holding the
+    // stick keeps turning. 0: the C-Stick presses the C buttons, as ever.
+    // The Controls page gets a "C-Stick" row (Camera / C buttons).
+    uint16_t cstick_camera_hold = 0;
+    uint16_t cstick_camera_lead_ms = 70;
+    uint16_t cstick_camera_press_ms = 100;
+    uint16_t cstick_camera_period_ms = 267;
 };
 
 // Brings up the console, registers the game and runs the runtime. Returns the

@@ -49,36 +49,60 @@ std::vector<V> clip_near(const std::vector<V>& in) {
     return out;
 }
 
+// Where draws land: the 400x240 screen, or an off-screen image in its own
+// N64 pixels (RefOptions::model_images).
+struct Target {
+    int w = 0, h = 0;
+    bool screen = true;
+    std::vector<uint32_t> color;
+    std::vector<float> depth;
+    void init(int tw, int th, bool is_screen) {
+        w = tw; h = th; screen = is_screen;
+        color.assign((size_t)w * h, 0x000000FFu);
+        depth.assign((size_t)w * h, 1.0f);
+    }
+};
+
 class Renderer {
 public:
     Renderer(const uint8_t* rdram, const FrameRecord& f, RefOptions opt) : rdram_(rdram), f_(f), opt_(opt) {
-        color_.assign(400 * 240, 0x000000FFu);
-        depth_.assign(400 * 240, 1.0f);
+        screen_.init(400, 240, true);
     }
 
     void run() {
         for (size_t i = 0; i < f_.draws.size(); i++) {
             if (opt_.only_draw >= 0 && (int)i != opt_.only_draw) continue;
             if (opt_.max_draw >= 0 && (int)i > opt_.max_draw) break;
-            draw(f_.draws[i]);
+            const DrawRecord& d = f_.draws[i];
+            cur_ = &screen_;
+            if (opt_.model_images && d.rtt >= 0 && d.rtt < rt64_3ds::kMaxRtt) {
+                const rt64_3ds::RttImage& img = f_.rtts[d.rtt];
+                Target& t = images_[d.rtt];
+                if (t.w != img.pot_w || t.h != img.pot_h) t.init(img.pot_w, img.pot_h, false);
+                if (t.w == 0 || t.h == 0) continue;
+                cur_ = &t;
+            }
+            draw(d);
         }
     }
 
-    const std::vector<uint32_t>& color() const { return color_; }
+    const std::vector<uint32_t>& color() const { return screen_.color; }
 
 private:
     const uint8_t* rdram_;
     const FrameRecord& f_;
     RefOptions opt_;
-    std::vector<uint32_t> color_;
-    std::vector<float> depth_;
-    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, Tex> texcache_;
+    Target screen_;
+    Target images_[rt64_3ds::kMaxRtt];
+    Target* cur_ = &screen_;
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, Tex> texcache_;
 
     const Tex* texture(const TexDesc& d) {
         if (!d.valid || d.snapshot) return nullptr;
+        if (opt_.model_images && (d.frame || d.rtt >= 0)) return nullptr;
         auto key = std::make_tuple(d.addr, d.pitch | ((uint32_t)d.fmt << 16) | ((uint32_t)d.siz << 20), (uint32_t)d.width | ((uint32_t)d.height << 16),
                                    d.tlut_index, (uint32_t)d.palette | ((uint32_t)d.nibble << 8) | ((uint32_t)d.tlut_mode << 12) | ((uint32_t)d.block << 16),
-                                   (uint32_t)d.dxt | ((uint32_t)d.load_word << 16));
+                                   (uint32_t)d.dxt | ((uint32_t)d.load_word << 16), (uint32_t)d.wrap_rows);
         auto it = texcache_.find(key);
         if (it != texcache_.end()) return &it->second;
         Tex& t = texcache_[key];
@@ -103,8 +127,25 @@ private:
         return c;
     }
 
+    static C4 unpack(uint32_t p) { return { (int)(p >> 24), (int)((p >> 16) & 0xFF), (int)((p >> 8) & 0xFF), (int)(p & 0xFF) }; }
+
     C4 sample(const TexDesc& d, const Tex* t, float u, float v) {
         if (d.snapshot) return { 128, 128, 128, 255 };
+        if (opt_.model_images && d.frame) {
+            // The snapshot layout: u = 240 - screen y, v = 512 - screen x.
+            int sx = (int)floorf(512.0f - v), sy = (int)floorf(240.0f - u);
+            if (sx < 0) sx = 0; if (sx > 399) sx = 399; if (sy < 0) sy = 0; if (sy > 239) sy = 239;
+            uint32_t p = screen_.color[(size_t)sy * 400 + sx];
+            return { (int)(p >> 24), (int)((p >> 16) & 0xFF), (int)((p >> 8) & 0xFF), 255 };   // full coverage
+        }
+        if (opt_.model_images && d.rtt >= 0 && d.rtt < rt64_3ds::kMaxRtt) {
+            // Texels of the image's texture, rows counted from its bottom.
+            const Target& img = images_[d.rtt];
+            if (img.w == 0) return { 0, 0, 0, 255 };
+            int x = (int)floorf(u), y = (int)floorf((float)img.h - v);
+            if (x < 0) x = 0; if (x >= img.w) x = img.w - 1; if (y < 0) y = 0; if (y >= img.h) y = img.h - 1;
+            return unpack(img.color[(size_t)y * img.w + x]);
+        }
         if (t == nullptr) return { 255, 255, 255, 255 };
         int s = (int)floorf(u), tt = (int)floorf(v);
         if (d.cms & 2) { if (s < 0) s = 0; }
@@ -168,7 +209,7 @@ private:
     void blend_pixel(const DrawRecord& d, int idx, C4 in, int shade_a) {
         uint32_t l = d.othermode_l;
         uint32_t cyc = (d.othermode_h >> 20) & 3;
-        uint32_t memc = color_[idx];
+        uint32_t memc = cur_->color[idx];
         C4 mem = { (int)(memc >> 24), (int)((memc >> 16) & 0xFF), (int)((memc >> 8) & 0xFF), 255 };
         C4 blendc = { d.blend[0], d.blend[1], d.blend[2], d.blend[3] }, fogc = { d.fog[0], d.fog[1], d.fog[2], d.fog[3] };
         bool force_bl = (l & 0x4000) != 0;
@@ -189,7 +230,7 @@ private:
         C4 out;
         if (cyc == 1) out = cycle_blend(1, cycle_blend(0, in, false), true);
         else out = cycle_blend(0, in, true);
-        color_[idx] = ((uint32_t)out.r << 24) | ((uint32_t)out.g << 16) | ((uint32_t)out.b << 8) | 0xFF;
+        cur_->color[idx] = ((uint32_t)out.r << 24) | ((uint32_t)out.g << 16) | ((uint32_t)out.b << 8) | 0xFF;
     }
 
     void draw(const DrawRecord& d) {
@@ -201,6 +242,7 @@ private:
         int sx1 = (int)lroundf(g.screen_x((float)d.scissor[2])), sy1 = (int)lroundf(g.screen_y((float)d.scissor[3]));
         if (d.scissor[0] <= 0 && d.scissor[2] >= g.w) { sx0 = 0; sx1 = 400; }
         if (sx0 < 0) sx0 = 0; if (sy0 < 0) sy0 = 0; if (sx1 > 400) sx1 = 400; if (sy1 > 240) sy1 = 240;
+        if (!cur_->screen) { sx0 = 0; sy0 = 0; sx1 = cur_->w; sy1 = cur_->h; }   // an image is its own clip
         uint32_t l = d.othermode_l;
         bool is_rect = d.kind != DrawRecord::Tris;
         bool zcmp = (l & 0x10) && !is_rect && cyc < 2, zupd = (l & 0x20) && !is_rect && cyc < 2;
@@ -221,7 +263,11 @@ private:
                 int sx0, int sy0, int sx1, int sy1, bool zcmp, bool zupd, uint32_t zmode) {
         const V* vs[3] = { &a, &b, &c };
         float X[3], Y[3], IW[3];
-        for (int i = 0; i < 3; i++) { IW[i] = 1.0f / vs[i]->w; X[i] = opt_.geo.screen_x(vs[i]->x * IW[i]); Y[i] = opt_.geo.screen_y(vs[i]->y * IW[i]); }
+        for (int i = 0; i < 3; i++) {
+            IW[i] = 1.0f / vs[i]->w;
+            X[i] = cur_->screen ? opt_.geo.screen_x(vs[i]->x * IW[i]) : vs[i]->x * IW[i];
+            Y[i] = cur_->screen ? opt_.geo.screen_y(vs[i]->y * IW[i]) : vs[i]->y * IW[i];
+        }
         float area = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
         if (fabsf(area) < 1e-6f) return;
         int minx = (int)floorf(fminf(X[0], fminf(X[1], X[2]))), maxx = (int)ceilf(fmaxf(X[0], fmaxf(X[1], X[2])));
@@ -238,10 +284,10 @@ private:
                 float iw = w0 * IW[0] + w1 * IW[1] + w2 * IW[2];
                 float p0 = w0 * IW[0] / iw, p1 = w1 * IW[1] / iw, p2 = w2 * IW[2] / iw;   // perspective-correct weights
                 float z = (w0 * a.z * IW[0] + w1 * b.z * IW[1] + w2 * c.z * IW[2]);       // z'/w is affine in screen space
-                int idx = py * 400 + px;
+                int idx = py * cur_->w + px;
                 if (zcmp) {
-                    if (zmode == 3) { if (z > depth_[idx] + 0.002f) continue; }
-                    else if (z > depth_[idx]) continue;
+                    if (zmode == 3) { if (z > cur_->depth[idx] + 0.002f) continue; }
+                    else if (z > cur_->depth[idx]) continue;
                 }
                 float u = p0 * a.u + p1 * b.u + p2 * c.u, v = p0 * a.v + p1 * b.v + p2 * c.v;
                 C4 sh = { clamp255((int)(p0 * a.r + p1 * b.r + p2 * c.r)), clamp255((int)(p0 * a.g + p1 * b.g + p2 * c.g)),
@@ -267,10 +313,10 @@ private:
                     if (cyc == 2 && ac && out.a == 0) continue;
                 }
                 if (cyc >= 2) {
-                    color_[idx] = ((uint32_t)out.r << 24) | ((uint32_t)out.g << 16) | ((uint32_t)out.b << 8) | 0xFF;
+                    cur_->color[idx] = ((uint32_t)out.r << 24) | ((uint32_t)out.g << 16) | ((uint32_t)out.b << 8) | 0xFF;
                 }
                 else blend_pixel(d, idx, out, sh.a);
-                if (zupd) depth_[idx] = z;
+                if (zupd) cur_->depth[idx] = z;
             }
         }
     }

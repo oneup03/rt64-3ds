@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "librecomp/rsp.hpp"
+#include "audio_hle_diff.h"
 
 namespace recomp3ds {
 
@@ -19,26 +20,20 @@ RspExitReason naudio_hle_run(uint8_t* rdram, uint32_t ucode_addr);
 enum class NaudioVariant : uint8_t { Dk64, BanjoKazooie };
 void naudio_hle_set_variant(NaudioVariant variant);
 
-// Differential mode: every task is also run through `reference` (the
-// recompiled microcode) on the same inputs, and every RDRAM range the task
-// writes is compared. Mismatches are logged; the reference's output is kept.
+// Differential mode (audio_hle_lockstep): every command also runs through
+// `reference` (the recompiled microcode) on the same inputs, and DMEM and the
+// RDRAM it writes are compared. Mismatches are logged; the reference's output
+// is kept.
 void naudio_hle_set_reference(RspUcodeFunc* reference);
 // Host tools: dump the next `mismatches` differential mismatches in full.
 void naudio_hle_set_diff_verbose(int mismatches);
 
-struct NaudioHleStats {
-    uint32_t tasks;
-    uint32_t commands;
-    uint32_t unknown_opcodes;
-    uint32_t diff_tasks;        // tasks compared against the reference
-    uint32_t diff_mismatches;   // ranges that differed
-};
-const NaudioHleStats& naudio_hle_stats();
+using NaudioHleStats = AudioHleStats;
+const AudioHleStats& naudio_hle_stats();
+// Host tools: the interpreter's DMEM (RDRAM byte order), and clearing it.
+const uint8_t* naudio_hle_dmem();
+void naudio_hle_reset_dmem();
 
 }   // namespace recomp3ds
-
-// Capture mode (see naudio_hle.cpp): directory that receives audio_task_N.bin,
-// and the first task captured (<= 0: task 200).
-void recomp3ds_naudio_capture_dir(const char* dir, int first_task);
 
 #endif

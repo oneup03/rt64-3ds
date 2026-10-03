@@ -22,7 +22,7 @@ namespace {
 
 constexpr int kMaxCmds = 256;
 constexpr int kMaxPhases = 32;
-enum Kind { KEYS, TOUCH, SHOT, LOG, EXIT, HOME };
+enum Kind { KEYS, TOUCH, SHOT, LOG, EXIT, HOME, CAPTURE };
 struct Cmd { int frame, frames; u32 keys; Kind kind; int phase; int tx, ty; char text[48]; };
 
 Cmd g_cmds[kMaxCmds];
@@ -86,6 +86,12 @@ void recomp3ds::autotest_load(const char* base_path) {
         else if (strcasecmp(b, "LOG") == 0)  { cmd->kind = LOG;  if (n > 2) strncpy(cmd->text, c, sizeof(cmd->text) - 1); }
         else if (strcasecmp(b, "EXIT") == 0) { cmd->kind = EXIT; }
         else if (strcasecmp(b, "HOME") == 0) { cmd->kind = HOME; }
+        // "CAPTURE": this display list with RDRAM (gfx_task*.bin) and the
+        // frame it draws (gfx_frame*.ppm), as a SELECT hold with
+        // debug_capture=1; "CAPTURE seq <count>": the next <count> frames
+        // shown, as images; "CAPTURE pair": this display list and the next,
+        // with RDRAM, for the host tools.
+        else if (strcasecmp(b, "CAPTURE") == 0) { cmd->kind = CAPTURE; if (n > 2) strncpy(cmd->text, c, sizeof(cmd->text) - 1); }
         else if (n > 2 && strncasecmp(c, "TOUCH", 5) == 0) {
             cmd->kind = TOUCH; cmd->frames = atoi(b);
             sscanf(c + 5, "%d %d", &cmd->tx, &cmd->ty);
@@ -145,6 +151,15 @@ u32 recomp3ds::autotest_tick() {
             case LOG:  if (fired) fprintf(stderr, "AUTOTEST: %s\n", c->text); break;
             case EXIT: if (fired) { fprintf(stderr, "AUTOTEST: exit\n"); recomp3ds::request_exit(); } break;
             case HOME: if (fired) { fprintf(stderr, "AUTOTEST: home\n"); g_home = true; } break;
+            case CAPTURE:
+                if (fired) {
+                    int count = 0;
+                    fprintf(stderr, "AUTOTEST: capture %s\n", c->text);
+                    if (sscanf(c->text, "seq %d", &count) == 1) rt64_3ds::request_frame_sequence(count);
+                    else if (strncasecmp(c->text, "pair", 4) == 0) rt64_3ds::request_capture_pair();
+                    else rt64_3ds::request_capture();
+                }
+                break;
         }
     }
     g_keys = keys;

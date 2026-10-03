@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <utility>
 #include <vector>
 
 namespace rt64_3ds {
@@ -30,6 +31,12 @@ public:
     uint32_t size() const { return size_; }
     bool empty() const { return size_ == 0; }
     Vtx3ds* data() { return data_; }
+    void swap(VtxArray& o) {
+        Vtx3ds* d = data_; data_ = o.data_; o.data_ = d;
+        uint32_t s = size_; size_ = o.size_; o.size_ = s;
+        s = cap_; cap_ = o.cap_; o.cap_ = s;
+        bool w = owned_; owned_ = o.owned_; o.owned_ = w;
+    }
     const Vtx3ds* data() const { return data_; }
     Vtx3ds& operator[](uint32_t i) { return data_[i]; }
     const Vtx3ds& operator[](uint32_t i) const { return data_[i]; }
@@ -70,6 +77,13 @@ struct TexDesc {
     bool bilerp = false;
     bool snapshot = false;  // samples the stored copy of a previous frame instead of RDRAM
     int8_t rtt = -1;        // samples the off-screen image FrameRecord::rtts[rtt] rendered on the GPU
+    // Samples the frame drawn so far (RenderDesc::sample_drawn_frame): the
+    // texel coordinates are the snapshot's (rotated 256x512 layout).
+    bool frame = false;
+    // TMEM holds only this many of the tile's rows: the RDP's TMEM address
+    // wraps (4 KB, or 2 KB for 32-bit texels and with the TLUT on), so row y
+    // reads row y % wrap_rows (0 = the tile fits).
+    uint16_t wrap_rows = 0;
     // LOADBLOCK row step: the RDP swaps the 32-bit halves of each 64-bit
     // TMEM word on rows its dxt counter calls odd, and the sampler swaps
     // them back on odd tile rows. Where the two disagree (dxt 0: data
@@ -100,6 +114,19 @@ struct DrawRecord {
     bool perspective = true;
     bool mv_auto = false;               // the modelview group is untagged (G_EX_ID_AUTO): reticle candidates
     uint32_t mv_seq = 0;                // modelview loads so far this list (reticle quads are split on it)
+    // RenderDesc::primary_world_instance: the projection instance (one
+    // camera's run of triangles, as RT64 counts its Projections: a new one
+    // at every change of the projection or viewport, after a rectangle and
+    // at a colour image change); 0 when not tracked.
+    uint32_t proj_inst = 0;
+    // RenderDesc::unify_world_depth: the depth terms of the projection the
+    // draw was transformed by (z_clip = a * z_eye + b, its [2][2] and [3][2]
+    // as depth_camera has them); 0, 0 when the option is off or the
+    // projection is not a perspective.
+    float depth_a = 0.0f, depth_b = 0.0f;
+    // A rectangle sampling a texture of a whole image (RenderDesc::
+    // merge_image_tiles): its neighbours alike merge into its record.
+    bool image_rect = false;
     uint32_t dbg_vtx = 0;               // RDRAM address of the last vertex load (debug)
     float dbg_vp[4] = {};               // viewport scale x/y, translate x/y (debug logging)
     float dbg_proj[4] = {};             // projection m[1][1], m[3][1], m[2][3], m[3][3]
@@ -126,7 +153,41 @@ struct FrameRecord {
     bool has_cam = false;               // a perspective projection was loaded this frame
     bool cam_is_world = false;          // ... under the world projection group (stereo depth terms)
     float cam[16] = {};
+    // The HUD camera's projection (RenderDesc::hud_camera_id), for a frame
+    // where that camera turns out to be the world's.
+    bool has_hud_cam = false;
+    float hud_cam[16] = {};
     RttImage rtts[kMaxRtt];             // indexed by DrawRecord::rtt and TexDesc::rtt
+    // RenderDesc::primary_world_instance: the projection of each projection
+    // instance under the HUD camera (RenderDesc::hud_camera_id), for the one
+    // that turns out to be the frame's world.
+    struct InstanceCam { uint32_t inst; float m[16]; };
+    std::vector<InstanceCam> inst_cams;
+    // RenderDesc::sample_drawn_frame: the last draw that samples the frame
+    // drawn so far (TexDesc::frame), -1 = none. The backend keeps a copy of
+    // each eye's frame up to there.
+    int32_t frame_sample_last = -1;
+
+    // Exchanges two records whole (frame interpolation keeps the in-between
+    // frame beside the game's).
+    void swap(FrameRecord& o) {
+        verts.swap(o.verts);
+        draws.swap(o.draws);
+        tlut.swap(o.tlut);
+        std::swap(has_fullsync, o.has_fullsync);
+        std::swap(snapshot_request, o.snapshot_request);
+        std::swap(color_image, o.color_image);
+        std::swap(color_width, o.color_width);
+        std::swap(depth_image, o.depth_image);
+        std::swap(has_cam, o.has_cam);
+        std::swap(cam_is_world, o.cam_is_world);
+        std::swap(cam, o.cam);
+        std::swap(has_hud_cam, o.has_hud_cam);
+        std::swap(hud_cam, o.hud_cam);
+        std::swap(rtts, o.rtts);
+        inst_cams.swap(o.inst_cams);
+        std::swap(frame_sample_last, o.frame_sample_last);
+    }
 
     void clear() {
         verts.clear();
@@ -136,6 +197,9 @@ struct FrameRecord {
         snapshot_request = false;
         has_cam = false;
         cam_is_world = false;
+        has_hud_cam = false;
+        frame_sample_last = -1;
+        inst_cams.clear();
     }
 };
 

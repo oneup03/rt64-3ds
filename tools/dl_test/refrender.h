@@ -12,6 +12,10 @@ struct RefOptions {
     int max_draw = -1;           // stop after this draw
     int lod_fraction = 0;        // LOD_FRACTION combiner input (mipmap blend)
     bool rect_shade_white = false;
+    // Draws into off-screen images (DrawRecord::rtt) go to images of their
+    // own (N64 pixels, 1:1) that TexDesc::rtt samples; TexDesc::frame samples
+    // the screen as drawn so far. Off: every draw lands on the screen.
+    bool model_images = false;
     // Where the game's frame sits on the 400x240 output (DK64's 320x240 by default).
     rt64_3ds::ScreenGeometry geo = rt64_3ds::ScreenGeometry::make(320, 240);
 };

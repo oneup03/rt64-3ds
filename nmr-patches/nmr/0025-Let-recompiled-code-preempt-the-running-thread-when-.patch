@@ -1,0 +1,129 @@
+From 0545840b25e75df9d523863c150d14f47524a6f7 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Fri, 2 Oct 2026 19:49:18 -0500
+Subject: [PATCH] Let recompiled code preempt the running thread when an event
+ is queued
+
+The runtime delivers external events (a VI retrace, a task's completion,
+a timer) to game threads only when the running game thread sends or
+receives a message, or when the game is idle. A thread that computes for
+long between messages holds every higher-priority thread back by that
+long, where the console's interrupt would have switched at once. On a
+3DS at the Old 3DS clock, Goemon's game thread ran for most of each
+frame without a message call: the scheduler and the audio thread were
+late by up to that, half the audio frames were lost and the music ran
+at half speed.
+
+Host threads now raise ultramodern_preempt_pending whenever they queue
+an external message. Recompiled code that tests it at function entry (a
+plain load; Goemon's per-function trace hook does) calls
+ultramodern_preempt, which clears the flag, delivers the queued messages
+and switches to a woken higher-priority thread, as osRecvMesg does.
+osSetIntMask is kept per thread, and a thread that has masked every
+interrupt (a critical section) is left alone.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ librecomp/src/ultra_translation.cpp           |  4 ++-
+ .../include/ultramodern/ultramodern.hpp       | 16 ++++++++++
+ ultramodern/src/mesgqueue.cpp                 | 29 +++++++++++++++++++
+ 3 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/librecomp/src/ultra_translation.cpp b/librecomp/src/ultra_translation.cpp
+index e0d367e..7fabda2 100644
+--- a/librecomp/src/ultra_translation.cpp
++++ b/librecomp/src/ultra_translation.cpp
+@@ -119,7 +119,9 @@ extern "C" void osWritebackDCacheAll_recomp(uint8_t * rdram, recomp_context * ct
+ }
+ 
+ extern "C" void osSetIntMask_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    ;
++    // Kept per thread so that recompiled code is not preempted inside a
++    // critical section (ultramodern_preempt).
++    ctx->r2 = ultramodern::set_int_mask((uint32_t)ctx->r4);
+ }
+ 
+ extern "C" void __osDisableInt_recomp(uint8_t * rdram, recomp_context * ctx) {
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index e38a509..4ba794d 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -90,6 +90,22 @@ void schedule_running_thread(RDRAM_ARG PTR(OSThread) t);
+ void cleanup_thread(UltraThreadContext* thread_context);
+ struct thread_terminated : std::exception {};
+ 
++// Preemption for recompiled code. The runtime delivers external events (a VI
++// retrace, a task's completion, a timer) to game threads only when the running
++// game thread sends or receives a message, or when the game is idle; a thread
++// that computes for long between messages holds every higher-priority thread
++// back by that long, where the console's interrupts would have switched at
++// once. Host threads raise `ultramodern_preempt_pending` whenever they queue
++// such an event; recompiled code that tests it at function entry (a plain
++// load) and calls ultramodern_preempt delivers the events there and switches
++// to a woken higher-priority thread, as the interrupt would have.
++extern "C" uint32_t ultramodern_preempt_pending;
++extern "C" void ultramodern_preempt(uint8_t* rdram);
++// The game's interrupt mask (osSetIntMask), per thread: with every interrupt
++// masked (OS_IM_NONE) the thread is in a critical section and is not
++// preempted. Returns the previous mask.
++uint32_t set_int_mask(uint32_t mask);
++
+ // CPU accounting per game thread: the host ticks each thread has run for and
+ // the times it was woken, for a host's statistics (which of the game's
+ // threads the CPU goes to). Both counters wrap at 32 bits: a reader keeps its
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
+index 9944a02..8f56efa 100644
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
+@@ -27,12 +27,19 @@ void ultramodern::set_message_queue_control(const ultramodern::MessageQueueContr
+     requeue_enabled.set(static_cast<int>(EventMessageSource::Dp), mqc.requeue_dp);
+ }
+ 
++// Raised after every external message is queued (see ultramodern.hpp); the
++// running game thread's next preemption check delivers the queue. Cleared
++// before the queue is drained, so a message queued meanwhile raises it again.
++extern "C" uint32_t ultramodern_preempt_pending = 0;
++
+ void ultramodern::enqueue_external_message_src(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, EventMessageSource src) {
+     external_messages.enqueue({mq, msg, jam, requeue_enabled[static_cast<int>(src)]});
++    __atomic_store_n(&ultramodern_preempt_pending, 1u, __ATOMIC_RELEASE);
+ }
+ 
+ void ultramodern::enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked) {
+     external_messages.enqueue({mq, msg, jam, requeue_if_blocked});
++    __atomic_store_n(&ultramodern_preempt_pending, 1u, __ATOMIC_RELEASE);
+ }
+ 
+ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
+@@ -50,6 +57,28 @@ void dequeue_external_messages(RDRAM_ARG1) {
+     }
+ }
+ 
++// libultra's OS_IM_ALL: every interrupt enabled, the state a thread starts in.
++constexpr uint32_t kIntMaskAll = 0x003FFF01u;
++thread_local uint32_t int_mask = kIntMaskAll;
++
++uint32_t ultramodern::set_int_mask(uint32_t mask) {
++    uint32_t old = int_mask;
++    int_mask = mask;
++    return old;
++}
++
++extern "C" void ultramodern_preempt(uint8_t* rdram) {
++    // Only a game thread with a context can switch; the start-up code and
++    // host threads that run recompiled code pass through here too. A thread
++    // that masked every interrupt is in a critical section: it waits.
++    if (!ultramodern::is_game_thread() || ultramodern::this_thread() == NULLPTR || (int_mask & 0x003FFF00u) == 0) {
++        return;
++    }
++    __atomic_store_n(&ultramodern_preempt_pending, 0u, __ATOMIC_ACQ_REL);
++    dequeue_external_messages(PASS_RDRAM1);
++    ultramodern::check_running_queue(PASS_RDRAM1);
++}
++
+ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
+     QueuedMessage to_send;
+     external_messages.wait_dequeue(to_send);
+-- 
+2.53.0
+

@@ -23,6 +23,8 @@ namespace recomp3ds {
     void audio_set_frequency(uint32_t freq);
     void audio_queue_samples(int16_t* samples, size_t sample_count);
     size_t audio_frames_remaining();
+    size_t audio_frames_queued();       // all of it, without the margin (the stats line)
+    void audio_set_margin_frames(int video_frames);   // GameDesc::audio_margin_frames
     void audio_set_volume(float v);
     // Audio off: the audio task is skipped (no microcode work, which the
     // CPU does here) and silence is queued in place of its output.
@@ -30,11 +32,16 @@ namespace recomp3ds {
     bool audio_enabled();
     // Since the previous call: frames the game queued, frames dropped because
     // the ring was full, and times the DSP had run dry before new samples came.
-    struct AudioCounters { uint32_t submitted, dropped, underruns, rate; };
+    // low_water: the fewest frames the DSP still held when the game handed
+    // over its next buffer (0xFFFFFFFF: none handed over). Near zero means the
+    // DSP ran short even when no underrun was caught (ndsp's status flags lag).
+    struct AudioCounters { uint32_t submitted, dropped, underruns, rate, low_water; };
     AudioCounters audio_take_counters();
 
     void input_set_deadzones(int stick_percent, int cstick_percent);
     void input_set_cstick_up(bool on);  // C-Stick up presses C-Up (off: nothing)
+    // GameDesc::cstick_camera_*: hold 0 turns the camera mode off.
+    void input_set_cstick_camera(uint16_t hold, uint16_t lead_ms, uint16_t press_ms, uint16_t period_ms);
     void input_poll();
     void input_motion_update();         // main thread, after hidScanInput
     bool input_get(int controller_num, uint16_t* buttons, float* x, float* y);
@@ -42,6 +49,7 @@ namespace recomp3ds {
     u32  input_raw_held();
     void input_set_rumble(int controller_num, bool rumble);
     ultramodern::input::connected_device_info_t input_device_info(int controller_num);
+    void input_set_controller_pak(ultramodern::input::Pak pak);   // GameDesc::controller_pak
 
     // The ROM read from the SD card as the game needs it (rom_stream.cpp):
     // installs the runtime's RomStream with a block cache of about

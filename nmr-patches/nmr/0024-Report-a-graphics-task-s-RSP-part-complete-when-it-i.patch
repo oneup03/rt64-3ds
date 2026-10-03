@@ -1,0 +1,81 @@
+From 616c65672f3437d9c5657ff935ac2047115c62bd Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Fri, 2 Oct 2026 19:30:34 -0500
+Subject: [PATCH] Report a graphics task's RSP part complete when it is
+ submitted
+
+The graphics thread sent the RSP completion message for a graphics task
+when it took the task from its queue, which is only after the previous
+task's renderer work. A renderer that takes a list for tens of
+milliseconds (rt64-3ds on a 3DS at the Old 3DS clock, about 30 ms a
+list) left the game's scheduler seeing the RSP busy for most of every
+frame, and an SDK-style scheduler starts no audio task while a task is
+on the RSP: Goemon's audio frames ran at half their rate, with the
+music at half speed and the DSP running dry.
+
+Every task now also goes through the task thread, a graphics task for
+its RSP completion message alone, which it answers within microseconds
+whatever the renderer is doing; the RDP's completion still follows the
+renderer, so a game cannot start another graphics task before the list
+is drawn. On the desktop, where the graphics thread took lists at once,
+nothing changes in practice.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ultramodern/src/events.cpp | 26 +++++++++++++++++---------
+ 1 file changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 311aee6..3c79eec 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -288,6 +288,13 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
+             return;
+         }
+ 
++        // A graphics task comes here for its RSP acknowledgement alone (see
++        // submit_rsp_task); the renderer has it from the action queue.
++        if (task->t.type == M_GFXTASK) {
++            sp_complete();
++            continue;
++        }
++
+         if (!ultramodern::rsp::run_task(PASS_RDRAM task)) {
+             fprintf(stderr, "Failed to execute task type: %" PRIu32 "\n", task->t.type);
+             ULTRAMODERN_QUICK_EXIT();
+@@ -364,11 +371,10 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+         if (events_context.action_queue.wait_dequeue_timed(action, 1ms)) {
+             // Determine the action type and act on it
+             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
+-                // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
+-                // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
+-                // is finished as well, so sending this early shouldn't be an issue in most cases.
+-                // If this causes issues then the logic can be replaced with responding to yield requests.
+-                sp_complete();
++                // The RSP's part of the task was reported complete when it was submitted (submit_rsp_task, through the
++                // task thread); the RDP's part follows the renderer below (dp_complete), so the game won't start another
++                // graphics task before this one is drawn. Games usually preserve the RSP inputs until the RDP is finished
++                // as well, so the early RSP completion isn't an issue in most cases.
+                 ultramodern::measure_input_latency();
+ 
+                 PTR(u64) displaylist = task_action->task.t.data_ptr;
+@@ -569,10 +575,12 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
+     if (task->t.type == M_GFXTASK) {
+         events_context.action_queue.enqueue(SpTaskAction{ *task });
+     }
+-    // Set all other tasks as the RSP task
+-    else {
+-        events_context.sp_task_queue.enqueue(task);
+-    }
++    // Every task also goes to the task thread: a graphics task for its RSP completion message alone, the others to be
++    // run. The graphics thread used to send that message when it took the list, which is only after the previous list's
++    // renderer work: with a renderer that takes a list for tens of milliseconds (rt64-3ds on a 3DS) the game's scheduler
++    // saw the RSP busy for most of every frame and held its audio tasks until then, running the music at half speed. The
++    // task thread answers within microseconds whatever the renderer is doing.
++    events_context.sp_task_queue.enqueue(task);
+ }
+ 
+ void ultramodern::send_si_message() {
+-- 
+2.53.0
+

@@ -1,0 +1,268 @@
+From c8e92a3263818dc898490558015d9bf9ca7d6937 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Fri, 2 Oct 2026 23:10:55 -0500
+Subject: [PATCH] Asynchronous audio tasks; report RSP completions at
+ submission
+
+An SDK-style audio manager builds its next task only after the previous
+one's completion message, and the game's scheduler starts tasks only at
+a retrace. With an audio microcode that takes most of a retrace interval
+(an interpreter on a 3DS at the Old 3DS clock: 10 to 17 ms a task) the
+manager misses every other retrace, produces two thirds of the samples
+the DAC plays, and the music runs slow and breaks up.
+
+ultramodern::set_async_audio_tasks(true) reports an audio task complete
+when it is submitted. The task thread runs it from a copy taken then (the
+game may reuse its OSTask). The buffers the game hands to
+osAiSetNextBuffer are kept until the tasks submitted by then have run and
+passed to the host by the task thread; osAiGetLength counts them as
+queued meanwhile; and osAiSetNextBuffer holds the game while two tasks
+are outstanding, whose command lists and output buffers the game is
+about to reuse. Opt-in, for a game that takes every task's output through
+osAiSetNextBuffer alone.
+
+The RSP completion of a graphics task is now sent from submit_rsp_task
+itself instead of through the task thread, where it would wait behind a
+running audio task.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../include/ultramodern/ultramodern.hpp       | 20 ++++++
+ ultramodern/src/audio.cpp                     | 62 +++++++++++++++--
+ ultramodern/src/events.cpp                    | 66 +++++++++++++++----
+ 3 files changed, 131 insertions(+), 17 deletions(-)
+
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index 4ba794d..9d819e3 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -90,6 +90,26 @@ void schedule_running_thread(RDRAM_ARG PTR(OSThread) t);
+ void cleanup_thread(UltraThreadContext* thread_context);
+ struct thread_terminated : std::exception {};
+ 
++// Asynchronous audio tasks, for a host whose audio microcode takes a large
++// part of a frame (an interpreter on a slow CPU). An SDK-style audio manager
++// builds its next task only after the previous one's completion message, and
++// the game's scheduler starts tasks only at a retrace: a task that takes
++// much of a retrace interval makes the manager miss every other retrace and
++// produce half the samples. With this on, an audio task's completion is
++// reported as soon as the task thread takes it; the buffers the game then
++// hands to osAiSetNextBuffer are passed on to the host when the tasks
++// submitted by then have really run, osAiGetLength counts them as queued
++// meanwhile, and osAiSetNextBuffer holds the game while two tasks are still
++// outstanding (their command lists and output buffers are about to be
++// reused). Only for a game that takes every task's output through
++// osAiSetNextBuffer and nowhere else.
++void set_async_audio_tasks(bool on);
++bool async_audio_tasks();
++uint32_t audio_tasks_submitted();
++uint32_t audio_tasks_completed();
++// The task thread, after each audio task: hands over the buffers waiting on it.
++void flush_audio_buffers(RDRAM_ARG uint32_t completed);
++
+ // Preemption for recompiled code. The runtime delivers external events (a VI
+ // retrace, a task's completion, a timer) to game threads only when the running
+ // game thread sends or receives a message, or when the game is idle; a thread
+diff --git a/ultramodern/src/audio.cpp b/ultramodern/src/audio.cpp
+index 3198be0..05eede5 100644
+--- a/ultramodern/src/audio.cpp
++++ b/ultramodern/src/audio.cpp
+@@ -1,6 +1,11 @@
+ #include "ultramodern/ultra64.h"
+ #include "ultramodern/ultramodern.hpp"
+ #include <cassert>
++#include <atomic>
++#include <chrono>
++#include <deque>
++#include <mutex>
++#include <thread>
+ 
+ static uint32_t sample_rate = 48000;
+ 
+@@ -22,17 +27,62 @@ void ultramodern::set_audio_frequency(uint32_t freq) {
+     sample_rate = freq;
+ }
+ 
++// Asynchronous audio tasks (ultramodern.hpp): buffers the game handed over
++// before the tasks that fill them had run, each with the count of tasks that
++// must complete first. The host's queue_samples is called under the lock, from
++// the game's thread or the task thread.
++namespace {
++struct PendingBuffer {
++    PTR(int16_t) data;
++    uint32_t byte_count;
++    uint32_t needs;
++};
++std::mutex pending_mutex;
++std::deque<PendingBuffer> pending_buffers;
++std::atomic_uint32_t pending_bytes = 0;
++
++void queue_now(RDRAM_ARG PTR(int16_t) audio_data_, uint32_t byte_count) {
++    uint32_t sample_count = byte_count / sizeof(int16_t);
++    if (sample_count > 0 && audio_callbacks.queue_samples) {
++        audio_callbacks.queue_samples(TO_PTR(int16_t, audio_data_), sample_count);
++    }
++}
++}
++
++void ultramodern::flush_audio_buffers(RDRAM_ARG uint32_t completed) {
++    std::lock_guard lock{ pending_mutex };
++    // Wrapping counters: a buffer is due when `completed` has reached its count.
++    while (!pending_buffers.empty() && (int32_t)(completed - pending_buffers.front().needs) >= 0) {
++        const PendingBuffer buf = pending_buffers.front();
++        pending_buffers.pop_front();
++        queue_now(PASS_RDRAM buf.data, buf.byte_count);
++        pending_bytes -= buf.byte_count;
++    }
++}
++
+ void ultramodern::queue_audio_buffer(RDRAM_ARG PTR(int16_t) audio_data_, uint32_t byte_count) {
+     // Ensure that the byte count is an integer multiple of samples.
+     assert((byte_count & 1) == 0);
+ 
+-    // Calculate the number of samples from the number of bytes.
+-    uint32_t sample_count = byte_count / sizeof(int16_t);
++    if (ultramodern::async_audio_tasks()) {
++        const uint32_t submitted = ultramodern::audio_tasks_submitted();
++        // Two tasks still to run: the game is about to build a third into
++        // the first one's command list and output buffer. Hold it here.
++        while ((int32_t)(submitted - ultramodern::audio_tasks_completed()) >= 2) {
++            std::this_thread::sleep_for(std::chrono::microseconds(200));
++        }
++        std::lock_guard lock{ pending_mutex };
++        if (ultramodern::audio_tasks_completed() != submitted || !pending_buffers.empty()) {
++            pending_buffers.push_back(PendingBuffer{ audio_data_, byte_count, submitted });
++            pending_bytes += byte_count;
++            return;
++        }
++        queue_now(PASS_RDRAM audio_data_, byte_count);
++        return;
++    }
+ 
+     // Queue the swapped audio data.
+-    if (sample_count > 0 && audio_callbacks.queue_samples) {
+-        audio_callbacks.queue_samples(TO_PTR(int16_t, audio_data_), sample_count);
+-    }
++    queue_now(PASS_RDRAM audio_data_, byte_count);
+ }
+ 
+ // For SDL2
+@@ -52,6 +102,8 @@ uint32_t ultramodern::get_remaining_audio_bytes() {
+     else {
+         buffered_byte_count = 100;
+     }
++    // Buffers of asynchronous audio tasks that have yet to reach the host.
++    buffered_byte_count += pending_bytes;
+     // Adjust the reported count to be some number of refreshes in the future, which helps ensure that
+     // there are enough samples even if the audio thread experiences a small amount of lag. This prevents
+     // audio popping on games that use the buffered audio byte count to determine how many samples
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 3c79eec..4359de2 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -1,5 +1,7 @@
+ #include <thread>
+ #include <atomic>
++#include <deque>
++#include <mutex>
+ #include <chrono>
+ #include <cinttypes>
+ #include <variant>
+@@ -272,6 +274,23 @@ void dp_complete() {
+     ultramodern::enqueue_external_message_src(events_context.dp.mq, events_context.dp.msg, false, ultramodern::EventMessageSource::Dp);
+ }
+ 
++// Asynchronous audio tasks (see ultramodern.hpp). The game hears that such a
++// task is done when it submits it and may reuse its OSTask at once, so the
++// task thread runs a copy taken then; the marker in its queue stands for the
++// oldest copy.
++static std::atomic_bool async_audio = false;
++static std::atomic_uint32_t audio_submitted = 0;
++static std::atomic_uint32_t audio_completed = 0;
++static std::mutex async_audio_mutex;
++static std::deque<OSTask> async_audio_copies;
++static OSTask async_audio_marker_storage;
++static OSTask* const async_audio_marker = &async_audio_marker_storage;
++
++void ultramodern::set_async_audio_tasks(bool on) { async_audio = on; }
++bool ultramodern::async_audio_tasks() { return async_audio; }
++uint32_t ultramodern::audio_tasks_submitted() { return audio_submitted; }
++uint32_t ultramodern::audio_tasks_completed() { return audio_completed; }
++
+ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_ready) {
+     ultramodern::set_native_thread_name("SP Task Thread");
+     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Normal);
+@@ -288,10 +307,20 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
+             return;
+         }
+ 
+-        // A graphics task comes here for its RSP acknowledgement alone (see
+-        // submit_rsp_task); the renderer has it from the action queue.
+-        if (task->t.type == M_GFXTASK) {
+-            sp_complete();
++        // An asynchronous audio task (submit_rsp_task): its completion has
++        // been reported; run the copy and hand over the samples waiting on it.
++        if (task == async_audio_marker) {
++            OSTask local;
++            {
++                std::lock_guard lock{ async_audio_mutex };
++                local = async_audio_copies.front();
++                async_audio_copies.pop_front();
++            }
++            if (!ultramodern::rsp::run_task(PASS_RDRAM &local)) {
++                fprintf(stderr, "Failed to execute task type: %" PRIu32 "\n", local.t.type);
++                ULTRAMODERN_QUICK_EXIT();
++            }
++            ultramodern::flush_audio_buffers(PASS_RDRAM ++audio_completed);
+             continue;
+         }
+ 
+@@ -371,8 +400,8 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+         if (events_context.action_queue.wait_dequeue_timed(action, 1ms)) {
+             // Determine the action type and act on it
+             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
+-                // The RSP's part of the task was reported complete when it was submitted (submit_rsp_task, through the
+-                // task thread); the RDP's part follows the renderer below (dp_complete), so the game won't start another
++                // The RSP's part of the task was reported complete when it was submitted (submit_rsp_task);
++                // the RDP's part follows the renderer below (dp_complete), so the game won't start another
+                 // graphics task before this one is drawn. Games usually preserve the RSP inputs until the RDP is finished
+                 // as well, so the early RSP completion isn't an issue in most cases.
+                 ultramodern::measure_input_latency();
+@@ -571,15 +600,28 @@ extern "C" PTR(void) osViGetCurrentFramebuffer() {
+ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
+     OSTask* task = TO_PTR(OSTask, task_);
+ 
+-    // Send gfx tasks to the graphics action queue
++    // Send gfx tasks to the graphics action queue. The RSP's part of the task is reported complete here and now: the
++    // graphics thread used to send that message when it took the list, which is only after the previous list's renderer
++    // work, and with a renderer that takes a list for tens of milliseconds (rt64-3ds on a 3DS) the game's scheduler saw
++    // the RSP busy for most of every frame and held its audio tasks until then. The message is queued like any external
++    // one and reaches the scheduler at its next receive, after it has noted the task as started.
+     if (task->t.type == M_GFXTASK) {
+         events_context.action_queue.enqueue(SpTaskAction{ *task });
++        sp_complete();
++        return;
++    }
++    // An asynchronous audio task: reported complete at once as well, and run by the task thread from a copy.
++    if (task->t.type == M_AUDTASK && async_audio) {
++        {
++            std::lock_guard lock{ async_audio_mutex };
++            async_audio_copies.push_back(*task);
++        }
++        audio_submitted++;
++        sp_complete();
++        events_context.sp_task_queue.enqueue(async_audio_marker);
++        return;
+     }
+-    // Every task also goes to the task thread: a graphics task for its RSP completion message alone, the others to be
+-    // run. The graphics thread used to send that message when it took the list, which is only after the previous list's
+-    // renderer work: with a renderer that takes a list for tens of milliseconds (rt64-3ds on a 3DS) the game's scheduler
+-    // saw the RSP busy for most of every frame and held its audio tasks until then, running the music at half speed. The
+-    // task thread answers within microseconds whatever the renderer is doing.
++    // Set all other tasks as the RSP task
+     events_context.sp_task_queue.enqueue(task);
+ }
+ 
+-- 
+2.55.0
+

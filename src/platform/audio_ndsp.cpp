@@ -18,6 +18,7 @@ constexpr int kNumBufs = 24;            // ~ a quarter second at 60 chunks/s
 constexpr size_t kMaxFramesPerBuf = 4096;
 bool g_ready = false;
 uint32_t g_rate = 32000;
+int g_margin_frames = 1;   // video frames reported fewer than are queued (GameDesc::audio_margin_frames)
 ndspWaveBuf g_bufs[kNumBufs];
 int16_t* g_storage[kNumBufs];
 int g_next = 0;
@@ -25,6 +26,7 @@ float g_volume = 1.0f;
 std::atomic<bool> g_enabled{ true };     // the menu's Audio setting
 bool g_started = false;
 volatile uint32_t g_submitted = 0, g_dropped = 0, g_underruns = 0;
+volatile uint32_t g_low_water = 0xFFFFFFFFu;
 
 // AUDIO_WAV.TXT beside the executable ("<start s> <length s>"): the game's
 // output from <start> seconds of audio in, for <length> seconds, to
@@ -116,12 +118,24 @@ void recomp3ds::audio_queue_samples(int16_t* samples, size_t sample_count) {
     if (!wav_checked) { wav_checked = true; wav_setup(); }
     if (g_wav != nullptr) wav_record(samples, frames);
     size_t done = 0;
+    if (g_started) {
+        const size_t before = audio_frames_queued();
+        if (before < g_low_water) g_low_water = (uint32_t)before;
+    }
     bool starved = !ndspChnIsPlaying(kChannel);
     for (int i = 0; i < kNumBufs && !starved; i++) {
         if (g_bufs[i].status == NDSP_WBUF_QUEUED || g_bufs[i].status == NDSP_WBUF_PLAYING) break;
         if (i == kNumBufs - 1) starved = true;
     }
-    if (starved && g_started) g_underruns = g_underruns + 1;
+    if (starved && g_started) {
+        g_underruns = g_underruns + 1;
+        // The channel stopped for want of data: give it its rate, format
+        // and interpolation again before it restarts, so a restart never
+        // plays at the DSP's own rate (slow and flat after an underrun).
+        ndspChnSetInterp(kChannel, NDSP_INTERP_LINEAR);
+        ndspChnSetRate(kChannel, (float)g_rate);
+        ndspChnSetFormat(kChannel, NDSP_FORMAT_STEREO_PCM16);
+    }
     g_started = true;
     g_submitted = g_submitted + (uint32_t)frames;
     while (done < frames) {
@@ -155,7 +169,7 @@ void recomp3ds::audio_queue_samples(int16_t* samples, size_t sample_count) {
     }
 }
 
-size_t recomp3ds::audio_frames_remaining() {
+size_t recomp3ds::audio_frames_queued() {
     if (!g_ready) {
         return 0;
     }
@@ -173,13 +187,29 @@ size_t recomp3ds::audio_frames_remaining() {
             queued += pos < g_bufs[i].nsamples ? g_bufs[i].nsamples - pos : 0;
         }
     }
-    // Like the desktop: report one VI's worth less so the game keeps a margin.
-    size_t frames_per_vi = g_rate / 60;
-    return queued > frames_per_vi ? queued - frames_per_vi : 0;
+    return queued;
+}
+
+size_t recomp3ds::audio_frames_remaining() {
+    // Like the desktop: report a margin's worth less (one VI unless the game
+    // asks for more) so the game keeps that much in reserve. Buffers of
+    // asynchronous audio tasks still to run count as queued before the margin
+    // is taken (ultramodern::pending_audio_bytes): with the margin taken from
+    // the DSP's queue alone, Goemon's audio manager saw a full frame too much
+    // whenever the DSP held less than the margin, stayed at its smallest
+    // frame (720 of the 735 a frame plays) and the DSP ran dry every frame.
+    const size_t queued = audio_frames_queued() + ultramodern::pending_audio_bytes() / 4;
+    const size_t margin = (size_t)(g_rate / 60) * (size_t)g_margin_frames;
+    return queued > margin ? queued - margin : 0;
+}
+
+void recomp3ds::audio_set_margin_frames(int video_frames) {
+    g_margin_frames = video_frames < 0 ? 0 : video_frames;
 }
 
 recomp3ds::AudioCounters recomp3ds::audio_take_counters() {
-    AudioCounters c{ g_submitted, g_dropped, g_underruns, g_rate };
+    AudioCounters c{ g_submitted, g_dropped, g_underruns, g_rate, g_low_water };
+    g_low_water = 0xFFFFFFFFu;
     g_submitted = 0; g_dropped = 0; g_underruns = 0;
     return c;
 }

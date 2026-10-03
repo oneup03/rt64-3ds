@@ -19,6 +19,8 @@
 #include "recomp3ds.h"
 #include "recomp3ds_internal.h"
 #include "naudio_hle.h"
+#include "aspmain_hle.h"
+#include "audio_hle_diff.h"
 
 // libctru's default main stack is 32 KB; the runtime's start path and the
 // C++ library want more.
@@ -35,6 +37,7 @@ u64 g_ucode_ticks = 0;
 u32 g_ucode_tasks = 0;
 
 bool g_audio_hle = false;
+recomp3ds::AudioHle g_audio_hle_family = recomp3ds::AudioHle::Naudio;
 
 uint8_t* g_rdram = nullptr;
 // SLOW.TXT "<gfx ms> <audio ms>": pad every display list and audio task by
@@ -43,6 +46,12 @@ int g_slow_audio_ms = -1;
 
 RspExitReason timed_ucode(uint8_t* rdram, uint32_t ucode_addr) {
     g_rdram = rdram;
+    if (recomp3ds::audio_hle_capturing()) {
+        // AUDIO_CAPTURE.TXT: the task as it arrives, whichever code runs it.
+        OSTask task;
+        memcpy(&task, &dmem[0xFC0], sizeof(OSTask));
+        if (task.t.type == M_AUDTASK) recomp3ds::audio_hle_maybe_capture(rdram, task);
+    }
     u64 t0 = svcGetSystemTick();
     RspExitReason r = g_ucode_inner(rdram, ucode_addr);
     if (g_slow_audio_ms > 0) svcSleepThread((s64)g_slow_audio_ms * 1000000);
@@ -64,21 +73,22 @@ RspUcodeFunc* timed_get_ucode(const OSTask* task) {
     if (f == nullptr) {
         return nullptr;
     }
-    if (g_audio_hle) {
-        // The CPU interpreter replaces the game's (recompiled) microcode. In
-        // differential mode it still runs the original to check itself.
-        static RspUcodeFunc* game_ucode = nullptr;
-        if (game_ucode == nullptr) {
-            game_ucode = f;
-            char path[192];
-            snprintf(path, sizeof(path), "%s/AUDIO_DIFF.TXT", g_base_path);
-            snprintf(path, sizeof(path), "%s/AUDIO_CAPTURE.TXT", g_base_path);
-            if (FILE* c = fopen(path, "r")) {
-                int first = 0;
-                if (fscanf(c, "%d", &first) != 1) first = 0;   // the first task to capture
-                fclose(c);
-                recomp3ds_naudio_capture_dir(g_base_path, first);
-            }
+    // The first microcode the game hands over is its audio task's.
+    static RspUcodeFunc* game_ucode = nullptr;
+    if (game_ucode == nullptr) {
+        game_ucode = f;
+        char path[192];
+        snprintf(path, sizeof(path), "%s/AUDIO_CAPTURE.TXT", g_base_path);
+        if (FILE* c = fopen(path, "r")) {
+            int first = 0;
+            if (fscanf(c, "%d", &first) != 1) first = 0;   // the first task to capture
+            fclose(c);
+            recomp3ds::audio_hle_capture_dir(g_base_path, first);
+        }
+        if (g_audio_hle) {
+            // The CPU interpreter replaces the game's (recompiled) microcode. In
+            // differential mode it still runs the original to check itself.
+            const bool aspmain = g_audio_hle_family == recomp3ds::AudioHle::Aspmain;
             snprintf(path, sizeof(path), "%s/AUDIO_RSP.TXT", g_base_path);
             if (FILE* r = fopen(path, "r")) {
                 fclose(r);
@@ -89,17 +99,19 @@ RspUcodeFunc* timed_get_ucode(const OSTask* task) {
             if (g_audio_hle) {
                 if (FILE* d = fopen(path, "r")) {
                     fclose(d);
-                    recomp3ds::naudio_hle_set_reference(f);
-                    fprintf(stderr, "recomp3ds: audio HLE in differential mode (AUDIO_DIFF.TXT present)\n");
+                    if (aspmain) recomp3ds::aspmain_hle_set_reference(f);
+                    else recomp3ds::naudio_hle_set_reference(f);
+                    fprintf(stderr, "recomp3ds: audio HLE (%s) in differential mode (AUDIO_DIFF.TXT present)\n", aspmain ? "aspMain" : "naudio");
                 }
                 else {
-                    fprintf(stderr, "recomp3ds: audio task interpreted on the CPU (AUDIO_RSP.TXT selects the recompiled microcode)\n");
+                    fprintf(stderr, "recomp3ds: audio task interpreted on the CPU (%s; AUDIO_RSP.TXT selects the recompiled microcode)\n",
+                            aspmain ? "aspMain" : "naudio");
                 }
             }
         }
-        if (g_audio_hle && f == game_ucode) {
-            f = recomp3ds::naudio_hle_run;
-        }
+    }
+    if (g_audio_hle && f == game_ucode) {
+        f = g_audio_hle_family == recomp3ds::AudioHle::Aspmain ? recomp3ds::aspmain_hle_run : recomp3ds::naudio_hle_run;
     }
     if (g_ucode_inner != nullptr && g_ucode_inner != f) {
         return f;   // a second microcode: leave it untimed rather than mix them
@@ -153,6 +165,10 @@ ultramodern::renderer::WindowHandle create_window(void*) {
         for (;;) svcSleepThread(1000000000ll);    // the other path is already leaving
     }
     fflush(stderr);
+    // A frame capture still being written stops between two FS requests
+    // (its file stays incomplete): nothing of ours is in flight on the card
+    // when FS is torn down below.
+    rt64_3ds::capture_stop(1500);
     recomp3ds::log_flush();
     recomp3ds::loadmon_stop();
     recomp3ds::audio_shutdown();
@@ -278,13 +294,16 @@ void update_gfx_inner() {
             select_since = 0;
             fired = false;
         }
-        static int shown_state = 0, shown_shot = 0;
-        const int state = rt64_3ds::capture_state();
-        if (state == 2 && shown_state != 2) {
-            recomp3ds::screen_printf("\x1b[28;0H%-39s", "Capture saved: gfx_task.bin");
+        // The capture writer's news: saving, progress, saved, refused (one
+        // is still being written), failed or stalled.
+        static int shown_seq = 0, shown_shot = 0;
+        int seq = 0;
+        const char* capture_line = rt64_3ds::capture_message(&seq);
+        if (seq != shown_seq) {
+            shown_seq = seq;
+            recomp3ds::screen_printf("\x1b[28;0H%-39.39s", capture_line);
             gfxFlushBuffers();
         }
-        shown_state = state;
         const int shot = rt64_3ds::screenshot_state();
         if (shot >= 2 && shown_shot != shot) {
             char line[48];
@@ -302,6 +321,7 @@ void update_gfx_inner() {
         last_report = now;
     }
     else if (now - last_report >= SYSCLOCK_ARM11) {
+        const u64 interval = now - last_report;
         last_report = now;
         int busy0 = -1, busy2 = -1;
         recomp3ds::loadmon_sample(&busy0, &busy2);
@@ -348,24 +368,118 @@ void update_gfx_inner() {
         }
         // The audio interpreter's unknown commands and, with AUDIO_DIFF.TXT,
         // its mismatches against the recompiled microcode: shown when non-zero.
-        char hle_stats[64] = "";
+        char hle_stats[96] = "";
         {
-            const recomp3ds::NaudioHleStats& hs = recomp3ds::naudio_hle_stats();
+            const recomp3ds::AudioHleStats& hs = g_audio_hle_family == recomp3ds::AudioHle::Aspmain ? recomp3ds::aspmain_hle_stats()
+                                                                                                    : recomp3ds::naudio_hle_stats();
             if (hs.unknown_opcodes != 0 || hs.diff_mismatches != 0)
                 snprintf(hle_stats, sizeof(hle_stats), " audio-hle unknown %lu mismatches %lu/%lu", (unsigned long)hs.unknown_opcodes,
                          (unsigned long)hs.diff_mismatches, (unsigned long)hs.diff_tasks);
+            if (hs.inexact != 0) {
+                const size_t used = strlen(hle_stats);
+                snprintf(hle_stats + used, sizeof(hle_stats) - used, " inexact %lu", (unsigned long)hs.inexact);
+            }
         }
-        char want_fps[24] = "";
+        // The audio interpreter's time by command (aspMain), ms in the
+        // interval: which of its loops a faster interpreter must target.
+        std::string hle_ms;
+        char hle_row[48] = "";
+        if (g_audio_hle && g_audio_hle_family == recomp3ds::AudioHle::Aspmain) {
+            static const char* const kOps[16] = { "nop", "adpcm", "clear", "envmix", "loadbuf", "resamp", "savebuf", "segment",
+                                                  "setbuff", "setvol", "dmemmv", "loadadp", "mixer", "interlv", "polef", "setloop" };
+            static uint32_t prev_ticks[16] = {};
+            const recomp3ds::AudioHleStats& hs = recomp3ds::aspmain_hle_stats();
+            unsigned ms[16], order[16];
+            for (int i = 0; i < 16; i++) {
+                ms[i] = (unsigned)((uint64_t)(uint32_t)(hs.op_ticks[i] - prev_ticks[i]) * 1000 / SYSCLOCK_ARM11);
+                prev_ticks[i] = hs.op_ticks[i];
+                order[i] = (unsigned)i;
+            }
+            for (int i = 1; i < 16; i++)      // by time, largest first
+                for (int j = i; j > 0 && ms[order[j]] > ms[order[j - 1]]; j--) { const unsigned t = order[j]; order[j] = order[j - 1]; order[j - 1] = t; }
+            size_t r = 0;
+            for (int i = 0; i < 16 && ms[order[i]] > 0; i++) {
+                hle_ms += (hle_ms.empty() ? " hle ms " : " ") + std::string(kOps[order[i]]) + " " + std::to_string(ms[order[i]]);
+                if (i < 5 && r + 10 < sizeof(hle_row)) r += (size_t)snprintf(hle_row + r, sizeof(hle_row) - r, "%s%.2s%u", r ? " " : "hle ", kOps[order[i]], ms[order[i]]);
+            }
+        }
+        // Each game thread's share of the interval and its wake-ups a second
+        // (ultramodern's accounting at the thread switches): how much of
+        // core 0 is the game's logic, its audio synthesizer, its scheduler;
+        // what loadmon's core 0 figure has beyond the total is the host's
+        // own threads and the switches themselves.
+        std::string thread_stats;
+        char thread_row[48] = "";
+        {
+            ultramodern::ThreadLoad loads[16];
+            static ultramodern::ThreadLoad prev[16];
+            static size_t prev_n = 0;
+            const size_t n = ultramodern::get_thread_loads(loads, 16);
+            const u64 span = interval != 0 ? interval : 1;
+            unsigned total_pct = 0, total_wakes = 0;
+            size_t r = 0;
+            for (size_t i = 0; i < n; i++) {
+                uint32_t ticks = loads[i].ticks, wakeups = loads[i].wakeups;
+                for (size_t p = 0; p < prev_n; p++) {
+                    if (prev[p].thread == loads[i].thread) { ticks -= prev[p].ticks; wakeups -= prev[p].wakeups; break; }
+                }
+                const unsigned pct = (unsigned)((u64)ticks * 100 / span);
+                const unsigned wakes = (unsigned)((u64)wakeups * SYSCLOCK_ARM11 / span);
+                total_pct += pct;
+                total_wakes += wakes;
+                if (pct == 0 && wakes == 0) continue;    // idle: left out
+                std::string name = std::to_string(loads[i].thread);
+                if (g_rdram != nullptr && g_desc != nullptr && g_desc->get_game_thread_name != nullptr) {
+                    name = g_desc->get_game_thread_name(reinterpret_cast<const OSThread*>(g_rdram + (loads[i].thread & 0x7FFFFFFFu)));
+                    if (name.rfind("[Game] ", 0) == 0) name.erase(0, 7);
+                }
+                thread_stats += (thread_stats.empty() ? " threads " : ", ") + name + " " + std::to_string(pct) + "% (" + std::to_string(wakes) + "/s)";
+                if (r + 12 < sizeof(thread_row)) r += (size_t)snprintf(thread_row + r, sizeof(thread_row) - r, "%s%.5s %u", r ? " " : "", name.c_str(), pct);
+            }
+            if (n > 0) thread_stats += " = " + std::to_string(total_pct) + "%, " + std::to_string(total_wakes) + " wakes/s";
+            if (r + 10 < sizeof(thread_row)) snprintf(thread_row + r, sizeof(thread_row) - r, " sw%u", total_wakes);
+            memcpy(prev, loads, n * sizeof(loads[0]));
+            prev_n = n;
+        }
+        char want_fps[240] = "";
         if (st.game_fps > 0) snprintf(want_fps, sizeof(want_fps), ", game asks %d", st.game_fps);
-        fprintf(stderr, "stats: %d dl/s%s (late %d, max gap %.0f ms) core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu heap %lu KB%s%s%s\n",
-                st.dl_per_sec, want_fps, st.late_frames, st.max_gap_ms, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_remaining(),
-                (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped,
-                (unsigned long)(mallinfo().arena / 1024), hle_stats, rom_stats, game_stats);
+        if (st.dl_skipped_per_sec > 0) {
+            // The frame cap passed over some: how many were drawn.
+            const size_t used = strlen(want_fps);
+            snprintf(want_fps + used, sizeof(want_fps) - used, ", %d drawn, %d passed over", st.dl_per_sec - st.dl_skipped_per_sec, st.dl_skipped_per_sec);
+        }
+        if (rt64_3ds::settings().frame_cap == 2 && g_desc != nullptr && g_desc->render.frame_interpolation) {
+            // Frame interpolation: frames shown, the in-betweens among them,
+            // and the lists the game asked 30 for that got none.
+            const size_t used = strlen(want_fps);
+            snprintf(want_fps + used, sizeof(want_fps) - used, ", %d shown (%d in-between, %d without%s%s)", st.presented_per_sec, st.inbetween_per_sec,
+                     st.inbetween_dropped_per_sec, st.inbetween_reasons[0] ? ": " : "", st.inbetween_reasons);
+        }
+        fprintf(stderr, "stats: %d dl/s%s (late %d, max gap %.0f ms) core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu low water %lu heap %lu KB%s%s%s%s%s\n",
+                st.dl_per_sec, want_fps, st.late_frames, st.max_gap_ms, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_queued(),
+                (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped, (unsigned long)(ac.low_water == 0xFFFFFFFFu ? 0u : ac.low_water),
+                (unsigned long)(mallinfo().arena / 1024), hle_stats, hle_ms.c_str(), rom_stats, game_stats, thread_stats.c_str());
         // One 40-column row: the audio microcode's ms per second last.
         char line[64];
-        if (busy2 >= 0) snprintf(line, sizeof(line), "%3d fps  cpu0 %3d%%  cpu2 %3d%%  audio %3u", st.dl_per_sec, busy0, busy2, ucode_ms);
-        else snprintf(line, sizeof(line), "%3d fps  cpu0 %3d%%  audio %3u", st.dl_per_sec, busy0, ucode_ms);   // an Old 3DS: no core 2
+        // Frames drawn (the frame cap passes some over; frame interpolation
+        // adds its in-betweens).
+        const int shown_fps = rt64_3ds::settings().frame_cap == 2 && g_desc != nullptr && g_desc->render.frame_interpolation
+                                  ? st.presented_per_sec : st.dl_per_sec - st.dl_skipped_per_sec;
+        // 39 columns: the audio interpreter's ms a second last, never cut.
+        if (busy2 >= 0) snprintf(line, sizeof(line), "%3d fps cpu0 %3d%% cpu2 %3d%% aud %4ums", shown_fps, busy0, busy2, ucode_ms);
+        else snprintf(line, sizeof(line), "%3d fps cpu0 %3d%% aud %4ums", shown_fps, busy0, ucode_ms);   // an Old 3DS: no core 2
         recomp3ds::screen_printf("\x1b[2;0H%-39.39s\n", line);
+        recomp3ds::screen_printf("\x1b[3;0H%-39.39s", thread_row);   // the game threads' shares, wake-ups a second last
+        // The audio pipeline's counters: tasks run a second, frames the game
+        // handed over a second against the rate, frames the DSP still holds,
+        // underruns and frames dropped for a full ring.
+        // lw: the fewest frames the DSP held when a buffer arrived (near 0:
+        // it ran short); q: frames queued now; ur: underruns caught.
+        const unsigned long low_water = ac.low_water == 0xFFFFFFFFu ? 0ul : (unsigned long)ac.low_water;
+        snprintf(line, sizeof(line), "aud %ut in %lu q %zu lw %lu ur %lu", ucode_tasks, (unsigned long)ac.submitted,
+                 recomp3ds::audio_frames_queued(), low_water, (unsigned long)ac.underruns);
+        recomp3ds::screen_printf("\x1b[27;0H%-39.39s", line);
+        recomp3ds::screen_printf("\x1b[29;0H%-39.39s", hle_row);   // the interpreter's ms a second by command
     }
     // Watchdog: a frame that stays in the replay or the GPU wait for 4 s is
     // a hung GPU; say which draw it was on, once.
@@ -578,6 +692,7 @@ int recomp3ds::run(const GameDesc& desc) {
     log_memory("boot");
     // Before the settings: a loaded setting's on_change may pick another map.
     recomp3ds::input_set_map(desc.button_map, desc.button_map_count);
+    recomp3ds::input_set_controller_pak(desc.controller_pak);
     recomp3ds::settings_menu_init(g_base_path, desc);
     {
         // The ROM in memory, or read from the SD card as the game needs it
@@ -613,6 +728,7 @@ int recomp3ds::run(const GameDesc& desc) {
     }
     recomp::register_config_path(std::filesystem::path(g_base_path));
 
+    recomp3ds::audio_set_margin_frames(desc.audio_margin_frames);
     recomp3ds::audio_init();
     rt64_3ds::set_render_desc(desc.render);
     rt64_3ds::set_data_dir(g_base_path);   // the renderer's debug switches and captures
@@ -624,6 +740,7 @@ int recomp3ds::run(const GameDesc& desc) {
         recomp::GameEntry entry = desc.entry;
         g_game_on_init = entry.on_init_callback;
         entry.on_init_callback = [](uint8_t* rdram, recomp_context* ctx) {
+            g_rdram = rdram;
             recomp3ds::settings_apply_mods();
             if (g_game_on_init != nullptr) g_game_on_init(rdram, ctx);
         };
@@ -671,6 +788,8 @@ int recomp3ds::run(const GameDesc& desc) {
     // function and this trampoline runs it under the tick counter.
     g_game_get_ucode = desc.rsp.get_rsp_microcode;
     g_audio_hle = desc.audio_hle;
+    ultramodern::set_async_audio_tasks(desc.audio_async);
+    g_audio_hle_family = desc.audio_hle_family;
     recomp3ds::naudio_hle_set_variant(desc.audio_hle_variant);
     if (g_game_get_ucode != nullptr) {
         cfg.rsp_callbacks.get_rsp_microcode = timed_get_ucode;

@@ -26,6 +26,11 @@ public:
     BoundTex get(const TexDesc& d, const uint16_t* tlut);
     void end_frame();       // ages entries, frees retired textures
     uint32_t uploads_this_frame() const { return uploads_; }
+    // RenderDesc::intensity_textures16: I and IA textures (and CI ones with
+    // an IA16 palette) as LA8, 16 bits a texel, instead of RGBA8. Set once,
+    // before the first texture.
+    void set_compact_intensity(bool on) { compact_ = on; }
+    bool compact_intensity() const { return compact_; }
     uint32_t live() const { return live_; }
     uint32_t bytes() const { return bytes_; }
 
@@ -34,6 +39,7 @@ private:
     Impl* impl_;
     const uint8_t* rdram_;
     uint32_t uploads_ = 0, live_ = 0, bytes_ = 0;
+    bool compact_ = false;
 };
 
 }   // namespace rt64_3ds

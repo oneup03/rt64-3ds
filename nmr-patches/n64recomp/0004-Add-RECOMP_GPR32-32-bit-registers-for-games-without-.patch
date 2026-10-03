@@ -1,0 +1,123 @@
+From efa8dcdb10af0459b96474e185fa6c3fb78659b9 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Fri, 2 Oct 2026 18:42:39 -0500
+Subject: [PATCH] Add RECOMP_GPR32: 32-bit registers for games without 64-bit
+ register code
+
+MIPS III registers are 64 bits wide and every 32-bit result is
+sign-extended into them, which the generated code reproduces with a
+64-bit gpr. A game whose recompiled code has no 64-bit register
+instruction (doubleword arithmetic and shifts, ld/sd/ldl/ldr/sdl/sdr of a
+register, dmtc1/dmfc1) only ever holds sign-extended 32-bit values, so
+its registers can be 32 bits wide and every macro sees the same numbers.
+On a 32-bit host (the 3DS's ARM11) that halves the context and turns
+each register operation into one instruction: Goemon's generated code
+compiles to 15-25% fewer ARM instructions.
+
+With RECOMP_GPR32: gpr is uint32_t, SIGNED casts to int32_t, the memory
+macros take an N64 address to its rdram offset with 32-bit arithmetic
+(RECOMP_RDRAM_OFFSET), SD casts its value to uint64_t so the FPU's
+doubles still store both halves, and the ldl/ldr/sdl/sdr helpers, which
+hold a doubleword in a register, are left out so a use fails to compile.
+Not for a host that loads mods: the context layout is part of their ABI.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ include/recomp.h | 40 +++++++++++++++++++++++++++++++++-------
+ 1 file changed, 33 insertions(+), 7 deletions(-)
+
+diff --git a/include/recomp.h b/include/recomp.h
+index fb05ac5..8d358ea 100644
+--- a/include/recomp.h
++++ b/include/recomp.h
+@@ -107,7 +107,21 @@ static inline void DDIVU(uint64_t a, uint64_t b, uint64_t* quot, uint64_t* rem)
+     *rem = a % b;
+ }
+ 
++// The register type. MIPS III registers are 64 bits wide, and the recompiled
++// code sign-extends every 32-bit result into them as the CPU does. A game whose
++// recompiled code has no 64-bit register instruction (doubleword arithmetic,
++// shifts, loads or stores of a register, dmtc1/dmfc1) only ever holds
++// sign-extended 32-bit values in them, so with RECOMP_GPR32 the registers are
++// 32 bits wide and the macros below see the same numbers; on a 32-bit host
++// (the 3DS's ARM11) that halves the context and makes each register operation
++// one instruction instead of two. Check the generated code before enabling it
++// (rt64-3ds: rt64_3ds_check_gpr32), and never on a host that loads mods: the
++// context layout is part of their ABI.
++#ifdef RECOMP_GPR32
++typedef uint32_t gpr;
++#else
+ typedef uint64_t gpr;
++#endif
+ 
+ // RDRAM is shared with host threads (DMA, the RSP task, the VI and the
+ // renderer). With RECOMP_VOLATILE_RDRAM every access is a real memory
+@@ -120,8 +134,18 @@ typedef uint64_t gpr;
+ #define RECOMP_RDRAM_V
+ #endif
+ 
++#ifdef RECOMP_GPR32
++#define SIGNED(val) \
++    ((int32_t)(val))
++// An N64 address as its offset into rdram (32-bit wrap: 0x80xxxxxx -> xxxxxx).
++#define RECOMP_RDRAM_OFFSET(addr) \
++    ((uint32_t)(addr) - 0x80000000u)
++#else
+ #define SIGNED(val) \
+     ((int64_t)(val))
++#define RECOMP_RDRAM_OFFSET(addr) \
++    ((addr) - 0xFFFFFFFF80000000)
++#endif
+ 
+ #define ADD32(a, b) \
+     ((gpr)(int32_t)((a) + (b)))
+@@ -130,23 +154,23 @@ typedef uint64_t gpr;
+     ((gpr)(int32_t)((a) - (b)))
+ 
+ #define MEM_W(offset, reg) \
+-    (*(RECOMP_RDRAM_V int32_t*)(rdram + ((((reg) + (offset))) - 0xFFFFFFFF80000000)))
++    (*(RECOMP_RDRAM_V int32_t*)(rdram + RECOMP_RDRAM_OFFSET(((reg) + (offset)))))
+ 
+ #define MEM_H(offset, reg) \
+-    (*(RECOMP_RDRAM_V int16_t*)(rdram + ((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000)))
++    (*(RECOMP_RDRAM_V int16_t*)(rdram + RECOMP_RDRAM_OFFSET(((reg) + (offset)) ^ 2)))
+ 
+ #define MEM_B(offset, reg) \
+-    (*(RECOMP_RDRAM_V int8_t*)(rdram + ((((reg) + (offset)) ^ 3) - 0xFFFFFFFF80000000)))
++    (*(RECOMP_RDRAM_V int8_t*)(rdram + RECOMP_RDRAM_OFFSET(((reg) + (offset)) ^ 3)))
+ 
+ #define MEM_HU(offset, reg) \
+-    (*(RECOMP_RDRAM_V uint16_t*)(rdram + ((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000)))
++    (*(RECOMP_RDRAM_V uint16_t*)(rdram + RECOMP_RDRAM_OFFSET(((reg) + (offset)) ^ 2)))
+ 
+ #define MEM_BU(offset, reg) \
+-    (*(RECOMP_RDRAM_V uint8_t*)(rdram + ((((reg) + (offset)) ^ 3) - 0xFFFFFFFF80000000)))
++    (*(RECOMP_RDRAM_V uint8_t*)(rdram + RECOMP_RDRAM_OFFSET(((reg) + (offset)) ^ 3)))
+ 
+ #define SD(val, offset, reg) { \
+-    *(RECOMP_RDRAM_V uint32_t*)(rdram + ((((reg) + (offset) + 4)) - 0xFFFFFFFF80000000)) = (uint32_t)((gpr)(val) >> 0); \
+-    *(RECOMP_RDRAM_V uint32_t*)(rdram + ((((reg) + (offset) + 0)) - 0xFFFFFFFF80000000)) = (uint32_t)((gpr)(val) >> 32); \
++    *(RECOMP_RDRAM_V uint32_t*)(rdram + RECOMP_RDRAM_OFFSET(((reg) + (offset) + 4))) = (uint32_t)((uint64_t)(val) >> 0); \
++    *(RECOMP_RDRAM_V uint32_t*)(rdram + RECOMP_RDRAM_OFFSET(((reg) + (offset) + 0))) = (uint32_t)((uint64_t)(val) >> 32); \
+ }
+ 
+ static inline uint64_t load_doubleword(uint8_t* rdram, gpr reg, gpr offset) {
+@@ -224,6 +248,7 @@ static inline void do_swr(uint8_t* rdram, gpr offset, gpr reg, gpr val) {
+     MEM_W(0, word_address) = masked_initial_value | shifted_input_value;
+ }
+ 
++#ifndef RECOMP_GPR32   // ldl/ldr/sdl/sdr hold doublewords in registers
+ static inline gpr do_ldl(uint8_t* rdram, gpr initial_value, gpr offset, gpr reg) {
+     // Calculate the overall address
+     gpr address = (offset + reg);
+@@ -297,6 +322,7 @@ static inline void do_sdr(uint8_t* rdram, gpr offset, gpr reg, gpr val) {
+     MEM_W(0, dword_address + 4) = lo;
+     MEM_W(0, dword_address + 0) = hi;
+ }
++#endif   // RECOMP_GPR32
+ 
+ static inline uint32_t get_cop1_cs() {
+     uint32_t rounding_mode = 0;
+-- 
+2.53.0
+

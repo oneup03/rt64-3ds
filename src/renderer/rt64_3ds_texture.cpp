@@ -96,9 +96,11 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
         h *= 0xFF51AFD7ED558CCDull;
         return h ^ (h >> 33);
     };
+    // The rows really read from RDRAM (TMEM may wrap: TexDesc::wrap_rows).
+    const uint32_t rows_read = (d.wrap_rows != 0 && d.wrap_rows < d.height) ? d.wrap_rows : d.height;
     uint32_t fp = 2166136261u;
     for (uint32_t j = 0; j < 4; j++) {
-        const uint32_t row = d.addr + (2 * j + 1) * d.height / 8 * d.pitch;
+        const uint32_t row = d.addr + (2 * j + 1) * rows_read / 8 * d.pitch;
         for (uint32_t i = 0; i < 4; i++) {
             fp ^= rw(rdram_, row + (2 * i + 1) * row_bytes / 8);
             fp *= 16777619u;
@@ -108,6 +110,7 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
     key = mix(key, (uint64_t)d.fmt | ((uint64_t)d.siz << 4) | ((uint64_t)d.width << 8) | ((uint64_t)d.height << 24) | ((uint64_t)d.pitch << 40));
     key = mix(key, (uint64_t)d.tlut_hash | ((uint64_t)d.palette << 32) | ((uint64_t)d.nibble << 40) | ((uint64_t)d.block << 48));
     if (d.block) key = mix(key, (uint64_t)d.dxt | ((uint64_t)d.load_word << 32));
+    if (d.wrap_rows != 0) key = mix(key, d.wrap_rows);
     key = mix(key, fp);
     auto content_hash = [&]() {
         // A fixed sample: up to 8 rows spread over the texture, up to 8 words
@@ -115,11 +118,11 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
         // reused memory or animated in place changes far more than that;
         // hashing every fourth word cost up to ~9 ms a frame on the console.
         uint32_t h = 2166136261u;
-        const uint32_t rows = d.height < 8 ? d.height : 8;
+        const uint32_t rows = rows_read < 8 ? rows_read : 8;
         const uint32_t words = (row_bytes + 3) / 4;
         const uint32_t cols = words < 8 ? words : 8;
         for (uint32_t i = 0; i < rows; i++) {
-            uint32_t y = rows > 1 ? i * (d.height - 1) / (rows - 1) : 0;
+            uint32_t y = rows > 1 ? i * (rows_read - 1) / (rows - 1) : 0;
             uint32_t a = (d.addr + y * d.pitch) & ~3u;
             for (uint32_t j = 0; j < cols; j++) {
                 uint32_t w = cols > 1 ? j * (words - 1) / (cols - 1) : 0;
@@ -160,13 +163,19 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
     // Decode.
     uint32_t potw = pot(d.width), poth = pot(d.height);
     bool wide = (d.fmt == 0 && d.siz == 3) || d.fmt == 3 || d.fmt == 4 || (d.fmt == 2 && d.tlut_mode == 3);
-    GPU_TEXCOLOR fmt = wide ? GPU_RGBA8 : GPU_RGBA5551;
+    // Intensity texels (r = g = b from the decoder) as LA8: L in the high
+    // byte, A in the low one; the PICA samples (L, L, L, A), exactly what
+    // RGBA8 held (set_compact_intensity).
+    const bool la8 = compact_ && ((d.fmt == 3 && d.siz <= 2) || (d.fmt == 4 && d.siz <= 1) || (d.fmt == 2 && d.tlut_mode == 3 && d.siz <= 1));
+    if (la8) wide = false;
+    GPU_TEXCOLOR fmt = wide ? GPU_RGBA8 : la8 ? GPU_LA8 : GPU_RGBA5551;
     uint32_t texel_bytes = wide ? 4 : 2;
     uint32_t bytes = potw * poth * texel_bytes;
     if (wide) impl_->stage32.assign(potw * poth, 0); else impl_->stage16.assign(potw * poth, 0);
 
     decode_texels(rdram_, d, tlut, [&](uint32_t xt, uint32_t y, bool have16, uint16_t p16, uint32_t r, uint32_t g, uint32_t bl, uint32_t a) {
         if (wide) impl_->stage32[y * potw + xt] = have16 ? rgba5551_to_rgba8(p16) : ((r << 24) | (g << 16) | (bl << 8) | a);
+        else if (la8) impl_->stage16[y * potw + xt] = have16 ? (uint16_t)0xFFFF : (uint16_t)((r << 8) | a);
         else impl_->stage16[y * potw + xt] = have16 ? p16 : ia_to_rgba5551((uint8_t)r, (uint8_t)a);
     });
     for (uint32_t y = 0; y < d.height; y++) {
@@ -203,6 +212,7 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut) {
             for (uint32_t y = 0; y < d.height; y++) for (uint32_t x = 0; x < d.width; x++) {
                 uint8_t px[3];
                 if (wide) { uint32_t v = impl_->stage32[y * potw + x]; px[0] = v >> 24; px[1] = v >> 16; px[2] = v >> 8; }
+                else if (la8) { uint16_t v = impl_->stage16[y * potw + x]; px[0] = px[1] = px[2] = (uint8_t)(v >> 8); }
                 else { uint16_t v = impl_->stage16[y * potw + x]; px[0] = ((v >> 11) & 31) * 8; px[1] = ((v >> 6) & 31) * 8; px[2] = ((v >> 1) & 31) * 8; }
                 fwrite(px, 1, 3, f);
             }

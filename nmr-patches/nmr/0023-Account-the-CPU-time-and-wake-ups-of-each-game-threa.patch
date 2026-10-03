@@ -1,0 +1,191 @@
+From c9b44e47414b449f19d74af8cf8271e99409bc64 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Fri, 2 Oct 2026 19:04:33 -0500
+Subject: [PATCH] Account the CPU time and wake-ups of each game thread
+
+A host that wants to know where the game's core goes (its logic, its
+audio synthesizer, its scheduler) can now read it per N64 thread:
+ultramodern::get_thread_loads returns, for every live thread, the host
+ticks it has run for and how often it was woken. The counters are kept
+in a slot per thread and written only by that thread, at its wake-up in
+wait_for_resumed and before its next wait or its end, so the switch path
+takes no lock; the slot table is locked for allocation (osCreateThread),
+release (the cleaner) and reading. Both counters wrap at 32 bits, which
+on the 3DS (svcGetSystemTick) is 16 s: a reader keeps its previous
+reading and subtracts. Elsewhere the ticks are microseconds.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../include/ultramodern/ultramodern.hpp       | 18 ++++
+ ultramodern/src/threads.cpp                   | 84 +++++++++++++++++++
+ 2 files changed, 102 insertions(+)
+
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index c78e9e8..e38a509 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -26,6 +26,10 @@ struct UltraThreadContext {
+     ultramodern::HostThread host_thread;
+     moodycamel::LightweightSemaphore running;
+     moodycamel::LightweightSemaphore initialized;
++    // CPU accounting (ultramodern::get_thread_loads): the thread's slot and
++    // the host tick at which it last started running (0: not running).
++    int32_t load_slot = -1;
++    uint32_t load_since = 0;
+ };
+ 
+ namespace ultramodern {
+@@ -86,6 +90,20 @@ void schedule_running_thread(RDRAM_ARG PTR(OSThread) t);
+ void cleanup_thread(UltraThreadContext* thread_context);
+ struct thread_terminated : std::exception {};
+ 
++// CPU accounting per game thread: the host ticks each thread has run for and
++// the times it was woken, for a host's statistics (which of the game's
++// threads the CPU goes to). Both counters wrap at 32 bits: a reader keeps its
++// previous reading and subtracts.
++struct ThreadLoad {
++    PTR(OSThread) thread;
++    uint32_t ticks;
++    uint32_t wakeups;
++};
++// Copies the known threads' totals into `out` (up to `max`); returns how many.
++size_t get_thread_loads(ThreadLoad* out, size_t max);
++// ThreadLoad::ticks per second.
++uint32_t thread_load_tick_rate();
++
+ enum class ThreadPriority {
+     Low,
+     Normal,
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index 36c7b5a..45eb587 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -1,5 +1,10 @@
+ #include <cstdio>
+ #include <thread>
++#include <chrono>
++#include <mutex>
++#ifdef __3DS__
++#include <3ds.h>
++#endif
+ #include <cassert>
+ #include <string>
+ 
+@@ -34,6 +39,79 @@ thread_local bool is_entrypoint_thread = false;
+ thread_local bool is_game_thread = false;
+ thread_local PTR(OSThread) thread_self = NULLPTR;
+ 
++// CPU accounting (ultramodern::get_thread_loads): a slot per game thread,
++// its counters written only by that thread, between its wake-up and its
++// next wait, so no lock sits on the switch path; the slot table itself is
++// locked for allocation and reading.
++namespace {
++constexpr size_t kLoadSlots = 32;
++struct LoadSlot {
++    PTR(OSThread) thread = NULLPTR;
++    uint32_t ticks = 0;
++    uint32_t wakeups = 0;
++    bool used = false;
++};
++LoadSlot load_slots[kLoadSlots];
++std::mutex load_slots_mutex;
++
++uint32_t load_now() {
++#ifdef __3DS__
++    return (uint32_t)svcGetSystemTick();
++#else
++    return (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++#endif
++}
++
++int32_t load_slot_alloc(PTR(OSThread) t) {
++    std::lock_guard lock{ load_slots_mutex };
++    for (size_t i = 0; i < kLoadSlots; i++) {
++        if (!load_slots[i].used) {
++            load_slots[i] = LoadSlot{ t, 0, 0, true };
++            return (int32_t)i;
++        }
++    }
++    return -1;
++}
++
++void load_slot_free(int32_t slot) {
++    if (slot < 0) return;
++    std::lock_guard lock{ load_slots_mutex };
++    load_slots[slot].used = false;
++}
++
++// The thread was woken and runs from now on.
++void load_start(UltraThreadContext* c) {
++    if (c->load_slot < 0) return;
++    load_slots[c->load_slot].wakeups++;
++    uint32_t now = load_now();
++    c->load_since = now != 0 ? now : 1;
++}
++
++// The thread stops running: it is about to wait, or it ends.
++void load_stop(UltraThreadContext* c) {
++    if (c->load_slot < 0 || c->load_since == 0) return;
++    load_slots[c->load_slot].ticks += load_now() - c->load_since;
++    c->load_since = 0;
++}
++}   // namespace
++
++size_t ultramodern::get_thread_loads(ThreadLoad* out, size_t max) {
++    std::lock_guard lock{ load_slots_mutex };
++    size_t n = 0;
++    for (size_t i = 0; i < kLoadSlots && n < max; i++) {
++        if (load_slots[i].used) out[n++] = ThreadLoad{ load_slots[i].thread, load_slots[i].ticks, load_slots[i].wakeups };
++    }
++    return n;
++}
++
++uint32_t ultramodern::thread_load_tick_rate() {
++#ifdef __3DS__
++    return SYSCLOCK_ARM11;
++#else
++    return 1000000;
++#endif
++}
++
+ void ultramodern::set_entrypoint_thread() {
+     ::is_game_thread = true;
+     ::is_entrypoint_thread = true;
+@@ -161,7 +239,9 @@ void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
+ #endif
+ 
+ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
++    load_stop(thread_context);
+     thread_context->running.wait();
++    load_start(thread_context);
+     // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
+     // This will trigger thread cleanup instead.
+     if (TO_PTR(OSThread, ultramodern::this_thread())->context != thread_context) {
+@@ -230,6 +310,8 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
+         debug_printf("[Thread] Thread destroyed before being started: %d\n", self->id);
+     }
+ 
++    load_stop(thread_context);
++
+     // Check if the thread hasn't been destroyed or replaced. If so, then the thread terminated or destroyed itself,
+     // so mark this thread as destroyed and run the next queued thread.
+     if (self->context == thread_context) {
+@@ -273,6 +355,7 @@ extern "C" void osCreateThread(RDRAM_ARG PTR(OSThread) t_, OSId id, PTR(thread_f
+     // Pass the context as an argument to the thread function to ensure that it can't get cleared before the thread captures its value.
+     UltraThreadContext* context = new UltraThreadContext{};
+     t->context = context;
++    context->load_slot = load_slot_alloc(t_);
+     context->host_thread = ultramodern::HostThread{ultramodern::HostThreadKind::Game, [=]() {
+         _thread_func(PASS_RDRAM t_, entrypoint, arg, context);
+     }};
+@@ -365,6 +448,7 @@ void thread_cleaner_func() {
+             debug_printf("[Cleanup] Deleting thread context %p\n", to_delete);
+ 
+             to_delete->host_thread.join();
++            load_slot_free(to_delete->load_slot);
+             delete to_delete;
+         }
+     }
+-- 
+2.53.0
+

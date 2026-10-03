@@ -29,6 +29,53 @@ volatile bool g_cstick_buttons = true;
 volatile bool g_cstick_up = true;       // C-Stick up presses C-Up (settings menu)
 volatile float g_stick_dz = 0.05f, g_cstick_dz = 0.20f;
 
+// GameDesc::cstick_camera_*: the C-Stick holds these buttons and repeats a C
+// press while it points a way (0: the plain C buttons). The pulse state lives
+// on the game thread (input_get).
+struct CstickCamera { uint16_t hold, lead_ms, press_ms, period_ms; };
+std::atomic<uint64_t> g_cam_cfg{ 0 };
+uint16_t g_cam_dir = 0;          // the C button being pulsed (0: stick centred)
+uint64_t g_cam_held_since = 0;   // ms: when the hold buttons went down
+uint64_t g_cam_dir_since = 0;    // ms: when this direction's presses start
+
+CstickCamera cam_cfg() {
+    const uint64_t v = g_cam_cfg.load();
+    return CstickCamera{ uint16_t(v), uint16_t(v >> 16), uint16_t(v >> 32), uint16_t(v >> 48) };
+}
+
+// The buttons the C-Stick presses in camera mode: the hold buttons while it
+// points a way, and that way's C button for press_ms of every period_ms,
+// starting lead_ms after the hold buttons (the game must see those first:
+// Goemon ignores a C press that comes with R in the same frame).
+uint16_t cstick_camera(const CstickCamera& c, float cx, float cy) {
+    uint16_t dir = 0;
+    if (fabsf(cx) >= fabsf(cy)) {
+        if (cx < -CSTICK_BUTTON) dir = N64_CLEFT;
+        else if (cx > CSTICK_BUTTON) dir = N64_CRIGHT;
+    }
+    else {
+        if (cy > CSTICK_BUTTON && g_cstick_up) dir = N64_CUP;
+        else if (cy < -CSTICK_BUTTON) dir = N64_CDOWN;
+    }
+    if (dir == 0) { g_cam_dir = 0; return 0; }
+    const uint64_t now = recomp3ds::wall_ms();
+    if (g_cam_dir == 0) {
+        g_cam_held_since = now;
+        g_cam_dir_since = now + c.lead_ms;
+    }
+    else if (dir != g_cam_dir) {
+        // A new way while the hold buttons are down: its presses start now
+        // (or once the lead is over).
+        const uint64_t lead_end = g_cam_held_since + c.lead_ms;
+        g_cam_dir_since = now > lead_end ? now : lead_end;
+    }
+    g_cam_dir = dir;
+    uint16_t b = c.hold;
+    const uint32_t period = c.period_ms > c.press_ms ? c.period_ms : (uint32_t)c.press_ms + 1;
+    if (now >= g_cam_dir_since && (now - g_cam_dir_since) % period < c.press_ms) b |= dir;
+    return b;
+}
+
 // Radial deadzone over the stick's raw counts, the rest of the range scaled
 // back to 0..1 so movement still starts at zero and still reaches full.
 void stick_value(const circlePosition& p, float dz, float* x, float* y) {
@@ -58,6 +105,9 @@ void recomp3ds::input_set_map(const ButtonMap* map, size_t count) {
 }
 
 void recomp3ds::input_set_cstick_buttons(bool on) { g_cstick_buttons = on; }
+void recomp3ds::input_set_cstick_camera(uint16_t hold, uint16_t lead_ms, uint16_t press_ms, uint16_t period_ms) {
+    g_cam_cfg.store(uint64_t(hold) | (uint64_t(lead_ms) << 16) | (uint64_t(press_ms) << 32) | (uint64_t(period_ms) << 48));
+}
 void recomp3ds::input_set_cstick_up(bool on) { g_cstick_up = on; }
 
 // Motion (gyro aiming), through JibbSmart's GamepadMotionHelpers (MIT, as
@@ -200,10 +250,17 @@ bool recomp3ds::input_get(int controller_num, uint16_t* buttons, float* x, float
     if (g_cstick_buttons) {
         float cx, cy;
         stick_value(g_cstick, g_cstick_dz, &cx, &cy);
-        if (cy > CSTICK_BUTTON && g_cstick_up) b |= N64_CUP;
-        if (cy < -CSTICK_BUTTON) b |= N64_CDOWN;
-        if (cx < -CSTICK_BUTTON) b |= N64_CLEFT;
-        if (cx > CSTICK_BUTTON) b |= N64_CRIGHT;
+        const CstickCamera cam = cam_cfg();
+        if (cam.hold != 0) {
+            b |= cstick_camera(cam, cx, cy);
+        }
+        else {
+            g_cam_dir = 0;
+            if (cy > CSTICK_BUTTON && g_cstick_up) b |= N64_CUP;
+            if (cy < -CSTICK_BUTTON) b |= N64_CDOWN;
+            if (cx < -CSTICK_BUTTON) b |= N64_CLEFT;
+            if (cx > CSTICK_BUTTON) b |= N64_CRIGHT;
+        }
     }
     b |= touch_pad_held();
     *buttons = b;
@@ -223,9 +280,17 @@ void recomp3ds::input_set_rumble(int controller_num, bool rumble) {
     (void)controller_num; (void)rumble;
 }
 
+namespace {
+ultramodern::input::Pak g_controller_pak = ultramodern::input::Pak::None;
+}
+
+void recomp3ds::input_set_controller_pak(ultramodern::input::Pak pak) {
+    g_controller_pak = pak;
+}
+
 ultramodern::input::connected_device_info_t recomp3ds::input_device_info(int controller_num) {
     ultramodern::input::connected_device_info_t info{};
     info.connected_device = controller_num == 0 ? ultramodern::input::Device::Controller : ultramodern::input::Device::None;
-    info.connected_pak = ultramodern::input::Pak::None;
+    info.connected_pak = controller_num == 0 ? g_controller_pak : ultramodern::input::Pak::None;
     return info;
 }

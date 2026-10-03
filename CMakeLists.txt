@@ -47,6 +47,45 @@ function(rt64_3ds_check_patch_ram target map_file)
     add_dependencies(${target} ${target}_patch_ram)
 endfunction()
 
+# rt64_3ds_check_gpr32(<dir>...): RECOMP_GPR32 (32-bit N64 registers; see
+# N64Recomp's recomp.h) is only sound for generated code that holds no 64-bit
+# register instruction: doubleword arithmetic and shifts, ld/sd/ldl/ldr/sdl/sdr
+# of a register, dmult/ddiv, dmtc1/dmfc1. Call it with the directories of the
+# recompiled sources (RecompiledFuncs, RecompiledPatches); it fails the
+# configure step naming the offending lines.
+function(rt64_3ds_check_gpr32)
+    set(pattern "ctx->r[0-9]+ = LD\\(|SD\\(ctx->r[0-9]+,|do_ldl|do_ldr|do_sdl|do_sdr|DMULT|DDIV|<< 32|\\+ 32\\)|= ctx->r[0-9]+ << [0-9(]|= ctx->r[0-9]+ >> [0-9(]|ctx->r[0-9]+ = SIGNED\\(ctx->r[0-9]+\\) >>|= ctx->r[0-9]+ [-+] ctx->r[0-9]+;|= ctx->r[0-9]+ [-+] -?0X[0-9A-F]+;|\\.u64 = ctx->r|ctx->r[0-9]+ = [^;]*\\.u64")
+    set(sources)
+    foreach(dir ${ARGN})
+        file(GLOB dir_sources "${dir}/*.c")
+        list(APPEND sources ${dir_sources})
+    endforeach()
+    if(NOT sources)
+        message(FATAL_ERROR "rt64_3ds_check_gpr32: no recompiled sources in ${ARGN}")
+    endif()
+    find_program(RT64_3DS_GREP grep)
+    set(hits "")
+    if(RT64_3DS_GREP)
+        execute_process(COMMAND "${RT64_3DS_GREP}" -nE "${pattern}" ${sources}
+                        RESULT_VARIABLE rc OUTPUT_VARIABLE hits ERROR_QUIET)
+        if(NOT rc EQUAL 0)
+            set(hits "")
+        endif()
+    else()
+        foreach(src ${sources})
+            file(STRINGS "${src}" lines REGEX "${pattern}")
+            foreach(line ${lines})
+                string(APPEND hits "${src}: ${line}\n")
+            endforeach()
+        endforeach()
+    endif()
+    if(hits)
+        string(SUBSTRING "${hits}" 0 3000 hits)
+        message(FATAL_ERROR "RECOMP_GPR32 needs generated code without 64-bit register instructions, but these were found (first lines):\n${hits}")
+    endif()
+    message(STATUS "RECOMP_GPR32: no 64-bit register instructions in the generated code")
+endfunction()
+
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/Pica.cmake")
 
 add_library(rt64_3ds STATIC
@@ -54,6 +93,7 @@ add_library(rt64_3ds STATIC
     src/renderer/rt64_3ds_null_context.cpp
     src/renderer/rt64_3ds_context.cpp
     src/renderer/rt64_3ds_dl.cpp
+    src/renderer/rt64_3ds_interp.cpp
     src/renderer/rt64_3ds_texture.cpp
     src/renderer/rt64_3ds_tev.cpp
     src/renderer/rt64_3ds_stereo.cpp
@@ -72,6 +112,8 @@ add_library(recomp_3ds STATIC
     src/platform/bps_stream.cpp
     src/platform/touch_pad.cpp
     src/platform/naudio_hle.cpp
+    src/platform/aspmain_hle.cpp
+    src/platform/audio_hle_diff.cpp
     src/platform/input_hid.cpp
     src/platform/loadmon.cpp
     src/platform/log.cpp

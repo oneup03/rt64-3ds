@@ -19,6 +19,8 @@
 //   9 SETVOL        10 DMEMMOVE     11 LOADADPCM  13 INTERLEAVE
 //  14 (writes the SETVOL rate slots)  15 SETLOOP
 #include "naudio_hle.h"
+#include "audio_hle_simd.h"
+#include "audio_hle_diff.h"
 
 #include <cstdio>
 #include <cstring>
@@ -40,6 +42,7 @@ constexpr uint32_t kMainL = 0x9D0, kMainR = 0xB40, kAuxL = 0xCB0, kAuxR = 0xE20;
 alignas(8) uint8_t g_dm[0x1000];
 typedef int16_t __attribute__((may_alias)) dm_i16;
 typedef uint32_t __attribute__((may_alias)) dm_u32;
+namespace ahle = recomp3ds::ahle;
 
 inline uint8_t db(uint32_t a) { return g_dm[(a & 0xFFF) ^ 3]; }
 inline void dbw(uint32_t a, uint8_t v) { g_dm[(a & 0xFFF) ^ 3] = v; }
@@ -106,7 +109,7 @@ void dma_write(uint8_t* rdram, uint32_t dmem, uint32_t dram, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) rbw(rdram, dram + i, db(dmem + i));
 }
 
-recomp3ds::NaudioHleStats g_stats{};
+recomp3ds::AudioHleStats g_stats{};
 RspUcodeFunc* g_reference = nullptr;
 bool g_phase_invert = true;     // NaudioVariant::Dk64
 
@@ -202,9 +205,7 @@ void cmd_mixer(uint32_t w0, uint32_t w1) {
     uint32_t out = (w1 & 0xFFFF) + kBufBase;
     uint32_t in = (w1 >> 16) + kBufBase;
     if (raw_ok(out, kCount) && raw_ok(in, kCount) && (in == out || in + kCount <= out || out + kCount <= in)) {
-        dm_i16* o = dmraw(out);
-        const dm_i16* x = dmraw(in);
-        for (uint32_t j = 0; j < kCount / 2; j++) o[j] = (int16_t)sat16((o[j] * 0x7FFF + x[j] * gain + 0x4000) >> 15);
+        ahle::mix_fixed((ahle::word_t*)dmraw(out), (const ahle::word_t*)dmraw(in), gain, kCount / 4);
         return;
     }
     for (uint32_t i = 0; i < kCount; i += 2) {
@@ -249,6 +250,8 @@ void cmd_adpcm(uint8_t* rdram, uint32_t w0, uint32_t w1) {
             // nibble << 12 (sign in the top bit), then scaled; scales above
             // 12 stay at 12 because the multiply is skipped.
             int32_t mult = scale < 12 ? (1 << (scale + 4)) : 0;
+            ahle::AdpcmBook bk;
+            ahle::adpcm_book(bk, c1, c2);
             for (int g = 0; g < 2; g++) {
                 int32_t s[8];
                 for (int i = 0; i < 4; i++) {
@@ -260,11 +263,7 @@ void cmd_adpcm(uint8_t* rdram, uint32_t w0, uint32_t w1) {
                     for (int i = 0; i < 8; i++) s[i] = (s[i] * mult) >> 16;
                 }
                 int32_t o[8];
-                for (int i = 0; i < 8; i++) {
-                    int32_t acc = c1[i] * p2 + c2[i] * p1 + (s[i] << 11);
-                    for (int k = 0; k < i; k++) acc += c2[i - 1 - k] * s[k];
-                    o[i] = clamp16(acc >> 11);
-                }
+                ahle::adpcm_half(bk, s, p2, p1, o);
                 for (int i = 0; i < 8; i++) dhw(out + 2 * i, o[i]);
                 out += 16;
                 p2 = o[6];
@@ -341,21 +340,17 @@ void cmd_resample(uint8_t* rdram, uint32_t w0, uint32_t w1) {
 #endif
     if (!overlap && span <= 0x1000 && ((base + span) & 0xFFFF) > base && base + span <= 0x1000 && pitch >= 0) {
         int16_t x[0x800];
-        int16_t lut[64][4];
         for (uint32_t i = 0; i < span / 2; i++) x[i] = dh(base + 2 * i);
-        for (int r = 0; r < 64; r++) for (int t = 0; t < 4; t++) lut[r][t] = dh(kLut + r * 8 + t * 2);
+        // Row r: the words (tap 1, tap 0) and (tap 3, tap 2) (raw order).
+        const ahle::word_t* lutw = (const ahle::word_t*)dmraw(kLut);
         for (int block = 0; block < 23; block++) {
             int16_t o[8];
             for (int k = 0; k < 8; k++) {
                 // Lane k reads samples ipos[k] .. +3 (the table stores base +
                 // 2 * ipos truncated to 16 bits; ipos stays small here).
                 const int16_t* xs = &x[(uint16_t)ipos[k]];
-                const int16_t* l = lut[frac[k] >> 10];
-                int32_t t0 = vmulf(xs[0], l[0]);
-                int32_t t1 = vmulf(xs[1], l[1]);
-                int32_t t2 = vmulf(xs[2], l[2]);
-                int32_t t3 = vmulf(xs[3], l[3]);
-                o[k] = clamp16(clamp16(t0 + t1) + clamp16(t2 + t3));
+                const ahle::word_t* l = lutw + (frac[k] >> 10) * 2;
+                o[k] = (int16_t)ahle::tap4(xs[0], xs[1], xs[2], xs[3], l[0], l[1]);
             }
             uint32_t pos7 = ((uint32_t)ipos[7] << 16) | frac[7];
             for (int k = 0; k < 8; k++) {
@@ -451,23 +446,25 @@ void cmd_envmixer(uint8_t* rdram, uint32_t w0, uint32_t w1) {
     const bool raw = raw_ok(in, 16 * 23) && raw_ok(mainL, 16 * 23) && raw_ok(mainR, 16 * 23) && raw_ok(auxL, 16 * 23) && raw_ok(auxR, 16 * 23);
     auto apply = [&]() {
         if (raw) {
-            // Raw halfword r of a block is lane r ^ 1.
+            // Raw halfword r of a block is lane r ^ 1; the mixing kernel
+            // (audio_hle_simd.h) takes gain words in that order, and the
+            // phase inversion (x ^ -1) applies to both halves of a word.
             int32_t gld[8], glw[8], grd[8], grw[8];
             for (int r = 0; r < 8; r++) {
                 int k = r ^ 1;
                 gld[r] = vmulf(lhi[k], dry); glw[r] = vmulf(lhi[k], wet);
                 grd[r] = vmulf(rhi[k], dry); grw[r] = vmulf(rhi[k], wet);
             }
-            const dm_i16* xi = dmraw(in);
-            dm_i16* ml = dmraw(mainL); dm_i16* al = dmraw(auxL); dm_i16* mr = dmraw(mainR); dm_i16* ar = dmraw(auxR);
-            for (int r = 0; r < 8; r++) {
-                int32_t x = xi[r];
-                int32_t xl = x ^ maskL, xr = x ^ maskR;
-                ml[r] = (int16_t)sat16((ml[r] * 0x7FFF + xl * gld[r] + 0x4000) >> 15);
-                al[r] = (int16_t)sat16((al[r] * 0x7FFF + xl * glw[r] + 0x4000) >> 15);
-                mr[r] = (int16_t)sat16((mr[r] * 0x7FFF + xr * grd[r] + 0x4000) >> 15);
-                ar[r] = (int16_t)sat16((ar[r] * 0x7FFF + xr * grw[r] + 0x4000) >> 15);
-            }
+            uint32_t kld[4], klw[4], krd[4], krw[4];
+            const bool uld = ahle::raw_gain_words(gld, kld), ulw = ahle::raw_gain_words(glw, klw);
+            const bool urd = ahle::raw_gain_words(grd, krd), urw = ahle::raw_gain_words(grw, krw);
+            const ahle::word_t* xw = (const ahle::word_t*)dmraw(in);
+            uint32_t xl[4], xr[4];
+            for (int m = 0; m < 4; m++) { xl[m] = xw[m] ^ (uint32_t)maskL; xr[m] = xw[m] ^ (uint32_t)maskR; }
+            ahle::mix_block_any((ahle::word_t*)dmraw(mainL), xl, kld, uld);
+            ahle::mix_block_any((ahle::word_t*)dmraw(auxL), xl, klw, ulw);
+            ahle::mix_block_any((ahle::word_t*)dmraw(mainR), xr, krd, urd);
+            ahle::mix_block_any((ahle::word_t*)dmraw(auxR), xr, krw, urw);
             in += 16; mainL += 16; mainR += 16; auxL += 16; auxR += 16;
             blocks_done++;
             return;
@@ -594,162 +591,70 @@ void run_task(uint8_t* rdram, const OSTask& task) {
     g_stats.tasks++;
 }
 
-// Differential testing: the RDRAM range one command writes.
-struct Range { uint32_t addr, len; };
-
-bool command_range(uint32_t w0, uint32_t w1, Range& r) {
+// Differential testing (audio_hle_diff.cpp): the RDRAM range one command writes.
+bool command_range(uint32_t w0, uint32_t w1, uint32_t* addr, uint32_t* len) {
     switch (w0 >> 24) {
-        case 1: r = { w0 & 0xFFFFF8, 32 }; return true;
-        case 3: r = { w1 & 0xFFFFF8, 0x50 }; return true;
-        case 5: r = { w0 & 0xFFFFF8, 16 }; return true;
+        case 1: *addr = w0 & 0xFFFFF8; *len = 32; return true;
+        case 3: *addr = w1 & 0xFFFFF8; *len = 0x50; return true;
+        case 5: *addr = w0 & 0xFFFFF8; *len = 16; return true;
         case 6: {
             uint32_t count = (w0 >> 12) & 0xFFF;
             if (count == 0) return false;
-            r = { w1 & 0xFFFFF8, count };
+            *addr = w1 & 0xFFFFF8; *len = count;
             return true;
         }
         default: return false;
     }
 }
 
-int g_reports_by_op[16];
 int g_diff_verbose = 0;     // mismatches still to dump in full (host tools)
 
-// Every command runs through the reference (the recompiled microcode, on a
-// one-command task) and this implementation from the same DMEM state; DMEM
-// and the command's RDRAM range are compared afterwards and the reference's
-// results are kept so one bug does not hide the next.
-void run_task_lockstep(uint8_t* rdram, const OSTask& task, uint32_t ucode_addr) {
-    dma_read(rdram, 0, task.t.ucode_data, 0xF80);
-    memcpy(&g_dm[0xFC0], &task, sizeof(OSTask));
-    uint32_t list = task.t.data_ptr & 0xFFFFFF;
-    uint32_t n = task.t.data_size / 8;
-    static uint8_t ref_dm[0x1000];
-    static uint8_t before[0x1000], ref[0x1000], pre_dm[0x1000];
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t w0 = rw(rdram, list + i * 8), w1 = rw(rdram, list + i * 8 + 4);
-        uint32_t op = w0 >> 24;
-        Range r{};
-        bool has_range = command_range(w0, w1, r);
-
-        // Reference on a one-command task, from this implementation's DMEM.
-        if (g_diff_verbose > 0) memcpy(pre_dm, g_dm, 0x1000);
-        memcpy(dmem, g_dm, 0x1000);
-        uint32_t one_ptr = task.t.data_ptr + i * 8, one_size = 8;
-        memcpy(&dmem[0xFC0 + 0x30], &one_ptr, 4);
-        memcpy(&dmem[0xFC0 + 0x34], &one_size, 4);
-        memcpy(&g_dm[0xFC0 + 0x30], &one_ptr, 4);
-        memcpy(&g_dm[0xFC0 + 0x34], &one_size, 4);
-        if (has_range) for (uint32_t k = 0; k < r.len; k++) before[k] = rb(rdram, r.addr + k);
-        g_reference(rdram, ucode_addr);
-        memcpy(ref_dm, dmem, 0x1000);
-        if (has_range) {
-            for (uint32_t k = 0; k < r.len; k++) { ref[k] = rb(rdram, r.addr + k); rbw(rdram, r.addr + k, before[k]); }
-        }
-
-        run_command(rdram, w0, w1);
-
-        // Compare (the list chunk at 0x2B0 and the task copy at 0xFC0 differ by construction).
-        int bad_dmem = -1, bad_rdram = -1;
-        for (uint32_t a = 0; a < 0x1000; a++) {
-            if (a >= 0x2B0 && a < 0x4F0) continue;
-            if (a >= 0xFC0) continue;
-            if (g_dm[a ^ 3] != ref_dm[a ^ 3]) { bad_dmem = (int)a; break; }
-        }
-        if (has_range) {
-            for (uint32_t k = 0; k < r.len; k++) {
-                if (rb(rdram, r.addr + k) != ref[k]) { bad_rdram = (int)k; break; }
-            }
-        }
-        if ((bad_dmem >= 0 || bad_rdram >= 0) && op < 16) {
-            g_stats.diff_mismatches++;
-            if (g_reports_by_op[op] < 3) {
-                g_reports_by_op[op]++;
-                if (bad_dmem >= 0) {
-                    uint32_t a = (uint32_t)bad_dmem & ~1u;
-                    fprintf(stderr, "naudio-hle: task %u cmd %u op %u %08x %08x: DMEM differs at %03x (mine %04x ref %04x)\n",
-                            g_stats.diff_tasks + 1, i, op, w0, w1, a, (uint16_t)dh(a),
-                            (uint16_t)((ref_dm[a ^ 3] << 8) | ref_dm[(a + 1) ^ 3]));
-                }
-                if (bad_rdram >= 0) {
-                    uint32_t k = (uint32_t)bad_rdram & ~1u;
-                    fprintf(stderr, "naudio-hle: task %u cmd %u op %u %08x %08x: RDRAM differs at %06x+%u (mine %02x%02x ref %02x%02x)\n",
-                            g_stats.diff_tasks + 1, i, op, w0, w1, r.addr, k,
-                            rb(rdram, r.addr + k), rb(rdram, r.addr + k + 1), ref[k], ref[k + 1]);
-                }
-            }
-        }
-        if (bad_dmem >= 0 && g_diff_verbose > 0) {
-            // The whole picture: the volume block going in, and per output
-            // buffer how many samples differ and the first ones.
-            g_diff_verbose--;
-            auto h = [](const uint8_t* m, uint32_t a) { return (int16_t)((m[a ^ 3] << 8) | m[(a + 1) ^ 3]); };
-            fprintf(stderr, "  cmd %u %08x %08x, state 40..50 before:", i, w0, w1);
-            for (uint32_t a = 0x40; a <= 0x50; a += 2) fprintf(stderr, " %04x", (uint16_t)h(pre_dm, kState + a));
-            fprintf(stderr, "\n");
-            static const uint32_t bufs[4] = { kMainL, kMainR, kAuxL, kAuxR };
-            static const char* names[4] = { "mainL", "mainR", "auxL", "auxR" };
-            for (int b = 0; b < 4; b++) {
-                int nd = 0, neg = 0;
-                for (uint32_t k = 0; k < kCount; k += 2) {
-                    int16_t m = h(g_dm, bufs[b] + k), r = h(ref_dm, bufs[b] + k);
-                    if (m != r) { nd++; if (m == -r || m + r == -1) neg++; }
-                }
-                fprintf(stderr, "  %s: %d/%u differ (%d negated); mine/ref/before:", names[b], nd, kCount / 2, neg);
-                for (uint32_t k = 0; k < 16; k += 2) fprintf(stderr, " %d/%d/%d", h(g_dm, bufs[b] + k), h(ref_dm, bufs[b] + k), h(pre_dm, bufs[b] + k));
-                fprintf(stderr, "\n");
-            }
-            fprintf(stderr, "  input:");
-            for (uint32_t k = 0; k < 16; k += 2) fprintf(stderr, " %d", h(pre_dm, kBufBase + k));
-            fprintf(stderr, "\n  state 00..50 after mine/ref:");
-            for (uint32_t a = 0; a < 0x50; a += 2) if (h(g_dm, kState + a) != h(ref_dm, kState + a)) fprintf(stderr, " %02x:%04x/%04x", a, (uint16_t)h(g_dm, kState + a), (uint16_t)h(ref_dm, kState + a));
-            fprintf(stderr, "\n");
-        }
-        // Continue from the reference's state.
-        memcpy(g_dm, ref_dm, 0x1000);
-        if (has_range) for (uint32_t k = 0; k < r.len; k++) rbw(rdram, r.addr + k, ref[k]);
-    }
-    g_stats.tasks++;
-    g_stats.diff_tasks++;
+// The command list chunk (0x2B0) and the task copy (0xFC0) differ from the
+// reference's by construction: this interpreter reads the list from RDRAM.
+bool dmem_ignored(uint32_t a) {
+    return (a >= 0x2B0 && a < 0x4F0) || a >= 0xFC0;
 }
+
+// A DMEM mismatch in full: the volume block going in, and per output buffer
+// how many samples differ and the first ones.
+void dump_mismatch(uint32_t i, uint32_t w0, uint32_t w1, const uint8_t* pre_dm, const uint8_t* mine, const uint8_t* ref_dm) {
+    auto h = [](const uint8_t* m, uint32_t a) { return (int16_t)((m[a ^ 3] << 8) | m[(a + 1) ^ 3]); };
+    fprintf(stderr, "  cmd %u %08x %08x, state 40..50 before:", i, w0, w1);
+    for (uint32_t a = 0x40; a <= 0x50; a += 2) fprintf(stderr, " %04x", (uint16_t)h(pre_dm, kState + a));
+    fprintf(stderr, "\n");
+    static const uint32_t bufs[4] = { kMainL, kMainR, kAuxL, kAuxR };
+    static const char* names[4] = { "mainL", "mainR", "auxL", "auxR" };
+    for (int b = 0; b < 4; b++) {
+        int nd = 0, neg = 0;
+        for (uint32_t k = 0; k < kCount; k += 2) {
+            int16_t m = h(mine, bufs[b] + k), r = h(ref_dm, bufs[b] + k);
+            if (m != r) { nd++; if (m == -r || m + r == -1) neg++; }
+        }
+        fprintf(stderr, "  %s: %d/%u differ (%d negated); mine/ref/before:", names[b], nd, kCount / 2, neg);
+        for (uint32_t k = 0; k < 16; k += 2) fprintf(stderr, " %d/%d/%d", h(mine, bufs[b] + k), h(ref_dm, bufs[b] + k), h(pre_dm, bufs[b] + k));
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "  input:");
+    for (uint32_t k = 0; k < 16; k += 2) fprintf(stderr, " %d", h(pre_dm, kBufBase + k));
+    fprintf(stderr, "\n  state 00..50 after mine/ref:");
+    for (uint32_t a = 0; a < 0x50; a += 2) if (h(mine, kState + a) != h(ref_dm, kState + a)) fprintf(stderr, " %02x:%04x/%04x", a, (uint16_t)h(mine, kState + a), (uint16_t)h(ref_dm, kState + a));
+    fprintf(stderr, "\n");
+}
+
+recomp3ds::AudioHleFamily g_family = {
+    "naudio-hle", g_dm, &g_stats, run_command, command_range, dmem_ignored, dump_mismatch, {},
+};
 
 }   // namespace
-
-// Capture support: AUDIO_CAPTURE.TXT next to the executable makes 8 tasks
-// from the one it names (200 when it names none) write the whole RDRAM plus
-// their OSTask to audio_task_N.bin, for the host-side test (tools/naudio_test).
-const char* g_capture_dir = nullptr;
-int g_capture_first = 200;
-
-void recomp3ds_naudio_capture_dir(const char* dir, int first_task) {
-    g_capture_dir = dir;
-    if (first_task > 0) g_capture_first = first_task;
-}
-
-void maybe_capture(const uint8_t* rdram, const OSTask& task) {
-    static int seen = 0;
-    if (g_capture_dir == nullptr) return;
-    seen++;
-    if (seen < g_capture_first || seen >= g_capture_first + 8) return;
-    char path[192];
-    snprintf(path, sizeof(path), "%s/audio_task_%d.bin", g_capture_dir, seen - g_capture_first);
-    FILE* f = fopen(path, "wb");
-    if (f == nullptr) { fprintf(stderr, "naudio-hle: capture failed to open %s\n", path); return; }
-    fwrite(&task, 1, sizeof(OSTask), f);
-    for (uint32_t off = 0; off < 16u * 1024 * 1024; off += 65536) fwrite(rdram + off, 1, 65536, f);
-    fclose(f);
-    fprintf(stderr, "naudio-hle: captured task %d to %s\n", seen, path);
-}
 
 RspExitReason recomp3ds::naudio_hle_run(uint8_t* rdram, uint32_t ucode_addr) {
     OSTask task;
     memcpy(&task, &dmem[0xFC0], sizeof(OSTask));
-    maybe_capture(rdram, task);
     if (g_reference == nullptr) {
         run_task(rdram, task);
     }
     else {
-        run_task_lockstep(rdram, task, ucode_addr);
+        recomp3ds::audio_hle_lockstep(g_family, rdram, task, ucode_addr, g_reference, &g_diff_verbose);
     }
     return RspExitReason::Broke;
 }
@@ -766,6 +671,14 @@ void recomp3ds::naudio_hle_set_diff_verbose(int mismatches) {
     g_diff_verbose = mismatches;
 }
 
-const recomp3ds::NaudioHleStats& recomp3ds::naudio_hle_stats() {
+const recomp3ds::AudioHleStats& recomp3ds::naudio_hle_stats() {
     return g_stats;
+}
+
+const uint8_t* recomp3ds::naudio_hle_dmem() {
+    return g_dm;
+}
+
+void recomp3ds::naudio_hle_reset_dmem() {
+    memset(g_dm, 0, sizeof(g_dm));
 }

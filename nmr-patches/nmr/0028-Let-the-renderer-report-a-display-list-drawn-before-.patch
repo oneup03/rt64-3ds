@@ -1,0 +1,133 @@
+From 3ea18158aece1fd554470ace13302c4c1cb119bb Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 3 Oct 2026 12:21:05 -0500
+Subject: [PATCH] Let the renderer report a display list drawn before it
+ returns
+
+The graphics thread reported a list's RDP completion when the renderer's
+send_dl returned. A renderer that paces its presents to the screen (rt64-3ds
+with frame interpolation: an in-between frame and the game's frame, each
+waiting for a refresh of the 3DS's 59.83 Hz screen) returns only after
+those waits, and a game that waits for the RDP before its next frame
+(Banjo-Kazooie's frame limiter does, every frame) was held back by them: it
+missed retraces, its cutscenes fell behind their music.
+
+ultramodern::renderer::report_list_drawn() lets the renderer report the
+list drawn once it has read all it needs from RDRAM; the graphics thread
+then does not report it again. A renderer that never calls it changes
+nothing.
+
+The game's next list may then be queued while the renderer is still busy
+with the one before. ultramodern::renderer::list_wait_us() says how long the
+list in send_dl waited for the graphics thread, so a renderer can tell a
+short wait from one that would soon hold the game back on its next
+"parsed" event.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../include/ultramodern/renderer_context.hpp  | 15 +++++++++
+ ultramodern/src/events.cpp                    | 32 ++++++++++++++++---
+ 2 files changed, 42 insertions(+), 5 deletions(-)
+
+diff --git a/ultramodern/include/ultramodern/renderer_context.hpp b/ultramodern/include/ultramodern/renderer_context.hpp
+index 0a106fa..70f1a2d 100644
+--- a/ultramodern/include/ultramodern/renderer_context.hpp
++++ b/ultramodern/include/ultramodern/renderer_context.hpp
+@@ -124,6 +124,21 @@ namespace ultramodern {
+         std::unique_ptr<RendererContext> create_render_context(uint8_t* rdram, WindowHandle window_handle, bool developer_mode);
+ 
+         std::string get_graphics_api_name(GraphicsApi api);
++
++        /**
++         * Reports the display list in RendererContext::send_dl drawn now: the game hears the RDP's completion
++         * before send_dl returns, and the graphics thread does not report it again. For a renderer that has read
++         * all it needs from RDRAM and still has a while to go (waiting for the screen), so the game is not held
++         * back by that wait. Graphics thread only.
++         */
++        void report_list_drawn();
++
++        /**
++         * How long the display list in RendererContext::send_dl waited for the graphics thread, in microseconds: from
++         * the game submitting it to the renderer taking it (it was queued while the renderer was busy with the one
++         * before). Graphics thread only.
++         */
++        uint32_t list_wait_us();
+     }
+ }
+ 
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 4359de2..790c710 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -28,6 +28,7 @@ void ultramodern::events::set_callbacks(const ultramodern::events::callbacks_t&
+ 
+ struct SpTaskAction {
+     OSTask task;
++    std::chrono::high_resolution_clock::time_point submitted;
+ };
+ 
+ struct ScreenUpdateAction {
+@@ -274,6 +275,23 @@ void dp_complete() {
+     ultramodern::enqueue_external_message_src(events_context.dp.mq, events_context.dp.msg, false, ultramodern::EventMessageSource::Dp);
+ }
+ 
++// The list in send_dl: whether it has been reported drawn, and how long it
++// waited for the graphics thread (graphics thread only).
++static bool list_drawn_reported = false;
++static uint32_t current_list_wait_us = 0;
++
++uint32_t ultramodern::renderer::list_wait_us() {
++    return current_list_wait_us;
++}
++
++void ultramodern::renderer::report_list_drawn() {
++    if (list_drawn_reported) {
++        return;
++    }
++    list_drawn_reported = true;
++    dp_complete();
++}
++
+ // Asynchronous audio tasks (see ultramodern.hpp). The game hears that such a
+ // task is done when it submits it and may reuse its OSTask at once, so the
+ // task thread runs a copy taken then; the marker in its queue stands for the
+@@ -401,19 +419,23 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+             // Determine the action type and act on it
+             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
+                 // The RSP's part of the task was reported complete when it was submitted (submit_rsp_task);
+-                // the RDP's part follows the renderer below (dp_complete), so the game won't start another
+-                // graphics task before this one is drawn. Games usually preserve the RSP inputs until the RDP is finished
+-                // as well, so the early RSP completion isn't an issue in most cases.
++                // the RDP's part follows the renderer below (report_list_drawn, unless the renderer reported it
++                // sooner), so the game won't start another graphics task before this one is drawn. Games usually
++                // preserve the RSP inputs until the RDP is finished as well, so the early RSP completion isn't an
++                // issue in most cases.
+                 ultramodern::measure_input_latency();
+ 
+                 PTR(u64) displaylist = task_action->task.t.data_ptr;
+                 ultramodern::extensions::on_displaylist_submitted(displaylist);
+ 
+                 [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
++                list_drawn_reported = false;
++                current_list_wait_us = static_cast<uint32_t>(
++                    std::chrono::duration_cast<std::chrono::microseconds>(renderer_start - task_action->submitted).count());
+                 renderer_context->send_dl(&task_action->task);
+                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
+ 
+-                dp_complete();
++                ultramodern::renderer::report_list_drawn();
+                 // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
+                 ultramodern::extensions::on_displaylist_parsed(displaylist);
+                 ultramodern::extensions::on_displaylist_completed(displaylist);
+@@ -606,7 +628,7 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
+     // the RSP busy for most of every frame and held its audio tasks until then. The message is queued like any external
+     // one and reaches the scheduler at its next receive, after it has noted the task as started.
+     if (task->t.type == M_GFXTASK) {
+-        events_context.action_queue.enqueue(SpTaskAction{ *task });
++        events_context.action_queue.enqueue(SpTaskAction{ *task, std::chrono::high_resolution_clock::now() });
+         sp_complete();
+         return;
+     }
+-- 
+2.55.0
+

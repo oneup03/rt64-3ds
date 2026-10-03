@@ -58,6 +58,14 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$FILE" ] && [ -f "$FILE" ] || { echo "usage: $0 <file.3dsx> [options]" >&2; exit 64; }
+# One run at a time on this machine: the emulator's log and config are
+# shared, and the cleanup below closes every Azahar window (and `flatpak
+# kill` stops every instance). A second run waits here for the first.
+exec 9>/var/tmp/azahar-run.lock
+if ! flock -n 9; then
+    echo "another azahar-run.sh is running; waiting for it to finish" >&2
+    flock 9
+fi
 FILE=$(readlink -f "$FILE")
 GLOG=$(dirname "$FILE")/AUTOTEST.LOG   # written by the game itself when AUTOTEST.TXT exists
 [ -n "$OUT" ] || OUT=./azahar-out/$(date +%Y%m%d-%H%M%S)
@@ -114,7 +122,8 @@ export DISPLAY=${DISPLAY:-:0}
 # X11 only: the app has wayland + fallback-x11, and in a Wayland session
 # flatpak gives it no X display; screenshots and the window search need the
 # X11 window.
-flatpak run --nosocket=wayland --socket=x11 --env=QT_QPA_PLATFORM=xcb "$APP" "${ARGS[@]}" "$FILE" >"$OUT/azahar.stdout" 2>&1 &
+# (Without the lock's descriptor: an emulator left running must not hold it.)
+flatpak run --nosocket=wayland --socket=x11 --env=QT_QPA_PLATFORM=xcb "$APP" "${ARGS[@]}" "$FILE" >"$OUT/azahar.stdout" 2>&1 9>&- &
 FPID=$!
 echo "azahar pid $FPID, output in $OUT"
 

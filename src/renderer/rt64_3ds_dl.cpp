@@ -4,10 +4,12 @@
 // [a ^ 3], halfword a at [a ^ 2], aligned words in host order.
 #include "rt64_3ds_dl.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace rt64_3ds {
 
@@ -100,11 +102,43 @@ struct TmemLoad {
     uint32_t seq = 0;        // load order: a later load overwrites the TMEM range
     uint8_t nibble = 0;      // 4-bit tile loads that start on an odd texel
     uint16_t dxt = 0;        // LOADBLOCK row step (1.11 per 64-bit word)
+    // LOADTILE: the image it cut its rectangle from and where
+    // (RenderDesc::merge_image_tiles).
+    uint32_t img_addr = 0;   // SETTIMG's address: the image's first row
+    uint16_t img_width = 0;  // texels per image row
+    uint16_t s0 = 0, t0 = 0, s1 = 0, t1 = 0;   // the rectangle in image texels, inclusive
+    uint16_t line = 0;       // the load tile's line (64-bit words per TMEM row)
 };
 
 struct Light { float dir[3]; uint8_t col[3]; };
 
 struct Mtx { float m[4][4]; };
+
+// A projection divides by w when its w column is anything but (0,0,0,s).
+// Testing m[2][3] alone misses a projection the game multiplied by its view
+// matrix (Goemon loads P*V on the projection stack): its w column is the
+// view's forward axis, whose z part is 0 whenever the camera looks along
+// the world's X axis, and the whole world then counted as orthographic.
+inline bool is_perspective(const Mtx& p) {
+    return p.m[0][3] != 0.0f || p.m[1][3] != 0.0f || p.m[2][3] != 0.0f || p.m[3][3] == 0.0f;
+}
+
+// The projection a depth camera is kept as: the context turns the depth
+// grid into distances with its [2][2] and [3][2] (z_clip = a*z_eye + b,
+// w = -z_eye). A projection times a view matrix V keeps that relation,
+// z_clip = -a*w + b, but spreads a and b over the matrix: column 2 is
+// a*V[.][2] + b*V[.][3] and column 3 is -V[.][2], so a comes from the two
+// columns' ratio and b from the bottom row. A plain projection gives back
+// its own [2][2] and [3][2].
+inline Mtx depth_camera(const Mtx& p) {
+    Mtx c = p;
+    const float ww = p.m[0][3] * p.m[0][3] + p.m[1][3] * p.m[1][3] + p.m[2][3] * p.m[2][3];
+    if (ww <= 0.0f) return c;
+    const float a = -(p.m[0][2] * p.m[0][3] + p.m[1][2] * p.m[1][3] + p.m[2][2] * p.m[2][3]) / ww;
+    c.m[2][2] = a;
+    c.m[3][2] = p.m[3][2] + a * p.m[3][3];
+    return c;
+}
 
 constexpr int kMaxDlDepth = 18;
 
@@ -136,7 +170,73 @@ constexpr TexOpTable kTexOpTable{};
 constexpr int kMaxMtxStack = 32;
 constexpr int kMaxVerts = 64;
 
+// The RSP's fog factor for a vertex (G_FOG puts it in the shade alpha): the
+// clip-space z clamped at zero, over w, times the fog multiplier plus the
+// offset (RT64's RSPProcessCS: max(z, 0) / w * mul + offset). The clamp
+// decides vertices behind the eye (z and w both negative): unclamped, their
+// z / w is positive and they take full fog, which the near-plane clip then
+// spreads over the near ground and water as a wash of the fog colour
+// (Goemon's plaza and sunset water). z is the vertex's z' = (z + w) / 2.
+inline uint8_t rsp_fog(float z, float w, float mul, float off) {
+    const float zc = 2.0f * z - w;
+    float f = (zc > 0.0f ? zc : 0.0f) / (w != 0.0f ? w : 1e-6f) * mul + off;
+    if (!(f > 0.0f)) f = 0.0f;
+    if (f > 255.0f) f = 255.0f;
+    return (uint8_t)f;
+}
+
 }   // namespace
+
+// Frame interpolation (Interpreter::set_interpolation): this list's
+// transforms as the run records them, the list before's, and what the
+// in-between run draws with.
+struct Interpreter::Interp {
+    interp::FrameLog logs[2];
+    int cur = 0;                    // logs[cur]: the list run last (or being run)
+    bool recording = false;         // run(): record into now()
+    bool applying = false;          // run_inbetween(): draw with now()'s interpolated transforms
+    bool diverged = false;          // run_inbetween() did not follow run()
+    float weight = 1.0f;
+    interp::FrameLog& now() { return logs[cur]; }
+    interp::FrameLog& before() { return logs[cur ^ 1]; }
+
+    // What build_inbetween needs of the list run last to draw it again with
+    // other transforms, without running it: each vertex load's matrix and
+    // viewport, each loaded vertex as it came from RDRAM and as it was lit,
+    // and each triangle with its draw and its texel coordinates.
+    struct LoadCtx {
+        float m[4][4];              // model -> N64 screen homogeneous, as loaded
+        float sx, sy, tx, ty;       // the viewport (and stretch) part of it
+        int32_t xf, pj;             // the transform and projection (FrameLog)
+        float uscale, vscale, fm, fo;
+        bool texgen;
+    };
+    struct LoadedVtx {
+        int16_t ob[3], tc[2];
+        uint32_t ctx;               // ctxs
+        uint32_t vi;                // its place among its transform's vertices
+        uint8_t rgba[4];            // lit (alpha before fog)
+        bool fog;                   // alpha is the fog factor (from z)
+    };
+    struct TriRec {
+        uint32_t src[3];            // lv
+        uint32_t draw;              // the record (after compact_rects)
+        float uv[3][2];             // texel coordinates as drawn
+        float ss, st;               // the tile's shift scale (vertex texcoord interpolation)
+        float zprim;                // < 0: the vertices' depth, else the primitive depth (z')
+        int32_t tile;               // its tile entry (FrameLog::tiles), -1 none
+        uint32_t cull;              // the cull bits in force
+        bool plain;                 // texel coordinates relative to its tile (no image/frame/snapshot mapping)
+    };
+    std::vector<LoadCtx> ctxs;
+    std::vector<LoadedVtx> lv;
+    std::vector<TriRec> tris;
+    std::vector<uint32_t> draw_remap;   // compact_rects: old record index -> new
+    std::vector<interp::M4> ctx_m;      // build_inbetween: each load's matrix in the in-between frame
+    std::vector<uint32_t> lv_stamp;     // ... and which vertices are transformed already
+    std::vector<Vtx3ds> lv_out;
+    uint32_t stamp = 0;
+};
 
 struct Interpreter::Impl {
     uint8_t* rdram;
@@ -175,14 +275,38 @@ struct Interpreter::Impl {
     int16_t fog_mul = 0, fog_off = 0;
     uint32_t proj_id = 0;
     // gEXMatrixGroup id stacks as RT64 keeps them: a push adds a level, the
-    // group sets the top. RT64 reads gEXPopMatrixGroup's projection flag from
-    // a bit that is always clear, so pops only ever reach the modelview stack;
-    // mirrored, since the desktop stereo was tuned against that.
+    // group sets the top. gEXPopMatrixGroup pops the stack its flag names
+    // (w1 bit 8). RT64 reads that flag from the opcode word, where it is
+    // always clear; the desktop fork reads w1, as here, for Goemon's sky,
+    // which pops a projection group. DK64 and Banjo only pop modelview ones.
     static constexpr int kGroupStack = 16;
     static constexpr uint32_t kIdAuto = 0xFFFFFFFFu;
     uint32_t proj_groups[kGroupStack] = {}, mv_groups[kGroupStack] = {};
     uint8_t proj_aspects[kGroupStack] = {};   // G_EX_ASPECT_* of each projection group
     int proj_group_depth = 0, mv_group_depth = 0;
+
+    // ---- Frame interpolation (null when off: nothing below is used then).
+    Interpreter::Interp* ip = nullptr;
+    // The groups as RT64 keeps them (TransformGroup stacks beside the ids
+    // above), and the index of each top in the log's groups (-1: changed
+    // since it was last recorded).
+    interp::Group mv_tg[kGroupStack], proj_tg[kGroupStack];
+    int32_t mv_tg_idx = -1, proj_tg_idx = -1;
+    // RT64's split of the projection stack into a view and a projection
+    // (RSP::matrixCommon), with gEXPushProjectionMatrix's stack.
+    Mtx pv_view{}, pv_proj{};
+    Mtx pv_view_stack[8]{}, pv_proj_stack[8]{};
+    uint32_t proj_addr_stack[8] = {};
+    uint32_t mv_addr[32] = {}, proj_addr = 0, mtx_addr = 0;   // RDRAM addresses of the matrices (gEXEditGroupByAddress)
+    uint32_t proj_seq = 1, proj_rec_seq = 0;   // projection changes, and the one last recorded
+    int32_t xf_i = -1, pj_i = -1, tl_i = -1;   // the current entries of the log
+    uint32_t v_i = 0;                          // vertices loaded under the current transform
+    uint32_t slot_src[kMaxVerts] = {};         // the Interp::lv each vertex slot holds (recording)
+    int32_t tile_cur = -1;                     // the tile entry of the current tile state, -1 none
+    Mtx eff_mv{}, eff_proj{};                  // what the in-between run draws with
+    uint32_t tile_rec_seq = 0;                 // tex_seq of the current tile entry
+    int tile_rec_tile = -1, tile_rec_xf = -2;
+    float tile_du[2] = {}, tile_dv[2] = {};    // the in-between's tile origin offsets (texels)
     uint32_t mv_seq = 0;
     uint32_t world_proj_ids[4] = { 5, 5, 5, 5 };
     bool is_world_proj(uint32_t id) const {
@@ -190,6 +314,9 @@ struct Interpreter::Impl {
     }
     bool split_untagged_ortho = false;
     bool force_branch_z = true;        // RenderDesc::force_lod_branch, or gEXForceBranch
+    bool fix_rect_lr = false;          // RenderDesc::fix_rect_lr
+    bool merge_rect_slices = false;    // RenderDesc::merge_rect_slices
+    uint32_t hud_camera_id = 0;        // RenderDesc::hud_camera_id (0 = none)
     Gbi gbi = Gbi::F3DEX2;
     // Loaded vertices, already in N64 screen homogeneous space (the RSP
     // applies the viewport at load time): x/w, y/w are pixels (y down),
@@ -236,14 +363,124 @@ struct Interpreter::Impl {
         if (cached_tex_seq != tex_seq || cached_tile != t0) {
             cached_tex[0] = TexDesc{};
             cached_tex[1] = TexDesc{};
-            if (uses_texel(0)) describe_tile(t0, cached_tex[0]);
+            tex0_load = -1;
+            if (uses_texel(0)) { describe_tile(t0, cached_tex[0]); tex0_load = last_best; }
             if (uses_texel(1)) describe_tile((t0 + 1) & 7, cached_tex[1]);
             cached_tex_seq = tex_seq;
             cached_tile = t0;
+            if (image_tiles) img_ok = describe_image(t0);
         }
         return cached_tex;
     }
     uint32_t last_draw_seq = 0;
+
+    // RenderDesc::merge_image_tiles. Per image LOADTILE cuts tiles from, the
+    // rows the last list that loaded from it loaded: a texture of the image
+    // spans those rows and its full width, which keeps it the same texture
+    // from frame to frame (a panorama's visible columns change as the camera
+    // turns; its rows do not).
+    bool image_tiles = false;
+    struct ImageRows {
+        uint32_t addr = 0;
+        uint16_t width = 0;
+        uint8_t siz = 0;
+        int16_t lo = -1, hi = -1;           // the rows of the last list that loaded from it
+        int16_t cur_lo = -1, cur_hi = -1;   // ... of this list so far
+        uint32_t last_list = 0;
+    };
+    static constexpr int kImages = 16;
+    static constexpr uint32_t kImageBytes = 1024 * 1024;   // largest PICA texture of an image
+    ImageRows images[kImages];
+    void note_image_load(const TmemLoad& L) {
+        ImageRows* e = nullptr;
+        for (ImageRows& im : images) {
+            if (im.addr == L.img_addr && im.width == L.img_width && im.siz == L.siz) { e = &im; break; }
+        }
+        if (e == nullptr) {
+            e = &images[0];
+            for (ImageRows& im : images) if (im.last_list < e->last_list) e = &im;   // empty ones have 0
+            *e = ImageRows{};
+            e->addr = L.img_addr; e->width = L.img_width; e->siz = L.siz;
+        }
+        if (e->cur_lo < 0 || (int16_t)L.t0 < e->cur_lo) e->cur_lo = (int16_t)L.t0;
+        if (e->cur_hi < 0 || (int16_t)L.t1 > e->cur_hi) e->cur_hi = (int16_t)L.t1;
+        e->last_list = list_seq;
+    }
+    // At the start of a list: what the last one loaded becomes the rows;
+    // images unused for a while are forgotten.
+    void roll_images() {
+        for (ImageRows& im : images) {
+            if (im.cur_lo >= 0) { im.lo = im.cur_lo; im.hi = im.cur_hi; im.cur_lo = im.cur_hi = -1; }
+            else if (im.addr != 0 && list_seq - im.last_list > 16) im = ImageRows{};
+        }
+    }
+    // The current texture state as one texture of its image (img_tex), when
+    // that samples what the tile does for coordinates inside the loaded
+    // rectangle [0, img_lim_u] x [0, img_lim_v] of the tile: the triangle's
+    // coordinates move by img_du, img_dv into the image texture.
+    bool img_ok = false;
+    TexDesc img_tex[2];
+    float img_du = 0.0f, img_dv = 0.0f, img_lim_u = 0.0f, img_lim_v = 0.0f;
+    bool last_tri_img = false;          // the last triangle's record samples an image texture
+    int last_best = -1;                 // describe_tile's load
+    int tex0_load = -1;                 // ... for TEXEL0's tile (current_textures)
+    struct ImageMap { float du = 0.0f, dv = 0.0f, lim_u = 0.0f, lim_v = 0.0f; };
+    static constexpr float kClampOvershoot = 8.0f;   // texels a rectangle may reach past its tile into the clamp
+    bool describe_image(int t0) {
+        if (cached_tex[1].valid) return false;
+        ImageMap m;
+        if (!image_of(t0, cached_tex[0], tex0_load, img_tex[0], m)) return false;
+        img_tex[1] = TexDesc{};
+        img_du = m.du; img_dv = m.dv; img_lim_u = m.lim_u; img_lim_v = m.lim_v;
+        return true;
+    }
+    // Tile t0, described as d from load `load`, as a texture of its image:
+    // `out`, and where the tile's texel coordinates go in it.
+    bool image_of(int t0, const TexDesc& d, int load, TexDesc& out, ImageMap& map) const {
+        if (!d.valid || d.snapshot || d.frame || d.rtt >= 0 || d.block || d.wrap_rows != 0 || load < 0) return false;
+        const TmemLoad& L = loads[load];
+        const Tile& tl = tiles[t0 & 7];
+        if (L.block || L.img_width == 0 || tl.tmem != L.tmem || tl.siz != L.siz || (tl.siz != 1 && tl.siz != 2) || tl.line != L.line) return false;
+        const ImageRows* im = nullptr;
+        for (const ImageRows& e : images) {
+            if (e.addr == L.img_addr && e.width == L.img_width && e.siz == L.siz) { im = &e; break; }
+        }
+        if (im == nullptr || im->lo < 0 || (int)L.t0 < im->lo || (int)L.t1 > im->hi) return false;
+        const uint32_t rows = (uint32_t)(im->hi - im->lo + 1), w = L.img_width;
+        if (w > 1024 || rows > 1024) return false;
+        const bool wide = d.fmt == 3 || d.fmt == 4 || (d.fmt == 2 && d.tlut_mode == 3);   // decoded to RGBA8
+        if ((uint32_t)pot16(w) * pot16(rows) * (wide ? 4u : 2u) > kImageBytes) return false;
+        const uint32_t addr = L.img_addr + (uint32_t)im->lo * L.pitch;
+        if ((addr & 0xFFFFFF) + rows * L.pitch > 0x1000000u) return false;
+        out = d;
+        TexDesc& m = out;
+        m.addr = addr;
+        m.pitch = L.pitch;
+        m.width = (uint16_t)w;
+        m.height = (uint16_t)rows;
+        m.masks = m.maskt = 0;
+        m.cms = m.cmt = 2;           // clamped at the image's edges
+        m.nibble = 0;
+        m.dxt = 0;
+        m.load_word = 0;
+        map.du = (float)L.s0;
+        map.dv = (float)(L.t0 - im->lo);
+        map.lim_u = (float)std::min<int>(d.width, L.s1 - L.s0 + 1);
+        map.lim_v = (float)std::min<int>(d.height, L.t1 - L.t0 + 1);
+        return true;
+    }
+
+    // The frame cap (Interpreter::pass_over): what the list drew into. Plain
+    // = only the colour image it draws first (and fills of the depth buffer).
+    bool skim = false;                  // pass_over: state only, nothing drawn
+    bool plain = true;
+    uint32_t plain_cimg = 0;
+    void note_target(bool fill) {
+        if (cur_rtt >= 0) { plain = false; return; }
+        if (zimg != 0 && cimg == zimg) { if (!fill) plain = false; return; }
+        if (plain_cimg == 0) plain_cimg = cimg;
+        else if (cimg != plain_cimg) plain = false;
+    }
     int16_t rect_align[4]{};   // left/top/right/bottom offsets (extended)
     uint32_t rect_lorigin = 0x800, rect_rorigin = 0x800;
     uint8_t rect_aspect = 0;
@@ -262,14 +499,126 @@ struct Interpreter::Impl {
     // a GPU texture of its own, which later loads from that image sample.
     bool rtt_enabled = false;
     RttImage rtt_images[kMaxRtt];
+    uint32_t rtt_list[kMaxRtt] = {};    // the list (list_seq) that last drew into each image
     int rtt_count = 0, rtt_next = 0;
     int cur_rtt = -1;                   // the image the current colour image draws into, or -1
+    uint32_t list_seq = 0;              // display lists run so far
+
+    // RenderDesc::sample_drawn_frame: the game copies parts of the frame it
+    // is drawing into small images of its own, mid-list, and draws with them
+    // (Goemon's menu box rims). Loads from the colour image being drawn,
+    // after draws went into it, sample the frame as drawn so far
+    // (TexDesc::frame); images narrower or wider than the frame are drawn
+    // into GPU textures as render_to_texture would (a framebuffer always has
+    // the frame's width).
+    bool frame_copy = false;
+    // RenderDesc::primary_world_instance: projection instances
+    // (DrawRecord::proj_inst). A triangle record starts a new one when the
+    // projection or the viewport differs from the instance's, or a rectangle
+    // or a colour image change came in between (RT64 starts a new Projection
+    // then); records are not merged across instances.
+    bool inst_track = false;
+    // RenderDesc::unify_world_depth, and the current projection's depth
+    // terms (DrawRecord::depth_a/b), kept while the option is on.
+    bool unify_depth = false;
+    float cur_depth_a = 0.0f, cur_depth_b = 0.0f;
+    void update_depth_terms() {
+        if (!unify_depth || !is_perspective(proj)) { cur_depth_a = cur_depth_b = 0.0f; return; }
+        const Mtx dc = depth_camera(proj);
+        cur_depth_a = dc.m[2][2];
+        cur_depth_b = dc.m[3][2];
+    }
+    bool world_depth_draw(const DrawRecord& d) const {
+        return d.kind == DrawRecord::Tris && d.perspective && d.rtt < 0 && (d.othermode_l & G_ZS_PRIM) == 0 &&
+               is_world_proj(d.proj_id) && d.depth_b != 0.0f;
+    }
+    // RenderDesc::unify_world_depth, once the frame's draws are recorded:
+    // the World projection with the nearest near plane (n = b / (a - 1))
+    // gives every World draw its depth, z' = ((1 - a) w + b) / 2 from the
+    // vertex's w (= -z_eye), clamped to 0..w. The draws keep their own
+    // terms, so an in-between frame built from the records does the same.
+    void unify_world_depth(FrameRecord& f) const {
+        if (!unify_depth) return;
+        bool have = false, differ = false;
+        float fa = 0.0f, fb = 0.0f, ta = 0.0f, tb = 0.0f, best = 0.0f;
+        for (const DrawRecord& d : f.draws) {
+            if (!world_depth_draw(d)) continue;
+            const float n = d.depth_b / (d.depth_a - 1.0f);
+            if (!(n > 0.0f)) continue;
+            if (!have) { have = true; fa = ta = d.depth_a; fb = tb = d.depth_b; best = n; continue; }
+            if (d.depth_a != fa || d.depth_b != fb) differ = true;
+            if (n < best) { best = n; ta = d.depth_a; tb = d.depth_b; }
+        }
+        if (!have || !differ) return;
+        for (const DrawRecord& d : f.draws) {
+            if (!world_depth_draw(d) || (d.depth_a == ta && d.depth_b == tb)) continue;
+            for (uint32_t k = d.first; k < d.first + d.count && k < f.verts.size(); k++) {
+                Vtx3ds& v = f.verts[k];
+                if (!(v.w > 0.0f)) continue;
+                const float z = 0.5f * ((1.0f - ta) * v.w + tb);
+                v.z = z < 0.0f ? 0.0f : (z > v.w ? v.w : z);
+            }
+        }
+        if (f.cam_is_world) { f.cam[10] = ta; f.cam[14] = tb; }
+    }
+    uint32_t proj_inst = 0;
+    bool inst_break = true;
+    Mtx inst_proj{};
+    Viewport inst_vp{};
+    // The projection or the viewport may differ from the instance's: set by
+    // everything that writes them, cleared once they compare equal (the
+    // comparison per triangle cost ~3 ms a frame on the console).
+    bool inst_dirty = true;
+    bool new_instance_pending() {
+        if (inst_break) return true;
+        if (!inst_dirty) return false;
+        const bool differs = memcmp(&inst_proj, &proj, sizeof(Mtx)) != 0 ||
+                             memcmp(vp.scale, inst_vp.scale, sizeof(vp.scale)) != 0 || memcmp(vp.trans, inst_vp.trans, sizeof(vp.trans)) != 0;
+        if (!differs) inst_dirty = false;
+        return differs;
+    }
+    void start_instance(DrawRecord& r) {
+        if (new_instance_pending()) {
+            proj_inst++;
+            inst_proj = proj;
+            inst_vp = vp;
+            inst_break = false;
+            inst_dirty = false;
+            if (hud_camera_id != 0 && proj_id == hud_camera_id && r.perspective) {
+                FrameRecord::InstanceCam c;
+                c.inst = proj_inst;
+                const Mtx cam = depth_camera(proj);
+                memcpy(c.m, &cam, sizeof(c.m));
+                out->inst_cams.push_back(c);
+            }
+        }
+        r.proj_inst = proj_inst;
+    }
+    uint32_t screen_cimg = 0;           // the on-screen colour image this list draws into
+    bool screen_drawn = false;          // ... and something was drawn there
+
     bool is_presented_fb(uint32_t a) const {
         for (uint32_t fb : vi_fbs) if (fb != 0 && a == fb) return true;
         return false;
     }
     int rtt_for_cimg(uint32_t a, uint32_t width) {
-        if (!rtt_enabled || a == zimg) return -1;
+        if (a == zimg) return -1;
+        if (!rtt_enabled) {
+            if (!frame_copy || width == (uint32_t)screen_w || width == 0) return -1;
+            // A copy target: one texture per address and width (Goemon draws
+            // an 8-wide and a 256-wide image at one address, in memory that
+            // does not overlap, but would in one texture).
+            for (int i = 0; i < rtt_count; i++) {
+                if (rtt_images[i].addr == a && rtt_images[i].width == width) { rtt_list[i] = list_seq; return i; }
+            }
+            int i = rtt_count < kMaxRtt ? rtt_count++ : (rtt_next++ % kMaxRtt);
+            rtt_images[i].addr = a;
+            rtt_images[i].width = (uint16_t)width;
+            rtt_images[i].pot_w = pot16(width);
+            rtt_images[i].pot_h = pot16((uint32_t)screen_h);
+            rtt_list[i] = list_seq;
+            return i;
+        }
         // Known once two framebuffers have been presented (a double-buffered
         // game's second one is drawn before it is ever shown).
         const bool known = vi_fbs[0] != 0 && vi_fbs[1] != 0;
@@ -339,10 +688,146 @@ struct Interpreter::Impl {
         memset(&m, 0, sizeof(m));
         m.m[0][0] = m.m[1][1] = m.m[2][2] = m.m[3][3] = 1.0f;
     }
-    void update_mvp() {
+    void update_mvp(uint32_t vtx_addr) {
         if (mvp_dirty) {
+            if (ip != nullptr) {
+                interp_point(vtx_addr);
+                if (ip->applying) { mul(mvp, eff_mv, eff_proj); mvp_dirty = false; return; }
+            }
             mul(mvp, mv_stack[mv_depth], proj);
             mvp_dirty = false;
+        }
+    }
+
+    // ---- frame interpolation
+    static interp::M4 m4(const Mtx& m) { interp::M4 r; memcpy(&r, &m, sizeof(r)); return r; }
+    static Mtx mtx(const interp::M4& m) { Mtx r; memcpy(&r, &m, sizeof(r)); return r; }
+    // A new transform for the vertices about to load (RT64 records a world
+    // transform whenever the matrices changed since the last load, and a
+    // projection when the projection did): recorded by run(), and by
+    // run_inbetween() replaced with what match_previous() computed.
+    void interp_point(uint32_t vtx_addr) {
+        interp::FrameLog& L = ip->now();
+        if (proj_seq != proj_rec_seq) {
+            proj_rec_seq = proj_seq;
+            pj_i++;
+            if (ip->recording) {
+                if (proj_tg_idx < 0) { proj_tg_idx = (int32_t)L.groups.size(); L.groups.push_back(proj_tg[proj_group_depth]); }
+                interp::PjEntry e;
+                e.view = m4(pv_view);
+                e.proj = m4(pv_proj);
+                e.full = m4(proj);
+                e.group = (uint32_t)proj_tg_idx;
+                e.addr = proj_addr;
+                e.perspective = is_perspective(proj);
+                L.pj.push_back(e);
+            }
+            if (ip->applying) {
+                eff_proj = proj;
+                if ((size_t)pj_i < L.pj.size()) {
+                    const interp::PjEntry& e = L.pj[pj_i];
+                    if (memcmp(&e.full, &proj, sizeof(Mtx)) != 0) ip->diverged = true;
+                    else if (e.interp) eff_proj = mtx(e.lerped);
+                }
+                else ip->diverged = true;
+            }
+        }
+        xf_i++;
+        v_i = 0;
+        if (ip->recording) {
+            if (mv_tg_idx < 0) { mv_tg_idx = (int32_t)L.groups.size(); L.groups.push_back(mv_tg[mv_group_depth]); }
+            interp::XfEntry e;
+            e.m = m4(mv_stack[mv_depth]);
+            e.group = (uint32_t)mv_tg_idx;
+            e.key = vtx_addr;
+            e.addr = mv_addr[mv_depth];
+            e.pj = pj_i;
+            e.vfirst = (uint32_t)(L.vdata.size() / 5);
+            const interp::Group& g = L.groups[e.group];
+            e.vstored = g.vert != interp::kSkip || g.tc != interp::kSkip;
+            L.xf.push_back(e);
+        }
+        if (ip->applying) {
+            eff_mv = mv_stack[mv_depth];
+            if ((size_t)xf_i < L.xf.size()) {
+                const interp::XfEntry& e = L.xf[xf_i];
+                if (memcmp(&e.m, &mv_stack[mv_depth], sizeof(Mtx)) != 0) ip->diverged = true;
+                else if (e.interp) eff_mv = mtx(e.lerped);
+            }
+            else ip->diverged = true;
+            ldir_dirty = true;     // lighting follows the interpolated modelview
+        }
+    }
+    const Mtx& light_mv() const { return (ip != nullptr && ip->applying) ? eff_mv : mv_stack[mv_depth]; }
+    // A projection matrix command, as RT64 splits it into a view and a
+    // projection (RSP::matrixCommon).
+    void interp_proj_matrix(const Mtx& m, uint8_t p) {
+        const interp::M4 f = m4(m);
+        if (p & 2) {
+            interp::M4 v, pr;
+            if (interp::is_view_proj(f)) interp::decompose_view_proj(f, v, pr);
+            else { pr = f; v = interp::identity(); }
+            pv_view = mtx(v);
+            pv_proj = mtx(pr);
+        }
+        else if (interp::is_affine(f) && !interp::is_identity(f)) mul(pv_view, m, pv_view);
+        else mul(pv_proj, m, pv_proj);
+        proj_addr = mtx_addr;
+        proj_seq++;
+    }
+    // gEXEditGroupByAddress: the groups of this list's transforms loaded
+    // from that address take the new properties where they allow it.
+    void interp_edit_group(uint32_t addr, uint32_t flags) {
+        interp::FrameLog& L = ip->now();
+        const interp::Group g = interp::Group::decode(0, flags);
+        const bool proj_group = (flags >> 1) & 1;
+        auto edit = [&](uint32_t gi) { if (gi < L.groups.size() && L.groups[gi].edit == 1) L.groups[gi].set_props(g); };
+        if (proj_group) { for (const interp::PjEntry& e : L.pj) if (e.addr == addr) edit(e.group); }
+        else { for (const interp::XfEntry& e : L.xf) if (e.addr == addr) edit(e.group); }
+    }
+    // The texture tiles a triangle samples, as RT64 matches them per draw:
+    // a new entry when the tiles or the transform changed. Sets tile_du/dv.
+    void interp_tiles() {
+        if (tex_seq == tile_rec_seq && (int)texture.tile == tile_rec_tile && xf_i == tile_rec_xf) return;
+        tile_rec_seq = tex_seq;
+        tile_rec_tile = texture.tile;
+        tile_rec_xf = xf_i;
+        tile_du[0] = tile_du[1] = tile_dv[0] = tile_dv[1] = 0.0f;
+        tile_cur = -1;
+        interp::FrameLog& L = ip->now();
+        if (xf_i < 0 || (size_t)xf_i >= L.xf.size()) return;
+        const interp::Group& g = L.groups[L.xf[xf_i].group];
+        if (g.tile == interp::kSkip) return;
+        const TexDesc* tex = current_textures();
+        if (!tex[0].valid || (image_tiles && img_ok)) return;
+        tl_i++;
+        tile_cur = tl_i;
+        if (ip->recording) {
+            interp::TileEntry e;
+            uint32_t h = 2166136261u;
+            auto mixh = [&h](uint32_t v) { h = (h ^ v) * 16777619u; };
+            mixh(cc_w0); mixh(cc_w1); mixh(othermode_h); mixh(othermode_l); mixh(geometry_mode); mixh(g.id);
+            e.key = h;
+            h = 2166136261u;
+            mixh(tex[0].addr); mixh((uint32_t)tex[0].fmt | ((uint32_t)tex[0].siz << 8) | ((uint32_t)tex[0].palette << 16)); mixh(tex[0].tlut_hash);
+            e.tex = h;
+            e.flag = g.tile;
+            e.ntiles = tex[1].valid ? 2 : 1;
+            for (int t = 0; t < e.ntiles; t++) {
+                const Tile& tl = tiles[(texture.tile + t) & 7];
+                interp::TileParams& p = e.t[t];
+                p.uls = tl.uls; p.ult = tl.ult; p.lrs = tl.lrs; p.lrt = tl.lrt; p.line = tl.line;
+                p.fmt = tl.fmt; p.siz = tl.siz; p.masks = tl.masks; p.maskt = tl.maskt; p.shifts = tl.shifts; p.shiftt = tl.shiftt;
+                p.cms = tl.cms; p.cmt = tl.cmt;
+            }
+            L.tiles.push_back(e);
+        }
+        if (ip->applying) {
+            if ((size_t)tl_i >= L.tiles.size()) { ip->diverged = true; return; }
+            const interp::TileEntry& e = L.tiles[tl_i];
+            if (!e.interp) return;
+            tile_du[0] = e.du[0]; tile_dv[0] = e.dv[0];
+            tile_du[1] = e.du[1]; tile_dv[1] = e.dv[1];
         }
     }
 
@@ -352,7 +837,7 @@ struct Interpreter::Impl {
         // product, as the RSP effectively does) so they can be dotted with
         // model-space normals; the vertex normals themselves are used as the
         // RSP uses them, unnormalised, scaled by 1/127.
-        const Mtx& mv = mv_stack[mv_depth];
+        const Mtx& mv = light_mv();
         for (int i = 0; i < num_lights; i++) {
             float d[3];
             for (int k = 0; k < 3; k++) d[k] = lights[i].dir[0] * mv.m[k][0] + lights[i].dir[1] * mv.m[k][1] + lights[i].dir[2] * mv.m[k][2];
@@ -376,8 +861,12 @@ struct Interpreter::Impl {
 #ifdef DL_BENCH_SKIP_VTX
         return;
 #endif
+        // A pass_over needs no vertices, unless G_BRANCH_Z tests their depth
+        // (force_lod_branch off): then the list's flow, and so the state it
+        // leaves, depends on them.
+        if (skim && force_branch_z) return;
         last_vtx_addr = addr;
-        update_mvp();
+        update_mvp(addr);
         const bool lit = (geometry_mode & G_LIGHTING) != 0;
         const bool texgen = (geometry_mode & G_TEXTURE_GEN) != 0;
         const bool fogged = (geometry_mode & G_FOG) != 0;
@@ -401,19 +890,63 @@ struct Interpreter::Impl {
         const int32_t amb0 = ambient[0] << 16, amb1 = ambient[1] << 16, amb2 = ambient[2] << 16;
         int lo = v0 < 0 ? -v0 : 0, hi = n;
         if (v0 + hi > kMaxVerts) hi = kMaxVerts - v0;
+        // Frame interpolation: the transform's vertices are recorded (when
+        // its group interpolates vertices or texcoords), or moved between the
+        // previous frame's and these.
+        interp::XfEntry* xe = nullptr;
+        const int16_t* vprev = nullptr;
+        float vw = 0.0f;
+        uint32_t vi0 = 0;
+        if (ip != nullptr && hi > lo) {
+            interp::FrameLog& L = ip->now();
+            if (xf_i >= 0 && (size_t)xf_i < L.xf.size()) {
+                xe = &L.xf[xf_i];
+                if (ip->recording) {
+                    Interpreter::Interp::LoadCtx lc;
+                    memcpy(lc.m, m, sizeof(lc.m));
+                    lc.sx = sx; lc.sy = sy; lc.tx = tx; lc.ty = ty;
+                    lc.xf = xf_i; lc.pj = pj_i;
+                    lc.uscale = uscale; lc.vscale = vscale; lc.fm = fm; lc.fo = fo;
+                    lc.texgen = lit && texgen;
+                    ip->ctxs.push_back(lc);
+                    if (xe->vstored) {
+                        for (int i = lo; i < hi; i++) {
+                            const uint8_t* src = rdram + ((addr + i * 16) & 0xFFFFFC);
+                            const int16_t q[5] = { *(const int16_t*)(src + 2), *(const int16_t*)(src + 0), *(const int16_t*)(src + 6),
+                                                   *(const int16_t*)(src + 10), *(const int16_t*)(src + 8) };
+                            L.vdata.insert(L.vdata.end(), q, q + 5);
+                        }
+                    }
+                    xe->vcount += (uint32_t)(hi - lo);
+                }
+                else if (ip->applying && (xe->vpos || xe->vtc) && v_i + (uint32_t)(hi - lo) <= xe->vcount) {
+                    vprev = &ip->before().vdata[((size_t)xe->vprev + v_i) * 5];
+                    vw = 1.0f - ip->weight;
+                }
+            }
+            vi0 = v_i;
+            v_i += (uint32_t)(hi - lo);
+        }
         for (int i = lo; i < hi; i++) {
             const uint8_t* src = rdram + ((addr + i * 16) & 0xFFFFFC);
             // RDRAM is stored in 32-bit little-endian words: halves are at ^2, bytes at ^3.
-            const float ob0 = (float)*(const int16_t*)(src + 2), ob1 = (float)*(const int16_t*)(src + 0), ob2 = (float)*(const int16_t*)(src + 6);
+            float ob0 = (float)*(const int16_t*)(src + 2), ob1 = (float)*(const int16_t*)(src + 0), ob2 = (float)*(const int16_t*)(src + 6);
             const int16_t tc0 = *(const int16_t*)(src + 10), tc1 = *(const int16_t*)(src + 8);
+            float tu = (float)tc0, tv = (float)tc1;
+            if (vprev != nullptr) {
+                // RT64: pos - (pos - prev) * (1 - weight), per component.
+                const int16_t* p = vprev + (size_t)(i - lo) * 5;
+                if (xe->vpos) { ob0 += ((float)p[0] - ob0) * vw; ob1 += ((float)p[1] - ob1) * vw; ob2 += ((float)p[2] - ob2) * vw; }
+                if (xe->vtc) { tu += ((float)p[3] - tu) * vw; tv += ((float)p[4] - tv) * vw; }
+            }
             const uint8_t c0 = src[15], c1 = src[14], c2 = src[13], c3 = src[12];
             auto& v = vtx[v0 + i];
             v.x = ob0 * m[0][0] + ob1 * m[1][0] + ob2 * m[2][0] + m[3][0];
             v.y = ob0 * m[0][1] + ob1 * m[1][1] + ob2 * m[2][1] + m[3][1];
             v.z = ob0 * m[0][2] + ob1 * m[1][2] + ob2 * m[2][2] + m[3][2];
             v.w = ob0 * m[0][3] + ob1 * m[1][3] + ob2 * m[2][3] + m[3][3];
-            v.u = (float)tc0 * uscale;
-            v.v = (float)tc1 * vscale;
+            v.u = tu * uscale;
+            v.v = tv * vscale;
             if (lit) {
                 // Integer lighting, as the RSP does it: the unnormalised
                 // signed normal dotted with 16.16 unit directions.
@@ -449,14 +982,17 @@ struct Interpreter::Impl {
             else {
                 v.r = c0; v.g = c1; v.b = c2; v.a = c3;
             }
-            if (fogged) {
-                // Fog factor into alpha: (z/w * mul + off) / 255, as the RSP
-                // does, with z/w the clip-space depth = 2 z' / w - 1.
-                float zw = v.w != 0.0f ? 2.0f * v.z / v.w - 1.0f : 0.0f;
-                if (zw < -1) zw = -1; if (zw > 1) zw = 1;
-                float f = zw * fm + fo;
-                if (f < 0) f = 0; if (f > 255) f = 255;
-                v.a = (uint8_t)f;
+            if (fogged) v.a = rsp_fog(v.z, v.w, fm, fo);   // fog factor into alpha
+            if (xe != nullptr && ip->recording) {
+                Interpreter::Interp::LoadedVtx q;
+                q.ob[0] = *(const int16_t*)(src + 2); q.ob[1] = *(const int16_t*)(src + 0); q.ob[2] = *(const int16_t*)(src + 6);
+                q.tc[0] = tc0; q.tc[1] = tc1;
+                q.ctx = (uint32_t)ip->ctxs.size() - 1;
+                q.vi = vi0 + (uint32_t)(i - lo);
+                q.rgba[0] = v.r; q.rgba[1] = v.g; q.rgba[2] = v.b; q.rgba[3] = v.a;
+                q.fog = fogged;
+                slot_src[v0 + i] = (uint32_t)ip->lv.size();
+                ip->lv.push_back(q);
             }
         }
     }
@@ -466,15 +1002,16 @@ struct Interpreter::Impl {
         const Tile& tl = tiles[t & 7];
         d.valid = false;
         // Find the load whose TMEM range holds this tile.
-        // The most recent load covering the tile's TMEM address wins.
+        // The most recent load covering the tile's TMEM address wins: the
+        // loads of this list sit in the ring in order, newest at
+        // load_count - 1, so the first one found looking back is it.
         const TmemLoad* best = nullptr;
-        for (int i = 0; i < 16; i++) {
-            const TmemLoad& L = loads[i];
-            if (!L.valid) continue;
-            if (tl.tmem >= L.tmem && tl.tmem < L.tmem + L.words) {
-                if (best == nullptr || L.seq > best->seq) best = &L;
-            }
+        const int oldest = load_count > 16 ? load_count - 16 : 0;
+        for (int k = load_count - 1; k >= oldest; k--) {
+            const TmemLoad& L = loads[k & 15];
+            if (L.valid && tl.tmem >= L.tmem && tl.tmem < L.tmem + L.words) { best = &L; break; }
         }
+        last_best = best != nullptr ? (int)(best - loads) : -1;
         if (best == nullptr) {
             stats->tex_unresolved++;
             if (stats->tex_unresolved <= 3) {
@@ -503,16 +1040,37 @@ struct Interpreter::Impl {
         d.valid = true;
         d.addr = best->addr + (tl.tmem - best->tmem) * 8;
         d.pitch = pitch;
+        // TMEM is 4 KB (2 KB for 32-bit texels, split over its halves, and
+        // for the texels when the TLUT holds the upper half); the sampler's
+        // address wraps there. A tile taller than that from the start of
+        // TMEM reads its first rows again (Goemon's menu curtain: a 64x32
+        // load fills TMEM, the tile's mask is 64 rows), not RDRAM past them.
+        d.wrap_rows = 0;
+        if (tl.tmem == 0 && tl.line != 0 && h > 1) {
+            const uint32_t limit = (tl.siz == 3 || ((othermode_h >> 14) & 3) >= 2) ? 256u : 512u;
+            if (limit % tl.line == 0 && limit / tl.line < (uint32_t)h) d.wrap_rows = (uint16_t)(limit / tl.line);
+        }
+        // RenderDesc::sample_drawn_frame: a 16-bit tile load out of the
+        // colour image this list is drawing into, after something was drawn
+        // there, reads the frame drawn so far (Goemon's menu boxes copy
+        // strips of the backdrop for their rims).
+        d.frame = frame_copy && screen_drawn && screen_cimg != 0 && !best->block && tl.siz == 2 &&
+                  best->pitch == (uint32_t)screen_w * 2 && d.addr >= screen_cimg && d.addr < screen_cimg + (uint32_t)(screen_w * screen_h * 2);
         // Reads of the stored frame are 16-bit tile loads out of a
         // screen-wide image; anything else at that address is ordinary
         // texture data (the storage may be heap memory the game reuses later).
-        d.snapshot = snapshot_valid && d.addr >= snapshot_base && d.addr < snapshot_base + (uint32_t)(screen_w * screen_h * 2) &&
+        d.snapshot = !d.frame && snapshot_valid && d.addr >= snapshot_base && d.addr < snapshot_base + (uint32_t)(screen_w * screen_h * 2) &&
                      !best->block && best->pitch == (uint32_t)screen_w * 2 && tl.siz == 2;
         d.rtt = -1;
-        if (rtt_enabled && !d.snapshot && !best->block && tl.siz == 2) {
+        // With sample_drawn_frame a block load of whole rows of an image
+        // reads it too (the rims load their strips with LOADBLOCK), but only
+        // an image drawn by this list: the memory is the game's to reuse.
+        if ((rtt_enabled || frame_copy) && !d.snapshot && !d.frame && (!best->block || frame_copy) && tl.siz == 2) {
+            const uint32_t row = best->block ? pitch : best->pitch;
             for (int i = 0; i < rtt_count; i++) {
                 const RttImage& img = rtt_images[i];
-                if (d.addr >= img.addr && d.addr < img.addr + (uint32_t)img.width * 2 * img.pot_h && best->pitch == (uint32_t)img.width * 2) {
+                if (!rtt_enabled && rtt_list[i] != list_seq) continue;
+                if (d.addr >= img.addr && d.addr < img.addr + (uint32_t)img.width * 2 * img.pot_h && row == (uint32_t)img.width * 2) {
                     d.rtt = (int8_t)i;
                     break;
                 }
@@ -547,15 +1105,22 @@ struct Interpreter::Impl {
     }
 
     // TEXEL1's coordinates relative to TEXEL0's (tile t0 and the next one).
-    void compute_uv1(float* uv1, int t0) const {
+    // tile_lerp: a triangle's, which takes the in-between frame's tile
+    // scroll (tile_du/dv, else 0).
+    void compute_uv1(float* uv1, int t0, bool tile_lerp = false) const {
         const Tile& a = tiles[t0 & 7];
         const Tile& b = tiles[(t0 + 1) & 7];
         float k_u = shift_scale(b.shifts) / shift_scale(a.shifts), k_v = shift_scale(b.shiftt) / shift_scale(a.shiftt);
         uv1[0] = k_u; uv1[1] = k_v;
+        if (tile_lerp) {
+            uv1[2] = ((float)(a.uls >> 2) + tile_du[0]) * k_u - ((float)(b.uls >> 2) + tile_du[1]);
+            uv1[3] = ((float)(a.ult >> 2) + tile_dv[0]) * k_v - ((float)(b.ult >> 2) + tile_dv[1]);
+            return;
+        }
         uv1[2] = (float)(a.uls >> 2) * k_u - (float)(b.uls >> 2);
         uv1[3] = (float)(a.ult >> 2) * k_v - (float)(b.ult >> 2);
     }
-    void set_uv1(DrawRecord& r, int t0) const { compute_uv1(r.uv1, t0); }
+    void set_uv1(DrawRecord& r, int t0, bool tile_lerp = false) const { compute_uv1(r.uv1, t0, tile_lerp); }
 
     void snapshot(DrawRecord& r) {
         r.cc_w0 = cc_w0; r.cc_w1 = cc_w1;
@@ -566,11 +1131,12 @@ struct Interpreter::Impl {
         effective_scissor(r.scissor, r.kind == DrawRecord::Tris && proj_stretch());
         r.proj_id = proj_id;
         r.rtt = (int8_t)cur_rtt;
-        r.perspective = proj.m[2][3] != 0.0f || proj.m[3][3] == 0.0f;
+        r.perspective = is_perspective(proj);
+        r.depth_a = cur_depth_a; r.depth_b = cur_depth_b;
         r.mv_auto = mv_groups[mv_group_depth] == kIdAuto;
         r.mv_seq = mv_seq;
         r.dbg_vtx = last_vtx_addr;
-        set_uv1(r, texture.tile);
+        set_uv1(r, texture.tile, r.kind == DrawRecord::Tris && ip != nullptr);
         r.dbg_vp[0] = vp.scale[0]; r.dbg_vp[1] = vp.scale[1]; r.dbg_vp[2] = vp.trans[0]; r.dbg_vp[3] = vp.trans[1];
         r.dbg_proj[0] = proj.m[1][1]; r.dbg_proj[1] = proj.m[3][1]; r.dbg_proj[2] = proj.m[2][3]; r.dbg_proj[3] = proj.m[3][3];
     }
@@ -594,23 +1160,38 @@ struct Interpreter::Impl {
         // every off-screen image is, and so is colour drawn into the depth
         // buffer's memory (Banjo stores the paused frame there): its copy
         // of the front buffer becomes a snapshot.
-        return rtt_enabled ? (cur_rtt >= 0 || (zimg != 0 && cimg == zimg)) : cimg >= 0x800000;
+        return rtt_enabled ? (cur_rtt >= 0 || (zimg != 0 && cimg == zimg)) : (cimg >= 0x800000 || cur_rtt >= 0);
     }
 
     void emit_tri(int i0, int i1, int i2) {
 #ifdef DL_BENCH_SKIP_TRI
         return;
 #endif
+        if (cimg != plain_cimg || cur_rtt >= 0) note_target(false);
+        if (skim) return;
         if (offscreen_target() && cur_rtt < 0) return;
         if (i0 >= kMaxVerts || i1 >= kMaxVerts || i2 >= kMaxVerts) return;
+        if (ip != nullptr) interp_tiles();
+        // RenderDesc::merge_image_tiles: the triangle samples a texture of its
+        // tile's whole image when its coordinates stay inside the tile.
+        bool img = false;
+        if (image_tiles) {
+            current_textures();
+            if (img_ok) {
+                img = tri_inside_image(i0, i1, i2);
+                if (img) stats->image_tris++;
+                else stats->image_fallbacks++;
+            }
+        }
         DrawRecord* r = nullptr;
         if (!out->draws.empty()) {
             DrawRecord& last = out->draws.back();
             // Reticle candidates (see set_split_untagged_ortho) end at a
             // modelview load.
             bool split = split_untagged_ortho && !last.perspective && last.mv_auto && last.mv_seq != mv_seq;
+            if (inst_track && new_instance_pending()) split = true;
             if (last.kind == DrawRecord::Tris && last.first + last.count == out->verts.size() && !split) {
-                if (last_draw_seq == state_seq) {
+                if (last_draw_seq == state_seq && last_tri_img == img) {
                     r = &last;
                 }
                 else {
@@ -621,7 +1202,7 @@ struct Interpreter::Impl {
 #ifdef DL_BENCH_NO_PROBE
                     if (false)
 #endif
-                    if (same_as_last(last, current_textures())) {
+                    if (same_as_last(last, img ? img_tex : current_textures())) {
                         last_draw_seq = state_seq;
                         r = &last;
                         stats->draws_merged++;
@@ -630,8 +1211,9 @@ struct Interpreter::Impl {
             }
         }
         if (r == nullptr) {
+            if (!rect_slices.empty()) flush_rect_slices();   // the run of rectangles ends
             last_draw_seq = state_seq;
-            const TexDesc* tex = current_textures();
+            const TexDesc* tex = img ? img_tex : current_textures();
             out->draws.emplace_back();
             r = &out->draws.back();
             r->kind = DrawRecord::Tris;
@@ -640,11 +1222,38 @@ struct Interpreter::Impl {
             snapshot(*r);
             r->tex[0] = tex[0];
             r->tex[1] = tex[1];
+            if (frame_copy) note_draw(*r);
+            if (inst_track) start_instance(*r);
         }
+        last_tri_img = img;
 #ifdef DL_BENCH_NO_EMIT
         return;
 #endif
         const auto& a = vtx[i0]; const auto& b = vtx[i1]; const auto& c = vtx[i2];
+        if (ip != nullptr && ip->recording) {
+            // Frame interpolation: the triangle as build_inbetween draws it
+            // again (its texel coordinates as below, culled or not).
+            Interpreter::Interp::TriRec t;
+            t.src[0] = slot_src[i0]; t.src[1] = slot_src[i1]; t.src[2] = slot_src[i2];
+            t.draw = (uint32_t)(r - out->draws.data());
+            const Tile& tl = tiles[texture.tile & 7];
+            const float uls = (float)(tl.uls >> 2), ult = (float)(tl.ult >> 2);
+            t.ss = shift_scale(tl.shifts); t.st = shift_scale(tl.shiftt);
+            t.zprim = (othermode_l & G_ZS_PRIM) != 0 ? prim_z() : -1.0f;
+            t.tile = tile_cur;
+            t.cull = geometry_mode & (G_CULL_FRONT | G_CULL_BACK);
+            t.plain = !img && !r->tex[0].snapshot && !r->tex[0].frame && r->tex[0].rtt < 0;
+            for (int k = 0; k < 3; k++) {
+                const auto& v = k == 0 ? a : (k == 1 ? b : c);
+                float u = v.u * t.ss - uls, w = v.v * t.st - ult;
+                if (img) { u += img_du; w += img_dv; }
+                else if (r->tex[0].snapshot) snapshot_uv(r->tex[0], u, w, u, w, proj_stretch());
+                else if (r->tex[0].frame) frame_uv(r->tex[0], u, w, u, w, proj_stretch() && cur_rtt < 0);
+                else if (r->tex[0].rtt >= 0) rtt_uv(r->tex[0], u, w);
+                t.uv[k][0] = u; t.uv[k][1] = w;
+            }
+            ip->tris.push_back(t);
+        }
         if (geometry_mode & (G_CULL_FRONT | G_CULL_BACK)) {
             // Winding in screen space (y down), each vertex scaled by the
             // other two w's so the comparison holds without dividing; a
@@ -660,7 +1269,8 @@ struct Interpreter::Impl {
             if ((geometry_mode & G_CULL_FRONT) && cross < 0.0f) return;
         }
         const Tile& tl = tiles[texture.tile & 7];
-        const float uls = (float)(tl.uls >> 2), ult = (float)(tl.ult >> 2);
+        // (tile_du/dv: the in-between frame's tile scroll, else 0.)
+        const float uls = (float)(tl.uls >> 2) + tile_du[0], ult = (float)(tl.ult >> 2) + tile_dv[0];
         const float ss = shift_scale(tl.shifts), st = shift_scale(tl.shiftt);
         const bool snap = r->tex[0].snapshot;
         const bool zprim = (othermode_l & G_ZS_PRIM) != 0;
@@ -671,7 +1281,9 @@ struct Interpreter::Impl {
             t.x = v.x; t.y = v.y; t.z = zprim ? prim_z() * v.w : v.z; t.w = v.w;
             t.u = v.u * ss - uls;
             t.v = v.v * st - ult;
-            if (snap) snapshot_uv(r->tex[0], t.u, t.v, t.u, t.v, proj_stretch());
+            if (img) { t.u += img_du; t.v += img_dv; }
+            else if (snap) snapshot_uv(r->tex[0], t.u, t.v, t.u, t.v, proj_stretch());
+            else if (r->tex[0].frame) frame_uv(r->tex[0], t.u, t.v, t.u, t.v, proj_stretch() && cur_rtt < 0);
             else if (r->tex[0].rtt >= 0) rtt_uv(r->tex[0], t.u, t.v);
             t.r = v.r; t.g = v.g; t.b = v.b; t.a = v.a;
         }
@@ -684,6 +1296,21 @@ struct Interpreter::Impl {
         if (o == nullptr) return;
         o[0] = tri[0]; o[1] = tri[1]; o[2] = tri[2];
         r->count += 3;
+    }
+
+    // RenderDesc::merge_image_tiles: the triangle's texel coordinates (as
+    // emit_tri computes them, relative to the tile) all inside the loaded
+    // rectangle, where the image texture holds what the tile would sample.
+    bool tri_inside_image(int i0, int i1, int i2) const {
+        const Tile& tl = tiles[texture.tile & 7];
+        const float uls = (float)(tl.uls >> 2), ult = (float)(tl.ult >> 2);
+        const float ss = shift_scale(tl.shifts), st = shift_scale(tl.shiftt);
+        const int idx[3] = { i0, i1, i2 };
+        for (int k = 0; k < 3; k++) {
+            const float u = vtx[idx[k]].u * ss - uls, v = vtx[idx[k]].v * st - ult;
+            if (!(u >= 0.0f && u <= img_lim_u && v >= 0.0f && v <= img_lim_v)) return false;
+        }
+        return true;
     }
 
     // The PICA rasterises in fixed point over a limited range: a triangle
@@ -707,6 +1334,31 @@ struct Interpreter::Impl {
         return o;
     }
     void emit_clipped(DrawRecord& r, const Vtx3ds* tri) {
+        {
+            // Wholly outside one plane: nothing is left (what the clipping
+            // below finds, without the clipping). Skies and models behind
+            // the camera are most of the triangles that come here. Exact:
+            // the guard band planes are tested only while no earlier plane
+            // cut the triangle, i.e. on the vertices the loop would see.
+            const float cx = (float)screen_w * 0.5f, cy = (float)screen_h * 0.5f;
+            int out0 = 0;
+            for (int i = 0; i < 3; i++) out0 += (tri[i].z - 1e-5f * tri[i].w) < 0.0f;
+            if (out0 == 3) return;
+            if (out0 == 0) {
+                for (int plane = 1; plane < 5; plane++) {
+                    int outs = 0;
+                    for (int i = 0; i < 3; i++) {
+                        const Vtx3ds& v = tri[i];
+                        const float g = kGuard * v.w;
+                        const float f = plane == 1 ? g - (v.x - cx * v.w) : plane == 2 ? g + (v.x - cx * v.w) :
+                                        plane == 3 ? g - (v.y - cy * v.w) : g + (v.y - cy * v.w);
+                        outs += f < 0.0f;
+                    }
+                    if (outs == 3) return;
+                    if (outs != 0) break;
+                }
+            }
+        }
         Vtx3ds buf_a[12], buf_b[12];
         int n = 3;
         for (int i = 0; i < 3; i++) buf_a[i] = tri[i];
@@ -755,7 +1407,15 @@ struct Interpreter::Impl {
     // at the LAST row (normal textures are stored flipped for that), so t
     // counts back from 512.
     void snapshot_uv(const TexDesc& d, float u, float v, float& su, float& sv, bool stretch) const {
-        uint32_t texel = (d.addr - snapshot_base) / 2;
+        image_uv(snapshot_base, d, u, v, su, sv, stretch);
+    }
+    // TexDesc::frame: the same layout, from the colour image being drawn
+    // (the backend keeps each eye's frame in a 256x512 texture that way).
+    void frame_uv(const TexDesc& d, float u, float v, float& su, float& sv, bool stretch) const {
+        image_uv(screen_cimg, d, u, v, su, sv, stretch);
+    }
+    void image_uv(uint32_t base, const TexDesc& d, float u, float v, float& su, float& sv, bool stretch) const {
+        uint32_t texel = (d.addr - base) / 2;
         float x0 = (float)(texel % (uint32_t)screen_w), y0 = (float)(texel / (uint32_t)screen_w);
         float nx = stretch ? (x0 + u) * stretch_k() - geo.x0 : x0 + u;   // N64 x on the wide screen
         float sx = geo.screen_x(nx);                                       // screen pixel, 0..400
@@ -764,21 +1424,44 @@ struct Interpreter::Impl {
         sv = 512.0f - sx;
     }
 
+    // RenderDesc::sample_drawn_frame bookkeeping for a new record: what was
+    // drawn on screen, and the last draw that samples the frame.
+    void note_draw(const DrawRecord& r) {
+        if (r.rtt < 0) screen_drawn = true;
+        if ((r.tex[0].valid && r.tex[0].frame) || (r.tex[1].valid && r.tex[1].frame)) {
+            out->frame_sample_last = (int32_t)(out->draws.size() - 1);
+            stats->frame_samples++;
+        }
+    }
+
     static bool same_tex(const TexDesc& a, const TexDesc& b) {
         if (a.valid != b.valid) return false;
         if (!a.valid) return true;
         return a.addr == b.addr && a.pitch == b.pitch && a.fmt == b.fmt && a.siz == b.siz && a.width == b.width && a.height == b.height &&
                a.masks == b.masks && a.maskt == b.maskt && a.cms == b.cms && a.cmt == b.cmt && a.palette == b.palette &&
                a.nibble == b.nibble && a.tlut_hash == b.tlut_hash && a.tlut_mode == b.tlut_mode && a.bilerp == b.bilerp && a.snapshot == b.snapshot && a.rtt == b.rtt &&
-               a.block == b.block && a.dxt == b.dxt && a.load_word == b.load_word;
+               a.block == b.block && a.dxt == b.dxt && a.load_word == b.load_word && a.frame == b.frame && a.wrap_rows == b.wrap_rows;
     }
     static bool same_draw_state(const DrawRecord& a, const DrawRecord& b) {
         return a.cc_w0 == b.cc_w0 && a.cc_w1 == b.cc_w1 && a.othermode_h == b.othermode_h && a.othermode_l == b.othermode_l &&
                a.geometry_mode == b.geometry_mode && memcmp(a.prim, b.prim, 4) == 0 && memcmp(a.env, b.env, 4) == 0 &&
                memcmp(a.blend, b.blend, 4) == 0 && memcmp(a.fog, b.fog, 4) == 0 && a.prim_lod_frac == b.prim_lod_frac &&
                memcmp(a.scissor, b.scissor, sizeof(a.scissor)) == 0 && a.proj_id == b.proj_id && a.perspective == b.perspective && a.rtt == b.rtt &&
-               memcmp(a.uv1, b.uv1, sizeof(a.uv1)) == 0 &&
+               memcmp(a.uv1, b.uv1, sizeof(a.uv1)) == 0 && a.depth_a == b.depth_a && a.depth_b == b.depth_b &&
                same_tex(a.tex[0], b.tex[0]) && same_tex(a.tex[1], b.tex[1]);
+    }
+
+    // Bitwise equality of small fixed-size fields, as memcmp has it, in
+    // word loads (newlib's memcmp is a call and a loop on the console).
+    template <size_t N>
+    static bool same_bits(const void* a, const void* b) {
+        static_assert(N % 4 == 0, "whole words");
+        uint32_t x[N / 4], y[N / 4];
+        memcpy(x, a, N);
+        memcpy(y, b, N);
+        uint32_t d = 0;
+        for (size_t i = 0; i < N / 4; i++) d |= x[i] ^ y[i];
+        return d == 0;
     }
 
     // The current state against a recorded draw (what same_draw_state
@@ -787,14 +1470,19 @@ struct Interpreter::Impl {
         if (a.cc_w0 != cc_w0 || a.cc_w1 != cc_w1 || a.othermode_h != othermode_h || a.othermode_l != othermode_l ||
             a.geometry_mode != geometry_mode || a.prim_lod_frac != prim_lod_frac || a.proj_id != proj_id || a.rtt != cur_rtt) return false;
         if (a.mv_auto != (mv_groups[mv_group_depth] == kIdAuto)) return false;
-        if (memcmp(a.prim, prim, 4) != 0 || memcmp(a.env, env, 4) != 0 || memcmp(a.blend, blend, 4) != 0 || memcmp(a.fog, fog, 4) != 0) return false;
+        if (a.depth_a != cur_depth_a || a.depth_b != cur_depth_b) return false;
+        if (!same_bits<4>(a.prim, prim) || !same_bits<4>(a.env, env) || !same_bits<4>(a.blend, blend) || !same_bits<4>(a.fog, fog)) return false;
         int16_t sc[4];
         effective_scissor(sc, proj_stretch());
-        if (memcmp(a.scissor, sc, sizeof(a.scissor)) != 0) return false;
-        if (a.perspective != (proj.m[2][3] != 0.0f || proj.m[3][3] == 0.0f)) return false;
-        float uv1[4];
-        compute_uv1(uv1, texture.tile);
-        if (memcmp(a.uv1, uv1, sizeof(uv1)) != 0) return false;
+        if (!same_bits<sizeof(sc)>(a.scissor, sc)) return false;
+        if (a.perspective != is_perspective(proj)) return false;
+        // uv1 places TEXEL1 alone (merge_image_tiles: the sky's column loads
+        // move tile 0's origin, which uv1 follows, with no TEXEL1 in use).
+        if (!(image_tiles && !a.tex[1].valid && !tex[1].valid)) {
+            float uv1[4];
+            compute_uv1(uv1, texture.tile, ip != nullptr);
+            if (!same_bits<sizeof(uv1)>(a.uv1, uv1)) return false;
+        }
         return same_tex(a.tex[0], tex[0]) && same_tex(a.tex[1], tex[1]);
     }
 
@@ -806,21 +1494,40 @@ struct Interpreter::Impl {
 
     // Rectangles are emitted in N64 pixels with w = 1.
     void emit_rect(float ulx, float uly, float lrx, float lry, bool textured, int tile, float s, float t, float dsdx, float dtdy, bool flip) {
-        emit_rect_aligned(ulx, uly, lrx, lry, textured, tile, s, t, dsdx, dtdy, flip, rect_lorigin, rect_rorigin, rect_align,
+        emit_rect_aligned(ulx, uly, lrx, lry, textured, tile, s, t, dsdx, dtdy, flip, origin_shift(rect_lorigin), origin_shift(rect_rorigin), rect_align,
                           rect_lorigin == 0x800 && rect_rorigin == 0x800);
     }
+    // The edges arrive as the command has them (plus the alignment offsets);
+    // lshift/rshift then move each from its origin onto the wide screen.
     // plain_origins: neither edge is anchored to a screen edge (the only
     // rectangles RT64 stretches for covering the width).
     void emit_rect_aligned(float ulx, float uly, float lrx, float lry, bool textured, int tile, float s, float t, float dsdx, float dtdy, bool flip,
-                           uint32_t lorigin, uint32_t rorigin, const int16_t* align, bool plain_origins) {
-        ulx += align[0] + origin_shift(lorigin); uly += align[1];
-        lrx += align[2] + origin_shift(rorigin); lry += align[3];
+                           float lshift, float rshift, const int16_t* align, bool plain_origins) {
+        ulx += align[0]; uly += align[1];
+        lrx += align[2]; lry += align[3];
+        uint32_t cyc = (othermode_h >> 20) & 3;
+        if (fix_rect_lr) {
+            // RT64's rect.fixRectLR (rt64_rdp.cpp, drawRect): an edge within
+            // one pixel of the scissor's, on a rectangle starting before it,
+            // is extended to it. As there, judged before the origin moves the
+            // rectangle and with fill and copy mode's extra pixel counted
+            // (added below; RT64 has it in the coordinates by then).
+            const float extra = (cyc == 2 || cyc == 3) ? 1.0f : 0.0f;
+            const float sx = (float)scissor[2], sy = (float)scissor[3];
+            if (std::fabs(sx - (lrx + extra)) <= 1.0f && ulx < sx) lrx = sx - extra;
+            if (std::fabs(sy - (lry + extra)) <= 1.0f && uly < sy) lry = sy - extra;
+        }
+        ulx += lshift;
+        lrx += rshift;
+        note_target(!textured);
+        if (skim) return;
         if (offscreen_target()) {
             // A copy of the front buffer into the storage: snapshot instead.
             if (textured) {
                 TexDesc src;
                 describe_tile(tile, src);
-                if (src.valid && is_vi_framebuffer(src.addr)) {
+                // (A copy of the frame being drawn is drawn instead: frame_copy.)
+                if (src.valid && !src.frame && is_vi_framebuffer(src.addr)) {
                     if (!out->snapshot_request) stats->snapshots++;
                     out->snapshot_request = true;
                     snapshot_base = cimg;
@@ -831,7 +1538,6 @@ struct Interpreter::Impl {
             }
             if (cur_rtt < 0) return;
         }
-        uint32_t cyc = (othermode_h >> 20) & 3;
         if (!textured && zimg != 0 && cimg == zimg) return;   // depth clear: the target is cleared per frame
         state_seq++;
         out->draws.emplace_back();
@@ -840,14 +1546,17 @@ struct Interpreter::Impl {
         r.first = (uint32_t)out->verts.size();
         r.count = 6;
         snapshot(r);
+        int rect_load = -1;
         if (textured) {
             describe_tile(tile, r.tex[0]);
+            rect_load = last_best;
             if (cyc == 2 && uses_texel(1)) describe_tile((tile + 1) & 7, r.tex[1]);
             set_uv1(r, tile);
         }
         else if (cyc == 3) {
             memcpy(r.prim, fill, 4);   // fill mode: the fill colour rides in prim for the backend
         }
+        if (frame_copy) note_draw(r);
         // Fill and copy modes cover the lower-right pixel too.
         if (cyc == 2 || cyc == 3) { lrx += 1.0f; lry += 1.0f; }
         float w = lrx - ulx, h = lry - uly;
@@ -856,12 +1565,40 @@ struct Interpreter::Impl {
         float u0 = s - uls, v0 = t - ult;
         float u1 = u0 + dsdx * w, v1 = v0 + dtdy * h;
         if (cyc == 2) u1 = u0 + dsdx * w / 4.0f;   // copy mode: dsdx is in 4-texel units
+        // RenderDesc::merge_image_tiles: a strip of a wider image (Goemon's
+        // flat backdrops, rows of the panorama) samples the image's texture,
+        // so the strips' records can merge (compact_rects).
+        // A rectangle reaching a few texels past the loaded ones (fix_rect_lr
+        // extends Goemon's backdrop rows to the scissor) is drawn as two
+        // quads: the loaded texels, and past them the edge texel the tile's
+        // clamp repeats (sampled at its centre: the same with bilinear).
+        float u_clamp = -1.0f;
+        if (image_tiles && textured && !r.tex[1].valid) {
+            TexDesc m;
+            ImageMap map;
+            const Tile& tlr = tiles[tile & 7];
+            if (image_of(tile, r.tex[0], rect_load, m, map) && std::fmin(v0, v1) >= 0.0f && std::fmax(v0, v1) <= map.lim_v) {
+                const bool u_in = std::fmin(u0, u1) >= 0.0f && std::fmax(u0, u1) <= map.lim_u;
+                const bool u_over = !flip && u0 >= 0.0f && u0 < map.lim_u && u1 > map.lim_u && u1 <= map.lim_u + kClampOvershoot &&
+                                    ((tlr.cms & 2) || tlr.masks == 0);
+                if (u_in || u_over) {
+                    r.tex[0] = m;
+                    r.image_rect = true;
+                    if (u_over) u_clamp = map.lim_u;
+                    u0 += map.du; u1 += map.du;
+                    v0 += map.dv; v1 += map.dv;
+                    if (u_over) u_clamp += map.du;
+                    stats->image_rects++;
+                }
+            }
+        }
         Vtx3ds q[4];
         // RT64 spreads a rectangle over the whole wide screen when it reads a
         // frame copy, spans the full width with plain origins (full-screen
         // fills and tints), or is tagged STRETCH, unless it is tagged ADJUST.
-        const bool stretch = ((textured && r.tex[0].snapshot) || (plain_origins && ulx <= 0.0f && lrx >= (float)screen_w) ||
+        const bool stretch = ((textured && (r.tex[0].snapshot || r.tex[0].frame)) || (plain_origins && ulx <= 0.0f && lrx >= (float)screen_w) ||
                               rect_aspect == kAspectStretch) && rect_aspect != kAspectAdjust && cur_rtt < 0;
+        const float ulx_n64 = ulx, lrx_n64 = lrx;     // before any stretch (merge_rect_slices)
         if (stretch) {
             ulx = stretch_x(ulx);
             lrx = stretch_x(lrx);
@@ -870,18 +1607,84 @@ struct Interpreter::Impl {
         float xs[4] = { ulx, lrx, lrx, ulx }, ys[4] = { uly, uly, lry, lry };
         float us[4] = { u0, u1, u1, u0 }, vs[4] = { v0, v0, v1, v1 };
         if (flip) { us[1] = u0; vs[1] = v1; us[3] = u1; vs[3] = v0; }
+        // The clamped part of an image rectangle (u_clamp >= 0): from where
+        // the coordinate reaches the loaded texels' edge, a second quad.
+        float x_split = lrx;
+        if (u_clamp >= 0.0f) {
+            x_split = ulx + (lrx - ulx) * (u_clamp - u0) / (u1 - u0);
+            xs[1] = xs[2] = x_split;
+            us[1] = us[2] = u_clamp;
+        }
         for (int i = 0; i < 4; i++) {
             q[i].x = xs[i]; q[i].y = ys[i]; q[i].z = (othermode_l & G_ZS_PRIM) ? prim_z() : 0.0f; q[i].w = 1.0f;
             q[i].u = us[i]; q[i].v = vs[i];
             if (r.tex[0].snapshot) snapshot_uv(r.tex[0], q[i].u, q[i].v, q[i].u, q[i].v, stretch);
+            else if (r.tex[0].frame) frame_uv(r.tex[0], q[i].u, q[i].v, q[i].u, q[i].v, stretch);
             else if (r.tex[0].rtt >= 0) rtt_uv(r.tex[0], q[i].u, q[i].v);
             q[i].r = q[i].g = q[i].b = q[i].a = 0;   // rectangles have no shade: SHADE reads as 0 (as RT64)
         }
-        Vtx3ds* o = out->verts.append(6);
+        Vtx3ds* o = out->verts.append(u_clamp >= 0.0f ? 12 : 6);
         if (o == nullptr) { out->draws.pop_back(); return; }
         o[0] = q[0]; o[1] = q[1]; o[2] = q[2];
         o[3] = q[0]; o[4] = q[2]; o[5] = q[3];
+        if (u_clamp >= 0.0f) {
+            Vtx3ds c[4] = { q[1], q[1], q[2], q[2] };
+            c[0].x = c[3].x = x_split;
+            c[1].x = c[2].x = lrx;
+            for (Vtx3ds& v : c) v.u = u_clamp - 0.5f;     // the edge texel's centre
+            o[6] = c[0]; o[7] = c[1]; o[8] = c[2];
+            o[9] = c[0]; o[10] = c[2]; o[11] = c[3];
+            r.count = 12;
+        }
         stats->rects++;
+        inst_break = true;          // the next triangles are another projection instance
+        // Fill-mode rectangles take no part in the merged detection (as in
+        // the desktop fork), nor do ones drawn 1:1 into an image or ADJUST.
+        if (merge_rect_slices && plain_origins && cyc != 3 && cur_rtt < 0 && rect_aspect != kAspectAdjust) {
+            rect_slices.push_back({ (uint32_t)(out->draws.size() - 1), ulx_n64, lrx_n64, uly, lry, stretch });
+        }
+    }
+
+    // RenderDesc::merge_rect_slices: the rectangles of the current run of
+    // rectangles, in N64 units before any stretch. The desktop fork collects
+    // them per rectangle projection (rectangles between two triangle draws
+    // of one framebuffer pair), keyed by their rows; a row whose rectangles
+    // reach both edges of the frame between them is stretched like one
+    // rectangle covering the width.
+    struct RectSlice { uint32_t draw; float ulx, lrx, uly, lry; bool stretched; };
+    std::vector<RectSlice> rect_slices;
+    void flush_rect_slices() {
+        const size_t n = rect_slices.size();
+        if (n >= 2) {
+            // Rows together (a run of glyphs can be long: no pairwise scan).
+            std::sort(rect_slices.begin(), rect_slices.end(), [](const RectSlice& a, const RectSlice& b) {
+                return a.uly != b.uly ? a.uly < b.uly : a.lry != b.lry ? a.lry < b.lry : a.draw < b.draw;
+            });
+            for (size_t i = 0; i < n;) {
+                size_t j = i;
+                float lo = rect_slices[i].ulx, hi = rect_slices[i].lrx;
+                for (; j < n && rect_slices[j].uly == rect_slices[i].uly && rect_slices[j].lry == rect_slices[i].lry; j++) {
+                    lo = std::fmin(lo, rect_slices[j].ulx);
+                    hi = std::fmax(hi, rect_slices[j].lrx);
+                }
+                if (lo <= 0.0f && hi >= (float)screen_w) {
+                    for (size_t k = i; k < j; k++) {
+                        RectSlice& b = rect_slices[k];
+                        if (b.stretched) continue;
+                        DrawRecord& r = out->draws[b.draw];
+                        for (uint32_t v = r.first; v < r.first + r.count; v++) out->verts[v].x = stretch_x(out->verts[v].x);
+                        if (r.scissor[0] >= 0 && r.scissor[2] <= screen_w) {   // as effective_scissor
+                            r.scissor[0] = (int16_t)stretch_x((float)r.scissor[0]);
+                            r.scissor[2] = (int16_t)stretch_x((float)r.scissor[2]);
+                        }
+                        b.stretched = true;
+                        stats->rects_merged++;
+                    }
+                }
+                i = j;
+            }
+        }
+        rect_slices.clear();
     }
 
     void set_othermode(bool low, uint32_t w0, uint32_t w1) {
@@ -914,17 +1717,24 @@ struct Interpreter::Impl {
                     proj_id = id;
                     proj_aspects[depth] = (f >> 20) & 3;
                 }
+                if (ip != nullptr) {
+                    (is_proj ? proj_tg : mv_tg)[depth] = interp::Group::decode(id, f);
+                    (is_proj ? proj_tg_idx : mv_tg_idx) = -1;
+                }
                 return 1;
             }
             case EX_POPMATRIXGROUP: {
                 int count = w1 & 0xFF;
-                bool is_proj = (sub >> 8) & 1;     // always clear in practice, as in RT64
+                bool is_proj = (w1 >> 8) & 1;      // gEXPopMatrixGroup's proj, beside the count
                 int& depth = is_proj ? proj_group_depth : mv_group_depth;
                 depth = depth > count ? depth - count : 0;
                 if (is_proj) proj_id = proj_groups[proj_group_depth];
+                if (ip != nullptr) (is_proj ? proj_tg_idx : mv_tg_idx) = -1;
                 return 0;
             }
-            case EX_EDITGROUPBYADDRESS: return 1;
+            case EX_EDITGROUPBYADDRESS:
+                if (ip != nullptr && ip->recording) interp_edit_group(seg(w1), r32(pc + 8));
+                return 1;
             case EX_SETRECTALIGN: {
                 rect_lorigin = w1 & 0xFFF; rect_rorigin = (w1 >> 12) & 0xFFF;
                 uint32_t a = r32(pc + 8), b = r32(pc + 12);
@@ -960,7 +1770,7 @@ struct Interpreter::Impl {
                 if (vp_depth < 8) { vp_stack[vp_depth++] = vp; }
                 return 0;
             case EX_POPVIEWPORT:
-                if (vp_depth > 0) { vp = vp_stack[--vp_depth]; }
+                if (vp_depth > 0) { vp = vp_stack[--vp_depth]; inst_dirty = true; }
                 return 0;
             case EX_PUSHSCISSOR:
                 if (scissor_depth < 8) { memcpy(scissor_stack[scissor_depth++], scissor, sizeof(scissor)); }
@@ -973,26 +1783,29 @@ struct Interpreter::Impl {
                 bool flip = (w1 >> 7) & 1;
                 uint32_t lorigin = (w1 >> 3) & 0xFFF, rorigin = (w1 >> 15) & 0xFFF;
                 uint32_t a = r32(pc + 8), b = r32(pc + 12), c = r32(pc + 16), d = r32(pc + 20);
-                float ulx = (int16_t)(a >> 16) / 4.0f + origin_x(lorigin), uly = (int16_t)(a & 0xFFFF) / 4.0f;
-                float lrx = (int16_t)(b >> 16) / 4.0f + origin_x(rorigin), lry = (int16_t)(b & 0xFFFF) / 4.0f;
+                float ulx = (int16_t)(a >> 16) / 4.0f, uly = (int16_t)(a & 0xFFFF) / 4.0f;
+                float lrx = (int16_t)(b >> 16) / 4.0f, lry = (int16_t)(b & 0xFFFF) / 4.0f;
                 float s = (int16_t)(c >> 16) / 32.0f, t = (int16_t)(c & 0xFFFF) / 32.0f;
                 float dsdx = (int16_t)(d >> 16) / 1024.0f, dtdy = (int16_t)(d & 0xFFFF) / 1024.0f;
                 static const int16_t none[4] = { 0, 0, 0, 0 };
-                emit_rect_aligned(ulx, uly, lrx, lry, true, tile, s, t, dsdx, dtdy, flip, 0x800, 0x800, none, lorigin == 0x800 && rorigin == 0x800);
+                emit_rect_aligned(ulx, uly, lrx, lry, true, tile, s, t, dsdx, dtdy, flip, origin_x(lorigin), origin_x(rorigin), none,
+                                  lorigin == 0x800 && rorigin == 0x800);
                 return 2;
             }
             case EX_FILLRECT: {
                 uint32_t lorigin = w1 & 0xFFF, rorigin = (w1 >> 12) & 0xFFF;
                 uint32_t a = r32(pc + 8), b = r32(pc + 12);
-                float ulx = (int16_t)(a >> 16) / 4.0f + origin_x(lorigin), uly = (int16_t)(a & 0xFFFF) / 4.0f;
-                float lrx = (int16_t)(b >> 16) / 4.0f + origin_x(rorigin), lry = (int16_t)(b & 0xFFFF) / 4.0f;
+                float ulx = (int16_t)(a >> 16) / 4.0f, uly = (int16_t)(a & 0xFFFF) / 4.0f;
+                float lrx = (int16_t)(b >> 16) / 4.0f, lry = (int16_t)(b & 0xFFFF) / 4.0f;
                 static const int16_t none[4] = { 0, 0, 0, 0 };
-                emit_rect_aligned(ulx, uly, lrx, lry, false, 0, 0, 0, 0, 0, false, 0x800, 0x800, none, lorigin == 0x800 && rorigin == 0x800);
+                emit_rect_aligned(ulx, uly, lrx, lry, false, 0, 0, 0, 0, 0, false, origin_x(lorigin), origin_x(rorigin), none,
+                                  lorigin == 0x800 && rorigin == 0x800);
                 return 1;
             }
             case EX_VERTEX: return 1;
             case EX_MATRIX_FLOAT:
-                matrix_float(seg(r32(pc + 12)), w1);
+                mtx_addr = seg(r32(pc + 12));
+                matrix_float(mtx_addr, w1);
                 return 1;
             case EX_SETVERTEXSEGMENT: return 1;
             // State stacks, as RT64 keeps them: a push saves, a pop restores.
@@ -1015,10 +1828,17 @@ struct Interpreter::Impl {
                 if (geometry_depth > 0) { geometry_mode = geometry_stack[--geometry_depth]; ldir_dirty = true; }
                 return 0;
             case EX_PUSHPROJMATRIX:
-                if (proj_depth < kStateStack) proj_stack[proj_depth++] = proj;
+                if (proj_depth < kStateStack) {
+                    if (ip != nullptr) { pv_view_stack[proj_depth] = pv_view; pv_proj_stack[proj_depth] = pv_proj; proj_addr_stack[proj_depth] = proj_addr; }
+                    proj_stack[proj_depth++] = proj;
+                }
                 return 0;
             case EX_POPPROJMATRIX:
-                if (proj_depth > 0) { proj = proj_stack[--proj_depth]; mvp_dirty = true; }
+                if (proj_depth > 0) {
+                    proj = proj_stack[--proj_depth]; mvp_dirty = true; inst_dirty = true;
+                    update_depth_terms();
+                    if (ip != nullptr) { pv_view = pv_view_stack[proj_depth]; pv_proj = pv_proj_stack[proj_depth]; proj_addr = proj_addr_stack[proj_depth]; proj_seq++; }
+                }
                 return 0;
             case EX_PUSHENVCOLOR: case EX_PUSHBLENDCOLOR: case EX_PUSHFOGCOLOR: case EX_PUSHFILLCOLOR: case EX_PUSHPRIMCOLOR:
             case EX_POPENVCOLOR: case EX_POPBLENDCOLOR: case EX_POPFOGCOLOR: case EX_POPFILLCOLOR: case EX_POPPRIMCOLOR: {
@@ -1058,6 +1878,7 @@ struct Interpreter::Impl {
 
     float raw_vtrans_x = 640.0f;   // quarter pixels, as loaded
     void load_viewport(uint32_t addr) {
+        inst_dirty = true;
         vp.scale[0] = r16(addr + 0) / 4.0f;
         vp.scale[1] = r16(addr + 2) / 4.0f;
         vp.scale[2] = r16(addr + 4);
@@ -1101,12 +1922,20 @@ struct Interpreter::Impl {
     void apply_matrix(const Mtx& m, uint8_t p) {
         if (p & 4) {
             if (p & 2) proj = m; else mul(proj, m, proj);
-            if (proj.m[2][3] != 0.0f) {
+            update_depth_terms();
+            if (ip != nullptr) interp_proj_matrix(m, p);
+            inst_dirty = true;
+            if (is_perspective(proj)) {
                 bool world = is_world_proj(proj_id);
+                const Mtx cam = depth_camera(proj);
                 if (!out->has_cam || (world && !out->cam_is_world)) {
                     out->has_cam = true;
                     out->cam_is_world = world;
-                    memcpy(out->cam, &proj, sizeof(out->cam));
+                    memcpy(out->cam, &cam, sizeof(out->cam));
+                }
+                if (hud_camera_id != 0 && proj_id == hud_camera_id && !out->has_hud_cam) {
+                    out->has_hud_cam = true;
+                    memcpy(out->hud_cam, &cam, sizeof(out->hud_cam));
                 }
             }
         }
@@ -1116,6 +1945,7 @@ struct Interpreter::Impl {
                 if (mv_depth + 1 < kMaxMtxStack) { mv_stack[mv_depth + 1] = mv_stack[mv_depth]; mv_depth++; }
             }
             if (p & 2) mv_stack[mv_depth] = m; else mul(mv_stack[mv_depth], m, mv_stack[mv_depth]);
+            mv_addr[mv_depth] = mtx_addr;
             ldir_dirty = true;
         }
         mvp_dirty = true;
@@ -1325,6 +2155,14 @@ struct Interpreter::Impl {
                     int where = (w0 >> 16) & 0xFF;
                     int v = (w0 & 0xFFFF) / 2;
                     if (v < kMaxVerts) {
+                        if (where == 0x10 && ip != nullptr && ip->recording && slot_src[v] < ip->lv.size()) {
+                            // The vertex as now coloured, for the triangles that follow.
+                            Interpreter::Interp::LoadedVtx q = ip->lv[slot_src[v]];
+                            q.rgba[0] = w1 >> 24; q.rgba[1] = w1 >> 16; q.rgba[2] = w1 >> 8; q.rgba[3] = w1;
+                            q.fog = false;
+                            slot_src[v] = (uint32_t)ip->lv.size();
+                            ip->lv.push_back(q);
+                        }
                         if (where == 0x10) { vtx[v].r = w1 >> 24; vtx[v].g = w1 >> 16; vtx[v].b = w1 >> 8; vtx[v].a = w1; }
                         else if (where == 0x14) {
                             // The vertex buffer holds coordinates already
@@ -1384,7 +2222,8 @@ struct Interpreter::Impl {
                     break;
                 case G_MTX: {
                     Mtx m;
-                    load_mtx(m, seg(w1));
+                    mtx_addr = seg(w1);
+                    load_mtx(m, mtx_addr);
                     apply_matrix(m, (w0 & 0xFF) ^ 1);   // F3DEX2 inverts the push bit
                     break;
                 }
@@ -1464,13 +2303,21 @@ struct Interpreter::Impl {
                 case G_SETPRIMDEPTH: prim_depth_z = (uint16_t)(w1 >> 16); break;
                 case G_LOADTLUT: {
                     int tile = (w1 >> 24) & 7;
-                    int count = ((w1 >> 14) & 0x3FF) + 1;
-                    const Tile& tl = tiles[tile];
+                    Tile& tl = tiles[tile];
+                    // The command's own coordinates, which the RDP (and RT64)
+                    // also leave on the tile: the source starts at uls, ult of
+                    // the texture image and runs to lrs. The tile's coordinates
+                    // from an earlier load have nothing to do with it (Goemon's
+                    // sky loads palettes through tile 7 right after column
+                    // loads left uls far into its image).
+                    tl.uls = (w0 >> 12) & 0xFFF; tl.ult = w0 & 0xFFF; tl.lrs = (w1 >> 12) & 0xFFF; tl.lrt = w1 & 0xFFF;
+                    int count = (int)(tl.lrs >> 2) - (int)(tl.uls >> 2) + 1;
                     // Palettes sit in TMEM's upper half, one entry per 64-bit
                     // word (quadrupled): entry = word - 256. A 16-colour
                     // palette p is loaded at word 256 + 16p.
                     int base = (int)tl.tmem - 256;
-                    uint32_t src = timg.addr + ((tl.uls >> 2) * 2);
+                    const uint32_t row_bytes = ((uint32_t)timg.width << timg.siz) >> 1;
+                    uint32_t src = timg.addr + ((((uint32_t)tl.uls >> 2) << timg.siz) >> 1) + row_bytes * ((uint32_t)tl.ult >> 2);
                     uint32_t h = 2166136261u;
                     for (int i = 0; i < count; i++) {
                         int idx = base + i;
@@ -1505,6 +2352,7 @@ struct Interpreter::Impl {
                     L.seq = load_count;
                     L.nibble = 0;
                     L.dxt = (uint16_t)(w1 & 0xFFF);
+                    L.img_width = 0;
                     tl.uls = uls; tl.ult = ult; tl.lrs = lrs;
                     break;
                 }
@@ -1527,6 +2375,15 @@ struct Interpreter::Impl {
                     L.dxt = 0;
                     L.seq = load_count;
                     L.nibble = (timg.siz == 0) ? ((uls >> 2) & 1) : 0;
+                    L.img_addr = timg.addr;
+                    L.img_width = timg.width;
+                    L.s0 = (uint16_t)(uls >> 2); L.t0 = (uint16_t)(ult >> 2);
+                    L.s1 = (uint16_t)(lrs >> 2); L.t1 = (uint16_t)(lrt >> 2);
+                    L.line = (uint16_t)line_words;
+                    // Only cuts narrower than their image are tracked: a list
+                    // loads hundreds of whole small images (glyphs), which
+                    // would push the panorama out of the table.
+                    if (image_tiles && L.s1 >= L.s0 && L.t1 >= L.t0 && (uint32_t)(L.s1 - L.s0 + 1) < L.img_width) note_image_load(L);
                     tl.uls = uls; tl.ult = ult; tl.lrs = lrs; tl.lrt = lrt;
                     break;
                 }
@@ -1562,9 +2419,14 @@ struct Interpreter::Impl {
                     break;
                 case G_SETZIMG: zimg = seg(w1); break;
                 case G_SETCIMG:
+                    flush_rect_slices();      // a new framebuffer pair
+                    inst_break = true;
                     cimg = seg(w1); cimg_width = (w0 & 0xFFF) + 1;
                     cur_rtt = rtt_for_cimg(cimg, cimg_width);
                     if (cur_rtt >= 0) out->rtts[cur_rtt] = rtt_images[cur_rtt];
+                    // Back to the screen after drawing into a copy: what was
+                    // drawn there is still there.
+                    if (frame_copy && cur_rtt < 0 && cimg != zimg && cimg != screen_cimg) { screen_cimg = cimg; screen_drawn = false; }
                     out->color_image = cimg; out->color_width = cimg_width; out->depth_image = zimg;
                     break;
                 default:
@@ -1574,6 +2436,99 @@ struct Interpreter::Impl {
             pc = next;
         }
         return fullsync;
+    }
+
+    // Per-task RSP state that must not leak between lists, and the list's
+    // own bookkeeping.
+    // RenderDesc::merge_image_tiles: neighbouring rectangle records that
+    // sample an image texture with the same state become one record (their
+    // vertices follow each other). Run once the list's rectangle slices are
+    // settled (merge_rect_slices moves vertices and scissors per record).
+    void compact_rects() {
+        std::vector<DrawRecord>& d = out->draws;
+        if (d.size() < 2) return;
+        const int32_t sample_last = out->frame_sample_last;
+        int32_t new_sample_last = -1;
+        const bool remap = ip != nullptr && ip->recording;
+        if (remap) ip->draw_remap.assign(d.size(), 0);
+        size_t w = 0;
+        for (size_t i = 0; i < d.size(); i++) {
+            if (w > 0) {
+                DrawRecord& a = d[w - 1];
+                const DrawRecord& b = d[i];
+                if (a.image_rect && b.image_rect && a.kind == DrawRecord::TexRect && b.kind == DrawRecord::TexRect &&
+                    a.first + a.count == b.first && a.mv_auto == b.mv_auto && same_rect_state(a, b)) {
+                    a.count += b.count;
+                    stats->rects_compacted++;
+                    if ((int32_t)i == sample_last) new_sample_last = (int32_t)(w - 1);
+                    if (remap) ip->draw_remap[i] = (uint32_t)(w - 1);
+                    continue;
+                }
+            }
+            if (remap) ip->draw_remap[i] = (uint32_t)w;
+            if (w != i) d[w] = d[i];
+            if ((int32_t)i == sample_last) new_sample_last = (int32_t)w;
+            w++;
+        }
+        d.resize(w);
+        out->frame_sample_last = new_sample_last;
+    }
+    // same_draw_state without uv1, which only places TEXEL1 (none here).
+    static bool same_rect_state(const DrawRecord& a, const DrawRecord& b) {
+        return !a.tex[1].valid && !b.tex[1].valid && a.cc_w0 == b.cc_w0 && a.cc_w1 == b.cc_w1 && a.othermode_h == b.othermode_h &&
+               a.othermode_l == b.othermode_l && a.geometry_mode == b.geometry_mode && same_bits<4>(a.prim, b.prim) && same_bits<4>(a.env, b.env) &&
+               same_bits<4>(a.blend, b.blend) && same_bits<4>(a.fog, b.fog) && a.prim_lod_frac == b.prim_lod_frac &&
+               same_bits<sizeof(a.scissor)>(a.scissor, b.scissor) && a.proj_id == b.proj_id && a.perspective == b.perspective && a.rtt == b.rtt &&
+               same_tex(a.tex[0], b.tex[0]);
+    }
+
+    void begin_list(FrameRecord& o) {
+        out = &o;
+        mv_depth = 0;
+        mvp_dirty = true;
+        proj_group_depth = mv_group_depth = 0;
+        proj_groups[0] = 0;
+        // Untagged modelview draws carry G_EX_ID_AUTO, as RT64's TransformGroup
+        // does by default: DK64's crosshair quads are matched on that.
+        mv_groups[0] = kIdAuto;
+        proj_aspects[0] = 0;
+        proj_id = 0;
+        update_depth_terms();
+        mv_seq = 0;
+        vp_depth = 0;
+        scissor_depth = 0;
+        othermode_depth = combine_depth = geometry_depth = proj_depth = 0;
+        for (int& d : color_depth) d = 0;
+        load_count = 0;
+        tlut_frame_hash = 0;
+        for (int i = 0; i < kMaxRtt; i++) o.rtts[i] = rtt_images[i];
+        for (auto& L : loads) L.valid = false;
+        rect_slices.clear();
+        list_seq++;
+        screen_cimg = cur_rtt < 0 ? cimg : 0;
+        screen_drawn = false;
+        proj_inst = 0;
+        inst_break = true;
+        if (image_tiles) roll_images();
+        plain = true;
+        plain_cimg = 0;
+        if (ip != nullptr) {
+            // RT64 starts every workload with default groups (G_EX_ID_AUTO).
+            mv_tg[0] = interp::Group();
+            proj_tg[0] = interp::Group();
+            mv_tg_idx = proj_tg_idx = -1;
+            proj_seq++;                 // the first vertex load records the projection
+            xf_i = pj_i = tl_i = -1;
+            v_i = 0;
+            tile_rec_seq = 0; tile_rec_tile = -1; tile_rec_xf = -2;
+            tile_du[0] = tile_du[1] = tile_dv[0] = tile_dv[1] = 0.0f;
+        }
+    }
+    // A whole frame drawn into the screen alone (Interpreter::last_list_plain).
+    bool list_plain = false;
+    void end_list(bool fullsync) {
+        list_plain = fullsync && plain && cur_rtt < 0 && (plain_cimg == 0 || plain_cimg == cimg) &&
+                     !(zimg != 0 && cimg == zimg) && cimg < 0x800000 && is_presented_fb(cimg);
     }
 };
 
@@ -1592,32 +2547,249 @@ void Interpreter::note_presented_framebuffer(uint32_t addr) {
         for (int i = 0; i < impl_->rtt_count; i++) if (impl_->rtt_images[i].addr == addr) return;
         if (addr >= 0x800000) return;
     }
+    else if (impl_->frame_copy) {
+        for (int i = 0; i < impl_->rtt_count; i++) if (impl_->rtt_images[i].addr == addr) return;
+    }
     impl_->vi_fbs[impl_->vi_fb_next++ & 3] = addr;
 }
 
 
 bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
-    impl_->out = &out;
-    // Per-task RSP state that must not leak between lists.
-    impl_->mv_depth = 0;
-    impl_->mvp_dirty = true;
-    impl_->proj_group_depth = impl_->mv_group_depth = 0;
-    impl_->proj_groups[0] = 0;
-    // Untagged modelview draws carry G_EX_ID_AUTO, as RT64's TransformGroup
-    // does by default: DK64's crosshair quads are matched on that.
-    impl_->mv_groups[0] = Impl::kIdAuto;
-    impl_->proj_aspects[0] = 0;
-    impl_->proj_id = 0;
-    impl_->mv_seq = 0;
-    impl_->vp_depth = 0;
-    impl_->scissor_depth = 0;
-    impl_->othermode_depth = impl_->combine_depth = impl_->geometry_depth = impl_->proj_depth = 0;
-    for (int& d : impl_->color_depth) d = 0;
-    impl_->load_count = 0;
-    impl_->tlut_frame_hash = 0;
-    for (int i = 0; i < kMaxRtt; i++) out.rtts[i] = impl_->rtt_images[i];
-    for (auto& L : impl_->loads) L.valid = false;
-    return impl_->run(data_ptr);
+    Interp* ip = impl_->ip;
+    if (ip != nullptr) {
+        // Frame interpolation: keep the state the list starts from (the
+        // in-between run starts there too) and record its transforms.
+        *before_ = *impl_;
+        ip->cur ^= 1;
+        ip->now().clear();
+        ip->recording = true;
+        ip->applying = false;
+        ip->ctxs.clear();
+        ip->lv.clear();
+        ip->tris.clear();
+        ip->draw_remap.clear();
+        for (uint32_t& s : impl_->slot_src) s = ~0u;
+    }
+    impl_->begin_list(out);
+    const bool fullsync = impl_->run(data_ptr);
+    impl_->flush_rect_slices();
+    if (impl_->image_tiles) impl_->compact_rects();
+    impl_->end_list(fullsync);
+    impl_->unify_world_depth(out);
+    if (ip != nullptr) {
+        ip->recording = false;
+        ip->now().valid = fullsync;
+        if (!ip->draw_remap.empty()) {
+            for (Interp::TriRec& t : ip->tris) if (t.draw < ip->draw_remap.size()) t.draw = ip->draw_remap[t.draw];
+        }
+    }
+    return fullsync;
+}
+
+// The in-between frame from the list run last, without running it again:
+// its records with the vertices of every triangle transformed by the
+// interpolated matrices (and moved vertices and scrolled tiles where the
+// tags ask), then culled and clipped anew. What does not depend on the
+// transforms is the game frame's: rectangles, lighting and texture
+// generation, the draws' state and textures.
+bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint32_t* tris_out) {
+    Interp* ip = impl_->ip;
+    if (ip == nullptr || !ip->now().valid) return false;
+    const interp::FrameLog& L = ip->now();
+    const interp::FrameLog& P = ip->before();
+    const float wgt = ip->weight, back = 1.0f - wgt;
+    // The records, as the game frame has them.
+    o.draws = real.draws;
+    o.tlut = real.tlut;
+    o.has_fullsync = real.has_fullsync;
+    o.snapshot_request = real.snapshot_request;
+    o.color_image = real.color_image; o.color_width = real.color_width; o.depth_image = real.depth_image;
+    o.has_cam = real.has_cam; o.cam_is_world = real.cam_is_world;
+    memcpy(o.cam, real.cam, sizeof(o.cam));
+    o.has_hud_cam = real.has_hud_cam;
+    memcpy(o.hud_cam, real.hud_cam, sizeof(o.hud_cam));
+    for (int i = 0; i < kMaxRtt; i++) o.rtts[i] = real.rtts[i];
+    o.inst_cams = real.inst_cams;
+    o.frame_sample_last = real.frame_sample_last;
+    o.verts.clear();
+    // Each load's matrix in the in-between frame: the game frame's where
+    // neither its transform nor its projection is interpolated.
+    const size_t nc = ip->ctxs.size();
+    ip->ctx_m.resize(nc);
+    for (size_t i = 0; i < nc; i++) {
+        const Interp::LoadCtx& lc = ip->ctxs[i];
+        const interp::XfEntry* xe = (lc.xf >= 0 && (size_t)lc.xf < L.xf.size()) ? &L.xf[lc.xf] : nullptr;
+        const interp::PjEntry* pe = (lc.pj >= 0 && (size_t)lc.pj < L.pj.size()) ? &L.pj[lc.pj] : nullptr;
+        interp::M4& m = ip->ctx_m[i];
+        if ((xe == nullptr || !xe->interp) && (pe == nullptr || !pe->interp)) { memcpy(&m, lc.m, sizeof(m)); continue; }
+        const interp::M4 mv = xe == nullptr ? interp::identity() : (xe->interp ? xe->lerped : xe->m);
+        const interp::M4 pj = pe == nullptr ? interp::identity() : (pe->interp ? pe->lerped : pe->full);
+        const interp::M4 mvp = interp::mul(mv, pj);
+        for (int r = 0; r < 4; r++) {
+            const float cx = mvp.m[r][0], cy = mvp.m[r][1], cz = mvp.m[r][2], cw = mvp.m[r][3];
+            m.m[r][0] = cx * lc.sx + cw * lc.tx;
+            m.m[r][1] = cy * lc.sy + cw * lc.ty;
+            m.m[r][2] = 0.5f * (cz + cw);
+            m.m[r][3] = cw;
+        }
+    }
+    // Vertices, transformed when a triangle first uses them.
+    ip->stamp++;
+    if (ip->lv_stamp.size() < ip->lv.size()) ip->lv_stamp.resize(ip->lv.size(), 0);
+    if (ip->lv_out.size() < ip->lv.size()) ip->lv_out.resize(ip->lv.size());
+    auto vertex = [&](uint32_t idx) -> const Vtx3ds& {
+        Vtx3ds& v = ip->lv_out[idx];
+        if (ip->lv_stamp[idx] == ip->stamp) return v;
+        ip->lv_stamp[idx] = ip->stamp;
+        const Interp::LoadedVtx& q = ip->lv[idx];
+        const Interp::LoadCtx& lc = ip->ctxs[q.ctx];
+        const interp::M4& m = ip->ctx_m[q.ctx];
+        float ob0 = q.ob[0], ob1 = q.ob[1], ob2 = q.ob[2];
+        const interp::XfEntry* xe = (lc.xf >= 0 && (size_t)lc.xf < L.xf.size()) ? &L.xf[lc.xf] : nullptr;
+        float dtu = 0.0f, dtv = 0.0f;
+        if (xe != nullptr && (xe->vpos || xe->vtc) && q.vi < xe->vcount && ((size_t)xe->vprev + q.vi) * 5 + 4 < P.vdata.size()) {
+            const int16_t* p = &P.vdata[((size_t)xe->vprev + q.vi) * 5];
+            if (xe->vpos) { ob0 += ((float)p[0] - ob0) * back; ob1 += ((float)p[1] - ob1) * back; ob2 += ((float)p[2] - ob2) * back; }
+            if (xe->vtc && !lc.texgen) { dtu = ((float)p[3] - (float)q.tc[0]) * back * lc.uscale; dtv = ((float)p[4] - (float)q.tc[1]) * back * lc.vscale; }
+        }
+        v.x = ob0 * m.m[0][0] + ob1 * m.m[1][0] + ob2 * m.m[2][0] + m.m[3][0];
+        v.y = ob0 * m.m[0][1] + ob1 * m.m[1][1] + ob2 * m.m[2][1] + m.m[3][1];
+        v.z = ob0 * m.m[0][2] + ob1 * m.m[1][2] + ob2 * m.m[2][2] + m.m[3][2];
+        v.w = ob0 * m.m[0][3] + ob1 * m.m[1][3] + ob2 * m.m[2][3] + m.m[3][3];
+        v.u = dtu; v.v = dtv;        // texcoord moves (scaled by each triangle's tile)
+        v.r = q.rgba[0]; v.g = q.rgba[1]; v.b = q.rgba[2]; v.a = q.rgba[3];
+        if (q.fog) v.a = rsp_fog(v.z, v.w, lc.fm, lc.fo);
+        return v;
+    };
+    FrameRecord* saved_out = impl_->out;
+    const InterpreterStats saved = stats_;
+    impl_->out = &o;
+    uint32_t emitted = 0;
+    size_t ti = 0;
+    const size_t nt = ip->tris.size();
+    for (size_t di = 0; di < o.draws.size(); di++) {
+        DrawRecord& d = o.draws[di];
+        const uint32_t real_first = d.first, real_count = d.count;
+        d.first = o.verts.size();
+        d.count = 0;
+        if (d.kind != DrawRecord::Tris) {
+            Vtx3ds* dst = o.verts.append(real_count);
+            if (dst != nullptr && real_first + real_count <= real.verts.size()) {
+                memcpy(dst, &real.verts[real_first], real_count * sizeof(Vtx3ds));
+                d.count = real_count;
+            }
+            continue;
+        }
+        while (ti < nt && ip->tris[ti].draw < di) ti++;
+        for (; ti < nt && ip->tris[ti].draw == di; ti++) {
+            const Interp::TriRec& t = ip->tris[ti];
+            if (t.src[0] >= ip->lv.size() || t.src[1] >= ip->lv.size() || t.src[2] >= ip->lv.size()) continue;
+            Vtx3ds tri[3];
+            float du = 0.0f, dv = 0.0f;
+            if (t.plain && t.tile >= 0 && (size_t)t.tile < L.tiles.size() && L.tiles[t.tile].interp) { du = L.tiles[t.tile].du[0]; dv = L.tiles[t.tile].dv[0]; }
+            for (int k = 0; k < 3; k++) {
+                const Vtx3ds& v = vertex(t.src[k]);
+                Vtx3ds& q = tri[k];
+                q = v;
+                if (t.zprim >= 0.0f) q.z = t.zprim * v.w;
+                q.u = t.uv[k][0] - du + (t.plain ? v.u * t.ss : 0.0f);
+                q.v = t.uv[k][1] - dv + (t.plain ? v.v * t.st : 0.0f);
+            }
+            if (t.cull != 0) {
+                const Vtx3ds& a = tri[0]; const Vtx3ds& b = tri[1]; const Vtx3ds& c = tri[2];
+                const float ab = a.w * b.w, bc = b.w * c.w, ac = a.w * c.w;
+                const float ax = a.x * bc, ay = a.y * bc;
+                const float bx = b.x * ac, by = b.y * ac;
+                const float cx = c.x * ab, cy = c.y * ab;
+                float cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+                if (ab * c.w < 0.0f) cross = -cross;
+                if ((t.cull & G_CULL_BACK) && cross > 0.0f) continue;
+                if ((t.cull & G_CULL_FRONT) && cross < 0.0f) continue;
+            }
+            emitted++;
+            if (!impl_->inside_guard_band(tri[0]) || !impl_->inside_guard_band(tri[1]) || !impl_->inside_guard_band(tri[2])) {
+                impl_->emit_clipped(d, tri);
+                continue;
+            }
+            Vtx3ds* dst = o.verts.append(3);
+            if (dst == nullptr) continue;
+            dst[0] = tri[0]; dst[1] = tri[1]; dst[2] = tri[2];
+        }
+        d.count = o.verts.size() - d.first;
+    }
+    impl_->out = saved_out;
+    stats_ = saved;
+    impl_->unify_world_depth(o);
+    if (tris_out != nullptr) *tris_out = emitted;
+    return true;
+}
+
+void Interpreter::set_interpolation(bool on) {
+    if (on && ip_ == nullptr) {
+        ip_ = new Interp();
+        before_ = new Impl();
+        after_ = new Impl();
+    }
+    if (!on && ip_ != nullptr) { ip_->logs[0].clear(); ip_->logs[1].clear(); }
+    impl_->ip = on ? ip_ : nullptr;
+}
+
+interp::MatchResult Interpreter::match_previous(float weight) {
+    Interp* ip = impl_->ip;
+    if (ip == nullptr) return interp::MatchResult{};
+    ip->weight = weight;
+    auto world = [](uint32_t id, bool, void* ctx) { return static_cast<Impl*>(ctx)->is_world_proj(id); };
+    return interp::match(ip->before(), ip->now(), weight, world, impl_);
+}
+
+interp::MatchResult Interpreter::reweight_previous(float weight) {
+    interp::MatchResult res;
+    Interp* ip = impl_->ip;
+    if (ip == nullptr) return res;
+    ip->weight = weight;
+    interp::reweight(ip->before(), ip->now(), weight, &res);
+    return res;
+}
+
+bool Interpreter::run_inbetween(uint32_t data_ptr, FrameRecord& out, uint32_t* tris) {
+    Interp* ip = impl_->ip;
+    if (ip == nullptr || !ip->now().valid) return false;
+    // From the state the list started from, and back to where it left it.
+    *after_ = *impl_;
+    const InterpreterStats saved = stats_;
+    *impl_ = *before_;
+    ip->applying = true;
+    ip->diverged = false;
+    impl_->begin_list(out);
+    const bool fullsync = impl_->run(data_ptr);
+    impl_->flush_rect_slices();
+    if (impl_->image_tiles) impl_->compact_rects();
+    impl_->unify_world_depth(out);
+    const interp::FrameLog& L = ip->now();
+    const bool followed = !ip->diverged && fullsync && (size_t)(impl_->xf_i + 1) == L.xf.size() &&
+                          (size_t)(impl_->pj_i + 1) == L.pj.size() && (size_t)(impl_->tl_i + 1) == L.tiles.size();
+    ip->applying = false;
+    if (tris != nullptr) *tris = stats_.tris - saved.tris;
+    *impl_ = *after_;
+    stats_ = saved;
+    return followed;
+}
+
+bool Interpreter::last_list_plain() const { return impl_->list_plain; }
+
+bool Interpreter::pass_over(uint32_t data_ptr, FrameRecord& scratch) {
+    // A copy of the whole state (a few KB) to put back when the list turns
+    // out to need drawing.
+    if (saved_ == nullptr) saved_ = new Impl();
+    *saved_ = *impl_;
+    impl_->skim = true;
+    impl_->begin_list(scratch);
+    const bool fullsync = impl_->run(data_ptr);
+    impl_->skim = false;
+    impl_->end_list(fullsync);
+    if (impl_->list_plain) return true;
+    *impl_ = *saved_;
+    return false;
 }
 
 void Interpreter::set_world_proj_ids(const uint32_t* ids, int count) {
@@ -1627,6 +2799,13 @@ void Interpreter::set_split_untagged_ortho(bool on) { impl_->split_untagged_orth
 void Interpreter::set_force_branch_z(bool on) { impl_->force_branch_z = on; }
 void Interpreter::set_gbi(Gbi gbi) { impl_->gbi = gbi; }
 void Interpreter::set_render_to_texture(bool on) { impl_->rtt_enabled = on; }
+void Interpreter::set_sample_drawn_frame(bool on) { impl_->frame_copy = on; }
+void Interpreter::set_primary_world_instance(bool on) { impl_->inst_track = on; }
+void Interpreter::set_unify_world_depth(bool on) { impl_->unify_depth = on; impl_->update_depth_terms(); }
+void Interpreter::set_fix_rect_lr(bool on) { impl_->fix_rect_lr = on; }
+void Interpreter::set_merge_rect_slices(bool on) { impl_->merge_rect_slices = on; }
+void Interpreter::set_hud_camera_id(uint32_t id) { impl_->hud_camera_id = id; }
+void Interpreter::set_merge_image_tiles(bool on) { impl_->image_tiles = on; }
 void Interpreter::set_screen(const ScreenGeometry& geo) {
     impl_->geo = geo;
     impl_->screen_w = geo.w;
@@ -1635,6 +2814,7 @@ void Interpreter::set_screen(const ScreenGeometry& geo) {
     memcpy(impl_->scissor, full, sizeof(full));
     const float cx = (float)geo.w * 0.5f, cy = (float)geo.h * 0.5f;
     impl_->vp = Impl::Viewport{ { cx, -cy, 511 }, { cx, cy, 511 }, cx };
+    impl_->inst_dirty = true;
 }
 
 }   // namespace rt64_3ds

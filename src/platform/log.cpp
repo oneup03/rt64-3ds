@@ -186,11 +186,17 @@ void recomp3ds::log_start_writer() {
 }
 
 // Everything logged so far onto the card, and synchronous from then on
-// (exit paths).
+// (exit paths). A writer that does not finish within a second (its card
+// write stuck) is left alone, and so is the file: draining the ring here
+// too would share its chunk buffer and FILE with it, and block this thread
+// (the exit) on the same card.
 void recomp3ds::log_flush() {
     if (g_writer != nullptr) {
         g_writer_run = false;
-        threadJoin(g_writer, 1000000000ull);
+        if (R_FAILED(threadJoin(g_writer, 1000000000ull))) {
+            svcOutputDebugString("recomp3ds: log writer stuck; log.txt ends here\n", 47);
+            return;
+        }
         threadFree(g_writer);
         g_writer = nullptr;
     }

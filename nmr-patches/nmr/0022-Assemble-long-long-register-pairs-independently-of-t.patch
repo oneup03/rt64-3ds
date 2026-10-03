@@ -1,0 +1,149 @@
+From 10f8dbd39b36c0419f6100f86f1e48c21f2d6cbe Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Fri, 2 Oct 2026 18:42:39 -0500
+Subject: [PATCH] Assemble long-long register pairs independently of the
+ register width
+
+The host's __ll_* / __ull_* / conversion helpers build their 64-bit
+arguments from the o32 register pairs with `ctx->r4 << 32`, which relies
+on the register type being 64 bits wide: with RECOMP_GPR32 (N64Recomp's
+32-bit registers) that shift is zero and every one of them computed on
+garbage. Cast the high half to uint64_t first; the 64-bit build is
+unchanged.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ librecomp/src/math_routines.cpp | 42 ++++++++++++++++-----------------
+ 1 file changed, 21 insertions(+), 21 deletions(-)
+
+diff --git a/librecomp/src/math_routines.cpp b/librecomp/src/math_routines.cpp
+index 4d6a01d..59f4df7 100644
+--- a/librecomp/src/math_routines.cpp
++++ b/librecomp/src/math_routines.cpp
+@@ -5,8 +5,8 @@
+ // This has already been partially completed.
+ 
+ extern "C" void __udivdi3_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    uint64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
+-    uint64_t b = (ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
++    uint64_t a = ((uint64_t)(uint32_t)ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
++    uint64_t b = ((uint64_t)(uint32_t)ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
+     uint64_t ret = a / b;
+ 
+     ctx->r2 = (int32_t)(ret >> 32);
+@@ -14,8 +14,8 @@ extern "C" void __udivdi3_recomp(uint8_t * rdram, recomp_context * ctx) {
+ }
+ 
+ extern "C" void __divdi3_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    int64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
+-    int64_t b = (ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
++    int64_t a = ((uint64_t)(uint32_t)ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
++    int64_t b = ((uint64_t)(uint32_t)ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
+     int64_t ret = a / b;
+ 
+     ctx->r2 = (int32_t)(ret >> 32);
+@@ -23,8 +23,8 @@ extern "C" void __divdi3_recomp(uint8_t * rdram, recomp_context * ctx) {
+ }
+ 
+ extern "C" void __umoddi3_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    uint64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
+-    uint64_t b = (ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
++    uint64_t a = ((uint64_t)(uint32_t)ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
++    uint64_t b = ((uint64_t)(uint32_t)ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
+     uint64_t ret = a % b;
+ 
+     ctx->r2 = (int32_t)(ret >> 32);
+@@ -32,8 +32,8 @@ extern "C" void __umoddi3_recomp(uint8_t * rdram, recomp_context * ctx) {
+ }
+ 
+ extern "C" void __ull_div_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    uint64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
+-    uint64_t b = (ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
++    uint64_t a = ((uint64_t)(uint32_t)ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
++    uint64_t b = ((uint64_t)(uint32_t)ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
+     uint64_t ret = a / b;
+ 
+     ctx->r2 = (int32_t)(ret >> 32);
+@@ -41,8 +41,8 @@ extern "C" void __ull_div_recomp(uint8_t * rdram, recomp_context * ctx) {
+ }
+ 
+ extern "C" void __ll_div_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    int64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
+-    int64_t b = (ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
++    int64_t a = ((uint64_t)(uint32_t)ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
++    int64_t b = ((uint64_t)(uint32_t)ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
+     int64_t ret = a / b;
+ 
+     ctx->r2 = (int32_t)(ret >> 32);
+@@ -50,8 +50,8 @@ extern "C" void __ll_div_recomp(uint8_t * rdram, recomp_context * ctx) {
+ }
+ 
+ extern "C" void __ll_mul_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    uint64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
+-    uint64_t b = (ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
++    uint64_t a = ((uint64_t)(uint32_t)ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
++    uint64_t b = ((uint64_t)(uint32_t)ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
+     uint64_t ret = a * b;
+ 
+     ctx->r2 = (int32_t)(ret >> 32);
+@@ -59,8 +59,8 @@ extern "C" void __ll_mul_recomp(uint8_t * rdram, recomp_context * ctx) {
+ }
+ 
+ extern "C" void __ull_rem_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    uint64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
+-    uint64_t b = (ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
++    uint64_t a = ((uint64_t)(uint32_t)ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
++    uint64_t b = ((uint64_t)(uint32_t)ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
+     uint64_t ret = a % b;
+ 
+     ctx->r2 = (int32_t)(ret >> 32);
+@@ -68,22 +68,22 @@ extern "C" void __ull_rem_recomp(uint8_t * rdram, recomp_context * ctx) {
+ }
+ 
+ extern "C" void __ull_to_d_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    uint64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
++    uint64_t a = ((uint64_t)(uint32_t)ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
+     double ret = (double)a;
+ 
+     ctx->f0.d = ret;
+ }
+ 
+ extern "C" void __ull_to_f_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    uint64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
++    uint64_t a = ((uint64_t)(uint32_t)ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
+     float ret = (float)a;
+ 
+     ctx->f0.fl = ret;
+ }
+ 
+ extern "C" void __ull_rshift_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    uint64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
+-    uint64_t b = (ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
++    uint64_t a = ((uint64_t)(uint32_t)ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
++    uint64_t b = ((uint64_t)(uint32_t)ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
+     uint64_t ret = a >> b;
+ 
+     ctx->r2 = (int32_t)(ret >> 32);
+@@ -91,7 +91,7 @@ extern "C" void __ull_rshift_recomp(uint8_t * rdram, recomp_context * ctx) {
+ }
+ 
+ extern "C" void __ll_to_f_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    int64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
++    int64_t a = ((uint64_t)(uint32_t)ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
+     float ret = (float)a;
+ 
+     ctx->f0.fl = ret;
+@@ -105,8 +105,8 @@ extern "C" void __f_to_ll_recomp(uint8_t * rdram, recomp_context * ctx) {
+ }
+ 
+ extern "C" void __ll_lshift_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    uint64_t a = (ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
+-    uint64_t b = (ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
++    uint64_t a = ((uint64_t)(uint32_t)ctx->r4 << 32) | ((ctx->r5 << 0) & 0xFFFFFFFFu);
++    uint64_t b = ((uint64_t)(uint32_t)ctx->r6 << 32) | ((ctx->r7 << 0) & 0xFFFFFFFFu);
+     uint64_t ret = a << b;
+ 
+     ctx->r2 = (int32_t)(ret >> 32);
+-- 
+2.53.0
+

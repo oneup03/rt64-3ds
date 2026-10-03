@@ -17,7 +17,10 @@ namespace rt64_3ds {
 // "infinity" draws (skies) only the shear, screen overlays none, HUD draws a
 // fixed screen-relative offset.
 enum class StereoClass : uint8_t { None, World, Infinity, ScreenOverlay, Hud, HudBubble, Rect };
-enum class ProjKind : uint8_t { Any, Perspective, Ortho };
+// Rect matches texture/fill rectangles drawn while the rule's group id is in
+// force; Any, Perspective and Ortho keep matching triangles only, so existing
+// rule tables are unchanged.
+enum class ProjKind : uint8_t { Any, Perspective, Ortho, Rect };
 
 
 // A rule matches a projection-group id range (gEXMatrixGroup ids) and a
@@ -38,6 +41,7 @@ struct AutoConvTuning {
     float retreat = 0.05f;          // ... and toward a farther one
     float cut_ratio = 2.5f;         // this much nearer for 2 frames is a camera cut: jump there
     float ease_in = 0.14f, ease_out = 0.06f;   // convergence easing toward the target, nearer / farther
+    float near_clamp = 4.0f;        // convergence never comes nearer than this (world units)
 };
 
 struct RenderDesc {
@@ -76,7 +80,161 @@ struct RenderDesc {
     // picture puzzles render the world into such an image. Off, off-screen
     // draws are dropped (copies of the presented frame use the snapshot).
     bool render_to_texture = false;
+    // The game copies parts of the frame it is still drawing into small
+    // images of its own (texture rectangles out of the colour image, after
+    // drawing into it) and draws with those copies in the same frame
+    // (Goemon's menu boxes: their rims are strips of the backdrop drawn just
+    // before). On the N64 the copies read the frame from RDRAM, which
+    // rt64-3ds never writes. On: images of another width than the frame are
+    // drawn into GPU textures (as render_to_texture would), loads from the
+    // frame being drawn sample a copy of it, and the frames that do this
+    // draw each eye's draws up to the last such load a second time, into a
+    // 256x512 texture (about 1 MB of VRAM, allocated at start). Frames that
+    // don't pay nothing.
+    bool sample_drawn_frame = false;
     AutoConvTuning autoconv{};
+
+    // ---- Parity with the desktop fork's renderer for games that ask for it
+    // (Goemon). Every default keeps the behaviour DK64 and Banjo were tuned on.
+    //
+    // RT64's rect.fixRectLR (on by default there): a rectangle whose right or
+    // bottom edge ends within one pixel of the scissor's is extended to it.
+    // Games draw full-screen rectangles to x = 319 under a 320-wide scissor;
+    // extended, they cover the width and are stretched over the wide screen.
+    bool fix_rect_lr = false;
+    // Plain-origin rectangles of one run of rectangles (no triangles between
+    // them, one colour image) that share their rows (uly, lry) and together
+    // reach both edges of the frame are stretched over the wide screen like
+    // one full-width rectangle: backdrops drawn as slices, or split where
+    // their texture wraps (the desktop fork's merged widescreen detection).
+    bool merge_rect_slices = false;
+    // Infinity-class rectangles (backdrops at infinity) are scaled about the
+    // frame's centre by 1 + their per-eye shift as a fraction of the half
+    // width, so the shifted image still covers the screen in both eyes
+    // instead of uncovering a strip at one edge (the desktop's skybox-rect
+    // cover zoom).
+    bool infinity_rect_cover_zoom = false;
+    // HUD-class rectangles take the orthographic HUD's offset (hud_offset *
+    // hud_k_ortho: scaled by the separation, clamped like it) instead of the
+    // fixed offset scaled by the 3D slider alone, so 2D text and panels sit
+    // at the same depth as the rest of the HUD.
+    bool rect_hud_follows_separation = false;
+    // Hud, HudBubble and HUD-rectangle shifts are rounded to whole screen
+    // pixels (each eye's, symmetrically), so text samples the same texels in
+    // both eyes.
+    bool snap_hud_shift = false;
+    // The projection group (gEXMatrixGroup id) of a HUD camera: perspective
+    // HUD items drawn by a private camera the game's rules place as Hud.
+    // When its full-width perspective draws outnumber the frame's full-width
+    // world draws (a cutscene shot through a camera that passes the game's
+    // HUD-camera test), it is the frame's world: its draws are placed as
+    // World and its projection gives the depth terms. 0 = none.
+    uint32_t hud_camera_id = 0;
+    // How hud_camera_id becomes the world, as the desktop fork picks its
+    // primary world (rt64_projection_processor.cpp): off, every draw of the
+    // HUD camera is the world when its full-width draws outnumber the
+    // world's. On, one projection instance is: of the full-width perspective
+    // instances (DrawRecord::proj_inst) under the HUD camera or placed as
+    // World, the one with the most triangles; if it is a HUD-camera instance,
+    // only its draws are the world (and its projection the depth camera),
+    // and the HUD camera's other instances (Goemon's menu panels next to the
+    // curtain) stay HUD.
+    bool primary_world_instance = false;
+    // One depth scale for the world. A game may draw part of the world under
+    // a second projection with a nearer near plane (Goemon's own model in
+    // the closest camera zoom: near 15 against the world's 35, so the
+    // model, nearer than 35, is not cut away), which leaves the depth buffer
+    // holding two scales: the ground a little ahead of the camera, drawn
+    // first, then hides the nearer model below a straight line. On, every
+    // triangle draw under a World projection id (perspective, not
+    // prim-depth) takes the depth of the frame's World projection with the
+    // nearest near plane, from its distance (w): exact, as clipping already
+    // happened at each draw's own near plane. The depth camera's terms
+    // follow.
+    bool unify_world_depth = false;
+    // Rectangles that cover their scissor stay on the screen plane (off), or
+    // take the HUD rectangles' shift like any other (on: the desktop gives
+    // every non-skybox rectangle that shift; Goemon's panels drawn inside a
+    // scissor of their own). Rectangles covering the whole frame stay on the
+    // screen plane either way: a uniform full-screen tint or fade shows no
+    // depth, and shifted it would bare a strip at one edge of each eye.
+    bool covering_rects_hud = false;
+
+    // ---- Performance.
+    //
+    // Triangles textured from tiles that LOADTILE cut out of one wider image
+    // sample one texture of the whole image instead (its full width, and the
+    // rows the last list that used it loaded), their texel coordinates moved
+    // into it, so draws that differ only in which part of the image they
+    // loaded become one draw. Goemon's sky cylinder loads a 32-texel column of
+    // its panorama for each of up to 400 quads: the 280 sky draws of the
+    // heaviest opening frame become one. Only where that samples the same
+    // texels: TEXEL0 alone, 8- or 16-bit texels, the tile starting where the
+    // load put it and every texel coordinate of the triangle inside the
+    // loaded rectangle (no clamp, mask or mirror comes into play); anything
+    // else samples its tile as before. Bilinear filtering at a tile's edge
+    // then reads the image's true neighbour instead of the clamped edge.
+    bool merge_image_tiles = false;
+    // The GPU's share of a frame (the defaults are what DK64 and Banjo were
+    // tuned with; each is also a settings.ini key, read at start, for A/B
+    // tests on the console, where the frame line logs GPU ms per frame):
+    // eye_color16 (gpu_color16): the eyes' colour buffers RGB565 instead of
+    // RGBA8 (the N64's own framebuffer is 16-bit): half the colour traffic
+    // of every draw, blend, clear, ghost pass and display transfer.
+    // Snapshots follow the eye's format and so lose their alpha (sampled as
+    // 1): games that copy the frame and need it (DK64) keep RGBA8.
+    bool eye_color16 = false;
+    // eye_depth16 (gpu_depth16): 16-bit depth buffers for the eyes instead
+    // of 24-bit depth + stencil (nothing uses stencil): half the depth
+    // traffic. 65536 steps of z/w, against the N64's own 18-bit z.
+    bool eye_depth16 = false;
+    // intensity_textures16 (gpu_textures16): I and IA textures (and CI ones
+    // with an IA16 palette) as the PICA's 16-bit LA8 instead of RGBA8: the
+    // same texels (L replicated into RGB, 8-bit alpha), half the size.
+    bool intensity_textures16 = false;
+    // fill_clear (gpu_fill_clear): a frame whose first draw into the eye is
+    // a fill-mode rectangle covering it (the game's own clear, Goemon's
+    // every frame) clears the eyes to its colour instead of drawing it: one
+    // full screen of fragments less per eye, the same pixels.
+    bool fill_clear = false;
+    // double_eyes (gpu_double_eyes), with frame_interpolation: the
+    // in-between frames get eye targets of their own (two more 240x400
+    // colour + depth buffers: 1125 KB of VRAM at RGBA8/D16, taken last and
+    // skipped when the VRAM is not there), and the game's frame of each
+    // interpolated pair is recorded into a command buffer of its own while
+    // the GPU still draws the in-between. Without it that frame's
+    // C3D_FrameBegin waits for all of the in-between's GPU work (citro3d
+    // has one command buffer and one GX queue run per frame) before a
+    // single command is recorded: about one eye pair of GPU time a list on
+    // the game's path. The in-between's draws go to the GPU as soon as they
+    // are recorded (its targets are its own); only its display transfer
+    // waits for the frame before it to be on the screen. The presenter
+    // thread then queues the recorded frame (its draws run while the
+    // in-between waits for its refresh) and its display transfer once the
+    // in-between is on the screen.
+    bool double_eyes = false;
+
+    // early_drawn: the game hears a display list drawn (the RDP's
+    // completion) as soon as the renderer has read it from RDRAM (when it
+    // hears it parsed), not when the renderer is done with it. With frame
+    // interpolation the renderer's waits for the screen (each frame of a
+    // pair on a refresh of its own) then stay off the game's frame time: a
+    // game that waits for the RDP before its next frame (Banjo's frame
+    // limiter does, every frame) keeps its own pace, and its cutscenes keep
+    // to their music. Not with depth_to_rdram: that depth is written while
+    // the next list is drawn.
+    bool early_drawn = false;
+
+    // ---- Frame rate.
+    //
+    // Offer "60 interpolated" on the Frame rate row (Settings::frame_cap 2):
+    // while the game asks for 30 frames a second (gEXSetRefreshRate), each
+    // display list is drawn twice, first as an in-between frame halfway from
+    // the list before (the desktop's high frame rate: RT64's matching and
+    // interpolation of the transforms the game's patches tag with
+    // gEXMatrixGroup), then as itself one refresh later. For games whose
+    // patches tag their transforms for RT64's interpolation (Goemon).
+    bool frame_interpolation = false;
 };
 
 void set_render_desc(const RenderDesc& desc);
@@ -116,6 +274,17 @@ struct Settings {
     int ghost_contrast = 100;         // 50..100 percent
     int ghost_black_floor = 0;        // 0..20 percent
     float slider_gain = 0.5f;         // scales the desktop separation range down for the 3DS panel
+    // Frame cap: 0 draws every frame the game sends; 1 draws at most 30 a
+    // second while the game asks for more (gEXSetRefreshRate): every other
+    // display list is passed over (see send_dl), the game and its audio run
+    // on at their own rate and the screen keeps the last frame drawn.
+    // 2 (RenderDesc::frame_interpolation only): 60 a second while the game
+    // asks for 30, an interpolated frame between each two of the game's.
+    int frame_cap = 0;
+    // RenderDesc::eye_color16 / eye_depth16 / intensity_textures16 /
+    // fill_clear / double_eyes, as the game sets them unless settings.ini
+    // says otherwise (read at start).
+    int gpu_color16 = 0, gpu_depth16 = 0, gpu_textures16 = 0, gpu_fill_clear = 0, gpu_double_eyes = 0;
 };
 Settings& settings();
 
@@ -150,6 +319,11 @@ struct FrameStats {
     int late_frames = 0;              // gaps of more than 50 ms between display lists, last second
     float max_gap_ms = 0;             // the longest such gap, last second
     int game_fps = 0;                 // the rate the game asks for (gEXSetRefreshRate), 0 = not given
+    int dl_skipped_per_sec = 0;       // of dl_per_sec, the lists the frame cap passed over (Settings::frame_cap)
+    int presented_per_sec = 0;        // frames put on the screen, last second
+    int inbetween_per_sec = 0;        // of those, interpolated in-between frames (Settings::frame_cap 2)
+    int inbetween_dropped_per_sec = 0;// lists the game asked 30 for that got no in-between frame (late, unsafe, a cut)
+    char inbetween_reasons[112] = ""; // ... by reason ("budget 12 cut 1")
 };
 const FrameStats& stats();
 FrameStats& mutable_stats();   // for the renderer implementations
@@ -168,8 +342,21 @@ void set_paused(bool paused);
 
 // Save the next frame for the host tools: its gfx task and RDRAM
 // (gfx_task.bin) and what it rendered (gfx_frame.ppm), in the game's folder.
+// A writer thread writes it while the game plays on; asked for while an
+// earlier one is still being written, it is refused (capture_message says so).
 void request_capture();
-int capture_state();    // 0 none, 1 being written, 2 written
+int capture_state();    // 0 none, 1 being written, 2 written, 3 failed, 4 refused
+// The last capture event as one line for the touch screen ("Capture saved:
+// gfx_task3.bin (11 s)", "Capture refused: ..."); *seq changes with each.
+const char* capture_message(int* seq);
+// Quitting: stop the capture writer between two requests, waiting up to
+// timeout_ms for it; false if it is still busy (a stuck card).
+bool capture_stop(int timeout_ms);
+// The next `count` frames shown, as images (gfx_frame*.ppm), and this
+// display list and the next with their RDRAM (gfx_task*.bin): the test
+// scripts' CAPTURE command.
+void request_frame_sequence(int count);
+void request_capture_pair();
 
 // A screenshot of what is on the screens: the top screen's eyes (the right
 // one only when the frame was drawn in 3D) and the touch screen, as BMPs in

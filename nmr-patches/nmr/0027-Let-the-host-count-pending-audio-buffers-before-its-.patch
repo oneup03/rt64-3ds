@@ -1,0 +1,89 @@
+From 581dbd35ee63f7e82771bc419b70b23a444c5e87 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Fri, 2 Oct 2026 23:42:02 -0500
+Subject: [PATCH] Let the host count pending audio buffers before its margin
+
+With asynchronous audio tasks, get_remaining_audio_bytes added the bytes
+of buffers whose tasks had yet to run on top of the host's
+get_frames_remaining, which has already subtracted the host's margin and
+clamped at zero. Goemon's scheduler starts an audio task at the retrace,
+so when its audio manager hands over the previous buffer and asks for
+the length, that buffer is always pending. Whenever the device held less
+than the margin, the length read a whole frame too high: the manager
+stayed at its smallest frame (720 of the 735 frames a retrace plays) and
+the device ran dry a little every frame. That is crackling on a New 3DS
+with no underrun caught.
+
+ultramodern::pending_audio_bytes() now gives the host the pending bytes,
+and the host counts them as queued before its margin. The runtime no
+longer adds them itself. Flushing also takes a buffer out of the pending
+count before handing it over, so a concurrent read can miss it for a
+moment but never counts it twice.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ultramodern/include/ultramodern/ultramodern.hpp |  8 ++++++++
+ ultramodern/src/audio.cpp                       | 14 +++++++++++---
+ 2 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index 9d819e3..590d1b4 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -109,6 +109,14 @@ uint32_t audio_tasks_submitted();
+ uint32_t audio_tasks_completed();
+ // The task thread, after each audio task: hands over the buffers waiting on it.
+ void flush_audio_buffers(RDRAM_ARG uint32_t completed);
++// Bytes in buffers handed to osAiSetNextBuffer whose tasks have yet to run.
++// A host that turns asynchronous audio tasks on must count them as queued in
++// its get_frames_remaining, before any margin it subtracts there: a margin
++// taken from the device's queue alone, clamped at zero, with these added on
++// top, reports a full frame too much whenever the device holds less than the
++// margin, and the game's audio manager then stays at its smallest frame and
++// lets the device run dry (crackling with no underrun on record).
++uint32_t pending_audio_bytes();
+ 
+ // Preemption for recompiled code. The runtime delivers external events (a VI
+ // retrace, a task's completion, a timer) to game threads only when the running
+diff --git a/ultramodern/src/audio.cpp b/ultramodern/src/audio.cpp
+index 05eede5..51611bf 100644
+--- a/ultramodern/src/audio.cpp
++++ b/ultramodern/src/audio.cpp
+@@ -49,14 +49,22 @@ void queue_now(RDRAM_ARG PTR(int16_t) audio_data_, uint32_t byte_count) {
+ }
+ }
+ 
++uint32_t ultramodern::pending_audio_bytes() {
++    return pending_bytes;
++}
++
+ void ultramodern::flush_audio_buffers(RDRAM_ARG uint32_t completed) {
+     std::lock_guard lock{ pending_mutex };
+     // Wrapping counters: a buffer is due when `completed` has reached its count.
+     while (!pending_buffers.empty() && (int32_t)(completed - pending_buffers.front().needs) >= 0) {
+         const PendingBuffer buf = pending_buffers.front();
+         pending_buffers.pop_front();
+-        queue_now(PASS_RDRAM buf.data, buf.byte_count);
++        // Out of the pending count first: a length read meanwhile from the
++        // game's thread then misses this buffer for a moment (the game makes
++        // one frame a little larger) rather than counting it twice (smaller,
++        // and the device can run short).
+         pending_bytes -= buf.byte_count;
++        queue_now(PASS_RDRAM buf.data, buf.byte_count);
+     }
+ }
+ 
+@@ -102,8 +110,8 @@ uint32_t ultramodern::get_remaining_audio_bytes() {
+     else {
+         buffered_byte_count = 100;
+     }
+-    // Buffers of asynchronous audio tasks that have yet to reach the host.
+-    buffered_byte_count += pending_bytes;
++    // Buffers of asynchronous audio tasks that have yet to reach the host are
++    // counted by the host itself (pending_audio_bytes), before its margin.
+     // Adjust the reported count to be some number of refreshes in the future, which helps ensure that
+     // there are enough samples even if the audio thread experiences a small amount of lag. This prevents
+     // audio popping on games that use the buffered audio byte count to determine how many samples
+-- 
+2.55.0
+

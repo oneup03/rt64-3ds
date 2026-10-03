@@ -22,13 +22,26 @@ float clamp_ndc(float ndc, float unsigned_offset) {
 
 bool in_rule(uint32_t id, uint32_t lo, uint32_t hi) { return id >= lo && id <= hi; }
 
+// RenderDesc::snap_hud_shift: a shift (N64 units) onto whole screen pixels.
+// roundf is symmetric, so the two eyes' opposite shifts stay opposite.
+float snap_shift(float v, float px_scale) {
+    return px_scale > 0.0f ? roundf(v * px_scale) / px_scale : v;
+}
+
 }   // namespace
 
 StereoClass classify_draw(const DrawRecord& d, const RenderDesc& desc) {
-    if (d.kind != DrawRecord::Tris) return StereoClass::Rect;
+    if (d.kind != DrawRecord::Tris) {
+        // Only Rect rules place rectangles (Goemon's backdrops at infinity).
+        for (size_t i = 0; i < desc.rule_count; i++) {
+            const StereoRule& r = desc.rules[i];
+            if (r.kind == ProjKind::Rect && in_rule(d.proj_id, r.id_lo, r.id_hi)) return r.cls;
+        }
+        return StereoClass::Rect;
+    }
     for (size_t i = 0; i < desc.rule_count; i++) {
         const StereoRule& r = desc.rules[i];
-        if (!in_rule(d.proj_id, r.id_lo, r.id_hi)) continue;
+        if (r.kind == ProjKind::Rect || !in_rule(d.proj_id, r.id_lo, r.id_hi)) continue;
         if (r.kind == ProjKind::Any || (r.kind == ProjKind::Perspective) == d.perspective) {
             // Z_CMP and Z_UPD (othermode L bits 4, 5) clear and FORCE_BL
             // (bit 14) too: an opaque surface with no depth. Blob shadows are
@@ -66,11 +79,19 @@ void stereo_shift(const StereoFrame& sf, StereoClass cls, const DrawRecord& d, i
             if (sf.hud_offset == 0.0f) break;
             const float k = !d.perspective ? desc.hud_k_ortho
                           : cls == StereoClass::HudBubble ? desc.hud_k_bubble : desc.hud_k_persp;
-            *a = -e * clamp_ndc(sf.hud_offset * k, sf.hud_offset) * kPxPerNdc;
+            *a = snap_shift(-e * clamp_ndc(sf.hud_offset * k, sf.hud_offset) * kPxPerNdc, sf.px_scale);
             break;
         }
         case StereoClass::Rect:
-            *b = -e * sf.rect_ndc * kPxPerNdc;
+            if (desc.rect_hud_follows_separation) {
+                // Where the orthographic HUD goes (the desktop fork gives
+                // texture rectangles the same offset as its ortho HUD).
+                if (sf.hud_offset == 0.0f) break;
+                *b = snap_shift(-e * clamp_ndc(sf.hud_offset * desc.hud_k_ortho, sf.hud_offset) * kPxPerNdc, sf.px_scale);
+            }
+            else {
+                *b = snap_shift(-e * sf.rect_ndc * kPxPerNdc, sf.px_scale);
+            }
             break;
         default:
             break;
@@ -104,6 +125,90 @@ bool rect_covers_scissor(const DrawRecord& d, const Vtx3ds* verts) {
         x0 = std::min(x0, v.x); x1 = std::max(x1, v.x); y0 = std::min(y0, v.y); y1 = std::max(y1, v.y);
     }
     return x0 <= d.scissor[0] && x1 >= d.scissor[2] && y0 <= d.scissor[1] && y1 >= d.scissor[3];
+}
+
+void set_hud_terms(StereoFrame& sf, int hud_depth, float slider, float slider_gain) {
+    // 50 is the screen plane; above pops the HUD out, below pushes it back.
+    // Triangles scale with separation (so the HUD flattens with the world);
+    // rectangles carry the desktop's fixed offset, here scaled by the 3D
+    // slider (unless RenderDesc::rect_hud_follows_separation).
+    const float centered = ((float)hud_depth - 50.0f) / 50.0f;
+    sf.hud_offset = -centered * kHudMaxOffset * (sf.sep / kHudReferenceSeparation);
+    sf.rect_ndc = -centered * kHudMaxOffset * 2.75f * slider * slider_gain;
+}
+
+float cover_zoom_factor(float sep, const ScreenGeometry& geo) {
+    return 1.0f + sep * kPxPerNdc / (geo.wide_w * 0.5f);
+}
+
+void cover_zoom(const DrawRecord& d, Vtx3ds* verts, float factor, const ScreenGeometry& geo) {
+    const float cx = (float)geo.w * 0.5f, cy = (float)geo.h * 0.5f;
+    for (uint32_t k = d.first; k < d.first + d.count; k++) {
+        Vtx3ds& v = verts[k];      // rectangles: w = 1
+        v.x = cx + (v.x - cx) * factor;
+        v.y = cy + (v.y - cy) * factor;
+    }
+}
+
+bool hud_camera_is_world(const DrawRecord* draws, size_t count, const RenderDesc& desc, int frame_w) {
+    if (desc.hud_camera_id == 0) return false;
+    uint32_t hud_cam = 0, world = 0;
+    for (size_t i = 0; i < count; i++) {
+        const DrawRecord& d = draws[i];
+        if (d.kind != DrawRecord::Tris || !d.perspective || d.rtt >= 0) continue;
+        if (!(d.scissor[0] <= 0 && d.scissor[2] >= frame_w)) continue;      // full width
+        if (d.proj_id == desc.hud_camera_id) hud_cam++;
+        else if (classify_draw(d, desc) == StereoClass::World) world++;
+    }
+    return hud_cam > world;
+}
+
+uint32_t primary_world_instance(const DrawRecord* draws, size_t count, const RenderDesc& desc, int frame_w, bool* hud_cam,
+                                InstanceCount* table, int table_max, int* table_count) {
+    // Instances are numbered in draw order; a frame has a few dozen.
+    constexpr int kMax = 64;
+    InstanceCount inst[kMax];
+    int n = 0;
+    for (size_t i = 0; i < count; i++) {
+        const DrawRecord& d = draws[i];
+        if (d.kind != DrawRecord::Tris || !d.perspective || d.rtt >= 0 || d.proj_inst == 0) continue;
+        if (!(d.scissor[0] <= 0 && d.scissor[2] >= frame_w)) continue;      // full width
+        const bool hud = desc.hud_camera_id != 0 && d.proj_id == desc.hud_camera_id;
+        if (!hud && classify_draw(d, desc) != StereoClass::World) continue;
+        int k = n - 1;
+        while (k >= 0 && inst[k].inst != d.proj_inst) k--;
+        if (k < 0) {
+            if (n == kMax) continue;
+            k = n++;
+            inst[k].inst = d.proj_inst;
+            inst[k].proj_id = d.proj_id;
+        }
+        inst[k].records++;
+        inst[k].tris += d.count / 3;
+    }
+    // By triangles, not records: a record is a run of triangles in one state
+    // (Goemon's menu curtain, 392 triangles, is one, as it is one RT64 call),
+    // so counting records would make the first menu panel's rims (4 records
+    // of 2 triangles, one per texture) the world and put the curtain at the
+    // HUD's depth. In play the world camera has far more of both.
+    int best = -1;
+    for (int k = 0; k < n; k++) if (best < 0 || inst[k].tris > inst[best].tris) best = k;
+    if (table != nullptr) {
+        const int m = n < table_max ? n : table_max;
+        for (int k = 0; k < m; k++) table[k] = inst[k];
+        if (table_count != nullptr) *table_count = n;
+    }
+    *hud_cam = best >= 0 && desc.hud_camera_id != 0 && inst[best].proj_id == desc.hud_camera_id;
+    return best >= 0 ? inst[best].inst : 0;
+}
+
+bool rect_covers_frame(const DrawRecord& d, const Vtx3ds* verts, int frame_w, int frame_h) {
+    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+    for (uint32_t i = d.first; i < d.first + d.count; i++) {
+        const Vtx3ds& v = verts[i];
+        x0 = std::min(x0, v.x); x1 = std::max(x1, v.x); y0 = std::min(y0, v.y); y1 = std::max(y1, v.y);
+    }
+    return x0 <= 0.0f && x1 >= (float)frame_w && y0 <= 0.0f && y1 >= (float)frame_h;
 }
 
 float view_depth(float zp, float m22, float m32) {
@@ -156,14 +261,13 @@ float AutoConvergence::update(float nearest_z, float manual_conv, float sep, int
     }
 
     float target = (float)std::max(-50, std::min(60, comfort_thousandths)) * 0.001f;
-    constexpr float kNearClamp = 4.0f;
     const float at_manual = sep * 0.5f * (manual_conv / z_ema - 1.0f);
     float conv = manual_conv;
     if (at_manual > target) {
         conv = std::min(z_ema * (1.0f + 2.0f * target / sep), manual_conv);
     }
     conv = std::max(conv, z_ema * 0.25f);
-    conv = std::max(conv, kNearClamp);
+    conv = std::max(conv, tune.near_clamp);
 
     const float target_inv = 1.0f / conv;
     if (inv_conv <= 0.0f) inv_conv = target_inv;

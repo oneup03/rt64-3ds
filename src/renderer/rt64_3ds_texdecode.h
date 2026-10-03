@@ -22,14 +22,16 @@ void decode_texels(const uint8_t* rdram, const TexDesc& d, const uint16_t* pal, 
     const uint32_t row_words = d.pitch / 8;               // load iterations per texel row
     const uint32_t swap_bytes = (d.siz == 3) ? 8 : 4;     // 32-bit texels sit in two TMEM halves
     for (uint32_t y = 0; y < d.height; y++) {
-        const uint32_t row = d.addr + y * d.pitch;
+        // Rows past the end of TMEM read its start again (TexDesc::wrap_rows).
+        const uint32_t ty = d.wrap_rows != 0 ? y % d.wrap_rows : y;
+        const uint32_t row = d.addr + ty * d.pitch;
         // Odd-row interleave: the sampler swaps the 32-bit halves of each
         // TMEM word on odd tile rows; a block load swapped the rows its own
         // dxt counter called odd (sampled at the row's middle word). Rows
         // where the two disagree read swapped (dxt 0: pre-interleaved data).
         uint32_t sw = 0;
         if (d.block) {
-            uint32_t load_odd = (((uint32_t)d.load_word + y * row_words + row_words / 2) * d.dxt >> 11) & 1;
+            uint32_t load_odd = (((uint32_t)d.load_word + ty * row_words + row_words / 2) * d.dxt >> 11) & 1;
             if (load_odd != (y & 1)) sw = swap_bytes;
         }
         auto at = [&](uint32_t off) { return row + (off ^ sw); };

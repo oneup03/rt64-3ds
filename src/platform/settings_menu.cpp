@@ -33,6 +33,7 @@
 #include "rt64_3ds.h"
 #include "recomp3ds.h"
 #include "recomp3ds_internal.h"
+#include "aspmain_hle.h"
 #ifdef RECOMP_STATIC_MODS
 #include "librecomp/mods.hpp"
 #endif
@@ -110,6 +111,20 @@ void apply_cpu(int v) { recomp3ds::set_cpu_speed(v != 0); }
 int g_audio_on = 1;
 const char* const kAudioNames[] = { "Off", "On" };
 void apply_audio(int v) { recomp3ds::audio_set_enabled(v != 0); }
+// The aspMain interpreter's low quality (aspmain_hle.h): half-rate synthesis
+// without the reverb, about a quarter less of its time. The default on an
+// Old 3DS.
+int g_audio_quality = 1;
+const char* const kAudioQualityNames[] = { "Low", "Full" };
+void apply_audio_quality(int v) { recomp3ds::aspmain_hle_set_low_quality(v == 0); }
+
+// The frame cap (rt64_3ds::Settings::frame_cap): the game's own rate, or at
+// most 30 drawn frames a second while it asks for more (the game and its
+// audio keep their rate; every other frame stays on the screen twice), or,
+// for games that offer it (RenderDesc::frame_interpolation), 60 while the
+// game asks for 30: an interpolated frame between each two of the game's
+// ("60 interpolated"; the row is 12 columns wide).
+const char* const kFrameCapNames[] = { "Game", "30 fps", "60 interp." };
 
 // Where the ROM lives, set in settings.ini only (it takes effect at start,
 // so the menu does not show it): 0 auto (read from the SD card as needed on
@@ -130,6 +145,18 @@ void apply_deadzones(int) { recomp3ds::input_set_deadzones(g_stick_dz, g_cstick_
 int g_cstick_up = 1;
 const char* const kCstickUpNames[] = { "Off", "C-Up" };
 void apply_cstick_up(int v) { recomp3ds::input_set_cstick_up(v != 0); }
+
+// GameDesc::cstick_camera_hold games: the C-Stick as the game's button
+// camera (1, the default) or the plain C buttons (0).
+int g_cstick_camera = 1;
+const char* const kCstickCameraNames[] = { "C buttons", "Camera" };
+const recomp3ds::GameDesc* g_cam_desc = nullptr;
+void apply_cstick_camera(int v) {
+    const recomp3ds::GameDesc* d = g_cam_desc;
+    if (d == nullptr) return;
+    recomp3ds::input_set_cstick_camera(v != 0 ? d->cstick_camera_hold : 0, d->cstick_camera_lead_ms, d->cstick_camera_press_ms,
+                                       d->cstick_camera_period_ms);
+}
 
 void add_row(const Row& r) {
     if (g_row_count < kMaxRows) g_rows[g_row_count++] = r;
@@ -536,13 +563,35 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     }
     // After the game's rows: where C-Up is a camera (DK64's first person) it
     // follows the game's camera settings.
+    if (desc.cstick_camera_hold != 0) {
+        g_cam_desc = &desc;
+        add_row({ "cstick_camera", "C-Stick", 0, 1, &g_cstick_camera, kCstickCameraNames, false, nullptr, apply_cstick_camera, PageControls, 1, nullptr });
+    }
     add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, PageControls, 1, nullptr });
     add_row({ "audio", "Audio", 0, 1, &g_audio_on, kAudioNames, false, nullptr, apply_audio, PageGame, 1, nullptr });
+    add_row({ "frame_cap", "Frame rate", 0, desc.render.frame_interpolation ? 2 : 1, &st.frame_cap, kFrameCapNames, false, nullptr, nullptr, PageGame, 1, nullptr });
     add_row({ "rom_stream", "ROM stream", 0, 2, &g_rom_stream, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "debug_capture", "Debug capture", 0, 1, &g_debug_capture, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    // The renderer's GPU-cost choices (RenderDesc::eye_color16 and so on),
+    // settings.ini only and read at start: the game's choice unless the file
+    // says otherwise, for A/B tests on the console.
+    st.gpu_color16 = desc.render.eye_color16 ? 1 : 0;
+    st.gpu_depth16 = desc.render.eye_depth16 ? 1 : 0;
+    st.gpu_textures16 = desc.render.intensity_textures16 ? 1 : 0;
+    st.gpu_fill_clear = desc.render.fill_clear ? 1 : 0;
+    st.gpu_double_eyes = desc.render.double_eyes ? 1 : 0;
+    add_row({ "gpu_color16", "GPU 16-bit colour", 0, 1, &st.gpu_color16, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "gpu_depth16", "GPU 16-bit depth", 0, 1, &st.gpu_depth16, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "gpu_textures16", "GPU 16-bit I/IA textures", 0, 1, &st.gpu_textures16, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "gpu_fill_clear", "GPU fill clears", 0, 1, &st.gpu_fill_clear, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "gpu_double_eyes", "GPU double eye targets", 0, 1, &st.gpu_double_eyes, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
     if (is_new_3ds) add_row({ "cpu_speed", "CPU speed", 0, 1, &g_cpu_new, kCpuNames, false, nullptr, apply_cpu, PageGame, 1, nullptr });
+    if (desc.audio_hle && desc.audio_hle_family == recomp3ds::AudioHle::Aspmain) {
+        g_audio_quality = is_new_3ds ? 1 : 0;
+        add_row({ "audio_quality", "Audio quality", 0, 1, &g_audio_quality, kAudioQualityNames, false, nullptr, apply_audio_quality, PageGame, 1, nullptr });
+    }
     // The game's defaults, then what settings.ini holds.
     for (size_t d = 0; d < desc.menu_default_count; d++) {
         const MenuDefault& md = desc.menu_defaults[d];

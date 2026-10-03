@@ -1,0 +1,44 @@
+From 66200ed68c14815057b198181303419f5ee3f68b Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Thu, 1 Oct 2026 21:05:22 -0500
+Subject: [PATCH] Multiply the vector unit's unsigned lanes as unsigned
+
+VMUDL and VMADL multiplied two uint16_t lanes after integer promotion,
+in int: a product of 2^31 or more overflows, which is undefined. The
+x86 builds happen to wrap, but GCC for the 3DS's ARM11, with the whole
+microcode inlined, does not: Goemon's recompiled aspMain then computed
+its envelope ramps (VMUDL of the fraction by the rate's low half) a few
+LSBs off the desktop's, so every interpreter check against it on the
+console reported mismatches that were the reference's. The scalar path
+now multiplies in uint32_t, as the RSP does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/include/librecomp/rsp_vu_impl.hpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/librecomp/include/librecomp/rsp_vu_impl.hpp b/librecomp/include/librecomp/rsp_vu_impl.hpp
+index dbf46b2..99f05f8 100644
+--- a/librecomp/include/librecomp/rsp_vu_impl.hpp
++++ b/librecomp/include/librecomp/rsp_vu_impl.hpp
+@@ -944,7 +944,7 @@ auto RSP::VMADL(r128& vd, cr128& vs, cr128& vt) -> void {
+     if constexpr (Accuracy::RSP::SISD) {
+         cr128 vte = vt(e);
+         for (u32 n = 0; n < 8; n++) {
+-            accumulatorSet(n, accumulatorGet(n) + (u32(vs.u16(n) * vte.u16(n)) >> 16));
++            accumulatorSet(n, accumulatorGet(n) + (u32(vs.u16(n)) * vte.u16(n) >> 16));
+             vd.u16(n) = accumulatorSaturate(n, 0, 0x0000, 0xffff);
+         }
+     }
+@@ -1109,7 +1109,7 @@ auto RSP::VMUDL(r128& vd, cr128& vs, cr128& vt) -> void {
+     if constexpr (Accuracy::RSP::SISD) {
+         cr128 vte = vt(e);
+         for (u32 n = 0; n < 8; n++) {
+-            accumulatorSet(n, u16(vs.u16(n) * vte.u16(n) >> 16));
++            accumulatorSet(n, u16(u32(vs.u16(n)) * vte.u16(n) >> 16));
+         }
+         vd = ACCL;
+     }
+-- 
+2.53.0
+
