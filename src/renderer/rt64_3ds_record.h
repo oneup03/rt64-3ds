@@ -30,6 +30,8 @@ public:
     void clear() { size_ = 0; }
     uint32_t size() const { return size_; }
     bool empty() const { return size_ == 0; }
+    // How many more vertices fit (fixed storage; any number when it grows).
+    uint32_t room() const { return (!owned_ && data_ != nullptr) ? cap_ - size_ : UINT32_MAX; }
     Vtx3ds* data() { return data_; }
     void swap(VtxArray& o) {
         Vtx3ds* d = data_; data_ = o.data_; o.data_ = d;

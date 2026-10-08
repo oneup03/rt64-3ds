@@ -144,6 +144,18 @@ public:
     // clipped; rectangles, lighting, texture generation and state are the
     // game frame's. `tris` receives the triangles drawn.
     bool build_inbetween(const FrameRecord& real, FrameRecord& out, uint32_t* tris = nullptr);
+    // A second thread for build_inbetween: with one set, a list of enough
+    // triangles is split at a record near its middle, the records after it
+    // built on the helper into a buffer of its own, which is then copied
+    // after the calling thread's (the same frame as one thread builds).
+    // start(job, arg) runs job(arg) there and returns at once; finish()
+    // returns once it has. nullptr: one thread.
+    struct Helper {
+        virtual void start(void (*job)(void*), void* arg) = 0;
+        virtual void finish() = 0;
+        virtual ~Helper() = default;
+    };
+    void set_inbetween_helper(Helper* helper) { helper_ = helper; }
 
 private:
     struct Impl;
@@ -155,6 +167,7 @@ private:
     Impl* before_ = nullptr;    // frame interpolation: the state the last run started from
     Impl* after_ = nullptr;     // ... and the state it left
     Interp* ip_ = nullptr;
+    Helper* helper_ = nullptr;  // set_inbetween_helper
     InterpreterStats stats_;
 };
 

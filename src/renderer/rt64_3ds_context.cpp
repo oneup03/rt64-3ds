@@ -739,7 +739,8 @@ public:
                          "%u lists without one (late %u [%u to resync with the screen, the rest %s], over budget %u [%u runs tried anyway, next after %u], unsafe %u, "
                          "after a 60 or unsafe list %u, camera cut %u, nothing tagged %u, diverged %u)\n"
                          "rt64-3ds:   frame interpolation timing: waits for the screen %.1f ms per list, gfx thread %.1f ms per list (max %.1f; reading it %.1f, max %.1f), lists waited %.1f ms for the one before (max %.1f), "
-                         "pair %.1f ms (expected %.1f); first in-betweens matched and built on core 1 %u (%.1f ms each, %.1f of it waited for here)\n"
+                         "pair %.1f ms (expected %.1f); first in-betweens matched and built on core 1 %u (%.1f ms each, %.1f of it waited for here); "
+                         "halves built on core 3 %u (%.1f ms each, %.1f of it waited for)\n"
                          "rt64-3ds:   frame interpolation last match: transforms %u/%u/%u (vertices %u), projections %u/%u/%u, tiles %u/%u",
                          interp_mode_ ? "on" : "off", presented_, inb_drawn_, (float)(acc_inb_interp_) * per_inb, (float)acc_inb_replay_ * per_inb,
                          inb_missed, inb_late_, inb_late_resync_,
@@ -750,6 +751,8 @@ public:
                          lists ? (float)acc_list_read_ * ms / (float)lists : 0.0f, (float)max_list_read_ * ms,
                          lists ? (float)acc_list_wait_ * ms / (float)lists : 0.0f, (float)max_list_wait_ * ms, pair_ms_, pair_ema_,
                          builds_, builds_ ? (float)build_ticks_ * ms / (float)builds_ : 0.0f, builds_ ? (float)acc_build_wait_ * ms / (float)builds_ : 0.0f,
+                         helper_.jobs, helper_.jobs ? (float)helper_.run_ticks * ms / (float)helper_.jobs : 0.0f,
+                         helper_.jobs ? (float)helper_.wait_ticks * ms / (float)helper_.jobs : 0.0f,
                          last_match_.xf, last_match_.xf_matched, last_match_.xf_interp, last_match_.vert_entries,
                          last_match_.pj, last_match_.pj_matched, last_match_.pj_interp, last_match_.tiles, last_match_.tiles_interp);
                 presented_ = inb_drawn_ = inb_late_ = inb_budget_ = inb_unsafe_ = inb_unrelated_ = inb_cut_ = inb_nothing_ = inb_diverged_ = 0;
@@ -758,6 +761,8 @@ public:
                 acc_build_wait_ = 0;
                 build_ticks_ = 0;
                 builds_ = 0;
+                helper_.jobs = 0;
+                helper_.run_ticks = helper_.wait_ticks = 0;
                 acc_inb_interp_ = acc_inb_replay_ = acc_match_ = acc_vsync_ = 0;
                 presenter_wait_us_ = 0;
                 vsync_at_dl_ = 0;
@@ -1940,6 +1945,75 @@ private:
             LightSemaphore_Release(&self->build_done_, 1);
         }
     }
+    // ---- the builder's helper (New 3DS, core 3, which the application
+    // otherwise leaves idle; the system's head tracking also runs there):
+    // the second half of each in-between's
+    // triangles (Interpreter::set_inbetween_helper), whichever thread builds
+    // it. It writes a buffer of its own, which the building thread copies
+    // into the vertex buffer, so only that thread writes what the GPU reads
+    // and its flush covers it all. Heavy lists' builds took as long as their
+    // read (DK64: 12-18 ms), and the gfx thread waited 5-10 ms for them.
+    // BUILD_SPLIT_OFF.TXT: one thread.
+    struct CoreHelper : rt64_3ds::Interpreter::Helper {
+        Thread thread = nullptr;
+        LightSemaphore go, done;
+        volatile bool stop = false;
+        void (*job)(void*) = nullptr;
+        void* arg = nullptr;
+        // This report's builds, the helper's time and the builder's wait for
+        // it: written on core 3 and reset by the report, so a figure may now
+        // and then be torn or lose a build (statistics only).
+        volatile uint32_t jobs = 0;
+        volatile u64 run_ticks = 0, wait_ticks = 0;
+        static void main(void* p) {
+            CoreHelper* self = static_cast<CoreHelper*>(p);
+            for (;;) {
+                LightSemaphore_Acquire(&self->go, 1);
+                if (self->stop) break;
+                __dmb();
+                const u64 t0 = svcGetSystemTick();
+                self->job(self->arg);
+                self->run_ticks = self->run_ticks + (svcGetSystemTick() - t0);
+                self->jobs = self->jobs + 1;
+                __dmb();
+                LightSemaphore_Release(&self->done, 1);
+            }
+        }
+        void start(void (*j)(void*), void* a) override {
+            job = j;
+            arg = a;
+            __dmb();
+            LightSemaphore_Release(&go, 1);
+        }
+        void finish() override {
+            const u64 t0 = svcGetSystemTick();
+            LightSemaphore_Acquire(&done, 1);
+            __dmb();
+            wait_ticks = wait_ticks + (svcGetSystemTick() - t0);
+        }
+    };
+    CoreHelper helper_;
+    void start_helper() {
+        if (FILE* f = rt64_3ds::data_fopen("BUILD_SPLIT_OFF.TXT", "r")) {
+            fclose(f);
+            fprintf(stderr, "rt64-3ds: in-betweens built by one thread (BUILD_SPLIT_OFF.TXT)\n");
+            return;
+        }
+        LightSemaphore_Init(&helper_.go, 0, 1);
+        LightSemaphore_Init(&helper_.done, 0, 1);
+        // Below the system's threads on core 3 (head tracking's among them).
+        helper_.thread = threadCreate(CoreHelper::main, &helper_, 32 * 1024, 0x2F, 3, true);
+        if (helper_.thread != nullptr) interp_.set_inbetween_helper(&helper_);
+        fprintf(stderr, "rt64-3ds: in-betweens' second half %s\n", helper_.thread != nullptr ? "on core 3" : "not on core 3 (refused): one thread builds them");
+    }
+    void stop_helper() {
+        if (helper_.thread == nullptr) return;
+        interp_.set_inbetween_helper(nullptr);
+        helper_.stop = true;
+        LightSemaphore_Release(&helper_.go, 1);
+        threadJoin(helper_.thread, 1000000000ull);
+        helper_.thread = nullptr;
+    }
     void start_builder() {
         bool n3ds = false;
         if (R_FAILED(APT_CheckNew3DS(&n3ds)) || !n3ds) return;
@@ -1957,6 +2031,7 @@ private:
         // Core 1, below the audio task's thread there (0x24).
         builder_ = threadCreate(builder_main, this, 32 * 1024, 0x2E, 1, true);
         fprintf(stderr, "rt64-3ds: in-between builder %s (core 1)\n", builder_ != nullptr ? "up" : "FAILED: in-betweens built on this thread");
+        start_helper();
     }
     void kick_build() {
         build_busy_ = true;
@@ -1971,12 +2046,14 @@ private:
         return build_ok_;
     }
     void stop_builder() {
-        if (builder_ == nullptr) return;
-        join_build();
-        builder_stop_ = true;
-        LightSemaphore_Release(&build_go_, 1);
-        threadJoin(builder_, 1000000000ull);
-        builder_ = nullptr;
+        if (builder_ != nullptr) {
+            join_build();
+            builder_stop_ = true;
+            LightSemaphore_Release(&build_go_, 1);
+            threadJoin(builder_, 1000000000ull);
+            builder_ = nullptr;
+        }
+        stop_helper();
     }
 
     // Frame interpolation: wait until the frame presented before has been
@@ -3462,7 +3539,7 @@ public:
     u64 acc_build_wait_ = 0;                    // the builder: what of its builds this thread waited for
     uint32_t builds_ = 0;
     uint32_t inb_cut_ = 0, inb_nothing_ = 0, inb_diverged_ = 0;
-    char interp_line_[1100] = "";
+    char interp_line_[1200] = "";
     uint32_t frames_ = 0, report_ = 0;
     u64 last_dl_tick_ = 0;                      // when the game submitted the last list
     uint32_t late_ = 0, late_logged_ = 0;

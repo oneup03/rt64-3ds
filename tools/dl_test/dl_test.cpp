@@ -183,6 +183,34 @@ int main(int argc, char** argv) {
         }
         printf("rebuilt in-between: ok %d, %.3f ms, %u triangles, %zu draws %zu verts; same layout as the second run %d, worst difference %.6f, %zu vertices differ\n",
                (int)rok, std::chrono::duration<double, std::milli>(t4 - t3).count(), rtris, rebuilt.draws.size(), rebuilt.verts.size(), (int)same_layout, rworst, rdiffer);
+        // DL_SPLIT: the same in-between built with a helper thread
+        // (Interpreter::set_inbetween_helper, the console's core 3), against
+        // the one above: the vertices and records must be byte for byte the
+        // same. DL_SPLIT=<n> repeats it n times (for ThreadSanitizer).
+        if (const char* e = getenv("DL_SPLIT")) {
+            struct ThreadHelper : rt64_3ds::Interpreter::Helper {
+                std::thread th;
+                void start(void (*job)(void*), void* arg) override { th = std::thread(job, arg); }
+                void finish() override { th.join(); }
+            } helper;
+            const int reps = std::max(1, atoi(e));
+            int same = 0;
+            uint32_t stris = 0;
+            double ms = 0.0;
+            for (int i = 0; i < reps; i++) {
+                interp.set_inbetween_helper(&helper);
+                rt64_3ds::FrameRecord split;
+                auto s0 = std::chrono::steady_clock::now();
+                const bool sok = interp.build_inbetween(frame, split, &stris);
+                ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
+                interp.set_inbetween_helper(nullptr);
+                bool eq = sok == rok && stris == rtris && split.draws.size() == rebuilt.draws.size() && split.verts.size() == rebuilt.verts.size();
+                for (size_t k = 0; eq && k < split.draws.size(); k++) eq = split.draws[k].first == rebuilt.draws[k].first && split.draws[k].count == rebuilt.draws[k].count;
+                if (eq && split.verts.size() != 0) eq = memcmp(split.verts.data(), rebuilt.verts.data(), split.verts.size() * sizeof(rt64_3ds::Vtx3ds)) == 0;
+                if (eq) same++;
+            }
+            printf("split in-between: %d of %d builds identical to one thread's (%u triangles, %.3f ms each)\n", same, reps, stris, ms / reps);
+        }
         if (!same_layout) {
             // Per draw: where the two in-betweens part.
             int shown = 0;

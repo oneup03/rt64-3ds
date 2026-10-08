@@ -176,7 +176,28 @@ stages, depth, blend, alpha test, scissor, textures, uniforms,
 framebuffer. Frames with a capture or screenshot pending keep the old order.
 `BUILDER_OFF.TXT` keeps the builds on the gfx thread. The `frame
 interpolation timing:` line gives the builds and what of them the gfx
-thread waited for. With `PROFILE.TXT` a `read profile per list:` line
+thread waited for.
+
+A list's build took as long as its read in DK64's heavy scenes (12-18 ms
+for 220-450 records), longer than the game frame's recording, so the gfx
+thread waited 5-10 ms for it. A helper thread on core 3, which the
+application otherwise leaves idle (the system's head tracking also runs
+there), builds the second half of each in-between's triangles
+(`Interpreter::set_inbetween_helper`; lists of 512 triangles or more). The
+triangles are split at the record holding the middle one. The helper has
+its own vertex cache, and its output goes into a buffer of its own. The
+building thread then copies that buffer into the vertex buffer after its
+own output and moves the records' starts, so the frame is byte for byte
+the one a single thread builds. `dl_test`'s `DL_SPLIT=<n>` checks that
+identity, and is clean under ThreadSanitizer. Only the building thread
+writes what the GPU reads, so its flush still covers all of it. Core 3
+has been granted to a `.3dsx` from the Homebrew Launcher; when it is
+refused, one thread builds as before (the boot log says which). The
+timing line's `halves built on core 3` gives the helper's builds, their
+time, and how long the building thread waited for them.
+`BUILD_SPLIT_OFF.TXT` turns the helper off, for A/B tests. The touch
+screen's status row shows core 3's load as `c3` when the system lets the
+application use the core. With `PROFILE.TXT` a `read profile per list:` line
 splits the list's read (what a game waiting for "parsed" waits for) by
 kind of command, plus the texture decoding.
 What a list's read records for the in-betweens is kept small, because the

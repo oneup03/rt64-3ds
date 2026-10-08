@@ -490,9 +490,15 @@ struct Interpreter::Interp {
     std::vector<float> tri_uv;
     std::vector<uint32_t> draw_remap;   // compact_rects: old record index -> new
     std::vector<interp::M4> ctx_m;      // build_inbetween: each load's matrix in the in-between frame
-    std::vector<uint32_t> lv_stamp;     // ... and which vertices are transformed already
-    std::vector<Vtx3ds> lv_out;
-    uint32_t stamp = 0;
+    // ... and its loaded vertices as transformed (when a triangle first uses
+    // them), one cache for each thread building (the helper's second).
+    struct VtxCache {
+        std::vector<uint32_t> stamp;    // == cur: lv_out holds it
+        std::vector<Vtx3ds> out;
+        uint32_t cur = 0;
+    };
+    VtxCache cache[2];
+    VtxArray split_out;                 // the helper's share of the in-between (set_inbetween_helper)
 };
 
 // Deferred triangles (Interpreter::set_defer_triangles): the list's loaded
@@ -3118,102 +3124,164 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
             m.m[r][3] = cw;
         }
     }
-    // Vertices, transformed when a triangle first uses them.
-    ip->stamp++;
-    if (ip->lv_stamp.size() < ip->lv.size()) ip->lv_stamp.resize(ip->lv.size(), 0);
-    if (ip->lv_out.size() < ip->lv.size()) ip->lv_out.resize(ip->lv.size());
-    auto vertex = [&](uint32_t idx) -> const Vtx3ds& {
-        Vtx3ds& v = ip->lv_out[idx];
-        if (ip->lv_stamp[idx] == ip->stamp) return v;
-        ip->lv_stamp[idx] = ip->stamp;
-        const Interp::LoadedVtx& q = ip->lv[idx];
-        const Interp::LoadCtx& lc = ip->ctxs[q.ctx];
-        const interp::M4& m = ip->ctx_m[q.ctx];
-        float ob0 = q.ob[0], ob1 = q.ob[1], ob2 = q.ob[2];
-        const interp::XfEntry* xe = (lc.xf >= 0 && (size_t)lc.xf < L.xf.size()) ? &L.xf[lc.xf] : nullptr;
-        float dtu = 0.0f, dtv = 0.0f;
-        if (xe != nullptr && (xe->vpos || xe->vtc) && q.vi < xe->vcount && ((size_t)xe->vprev + q.vi) * 5 + 4 < P.vdata.size()) {
-            const int16_t* p = &P.vdata[((size_t)xe->vprev + q.vi) * 5];
-            if (xe->vpos) { ob0 += ((float)p[0] - ob0) * back; ob1 += ((float)p[1] - ob1) * back; ob2 += ((float)p[2] - ob2) * back; }
-            if (xe->vtc && !lc.texgen) { dtu = ((float)p[3] - (float)q.tc[0]) * back * lc.uscale; dtv = ((float)p[4] - (float)q.tc[1]) * back * lc.vscale; }
-        }
-        v.x = ob0 * m.m[0][0] + ob1 * m.m[1][0] + ob2 * m.m[2][0] + m.m[3][0];
-        v.y = ob0 * m.m[0][1] + ob1 * m.m[1][1] + ob2 * m.m[2][1] + m.m[3][1];
-        v.z = ob0 * m.m[0][2] + ob1 * m.m[1][2] + ob2 * m.m[2][2] + m.m[3][2];
-        v.w = ob0 * m.m[0][3] + ob1 * m.m[1][3] + ob2 * m.m[2][3] + m.m[3][3];
-        v.u = dtu; v.v = dtv;        // texcoord moves (scaled by each triangle's tile)
-        v.r = q.rgba[0]; v.g = q.rgba[1]; v.b = q.rgba[2]; v.a = q.rgba[3];
-        if (q.fog) v.a = rsp_fog(v.z, v.w, lc.fm, lc.fo);
-        return v;
-    };
-    FrameRecord* saved_out = impl_->out;
-    const InterpreterStats saved = stats_;
-    impl_->out = &o;
-    uint32_t emitted = 0;
-    size_t ti = 0;
-    const size_t nt = ip->tris.size();
-    for (size_t di = 0; di < o.draws.size(); di++) {
-        DrawRecord& d = o.draws[di];
-        const uint32_t real_first = d.first, real_count = d.count;
-        d.first = o.verts.size();
-        d.count = 0;
-        if (d.kind != DrawRecord::Tris) {
-            Vtx3ds* dst = o.verts.append(real_count);
-            if (dst != nullptr && real_first + real_count <= real.verts.size()) {
-                memcpy(dst, &real.verts[real_first], real_count * sizeof(Vtx3ds));
-                d.count = real_count;
-            }
-            continue;
-        }
-        while (ti < nt && ip->tri_states[ip->tris[ti].state].draw < di) ti++;
-        for (; ti < nt && ip->tri_states[ip->tris[ti].state].draw == di; ti++) {
-            const Interp::TriRec& t = ip->tris[ti];
-            const Interp::TriState& s = ip->tri_states[t.state];
-            if (t.src[0] >= ip->lv.size() || t.src[1] >= ip->lv.size() || t.src[2] >= ip->lv.size()) continue;
-            Vtx3ds tri[3];
-            float du = 0.0f, dv = 0.0f;
-            if (s.plain && s.tile >= 0 && (size_t)s.tile < L.tiles.size() && L.tiles[s.tile].interp) { du = L.tiles[s.tile].du[0]; dv = L.tiles[s.tile].dv[0]; }
-            // Mapped texel coordinates: as stored; the vertices' own: as
-            // emit_tri worked them out, plus their move (v.u, v.v).
-            const float* uv = s.plain ? nullptr : &ip->tri_uv[s.uv_first + (size_t)(ti - s.first_tri) * 6];
-            for (int k = 0; k < 3; k++) {
-                const Vtx3ds& v = vertex(t.src[k]);
-                Vtx3ds& q = tri[k];
-                q = v;
-                if (s.zprim >= 0.0f) q.z = s.zprim * v.w;
-                if (uv != nullptr) { q.u = uv[k * 2] - du; q.v = uv[k * 2 + 1] - dv; }
-                else {
-                    const Interp::LoadedVtx& lq = ip->lv[t.src[k]];
-                    q.u = (lq.u * s.ss - s.uls) - du + v.u * s.ss;
-                    q.v = (lq.v * s.st - s.ult) - dv + v.v * s.st;
+    // The triangles, record by record: [d0, d1) of the records from
+    // triangle ti0 into `out` with vertex cache `vc`, on whichever thread
+    // runs it. Everything it reads is fixed until the next list's run; it
+    // writes only its own records, cache and output.
+    struct Range {
+        Interp* ip;
+        const interp::FrameLog* L;
+        const interp::FrameLog* P;
+        const FrameRecord* real;
+        FrameRecord* o;
+        VtxArray* out;
+        Interp::VtxCache* vc;
+        size_t d0, d1, ti0;
+        float back;
+        int screen_w, screen_h;
+        uint32_t emitted, clipped, clip_tris;
+        static void run(void* arg) {
+            Range& r = *static_cast<Range*>(arg);
+            Interp* ip = r.ip;
+            const interp::FrameLog& L = *r.L;
+            const interp::FrameLog& P = *r.P;
+            const float back = r.back;
+            Interp::VtxCache& vc = *r.vc;
+            // Vertices, transformed when a triangle first uses them.
+            vc.cur++;
+            if (vc.stamp.size() < ip->lv.size()) vc.stamp.resize(ip->lv.size(), 0);
+            if (vc.out.size() < ip->lv.size()) vc.out.resize(ip->lv.size());
+            auto vertex = [&](uint32_t idx) -> const Vtx3ds& {
+                Vtx3ds& v = vc.out[idx];
+                if (vc.stamp[idx] == vc.cur) return v;
+                vc.stamp[idx] = vc.cur;
+                const Interp::LoadedVtx& q = ip->lv[idx];
+                const Interp::LoadCtx& lc = ip->ctxs[q.ctx];
+                const interp::M4& m = ip->ctx_m[q.ctx];
+                float ob0 = q.ob[0], ob1 = q.ob[1], ob2 = q.ob[2];
+                const interp::XfEntry* xe = (lc.xf >= 0 && (size_t)lc.xf < L.xf.size()) ? &L.xf[lc.xf] : nullptr;
+                float dtu = 0.0f, dtv = 0.0f;
+                if (xe != nullptr && (xe->vpos || xe->vtc) && q.vi < xe->vcount && ((size_t)xe->vprev + q.vi) * 5 + 4 < P.vdata.size()) {
+                    const int16_t* p = &P.vdata[((size_t)xe->vprev + q.vi) * 5];
+                    if (xe->vpos) { ob0 += ((float)p[0] - ob0) * back; ob1 += ((float)p[1] - ob1) * back; ob2 += ((float)p[2] - ob2) * back; }
+                    if (xe->vtc && !lc.texgen) { dtu = ((float)p[3] - (float)q.tc[0]) * back * lc.uscale; dtv = ((float)p[4] - (float)q.tc[1]) * back * lc.vscale; }
                 }
+                v.x = ob0 * m.m[0][0] + ob1 * m.m[1][0] + ob2 * m.m[2][0] + m.m[3][0];
+                v.y = ob0 * m.m[0][1] + ob1 * m.m[1][1] + ob2 * m.m[2][1] + m.m[3][1];
+                v.z = ob0 * m.m[0][2] + ob1 * m.m[1][2] + ob2 * m.m[2][2] + m.m[3][2];
+                v.w = ob0 * m.m[0][3] + ob1 * m.m[1][3] + ob2 * m.m[2][3] + m.m[3][3];
+                v.u = dtu; v.v = dtv;        // texcoord moves (scaled by each triangle's tile)
+                v.r = q.rgba[0]; v.g = q.rgba[1]; v.b = q.rgba[2]; v.a = q.rgba[3];
+                if (q.fog) v.a = rsp_fog(v.z, v.w, lc.fm, lc.fo);
+                return v;
+            };
+            VtxArray& out = *r.out;
+            size_t ti = r.ti0;
+            const size_t nt = ip->tris.size();
+            for (size_t di = r.d0; di < r.d1; di++) {
+                DrawRecord& d = r.o->draws[di];
+                const uint32_t real_first = d.first, real_count = d.count;
+                d.first = out.size();
+                d.count = 0;
+                if (d.kind != DrawRecord::Tris) {
+                    Vtx3ds* dst = out.append(real_count);
+                    if (dst != nullptr && real_first + real_count <= r.real->verts.size()) {
+                        memcpy(dst, &r.real->verts[real_first], real_count * sizeof(Vtx3ds));
+                        d.count = real_count;
+                    }
+                    continue;
+                }
+                while (ti < nt && ip->tri_states[ip->tris[ti].state].draw < di) ti++;
+                for (; ti < nt && ip->tri_states[ip->tris[ti].state].draw == di; ti++) {
+                    const Interp::TriRec& t = ip->tris[ti];
+                    const Interp::TriState& s = ip->tri_states[t.state];
+                    if (t.src[0] >= ip->lv.size() || t.src[1] >= ip->lv.size() || t.src[2] >= ip->lv.size()) continue;
+                    Vtx3ds tri[3];
+                    float du = 0.0f, dv = 0.0f;
+                    if (s.plain && s.tile >= 0 && (size_t)s.tile < L.tiles.size() && L.tiles[s.tile].interp) { du = L.tiles[s.tile].du[0]; dv = L.tiles[s.tile].dv[0]; }
+                    // Mapped texel coordinates: as stored; the vertices' own: as
+                    // emit_tri worked them out, plus their move (v.u, v.v).
+                    const float* uv = s.plain ? nullptr : &ip->tri_uv[s.uv_first + (size_t)(ti - s.first_tri) * 6];
+                    for (int k = 0; k < 3; k++) {
+                        const Vtx3ds& v = vertex(t.src[k]);
+                        Vtx3ds& q = tri[k];
+                        q = v;
+                        if (s.zprim >= 0.0f) q.z = s.zprim * v.w;
+                        if (uv != nullptr) { q.u = uv[k * 2] - du; q.v = uv[k * 2 + 1] - dv; }
+                        else {
+                            const Interp::LoadedVtx& lq = ip->lv[t.src[k]];
+                            q.u = (lq.u * s.ss - s.uls) - du + v.u * s.ss;
+                            q.v = (lq.v * s.st - s.ult) - dv + v.v * s.st;
+                        }
+                    }
+                    if (s.cull != 0) {
+                        const Vtx3ds& a = tri[0]; const Vtx3ds& b = tri[1]; const Vtx3ds& c = tri[2];
+                        const float ab = a.w * b.w, bc = b.w * c.w, ac = a.w * c.w;
+                        const float ax = a.x * bc, ay = a.y * bc;
+                        const float bx = b.x * ac, by = b.y * ac;
+                        const float cx = c.x * ab, cy = c.y * ab;
+                        float cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+                        if (ab * c.w < 0.0f) cross = -cross;
+                        if ((s.cull & G_CULL_BACK) && cross > 0.0f) continue;
+                        if ((s.cull & G_CULL_FRONT) && cross < 0.0f) continue;
+                    }
+                    r.emitted++;
+                    if (!in_guard_band(tri[0], r.screen_w, r.screen_h) || !in_guard_band(tri[1], r.screen_w, r.screen_h) ||
+                        !in_guard_band(tri[2], r.screen_w, r.screen_h)) {
+                        clip_tri(TriSink{ &out, &d.count, &r.clip_tris, &r.clipped, r.screen_w, r.screen_h }, tri);
+                        continue;
+                    }
+                    Vtx3ds* dst = out.append(3);
+                    if (dst == nullptr) continue;
+                    dst[0] = tri[0]; dst[1] = tri[1]; dst[2] = tri[2];
+                }
+                d.count = out.size() - d.first;
             }
-            if (s.cull != 0) {
-                const Vtx3ds& a = tri[0]; const Vtx3ds& b = tri[1]; const Vtx3ds& c = tri[2];
-                const float ab = a.w * b.w, bc = b.w * c.w, ac = a.w * c.w;
-                const float ax = a.x * bc, ay = a.y * bc;
-                const float bx = b.x * ac, by = b.y * ac;
-                const float cx = c.x * ab, cy = c.y * ab;
-                float cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-                if (ab * c.w < 0.0f) cross = -cross;
-                if ((s.cull & G_CULL_BACK) && cross > 0.0f) continue;
-                if ((s.cull & G_CULL_FRONT) && cross < 0.0f) continue;
-            }
-            emitted++;
-            if (!impl_->inside_guard_band(tri[0]) || !impl_->inside_guard_band(tri[1]) || !impl_->inside_guard_band(tri[2])) {
-                impl_->emit_clipped(d, tri);
-                continue;
-            }
-            Vtx3ds* dst = o.verts.append(3);
-            if (dst == nullptr) continue;
-            dst[0] = tri[0]; dst[1] = tri[1]; dst[2] = tri[2];
         }
-        d.count = o.verts.size() - d.first;
+    };
+    // Fewer triangles than this: not worth the hand-over (a few hundred
+    // microseconds of work on the console).
+    constexpr size_t kSplitMinTris = 512;
+    const size_t nd = o.draws.size(), nt = ip->tris.size();
+    Range a{ ip, &L, &P, &real, &o, &o.verts, &ip->cache[0], 0, nd, 0, back, impl_->screen_w, impl_->screen_h, 0, 0, 0 };
+    // With a helper and enough triangles: the records from the one holding
+    // the middle triangle (the triangles are in record order) go to it.
+    size_t split = nd;
+    if (helper_ != nullptr && nt >= kSplitMinTris) {
+        split = ip->tri_states[ip->tris[nt / 2].state].draw;
+        if (split == 0 || split >= nd) split = nd;
     }
-    impl_->out = saved_out;
-    stats_ = saved;
+    Range b = a;
+    if (split < nd) {
+        size_t ti = nt / 2;
+        while (ti > 0 && ip->tri_states[ip->tris[ti - 1].state].draw >= split) ti--;
+        a.d1 = split;
+        b.d0 = split; b.ti0 = ti;
+        b.out = &ip->split_out;
+        b.vc = &ip->cache[1];
+        ip->split_out.clear();
+        helper_->start(&Range::run, &b);
+    }
+    Range::run(&a);
+    if (split < nd) {
+        helper_->finish();
+        // The helper's vertices after this thread's, as far as they fit.
+        // Only roughly what one thread does with a full buffer (65536
+        // vertices): that drops each triangle that doesn't fit and may still
+        // fit a smaller one after it; this cuts the helper's half off.
+        const uint32_t base = o.verts.size();
+        const uint32_t n = std::min(ip->split_out.size(), o.verts.room());
+        Vtx3ds* dst = n != 0 ? o.verts.append(n) : nullptr;
+        if (dst != nullptr) memcpy(dst, ip->split_out.data(), n * sizeof(Vtx3ds));
+        for (size_t di = split; di < nd; di++) {
+            DrawRecord& d = o.draws[di];
+            const uint32_t first = std::min(d.first, n), end = std::min(d.first + d.count, n);
+            d.first = base + first;
+            d.count = end - first;
+        }
+    }
     impl_->unify_world_depth(o);
-    if (tris_out != nullptr) *tris_out = emitted;
+    if (tris_out != nullptr) *tris_out = a.emitted + (split < nd ? b.emitted : 0);
     return true;
 }
 
