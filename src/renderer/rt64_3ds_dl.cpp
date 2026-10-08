@@ -9,7 +9,16 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <vector>
+#ifdef __3DS__
+#include <3ds.h>
+static inline uint64_t prof_tick() { return svcGetSystemTick(); }
+#else
+#include <chrono>
+static inline uint64_t prof_tick() { return (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count(); }
+
+#endif
 
 namespace rt64_3ds {
 
@@ -33,8 +42,9 @@ enum : uint8_t {
 };
 
 // ---- F3DEX 1.x (GBI1) RSP opcodes, the ones whose number or encoding
-// differs from F3DEX2's. translate_f3dex() turns each into its F3DEX2 form
-// (or runs it) so one decoder serves both; the RDP opcodes are shared.
+// differs from F3DEX2's. The main loop runs them in its one dispatch, in
+// kF3dexOp's numbering: each is put into its F3DEX2 form there (or run) and
+// goes on as that; the RDP opcodes are shared.
 enum : uint8_t {
     F3DEX_G_SPNOOP = 0x00, F3DEX_G_MTX = 0x01, F3DEX_G_MOVEMEM = 0x03, F3DEX_G_VTX = 0x04, F3DEX_G_DL = 0x06,
     F3DEX_G_SPRITE2D_BASE = 0x09,
@@ -50,6 +60,27 @@ enum : uint8_t {
     F3DEX_G_MV_L7 = 0x94, F3DEX_G_MV_MATRIX_1 = 0x9E,
     F3DEX_G_MW_POINTS = 0x0C,
 };
+// The main loop's opcode numbering. An F3DEX list's low opcodes, which
+// F3DEX2 uses for others, move up to kF3dexLow + op; its 0xAF..0xBF and the
+// RDP's keep their numbers; anything a GBI1 list never holds (F3DEX2's own
+// commands among them) is kOpUnknown. An F3DEX2 list keeps its numbers but
+// for those F3DEX's take.
+constexpr uint8_t kF3dexLow = 0x80, kOpUnknown = 0x7F;
+struct OpTable {
+    uint8_t v[256];
+    constexpr explicit OpTable(bool f3dex) : v{} {
+        for (int i = 0; i < 256; i++) v[i] = (uint8_t)i;
+        for (int i = kF3dexLow; i <= F3DEX_G_TRI1; i++) v[i] = kOpUnknown;
+        if (!f3dex) return;
+        for (int i = 0; i < 0xC0; i++) v[i] = kOpUnknown;
+        for (int i = 0; i < 0x10; i++) v[i] = (uint8_t)(kF3dexLow | i);
+        for (int i = F3DEX_G_LOAD_UCODE; i <= F3DEX_G_TRI1; i++) v[i] = (uint8_t)i;
+        v[G_EXTENDED] = G_EXTENDED;           // RT64_EXTENDED_OPCODE is the same in both
+        for (int i = G_DMA_IO; i <= G_SETOTHERMODE_H; i++) v[i] = kOpUnknown;
+        v[G_RDPNOOP] = G_NOOP;
+    }
+};
+constexpr OpTable kF3dex2Op{ false }, kF3dexOp{ true };
 // GBI1 geometry-mode bits that sit elsewhere in F3DEX2 (the rest agree).
 enum : uint32_t {
     F3DEX_G_SHADING_SMOOTH = 0x00000200, F3DEX_G_CULL_FRONT = 0x00001000, F3DEX_G_CULL_BACK = 0x00002000,
@@ -147,8 +178,11 @@ struct StateOpTable {
     uint8_t v[256];
     constexpr StateOpTable() : v{} {
         for (int i = 0; i < 256; i++) v[i] = 1;
-        for (int op : { G_TRI1, G_TRI2, G_QUAD, G_VTX, G_MODIFYVTX, G_DL, G_ENDDL, G_CULLDL, G_BRANCH_Z, G_NOOP,
-                        G_RDPPIPESYNC, G_RDPLOADSYNC, G_RDPTILESYNC, G_MTX, G_POPMTX, G_MOVEMEM, G_RDPHALF_1, G_RDPHALF_2 })
+        for (int op : std::initializer_list<int>{ G_TRI1, G_TRI2, G_QUAD, G_VTX, G_MODIFYVTX, G_DL, G_ENDDL, G_CULLDL, G_BRANCH_Z, G_NOOP,
+                        G_RDPPIPESYNC, G_RDPLOADSYNC, G_RDPTILESYNC, G_MTX, G_POPMTX, G_MOVEMEM, G_RDPHALF_1, G_RDPHALF_2,
+                        F3DEX_G_TRI1, F3DEX_G_TRI2, F3DEX_G_QUAD, kF3dexLow | F3DEX_G_VTX, F3DEX_G_MODIFYVTX, kF3dexLow | F3DEX_G_DL,
+                        F3DEX_G_ENDDL, F3DEX_G_CULLDL, F3DEX_G_BRANCH_Z, kF3dexLow | F3DEX_G_MTX, F3DEX_G_POPMTX,
+                        kF3dexLow | F3DEX_G_MOVEMEM, F3DEX_G_RDPHALF_1, F3DEX_G_RDPHALF_2 })
             v[op] = 0;
     }
 };
@@ -161,14 +195,19 @@ constexpr StateOpTable kStateOpTable{};
 struct TexOpTable {
     uint8_t v[256];
     constexpr TexOpTable() : v{} {
-        for (int op : { G_SETTILE, G_SETTILESIZE, G_LOADBLOCK, G_LOADTILE, G_LOADTLUT, G_SETOTHERMODE_H, G_RDPSETOTHERMODE,
-                        G_TEXTURE, G_SETCOMBINE })
+        for (int op : std::initializer_list<int>{ G_SETTILE, G_SETTILESIZE, G_LOADBLOCK, G_LOADTILE, G_LOADTLUT, G_SETOTHERMODE_H, G_RDPSETOTHERMODE,
+                        G_TEXTURE, G_SETCOMBINE, F3DEX_G_SETOTHERMODE_H, F3DEX_G_TEXTURE })
             v[op] = 1;
     }
 };
 constexpr TexOpTable kTexOpTable{};
 constexpr int kMaxMtxStack = 32;
 constexpr int kMaxVerts = 64;
+
+// A loaded vertex, already in N64 screen homogeneous space (the RSP applies
+// the viewport at load time): x/w, y/w are pixels (y down), z/w in [0, 1];
+// u/v are texel coordinates after the G_TEXTURE scale.
+struct LoadedVertex { float x, y, z, w; float u, v; uint8_t r, g, b, a; };
 
 // The RSP's fog factor for a vertex (G_FOG puts it in the shade alpha): the
 // clip-space z clamped at zero, over w, times the fog multiplier plus the
@@ -183,6 +222,212 @@ inline uint8_t rsp_fog(float z, float w, float mul, float off) {
     if (!(f > 0.0f)) f = 0.0f;
     if (f > 255.0f) f = 255.0f;
     return (uint8_t)f;
+}
+
+// What a vertex load's vertices are transformed, lit and fogged with
+// (load_vertices; with deferred vertices also kept per load, for
+// finish_triangles). The lighting state of a lit load: the RSP's integer
+// lighting terms and texgen's look-at directions and scales.
+struct VtxShade {
+    int32_t amb[3];
+    int32_t n;                      // lights
+    int32_t dir[8][3];              // their directions in 16.16, rotated by the modelview
+    int32_t col[8][3];
+    float lk[2][3];                 // look-at directions (texgen)
+    float scale_s, scale_t;         // G_TEXTURE's scales (texgen)
+    uint32_t linear;                // G_TEXTURE_GEN_LINEAR
+};
+struct VtxCtx {
+    float m[4][4];                  // model -> N64 screen homogeneous
+    float uscale, vscale, fm, fo;   // G_TEXTURE's scales, the fog terms
+    bool lit, texgen, fogged;
+    uint32_t shade;                 // Interpreter::Defer::shades (lit, deferred)
+};
+// One vertex: transform, texel coordinates, lighting, texgen and fog, as the
+// RSP does them (sh: the load's lighting, for a lit one).
+__attribute__((always_inline)) inline void shade_vertex(LoadedVertex& v, const VtxCtx& x, const VtxShade* sh, float ob0, float ob1, float ob2, float tu, float tv,
+                         uint8_t c0, uint8_t c1, uint8_t c2, uint8_t c3) {
+    const float (*m)[4] = x.m;
+    v.x = ob0 * m[0][0] + ob1 * m[1][0] + ob2 * m[2][0] + m[3][0];
+    v.y = ob0 * m[0][1] + ob1 * m[1][1] + ob2 * m[2][1] + m[3][1];
+    v.z = ob0 * m[0][2] + ob1 * m[1][2] + ob2 * m[2][2] + m[3][2];
+    v.w = ob0 * m[0][3] + ob1 * m[1][3] + ob2 * m[2][3] + m[3][3];
+    v.u = tu * x.uscale;
+    v.v = tv * x.vscale;
+    if (x.lit) {
+        // Integer lighting, as the RSP does it: the unnormalised
+        // signed normal dotted with 16.16 unit directions.
+        const VtxShade& s = *sh;
+        const int32_t nx = (int8_t)c0, ny = (int8_t)c1, nz = (int8_t)c2;
+        int32_t r = s.amb[0], g = s.amb[1], b = s.amb[2];
+        for (int l = 0; l < s.n; l++) {
+            int32_t d = nx * s.dir[l][0] + ny * s.dir[l][1] + nz * s.dir[l][2];
+            if (d > 0) { r += d * s.col[l][0]; g += d * s.col[l][1]; b += d * s.col[l][2]; }
+        }
+        r >>= 16; g >>= 16; b >>= 16;
+        v.r = (uint8_t)(r > 255 ? 255 : r);
+        v.g = (uint8_t)(g > 255 ? 255 : g);
+        v.b = (uint8_t)(b > 255 ? 255 : b);
+        v.a = c3;
+        if (x.texgen) {
+            float fx = (float)nx, fy = (float)ny, fz = (float)nz;
+            float dx = fx * s.lk[0][0] + fy * s.lk[0][1] + fz * s.lk[0][2];
+            float dy = fx * s.lk[1][0] + fy * s.lk[1][1] + fz * s.lk[1][2];
+            if (dx < -1) dx = -1; if (dx > 1) dx = 1;
+            if (dy < -1) dy = -1; if (dy > 1) dy = 1;
+            if (s.linear) {
+                dx = acosf(-dx) / 3.14159265f;
+                dy = acosf(-dy) / 3.14159265f;
+            }
+            else {
+                dx = (dx + 1.0f) * 0.25f;
+                dy = (dy + 1.0f) * 0.25f;
+            }
+            v.u = dx * s.scale_s / 32.0f;
+            v.v = dy * s.scale_t / 32.0f;
+        }
+    }
+    else {
+        v.r = c0; v.g = c1; v.b = c2; v.a = c3;
+    }
+    if (x.fogged) v.a = rsp_fog(v.z, v.w, x.fm, x.fo);   // fog factor into alpha
+}
+
+// Where a triangle's output goes (output_tri, clip_tri): a vertex array (the
+// frame's, or Interpreter::Defer's for deferred triangles), the vertex count
+// of its record (or run), the counters, and the game's frame size.
+struct TriSink {
+    VtxArray* verts;
+    uint32_t* count;
+    uint32_t* tris;                 // triangles output
+    uint32_t* clipped;              // ... clipped
+    int screen_w, screen_h;
+};
+
+// The PICA rasterises in fixed point over a limited range: a triangle
+// with a corner far off screen (or behind the eye) is dropped on the
+// console, where emulators draw it. Such triangles are clipped here to a
+// guard band around the screen and to the near plane (z' >= 0), in
+// homogeneous screen space, then drawn as a fan.
+constexpr float kGuard = 1024.0f;   // pixels beyond the screen centre, each axis
+inline bool in_guard_band(const Vtx3ds& v, int screen_w, int screen_h) {
+    if (!(v.w > 0.0f) || v.z < 0.0f) return false;
+    const float gx = kGuard * v.w;
+    const float dx = v.x - (float)screen_w * 0.5f * v.w, dy = v.y - (float)screen_h * 0.5f * v.w;
+    return dx <= gx && dx >= -gx && dy <= gx && dy >= -gx;
+}
+inline Vtx3ds lerp_vtx(const Vtx3ds& p, const Vtx3ds& q, float t) {
+    Vtx3ds o;
+    o.x = p.x + (q.x - p.x) * t; o.y = p.y + (q.y - p.y) * t; o.z = p.z + (q.z - p.z) * t; o.w = p.w + (q.w - p.w) * t;
+    o.u = p.u + (q.u - p.u) * t; o.v = p.v + (q.v - p.v) * t;
+    auto mix = [t](uint8_t a, uint8_t b) { float f = (float)a + ((float)b - (float)a) * t; return (uint8_t)(f < 0.0f ? 0.0f : (f > 255.0f ? 255.0f : f + 0.5f)); };
+    o.r = mix(p.r, q.r); o.g = mix(p.g, q.g); o.b = mix(p.b, q.b); o.a = mix(p.a, q.a);
+    return o;
+}
+void clip_tri(const TriSink& s, const Vtx3ds* tri) {
+    const int screen_w = s.screen_w, screen_h = s.screen_h;
+    {
+        // Wholly outside one plane: nothing is left (what the clipping
+        // below finds, without the clipping). Skies and models behind
+        // the camera are most of the triangles that come here. Exact:
+        // the guard band planes are tested only while no earlier plane
+        // cut the triangle, i.e. on the vertices the loop would see.
+        const float cx = (float)screen_w * 0.5f, cy = (float)screen_h * 0.5f;
+        int out0 = 0;
+        for (int i = 0; i < 3; i++) out0 += (tri[i].z - 1e-5f * tri[i].w) < 0.0f;
+        if (out0 == 3) return;
+        if (out0 == 0) {
+            for (int plane = 1; plane < 5; plane++) {
+                int outs = 0;
+                for (int i = 0; i < 3; i++) {
+                    const Vtx3ds& v = tri[i];
+                    const float g = kGuard * v.w;
+                    const float f = plane == 1 ? g - (v.x - cx * v.w) : plane == 2 ? g + (v.x - cx * v.w) :
+                                    plane == 3 ? g - (v.y - cy * v.w) : g + (v.y - cy * v.w);
+                    outs += f < 0.0f;
+                }
+                if (outs == 3) return;
+                if (outs != 0) break;
+            }
+        }
+    }
+    Vtx3ds buf_a[12], buf_b[12];
+    int n = 3;
+    for (int i = 0; i < 3; i++) buf_a[i] = tri[i];
+    Vtx3ds* in = buf_a;
+    Vtx3ds* outp = buf_b;
+    // Planes as f(v) >= 0: near (z' >= 0), then the four guard band edges.
+    for (int plane = 0; plane < 5 && n >= 3; plane++) {
+        const float cx = (float)screen_w * 0.5f, cy = (float)screen_h * 0.5f;
+        auto f = [plane, cx, cy](const Vtx3ds& v) {
+            const float g = kGuard * v.w;
+            switch (plane) {
+                case 0: return v.z - 1e-5f * v.w;
+                case 1: return g - (v.x - cx * v.w);
+                case 2: return g + (v.x - cx * v.w);
+                case 3: return g - (v.y - cy * v.w);
+                default: return g + (v.y - cy * v.w);
+            }
+        };
+        int m = 0;
+        for (int i = 0; i < n && m < 11; i++) {
+            const Vtx3ds& p = in[i];
+            const Vtx3ds& q = in[(i + 1) % n];
+            const float fp = f(p), fq = f(q);
+            if (fp >= 0.0f) outp[m++] = p;
+            if ((fp >= 0.0f) != (fq >= 0.0f) && m < 11) outp[m++] = lerp_vtx(p, q, fp / (fp - fq));
+        }
+        n = m;
+        Vtx3ds* t = in; in = outp; outp = t;
+    }
+    if (n < 3) return;
+    (*s.clipped)++;
+    Vtx3ds* o = s.verts->append((uint32_t)(n - 2) * 3);
+    if (o == nullptr) return;
+    for (int i = 1; i + 1 < n; i++) { *o++ = in[0]; *o++ = in[i]; *o++ = in[i + 1]; }
+    *s.count += (uint32_t)(n - 2) * 3;
+}
+
+// A triangle's output (emit_tri's, or the deferred output's): culled by its
+// winding, its texel coordinates relative to the tile and then mapped by
+// remap, its depth the primitive's where zprim >= 0, clipped to the guard
+// band where a corner falls outside it.
+template <typename Remap>
+inline void output_tri(const TriSink& s, const LoadedVertex& a, const LoadedVertex& b, const LoadedVertex& c, uint32_t cull,
+                       float ss, float st, float uls, float ult, float zprim, Remap remap) {
+    if (cull) {
+        // Winding in screen space (y down), each vertex scaled by the
+        // other two w's so the comparison holds without dividing; a
+        // vertex behind the eye flips it, hence the sign of the product.
+        const float ab = a.w * b.w, bc = b.w * c.w, ac = a.w * c.w;
+        const float ax = a.x * bc, ay = a.y * bc;
+        const float bx = b.x * ac, by = b.y * ac;
+        const float cx = c.x * ab, cy = c.y * ab;
+        float cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        if (ab * c.w < 0.0f) cross = -cross;
+        // Front faces wind counter-clockwise on the y-down screen (cross < 0).
+        if ((cull & G_CULL_BACK) && cross > 0.0f) return;
+        if ((cull & G_CULL_FRONT) && cross < 0.0f) return;
+    }
+    Vtx3ds tri[3];
+    for (int k = 0; k < 3; k++) {
+        const LoadedVertex& v = k == 0 ? a : (k == 1 ? b : c);
+        Vtx3ds& t = tri[k];
+        t.x = v.x; t.y = v.y; t.z = zprim >= 0.0f ? zprim * v.w : v.z; t.w = v.w;
+        t.u = v.u * ss - uls;
+        t.v = v.v * st - ult;
+        remap(t.u, t.v);
+        t.r = v.r; t.g = v.g; t.b = v.b; t.a = v.a;
+    }
+    (*s.tris)++;
+    if (!in_guard_band(tri[0], s.screen_w, s.screen_h) || !in_guard_band(tri[1], s.screen_w, s.screen_h) || !in_guard_band(tri[2], s.screen_w, s.screen_h)) {
+        clip_tri(s, tri);
+        return;
+    }
+    Vtx3ds* o = s.verts->append(3);
+    if (o == nullptr) return;
+    o[0] = tri[0]; o[1] = tri[1]; o[2] = tri[2];
+    *s.count += 3;
 }
 
 }   // namespace
@@ -215,27 +460,195 @@ struct Interpreter::Interp {
         int16_t ob[3], tc[2];
         uint32_t ctx;               // ctxs
         uint32_t vi;                // its place among its transform's vertices
+        float u, v;                 // texel coordinates as loaded (G_TEXTURE's scale or texgen applied)
         uint8_t rgba[4];            // lit (alpha before fog)
         bool fog;                   // alpha is the fog factor (from z)
     };
-    struct TriRec {
-        uint32_t src[3];            // lv
+    // A triangle: its vertices, and the state it shares with the triangles
+    // around it (a run of them, a new one where anything below changed).
+    struct TriState {
         uint32_t draw;              // the record (after compact_rects)
-        float uv[3][2];             // texel coordinates as drawn
+        uint32_t first_tri;         // its first triangle (tris)
+        uint32_t uv_first;          // not plain: the first triangle's texel coordinates in tri_uv (6 floats a triangle)
         float ss, st;               // the tile's shift scale (vertex texcoord interpolation)
+        float uls, ult;             // the tile's origin, in texels
         float zprim;                // < 0: the vertices' depth, else the primitive depth (z')
         int32_t tile;               // its tile entry (FrameLog::tiles), -1 none
         uint32_t cull;              // the cull bits in force
-        bool plain;                 // texel coordinates relative to its tile (no image/frame/snapshot mapping)
+        // Texel coordinates the vertices' own, relative to the tile (else
+        // mapped onto an image, a frame or a snapshot: stored in tri_uv).
+        bool plain;
+    };
+    struct TriRec {
+        uint32_t src[3];            // lv
+        uint32_t state;             // tri_states
     };
     std::vector<LoadCtx> ctxs;
     std::vector<LoadedVtx> lv;
     std::vector<TriRec> tris;
+    std::vector<TriState> tri_states;
+    std::vector<float> tri_uv;
     std::vector<uint32_t> draw_remap;   // compact_rects: old record index -> new
     std::vector<interp::M4> ctx_m;      // build_inbetween: each load's matrix in the in-between frame
     std::vector<uint32_t> lv_stamp;     // ... and which vertices are transformed already
     std::vector<Vtx3ds> lv_out;
     uint32_t stamp = 0;
+};
+
+// Deferred triangles (Interpreter::set_defer_triangles): the list's loaded
+// vertices, its triangles as three of them each, and runs of triangles of
+// one record under one state (a new run where the record or the state
+// changed: every state command bumps state_seq).
+struct Interpreter::Defer {
+    struct Run {
+        uint32_t draw;              // the record
+        uint32_t first;             // its first triangle (tris)
+        float ss, st, uls, ult;     // the tile's shift scales and origin (texels)
+        float zprim;                // < 0: the vertices' depth, else the primitive depth (z')
+        uint32_t cull;              // the cull bits in force
+        uint32_t out_first, out_count;   // drain's: its triangles' vertices in out
+    };
+    struct Tri { uint32_t v[3]; };
+    // The log: verts[e] once raw[e] is done (kDone), else the vertex as in
+    // RDRAM and its load (ctxs), transformed when first used (resolve):
+    // on the reader for G_BRANCH_Z (its depth alone), records output in the
+    // read and vertex edits; the rest by drain.
+    static constexpr uint32_t kDone = 0x80000000u;
+    struct Raw { uint8_t b[16]; uint32_t ctx; };
+    // Fixed room, made once: drain reads the log on another thread while
+    // run writes on, so nothing may move. Full: a load is transformed in
+    // the read (no context or lighting left) or not loaded (no entries
+    // left), a triangle is dropped (as a full vertex buffer drops it).
+    static constexpr uint32_t kVerts = 65536, kTris = 32768, kRuns = 16384, kCtxs = 16384, kShades = 4096, kOut = 65536;
+    std::vector<LoadedVertex> verts;
+    std::vector<Raw> raw;
+    std::vector<VtxCtx> ctxs;
+    std::vector<VtxShade> shades;
+    std::vector<Run> runs;
+    std::vector<Tri> tris;
+    std::vector<Vtx3ds> out_store;
+    VtxArray out;                   // drain's output, copied after the frame's own vertices by finish
+    Defer() : verts(kVerts), raw(kVerts), ctxs(kCtxs), shades(kShades), runs(kRuns), tris(kTris), out_store(kOut) {
+        out.set_storage(out_store.data(), kOut);
+    }
+    // run's counts (the reader's).
+    uint32_t used = 0, nctxs = 0, nshades = 0, nruns = 0, ntris = 0, last_pub = 0;
+    // What run has published for drain: the runs and triangles written
+    // (release on pub_tris, acquire in drain), and its call to say so.
+    uint32_t pub_runs = 0, pub_tris = 0;
+    void (*notify)(void*) = nullptr;
+    void* notify_arg = nullptr;
+    static constexpr uint32_t kPublishEvery = 128;   // triangles
+    // drain's.
+    uint32_t done_tris = 0, started_runs = 0, out_tris = 0, out_clipped = 0;
+    int screen_w = 320, screen_h = 240;
+    bool pending = false;           // run() left triangles for finish_triangles
+    bool vertices = true;           // the vertices' transforms too (set_defer_triangles)
+
+    // A list's start (run, before it publishes anything; drain's side was
+    // put back by the last finish).
+    void begin(int sw, int sh) {
+        used = nctxs = nshades = nruns = ntris = last_pub = 0;
+        screen_w = sw; screen_h = sh;
+    }
+    void publish() {
+        last_pub = ntris;
+        __atomic_store_n(&pub_runs, nruns, __ATOMIC_RELAXED);
+        __atomic_store_n(&pub_tris, ntris, __ATOMIC_RELEASE);
+        if (notify != nullptr) notify(notify_arg);
+    }
+    // A fresh entry, done (the caller writes verts[e]). Full: the last one
+    // again (65536 vertices a list: never seen).
+    uint32_t add_done() {
+        const uint32_t e = used < kVerts ? used++ : kVerts - 1;
+        raw[e].ctx = kDone;
+        return e;
+    }
+    // The load's lighting: the last one again if the same, else a new one
+    // (~0u: full).
+    uint32_t shade_index(const VtxShade& s) {
+        if (nshades > 0 && memcmp(&shades[nshades - 1], &s, sizeof(s)) == 0) return nshades - 1;
+        if (nshades >= kShades) return ~0u;
+        shades[nshades] = s;
+        return nshades++;
+    }
+    static void unpack(const uint8_t* src, float& ob0, float& ob1, float& ob2) {
+        // RDRAM is stored in 32-bit little-endian words: halves are at ^2, bytes at ^3.
+        ob0 = (float)*(const int16_t*)(src + 2); ob1 = (float)*(const int16_t*)(src + 0); ob2 = (float)*(const int16_t*)(src + 6);
+    }
+    // Both threads may resolve one entry at once: each writes the same
+    // values, and the flag goes up after them.
+    LoadedVertex& resolve(uint32_t e) {
+        Raw& r = raw[e];
+        const uint32_t c = __atomic_load_n(&r.ctx, __ATOMIC_ACQUIRE);
+        if (!(c & kDone)) {
+            const VtxCtx& x = ctxs[c];
+            const uint8_t* src = r.b;
+            float ob0, ob1, ob2;
+            unpack(src, ob0, ob1, ob2);
+            shade_vertex(verts[e], x, x.lit ? &shades[x.shade] : nullptr, ob0, ob1, ob2,
+                         (float)*(const int16_t*)(src + 10), (float)*(const int16_t*)(src + 8), src[15], src[14], src[13], src[12]);
+            __atomic_store_n(&r.ctx, c | kDone, __ATOMIC_RELEASE);
+        }
+        return verts[e];
+    }
+    // The vertex's z and w alone, as resolve computes them.
+    void depth(uint32_t e, float& z, float& w) const {
+        const Raw& r = raw[e];
+        const uint32_t c = __atomic_load_n(&r.ctx, __ATOMIC_ACQUIRE);
+        if (c & kDone) { z = verts[e].z; w = verts[e].w; return; }
+        const float (*m)[4] = ctxs[c].m;
+        float ob0, ob1, ob2;
+        unpack(r.b, ob0, ob1, ob2);
+        z = ob0 * m[0][2] + ob1 * m[1][2] + ob2 * m[2][2] + m[3][2];
+        w = ob0 * m[0][3] + ob1 * m[1][3] + ob2 * m[2][3] + m[3][3];
+    }
+    // The published triangles' output into out, in order (each run's
+    // vertices one stretch of it, and each record's runs consecutive).
+    // On the thread that calls finish, while run goes on elsewhere or after.
+    void drain() {
+        const uint32_t nt = __atomic_load_n(&pub_tris, __ATOMIC_ACQUIRE);
+        const uint32_t nr = __atomic_load_n(&pub_runs, __ATOMIC_RELAXED);
+        for (; done_tris < nt; done_tris++) {
+            while (started_runs < nr && runs[started_runs].first <= done_tris) {
+                runs[started_runs].out_first = out.size();
+                runs[started_runs].out_count = 0;
+                started_runs++;
+            }
+            if (started_runs == 0) continue;
+            Run& R = runs[started_runs - 1];
+            const Tri& T = tris[done_tris];
+            output_tri(TriSink{ &out, &R.out_count, &out_tris, &out_clipped, screen_w, screen_h },
+                       resolve(T.v[0]), resolve(T.v[1]), resolve(T.v[2]), R.cull, R.ss, R.st, R.uls, R.ult, R.zprim,
+                       [](float&, float&) {});
+        }
+    }
+    // After run: the rest, then the output after the frame's own vertices
+    // and the records' first and count; drain's side put back.
+    void finish(FrameRecord& f, InterpreterStats& st) {
+        drain();
+        const uint32_t n = out.size();
+        const uint32_t base = f.verts.size();
+        Vtx3ds* dst = n != 0 ? f.verts.append(n) : nullptr;
+        if (dst != nullptr) memcpy(dst, out.data(), n * sizeof(Vtx3ds));
+        uint32_t cur = ~0u;
+        DrawRecord* r = nullptr;
+        for (uint32_t k = 0; k < started_runs; k++) {
+            const Run& R = runs[k];
+            if (R.draw != cur) {
+                cur = R.draw;
+                r = R.draw < f.draws.size() ? &f.draws[R.draw] : nullptr;
+                if (r != nullptr) { r->first = dst != nullptr ? base + R.out_first : base; r->count = 0; }
+            }
+            if (r != nullptr && dst != nullptr) r->count += R.out_count;
+        }
+        st.tris += out_tris;
+        st.clipped += out_clipped;
+        done_tris = started_runs = out_tris = out_clipped = 0;
+        out.clear();
+        __atomic_store_n(&pub_runs, 0u, __ATOMIC_RELAXED);
+        __atomic_store_n(&pub_tris, 0u, __ATOMIC_RELEASE);
+    }
 };
 
 struct Interpreter::Impl {
@@ -305,6 +718,10 @@ struct Interpreter::Impl {
     int32_t tile_cur = -1;                     // the tile entry of the current tile state, -1 none
     Mtx eff_mv{}, eff_proj{};                  // what the in-between run draws with
     uint32_t tile_rec_seq = 0;                 // tex_seq of the current tile entry
+    // emit_tri's last Interp::TriState: a new one when any of these changed.
+    uint32_t tri_key_draw = ~0u, tri_key_state = 0, tri_key_tex = 0;
+    int32_t tri_key_tile = -2;
+    bool tri_key_plain = false;
     int tile_rec_tile = -1, tile_rec_xf = -2;
     float tile_du[2] = {}, tile_dv[2] = {};    // the in-between's tile origin offsets (texels)
     uint32_t mv_seq = 0;
@@ -318,10 +735,28 @@ struct Interpreter::Impl {
     bool merge_rect_slices = false;    // RenderDesc::merge_rect_slices
     uint32_t hud_camera_id = 0;        // RenderDesc::hud_camera_id (0 = none)
     Gbi gbi = Gbi::F3DEX2;
-    // Loaded vertices, already in N64 screen homogeneous space (the RSP
-    // applies the viewport at load time): x/w, y/w are pixels (y down),
-    // z/w in [0, 1]; u/v are texel coordinates after the G_TEXTURE scale.
-    struct { float x, y, z, w; float u, v; uint8_t r, g, b, a; } vtx[kMaxVerts]{};
+    const uint8_t* op_table = kF3dex2Op.v;     // the main loop's numbering (kF3dexOp for F3DEX)
+    // The vertex buffer (with deferred triangles: as it stood before the
+    // list and after it, the list's own in dfr).
+    LoadedVertex vtx[kMaxVerts]{};
+    // ---- Interpreter::set_defer_triangles (dfr null when off): run()
+    // writes every loaded vertex into dfr->verts (dslot: each slot's entry)
+    // and each triangle of a plain record as its three entries, and
+    // finish_triangles does the rest of emit_tri.
+    Interpreter::Defer* dfr = nullptr;
+    bool defer_active = false;             // in run(), with dfr
+    int32_t defer_open = -1;               // the record taking deferred triangles (while it is the last)
+    uint32_t defer_key_draw = ~0u, defer_key_state = 0;   // the state of dfr's last run
+    uint32_t dslot[kMaxVerts] = {};
+    LoadedVertex& slot(int i) { return defer_active ? dfr->resolve(dslot[i]) : vtx[i]; }
+    // A fresh entry for slot i (edits of a vertex the triangles before it
+    // keep, the list's starting buffer): written at once, before the next
+    // one is made.
+    LoadedVertex& new_slot(int i) {
+        const uint32_t e = dfr->add_done();
+        dslot[i] = e;
+        return dfr->verts[e];
+    }
     int32_t ldir_i[8][3]{}, lk_i[2][3]{};   // light directions in 16.16 for the integer lighting loop
     uint32_t rdphalf1 = 0, rdphalf2 = 0;
 
@@ -364,7 +799,11 @@ struct Interpreter::Impl {
             cached_tex[0] = TexDesc{};
             cached_tex[1] = TexDesc{};
             tex0_load = -1;
-            if (uses_texel(0)) { describe_tile(t0, cached_tex[0]); tex0_load = last_best; }
+            if (uses_texel(0)) {
+                describe_tile(t0, cached_tex[0]);
+                tex0_load = last_best;
+                if (cached_tex[0].valid && lod_trilerp(cc_w0, cc_w1, othermode_h)) describe_mips(t0, cached_tex[0]);
+            }
             if (uses_texel(1)) describe_tile((t0 + 1) & 7, cached_tex[1]);
             cached_tex_seq = tex_seq;
             cached_tile = t0;
@@ -910,11 +1349,13 @@ struct Interpreter::Impl {
                     lc.texgen = lit && texgen;
                     ip->ctxs.push_back(lc);
                     if (xe->vstored) {
-                        for (int i = lo; i < hi; i++) {
+                        const size_t base = L.vdata.size();
+                        L.vdata.resize(base + (size_t)(hi - lo) * 5);
+                        int16_t* q = &L.vdata[base];
+                        for (int i = lo; i < hi; i++, q += 5) {
                             const uint8_t* src = rdram + ((addr + i * 16) & 0xFFFFFC);
-                            const int16_t q[5] = { *(const int16_t*)(src + 2), *(const int16_t*)(src + 0), *(const int16_t*)(src + 6),
-                                                   *(const int16_t*)(src + 10), *(const int16_t*)(src + 8) };
-                            L.vdata.insert(L.vdata.end(), q, q + 5);
+                            q[0] = *(const int16_t*)(src + 2); q[1] = *(const int16_t*)(src + 0); q[2] = *(const int16_t*)(src + 6);
+                            q[3] = *(const int16_t*)(src + 10); q[4] = *(const int16_t*)(src + 8);
                         }
                     }
                     xe->vcount += (uint32_t)(hi - lo);
@@ -926,6 +1367,49 @@ struct Interpreter::Impl {
             }
             vi0 = v_i;
             v_i += (uint32_t)(hi - lo);
+        }
+        VtxCtx x;
+        memcpy(x.m, m, sizeof(x.m));
+        x.uscale = uscale; x.vscale = vscale; x.fm = fm; x.fo = fo;
+        x.lit = lit; x.texgen = texgen; x.fogged = fogged;
+        x.shade = 0;
+        VtxShade sh;
+        if (lit) {
+            memset(&sh, 0, sizeof(sh));
+            sh.amb[0] = amb0; sh.amb[1] = amb1; sh.amb[2] = amb2;
+            sh.n = num_lights;
+            for (int l = 0; l < num_lights; l++) {
+                for (int k = 0; k < 3; k++) { sh.dir[l][k] = ldir_i[l][k]; sh.col[l][k] = lights[l].col[k]; }
+            }
+            memcpy(sh.lk, lk, sizeof(sh.lk));
+            sh.scale_s = (float)texture.scaleS; sh.scale_t = (float)texture.scaleT;
+            sh.linear = (geometry_mode & G_TEXTURE_GEN_LINEAR) != 0;
+        }
+        // Deferred triangles: the load's vertices go to fresh entries, as
+        // they are in RDRAM (Defer::resolve transforms them when used), or
+        // done now while frame interpolation records them.
+        LoadedVertex* dlog = nullptr;
+        if (defer_active && hi > lo) {
+            Interpreter::Defer& D = *dfr;
+            if (D.used + (uint32_t)(hi - lo) > Interpreter::Defer::kVerts) return;   // full: not loaded
+            bool raw_load = D.vertices && (ip == nullptr || !ip->recording) && vprev == nullptr && D.nctxs < Interpreter::Defer::kCtxs;
+            if (raw_load && lit) {
+                x.shade = D.shade_index(sh);
+                raw_load = x.shade != ~0u;
+            }
+            if (raw_load) {
+                const uint32_t ci = D.nctxs++;
+                D.ctxs[ci] = x;
+                for (int i = lo; i < hi; i++) {
+                    const uint32_t e = D.used++;
+                    Interpreter::Defer::Raw& r = D.raw[e];
+                    memcpy(r.b, rdram + ((addr + i * 16) & 0xFFFFFC), 16);
+                    r.ctx = ci;
+                    dslot[v0 + i] = e;
+                }
+                return;
+            }
+            dlog = D.verts.data();
         }
         for (int i = lo; i < hi; i++) {
             const uint8_t* src = rdram + ((addr + i * 16) & 0xFFFFFC);
@@ -940,55 +1424,17 @@ struct Interpreter::Impl {
                 if (xe->vtc) { tu += ((float)p[3] - tu) * vw; tv += ((float)p[4] - tv) * vw; }
             }
             const uint8_t c0 = src[15], c1 = src[14], c2 = src[13], c3 = src[12];
-            auto& v = vtx[v0 + i];
-            v.x = ob0 * m[0][0] + ob1 * m[1][0] + ob2 * m[2][0] + m[3][0];
-            v.y = ob0 * m[0][1] + ob1 * m[1][1] + ob2 * m[2][1] + m[3][1];
-            v.z = ob0 * m[0][2] + ob1 * m[1][2] + ob2 * m[2][2] + m[3][2];
-            v.w = ob0 * m[0][3] + ob1 * m[1][3] + ob2 * m[2][3] + m[3][3];
-            v.u = tu * uscale;
-            v.v = tv * vscale;
-            if (lit) {
-                // Integer lighting, as the RSP does it: the unnormalised
-                // signed normal dotted with 16.16 unit directions.
-                const int32_t nx = (int8_t)c0, ny = (int8_t)c1, nz = (int8_t)c2;
-                int32_t r = amb0, g = amb1, b = amb2;
-                for (int l = 0; l < num_lights; l++) {
-                    int32_t d = nx * ldir_i[l][0] + ny * ldir_i[l][1] + nz * ldir_i[l][2];
-                    if (d > 0) { r += d * lights[l].col[0]; g += d * lights[l].col[1]; b += d * lights[l].col[2]; }
-                }
-                r >>= 16; g >>= 16; b >>= 16;
-                v.r = (uint8_t)(r > 255 ? 255 : r);
-                v.g = (uint8_t)(g > 255 ? 255 : g);
-                v.b = (uint8_t)(b > 255 ? 255 : b);
-                v.a = c3;
-                if (texgen) {
-                    float fx = (float)nx, fy = (float)ny, fz = (float)nz;
-                    float dx = fx * lk[0][0] + fy * lk[0][1] + fz * lk[0][2];
-                    float dy = fx * lk[1][0] + fy * lk[1][1] + fz * lk[1][2];
-                    if (dx < -1) dx = -1; if (dx > 1) dx = 1;
-                    if (dy < -1) dy = -1; if (dy > 1) dy = 1;
-                    if (geometry_mode & G_TEXTURE_GEN_LINEAR) {
-                        dx = acosf(-dx) / 3.14159265f;
-                        dy = acosf(-dy) / 3.14159265f;
-                    }
-                    else {
-                        dx = (dx + 1.0f) * 0.25f;
-                        dy = (dy + 1.0f) * 0.25f;
-                    }
-                    v.u = dx * (float)texture.scaleS / 32.0f;
-                    v.v = dy * (float)texture.scaleT / 32.0f;
-                }
-            }
-            else {
-                v.r = c0; v.g = c1; v.b = c2; v.a = c3;
-            }
-            if (fogged) v.a = rsp_fog(v.z, v.w, fm, fo);   // fog factor into alpha
+            LoadedVertex* vp = &vtx[v0 + i];
+            if (dlog != nullptr) { const uint32_t e = dfr->used++; dfr->raw[e].ctx = Interpreter::Defer::kDone; dslot[v0 + i] = e; vp = &dlog[e]; }
+            LoadedVertex& v = *vp;
+            shade_vertex(v, x, &sh, ob0, ob1, ob2, tu, tv, c0, c1, c2, c3);
             if (xe != nullptr && ip->recording) {
                 Interpreter::Interp::LoadedVtx q;
                 q.ob[0] = *(const int16_t*)(src + 2); q.ob[1] = *(const int16_t*)(src + 0); q.ob[2] = *(const int16_t*)(src + 6);
                 q.tc[0] = tc0; q.tc[1] = tc1;
                 q.ctx = (uint32_t)ip->ctxs.size() - 1;
                 q.vi = vi0 + (uint32_t)(i - lo);
+                q.u = v.u; q.v = v.v;
                 q.rgba[0] = v.r; q.rgba[1] = v.g; q.rgba[2] = v.b; q.rgba[3] = v.a;
                 q.fog = fogged;
                 slot_src[v0 + i] = (uint32_t)ip->lv.size();
@@ -1104,6 +1550,35 @@ struct Interpreter::Impl {
         d.bilerp = ((othermode_h >> 12) & 3) != 0;
     }
 
+    // A mipmapped draw's further levels (lod_trilerp): the tiles after the
+    // base, up to G_TEXTURE's level count, each the one before at half the
+    // size and texel scale, in the same format and palette. The PICA's
+    // levels stop at 8x8 (smaller ones are left out: the far distance shows
+    // the 8x8 level); a tile that does not fit the chain ends it.
+    void describe_mips(int t0, TexDesc& b) {
+        if (texture.level == 0 || b.snapshot || b.frame || b.rtt >= 0 || b.wrap_rows != 0) return;
+        if ((b.width & (b.width - 1)) != 0 || (b.height & (b.height - 1)) != 0) return;
+        const Tile& base = tiles[t0 & 7];
+        TexDesc lv[7];
+        int n = 0;
+        for (int k = 1; k <= (int)texture.level && k <= 7; k++) {
+            if ((b.width >> k) < 8 || (b.height >> k) < 8) break;
+            const Tile& tk = tiles[(t0 + k) & 7];
+            if (tk.fmt != base.fmt || tk.siz != base.siz || tk.palette != base.palette || tk.cms != base.cms || tk.cmt != base.cmt) break;
+            if (shift_scale(tk.shifts) * (float)(1 << k) != shift_scale(base.shifts) ||
+                shift_scale(tk.shiftt) * (float)(1 << k) != shift_scale(base.shiftt)) break;
+            if (((tk.uls >> 2) << k) != (base.uls >> 2) || ((tk.ult >> 2) << k) != (base.ult >> 2)) break;
+            TexDesc& d = lv[n];
+            describe_tile((t0 + k) & 7, d);
+            if (!d.valid || d.width != (b.width >> k) || d.height != (b.height >> k) || d.wrap_rows != 0) break;
+            n++;
+        }
+        if (n == 0) return;
+        b.levels = (uint8_t)(n + 1);
+        b.mip_index = (uint32_t)out->mips.size();
+        out->mips.insert(out->mips.end(), lv, lv + n);
+    }
+
     // TEXEL1's coordinates relative to TEXEL0's (tile t0 and the next one).
     // tile_lerp: a triangle's, which takes the in-between frame's tile
     // scroll (tile_du/dv, else 0).
@@ -1142,7 +1617,9 @@ struct Interpreter::Impl {
     }
 
     bool uses_texel(int which) const {
-        // Any combiner input referencing TEXEL0/1 in either cycle.
+        // Any combiner input referencing TEXEL0/1 in either cycle; a
+        // mipmapped draw reads TEXEL1 as TEXEL0 (lod_trilerp).
+        if (which == 1 && lod_trilerp(cc_w0, cc_w1, othermode_h)) return false;
         uint32_t a0 = (cc_w0 >> 20) & 0xF, c0 = (cc_w0 >> 15) & 0x1F, Aa0 = (cc_w0 >> 12) & 7, Ac0 = (cc_w0 >> 9) & 7;
         uint32_t a1 = (cc_w0 >> 5) & 0xF, c1 = cc_w0 & 0x1F, b0 = (cc_w1 >> 28) & 0xF, b1 = (cc_w1 >> 24) & 0xF;
         uint32_t Aa1 = (cc_w1 >> 21) & 7, Ac1 = (cc_w1 >> 18) & 7, d0 = (cc_w1 >> 15) & 7, Ab0 = (cc_w1 >> 12) & 7;
@@ -1190,7 +1667,9 @@ struct Interpreter::Impl {
             // modelview load.
             bool split = split_untagged_ortho && !last.perspective && last.mv_auto && last.mv_seq != mv_seq;
             if (inst_track && new_instance_pending()) split = true;
-            if (last.kind == DrawRecord::Tris && last.first + last.count == out->verts.size() && !split) {
+            // (A record taking deferred triangles has no vertices yet.)
+            const bool tail = defer_open == (int32_t)out->draws.size() - 1 || last.first + last.count == out->verts.size();
+            if (last.kind == DrawRecord::Tris && tail && !split) {
                 if (last_draw_seq == state_seq && last_tri_img == img) {
                     r = &last;
                 }
@@ -1224,176 +1703,119 @@ struct Interpreter::Impl {
             r->tex[1] = tex[1];
             if (frame_copy) note_draw(*r);
             if (inst_track) start_instance(*r);
+            // Deferred triangles: a record whose texel coordinates are the
+            // vertices' own (not mapped onto an image, a frame, a snapshot
+            // or a render texture) takes them all.
+            if (defer_active && !img && !r->tex[0].snapshot && !r->tex[0].frame && r->tex[0].rtt < 0)
+                defer_open = (int32_t)out->draws.size() - 1;
         }
         last_tri_img = img;
 #ifdef DL_BENCH_NO_EMIT
         return;
 #endif
-        const auto& a = vtx[i0]; const auto& b = vtx[i1]; const auto& c = vtx[i2];
+        // Deferred (finish_triangles): the triangle as its three vertices.
+        const bool deferred = defer_open == (int32_t)(r - out->draws.data());
+        if (deferred && (ip == nullptr || !ip->recording)) {
+            defer_tri(i0, i1, i2);
+            return;
+        }
+        const LoadedVertex& a = slot(i0); const LoadedVertex& b = slot(i1); const LoadedVertex& c = slot(i2);
         if (ip != nullptr && ip->recording) {
             // Frame interpolation: the triangle as build_inbetween draws it
-            // again (its texel coordinates as below, culled or not).
-            Interpreter::Interp::TriRec t;
-            t.src[0] = slot_src[i0]; t.src[1] = slot_src[i1]; t.src[2] = slot_src[i2];
-            t.draw = (uint32_t)(r - out->draws.data());
-            const Tile& tl = tiles[texture.tile & 7];
-            const float uls = (float)(tl.uls >> 2), ult = (float)(tl.ult >> 2);
-            t.ss = shift_scale(tl.shifts); t.st = shift_scale(tl.shiftt);
-            t.zprim = (othermode_l & G_ZS_PRIM) != 0 ? prim_z() : -1.0f;
-            t.tile = tile_cur;
-            t.cull = geometry_mode & (G_CULL_FRONT | G_CULL_BACK);
-            t.plain = !img && !r->tex[0].snapshot && !r->tex[0].frame && r->tex[0].rtt < 0;
-            for (int k = 0; k < 3; k++) {
-                const auto& v = k == 0 ? a : (k == 1 ? b : c);
-                float u = v.u * t.ss - uls, w = v.v * t.st - ult;
-                if (img) { u += img_du; w += img_dv; }
-                else if (r->tex[0].snapshot) snapshot_uv(r->tex[0], u, w, u, w, proj_stretch());
-                else if (r->tex[0].frame) frame_uv(r->tex[0], u, w, u, w, proj_stretch() && cur_rtt < 0);
-                else if (r->tex[0].rtt >= 0) rtt_uv(r->tex[0], u, w);
-                t.uv[k][0] = u; t.uv[k][1] = w;
+            // again (its texel coordinates as below, culled or not): its
+            // vertices, and its state, shared with the triangles before it
+            // while nothing it holds can have changed.
+            const uint32_t draw = (uint32_t)(r - out->draws.data());
+            const bool plain = !img && !r->tex[0].snapshot && !r->tex[0].frame && r->tex[0].rtt < 0;
+            if (draw != tri_key_draw || state_seq != tri_key_state || tex_seq != tri_key_tex || tile_cur != tri_key_tile || plain != tri_key_plain) {
+                tri_key_draw = draw; tri_key_state = state_seq; tri_key_tex = tex_seq; tri_key_tile = tile_cur; tri_key_plain = plain;
+                Interpreter::Interp::TriState s;
+                const Tile& tl = tiles[texture.tile & 7];
+                s.draw = draw;
+                s.first_tri = (uint32_t)ip->tris.size();
+                s.uv_first = (uint32_t)ip->tri_uv.size();
+                s.ss = shift_scale(tl.shifts); s.st = shift_scale(tl.shiftt);
+                s.uls = (float)(tl.uls >> 2); s.ult = (float)(tl.ult >> 2);
+                s.zprim = (othermode_l & G_ZS_PRIM) != 0 ? prim_z() : -1.0f;
+                s.tile = tile_cur;
+                s.cull = geometry_mode & (G_CULL_FRONT | G_CULL_BACK);
+                s.plain = plain;
+                ip->tri_states.push_back(s);
             }
-            ip->tris.push_back(t);
+            const Interpreter::Interp::TriState& s = ip->tri_states.back();
+            ip->tris.push_back({ { slot_src[i0], slot_src[i1], slot_src[i2] }, (uint32_t)ip->tri_states.size() - 1 });
+            if (!plain) {
+                for (int k = 0; k < 3; k++) {
+                    const auto& v = k == 0 ? a : (k == 1 ? b : c);
+                    float u = v.u * s.ss - s.uls, w = v.v * s.st - s.ult;
+                    if (img) { u += img_du; w += img_dv; }
+                    else if (r->tex[0].snapshot) snapshot_uv(r->tex[0], u, w, u, w, proj_stretch());
+                    else if (r->tex[0].frame) frame_uv(r->tex[0], u, w, u, w, proj_stretch() && cur_rtt < 0);
+                    else if (r->tex[0].rtt >= 0) rtt_uv(r->tex[0], u, w);
+                    ip->tri_uv.push_back(u); ip->tri_uv.push_back(w);
+                }
+            }
         }
-        if (geometry_mode & (G_CULL_FRONT | G_CULL_BACK)) {
-            // Winding in screen space (y down), each vertex scaled by the
-            // other two w's so the comparison holds without dividing; a
-            // vertex behind the eye flips it, hence the sign of the product.
-            const float ab = a.w * b.w, bc = b.w * c.w, ac = a.w * c.w;
-            const float ax = a.x * bc, ay = a.y * bc;
-            const float bx = b.x * ac, by = b.y * ac;
-            const float cx = c.x * ab, cy = c.y * ab;
-            float cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-            if (ab * c.w < 0.0f) cross = -cross;
-            // Front faces wind counter-clockwise on the y-down screen (cross < 0).
-            if ((geometry_mode & G_CULL_BACK) && cross > 0.0f) return;
-            if ((geometry_mode & G_CULL_FRONT) && cross < 0.0f) return;
+        if (deferred) {
+            defer_tri(i0, i1, i2);
+            return;
         }
         const Tile& tl = tiles[texture.tile & 7];
         // (tile_du/dv: the in-between frame's tile scroll, else 0.)
         const float uls = (float)(tl.uls >> 2) + tile_du[0], ult = (float)(tl.ult >> 2) + tile_dv[0];
         const float ss = shift_scale(tl.shifts), st = shift_scale(tl.shiftt);
         const bool snap = r->tex[0].snapshot;
-        const bool zprim = (othermode_l & G_ZS_PRIM) != 0;
-        Vtx3ds tri[3];
-        for (int k = 0; k < 3; k++) {
-            const auto& v = k == 0 ? a : (k == 1 ? b : c);
-            Vtx3ds& t = tri[k];
-            t.x = v.x; t.y = v.y; t.z = zprim ? prim_z() * v.w : v.z; t.w = v.w;
-            t.u = v.u * ss - uls;
-            t.v = v.v * st - ult;
-            if (img) { t.u += img_du; t.v += img_dv; }
-            else if (snap) snapshot_uv(r->tex[0], t.u, t.v, t.u, t.v, proj_stretch());
-            else if (r->tex[0].frame) frame_uv(r->tex[0], t.u, t.v, t.u, t.v, proj_stretch() && cur_rtt < 0);
-            else if (r->tex[0].rtt >= 0) rtt_uv(r->tex[0], t.u, t.v);
-            t.r = v.r; t.g = v.g; t.b = v.b; t.a = v.a;
+        output_tri(TriSink{ &out->verts, &r->count, &stats->tris, &stats->clipped, screen_w, screen_h },
+                   a, b, c, geometry_mode & (G_CULL_FRONT | G_CULL_BACK), ss, st, uls, ult,
+                   (othermode_l & G_ZS_PRIM) != 0 ? prim_z() : -1.0f, [&](float& u, float& v) {
+            if (img) { u += img_du; v += img_dv; }
+            else if (snap) snapshot_uv(r->tex[0], u, v, u, v, proj_stretch());
+            else if (r->tex[0].frame) frame_uv(r->tex[0], u, v, u, v, proj_stretch() && cur_rtt < 0);
+            else if (r->tex[0].rtt >= 0) rtt_uv(r->tex[0], u, v);
+        });
+    }
+
+    // A deferred triangle: its three vertices, in the run of the record and
+    // state it comes under (a new run where either changed).
+    void defer_tri(int i0, int i1, int i2) {
+        Interpreter::Defer& D = *dfr;
+        if (D.ntris >= Interpreter::Defer::kTris) return;   // full: dropped
+        const uint32_t draw = (uint32_t)defer_open;
+        if (draw != defer_key_draw || state_seq != defer_key_state) {
+            if (D.nruns >= Interpreter::Defer::kRuns) return;
+            defer_key_draw = draw;
+            defer_key_state = state_seq;
+            const Tile& tl = tiles[texture.tile & 7];
+            D.runs[D.nruns++] = { draw, D.ntris, shift_scale(tl.shifts), shift_scale(tl.shiftt),
+                                  (float)(tl.uls >> 2) + tile_du[0], (float)(tl.ult >> 2) + tile_dv[0],
+                                  (othermode_l & G_ZS_PRIM) != 0 ? prim_z() : -1.0f, geometry_mode & (G_CULL_FRONT | G_CULL_BACK), 0, 0 };
         }
-        stats->tris++;
-        if (!inside_guard_band(tri[0]) || !inside_guard_band(tri[1]) || !inside_guard_band(tri[2])) {
-            emit_clipped(*r, tri);
-            return;
-        }
-        Vtx3ds* o = out->verts.append(3);
-        if (o == nullptr) return;
-        o[0] = tri[0]; o[1] = tri[1]; o[2] = tri[2];
-        r->count += 3;
+        Interpreter::Defer::Tri& T = D.tris[D.ntris++];
+        T.v[0] = dslot[i0]; T.v[1] = dslot[i1]; T.v[2] = dslot[i2];
+        // Every so many, for drain on the other thread.
+        if (D.ntris - D.last_pub >= Interpreter::Defer::kPublishEvery) D.publish();
     }
 
     // RenderDesc::merge_image_tiles: the triangle's texel coordinates (as
     // emit_tri computes them, relative to the tile) all inside the loaded
     // rectangle, where the image texture holds what the tile would sample.
-    bool tri_inside_image(int i0, int i1, int i2) const {
+    bool tri_inside_image(int i0, int i1, int i2) {
         const Tile& tl = tiles[texture.tile & 7];
         const float uls = (float)(tl.uls >> 2), ult = (float)(tl.ult >> 2);
         const float ss = shift_scale(tl.shifts), st = shift_scale(tl.shiftt);
         const int idx[3] = { i0, i1, i2 };
         for (int k = 0; k < 3; k++) {
-            const float u = vtx[idx[k]].u * ss - uls, v = vtx[idx[k]].v * st - ult;
+            const LoadedVertex& lv = slot(idx[k]);
+            const float u = lv.u * ss - uls, v = lv.v * st - ult;
             if (!(u >= 0.0f && u <= img_lim_u && v >= 0.0f && v <= img_lim_v)) return false;
         }
         return true;
     }
 
-    // The PICA rasterises in fixed point over a limited range: a triangle
-    // with a corner far off screen (or behind the eye) is dropped on the
-    // console, where emulators draw it. Such triangles are clipped here to a
-    // guard band around the screen and to the near plane (z' >= 0), in
-    // homogeneous screen space, then drawn as a fan.
-    static constexpr float kGuard = 1024.0f;   // pixels beyond the screen centre, each axis
-    bool inside_guard_band(const Vtx3ds& v) const {
-        if (!(v.w > 0.0f) || v.z < 0.0f) return false;
-        const float gx = kGuard * v.w;
-        const float dx = v.x - (float)screen_w * 0.5f * v.w, dy = v.y - (float)screen_h * 0.5f * v.w;
-        return dx <= gx && dx >= -gx && dy <= gx && dy >= -gx;
-    }
-    static Vtx3ds lerp_vtx(const Vtx3ds& p, const Vtx3ds& q, float t) {
-        Vtx3ds o;
-        o.x = p.x + (q.x - p.x) * t; o.y = p.y + (q.y - p.y) * t; o.z = p.z + (q.z - p.z) * t; o.w = p.w + (q.w - p.w) * t;
-        o.u = p.u + (q.u - p.u) * t; o.v = p.v + (q.v - p.v) * t;
-        auto mix = [t](uint8_t a, uint8_t b) { float f = (float)a + ((float)b - (float)a) * t; return (uint8_t)(f < 0.0f ? 0.0f : (f > 255.0f ? 255.0f : f + 0.5f)); };
-        o.r = mix(p.r, q.r); o.g = mix(p.g, q.g); o.b = mix(p.b, q.b); o.a = mix(p.a, q.a);
-        return o;
-    }
+    // (The guard band and clipping: in_guard_band and clip_tri.)
+    bool inside_guard_band(const Vtx3ds& v) const { return in_guard_band(v, screen_w, screen_h); }
     void emit_clipped(DrawRecord& r, const Vtx3ds* tri) {
-        {
-            // Wholly outside one plane: nothing is left (what the clipping
-            // below finds, without the clipping). Skies and models behind
-            // the camera are most of the triangles that come here. Exact:
-            // the guard band planes are tested only while no earlier plane
-            // cut the triangle, i.e. on the vertices the loop would see.
-            const float cx = (float)screen_w * 0.5f, cy = (float)screen_h * 0.5f;
-            int out0 = 0;
-            for (int i = 0; i < 3; i++) out0 += (tri[i].z - 1e-5f * tri[i].w) < 0.0f;
-            if (out0 == 3) return;
-            if (out0 == 0) {
-                for (int plane = 1; plane < 5; plane++) {
-                    int outs = 0;
-                    for (int i = 0; i < 3; i++) {
-                        const Vtx3ds& v = tri[i];
-                        const float g = kGuard * v.w;
-                        const float f = plane == 1 ? g - (v.x - cx * v.w) : plane == 2 ? g + (v.x - cx * v.w) :
-                                        plane == 3 ? g - (v.y - cy * v.w) : g + (v.y - cy * v.w);
-                        outs += f < 0.0f;
-                    }
-                    if (outs == 3) return;
-                    if (outs != 0) break;
-                }
-            }
-        }
-        Vtx3ds buf_a[12], buf_b[12];
-        int n = 3;
-        for (int i = 0; i < 3; i++) buf_a[i] = tri[i];
-        Vtx3ds* in = buf_a;
-        Vtx3ds* outp = buf_b;
-        // Planes as f(v) >= 0: near (z' >= 0), then the four guard band edges.
-        for (int plane = 0; plane < 5 && n >= 3; plane++) {
-            const float cx = (float)screen_w * 0.5f, cy = (float)screen_h * 0.5f;
-            auto f = [plane, cx, cy](const Vtx3ds& v) {
-                const float g = kGuard * v.w;
-                switch (plane) {
-                    case 0: return v.z - 1e-5f * v.w;
-                    case 1: return g - (v.x - cx * v.w);
-                    case 2: return g + (v.x - cx * v.w);
-                    case 3: return g - (v.y - cy * v.w);
-                    default: return g + (v.y - cy * v.w);
-                }
-            };
-            int m = 0;
-            for (int i = 0; i < n && m < 11; i++) {
-                const Vtx3ds& p = in[i];
-                const Vtx3ds& q = in[(i + 1) % n];
-                const float fp = f(p), fq = f(q);
-                if (fp >= 0.0f) outp[m++] = p;
-                if ((fp >= 0.0f) != (fq >= 0.0f) && m < 11) outp[m++] = lerp_vtx(p, q, fp / (fp - fq));
-            }
-            n = m;
-            Vtx3ds* t = in; in = outp; outp = t;
-        }
-        if (n < 3) return;
-        stats->clipped++;
-        Vtx3ds* o = out->verts.append((uint32_t)(n - 2) * 3);
-        if (o == nullptr) return;
-        for (int i = 1; i + 1 < n; i++) { *o++ = in[0]; *o++ = in[i]; *o++ = in[i + 1]; }
-        r.count += (uint32_t)(n - 2) * 3;
+        clip_tri(TriSink{ &out->verts, &r.count, &stats->tris, &stats->clipped, screen_w, screen_h }, tri);
     }
 
     // Texel coordinates relative to a tile that reads the stored frame ->
@@ -1440,7 +1862,8 @@ struct Interpreter::Impl {
         return a.addr == b.addr && a.pitch == b.pitch && a.fmt == b.fmt && a.siz == b.siz && a.width == b.width && a.height == b.height &&
                a.masks == b.masks && a.maskt == b.maskt && a.cms == b.cms && a.cmt == b.cmt && a.palette == b.palette &&
                a.nibble == b.nibble && a.tlut_hash == b.tlut_hash && a.tlut_mode == b.tlut_mode && a.bilerp == b.bilerp && a.snapshot == b.snapshot && a.rtt == b.rtt &&
-               a.block == b.block && a.dxt == b.dxt && a.load_word == b.load_word && a.frame == b.frame && a.wrap_rows == b.wrap_rows;
+               a.block == b.block && a.dxt == b.dxt && a.load_word == b.load_word && a.frame == b.frame && a.wrap_rows == b.wrap_rows &&
+               a.levels == b.levels;
     }
     static bool same_draw_state(const DrawRecord& a, const DrawRecord& b) {
         return a.cc_w0 == b.cc_w0 && a.cc_w1 == b.cc_w1 && a.othermode_h == b.othermode_h && a.othermode_l == b.othermode_l &&
@@ -1979,125 +2402,51 @@ struct Interpreter::Impl {
     // Rewrites an F3DEX command in place as the F3DEX2 command that does the
     // same (the RDP commands are shared). Returns false when the command was
     // carried out here and the F3DEX2 decoder must skip it.
-    bool translate_f3dex(uint8_t& op, uint32_t& w0, uint32_t& w1) {
+    // ---- main loop
+    // Interpreter::set_profile: each command's time goes to its kind when
+    // the next one starts (and at the end of the run).
+    struct ProfScope {
+        uint64_t* prof = nullptr;
+        uint64_t t = 0;
+        int kind = InterpreterStats::kProfOther;
+        void next(int k) {
+            const uint64_t now = prof_tick();
+            prof[kind] += now - t;
+            t = now;
+            kind = k;
+        }
+        ~ProfScope() { if (prof != nullptr) prof[kind] += prof_tick() - t; }
+    };
+    static int prof_kind(uint8_t op) {
         switch (op) {
-            case F3DEX_G_SPNOOP:
-                // The RT64 hook rides on GBI1's no-op (RT64_HOOK_OPCODE 0x00).
-                op = G_SPNOOP; w0 = ((uint32_t)G_SPNOOP << 24) | (w0 & 0xFFFFFF);
-                return true;
-            case F3DEX_G_MTX: {
-                // GBI1 flags: projection 1, load 2, push 4. F3DEX2 stores
-                // projection 4, load 2, push 1, the push bit inverted.
-                uint32_t p = (w0 >> 16) & 0xFF;
-                uint32_t p2 = ((p & 1) ? 4u : 0u) | (p & 2) | ((p & 4) ? 1u : 0u);
-                op = G_MTX; w0 = ((uint32_t)G_MTX << 24) | (p2 ^ 1);
-                return true;
-            }
-            case F3DEX_G_MOVEMEM: {
-                uint8_t index = (w0 >> 16) & 0xFF;
-                uint32_t offset;   // F3DEX2 G_MV_LIGHT offset: look-at X, Y, then the lights
-                if (index == F3DEX_G_MV_VIEWPORT) { op = G_MOVEMEM; w0 = ((uint32_t)G_MOVEMEM << 24) | 8; return true; }
-                if (index == F3DEX_G_MV_LOOKATX) offset = 0;
-                else if (index == F3DEX_G_MV_LOOKATY) offset = 0x18;
-                else if (index >= F3DEX_G_MV_L0 && index <= F3DEX_G_MV_L7) offset = 0x30 + (uint32_t)((index - F3DEX_G_MV_L0) / 2) * 0x18;
-                else { stats->unknown++; return false; }   // G_MV_MATRIX_* (forced matrices), G_MV_TXTATT
-                op = G_MOVEMEM; w0 = ((uint32_t)G_MOVEMEM << 24) | ((offset / 8) << 8) | 10;
-                return true;
-            }
-            case F3DEX_G_VTX: {
-                uint32_t n = (w0 >> 10) & 0x3F, v0 = (w0 >> 17) & 0x7F;
-                op = G_VTX; w0 = ((uint32_t)G_VTX << 24) | (n << 12) | (((v0 + n) & 0x7F) << 1);
-                return true;
-            }
-            case F3DEX_G_DL: op = G_DL; w0 = ((uint32_t)G_DL << 24) | (w0 & 0xFFFFFF); return true;
-            case F3DEX_G_SPRITE2D_BASE: stats->unknown++; return false;
-            case F3DEX_G_LOAD_UCODE: op = G_LOAD_UCODE; return true;
-            case F3DEX_G_BRANCH_Z: op = G_BRANCH_Z; w0 = ((uint32_t)G_BRANCH_Z << 24) | (w0 & 0xFFFFFF); return true;
-            case F3DEX_G_TRI2: op = G_TRI2; return true;             // same layout: two index triples (x2)
-            case F3DEX_G_MODIFYVTX: op = G_MODIFYVTX; return true;   // same layout
-            case F3DEX_G_RDPHALF_1: op = G_RDPHALF_1; return true;
-            case F3DEX_G_RDPHALF_2: op = G_RDPHALF_2; return true;
-            case F3DEX_G_QUAD:
-                // gSP1Quadrangle: four indices (x2) in w1, drawn as a, b, c and a, c, d.
-                // (L3DEX's G_LINE3D shares this number; Banjo draws no lines.)
-                emit_tri(((w1 >> 24) & 0xFF) / 2, ((w1 >> 16) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2);
-                emit_tri(((w1 >> 24) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2, (w1 & 0xFF) / 2);
-                return false;
-            case F3DEX_G_CLEARGEOMETRYMODE:
-                geometry_mode &= ~f3dex_geometry_bits(w1);
-                state_seq++;
-                return false;
-            case F3DEX_G_SETGEOMETRYMODE:
-                geometry_mode |= f3dex_geometry_bits(w1);
-                state_seq++;
-                return false;
-            case F3DEX_G_ENDDL: op = G_ENDDL; return true;
-            case F3DEX_G_SETOTHERMODE_L: case F3DEX_G_SETOTHERMODE_H: {
-                // GBI1 gives the shift and length; F3DEX2 32 - shift - len and len - 1.
-                uint32_t shift = (w0 >> 8) & 0xFF, len = w0 & 0xFF;
-                op = op == F3DEX_G_SETOTHERMODE_L ? G_SETOTHERMODE_L : G_SETOTHERMODE_H;
-                w0 = ((uint32_t)op << 24) | (((32 - shift - len) & 0xFF) << 8) | ((len - 1) & 0xFF);
-                return true;
-            }
-            case F3DEX_G_TEXTURE: op = G_TEXTURE; return true;       // same fields
-            case F3DEX_G_MOVEWORD: {
-                uint8_t index = w0 & 0xFF;
-                uint32_t offset = (w0 >> 8) & 0xFFFF;
-                if (index == 0x02) {
-                    // NUMLIGHT: 0x80000000 + 32 * (lights + 1) -> F3DEX2's lights * 24.
-                    int n = (int)((w1 - 0x80000000u) >> 5) - 1;
-                    w1 = (uint32_t)(n < 0 ? 0 : n) * 24;
-                }
-                else if (index == 0x0A) {
-                    // LIGHTCOL: GBI1 lights are 32 bytes apart in DMEM, F3DEX2's 24.
-                    offset = (offset / 32) * 24 + (offset % 32);
-                }
-                else if (index == F3DEX_G_MW_POINTS) {
-                    // gSPModifyVertex through G_MOVEWORD: offset = vertex * 40 + where.
-                    uint32_t v = offset / 40, where = offset % 40;
-                    op = G_MODIFYVTX; w0 = ((uint32_t)G_MODIFYVTX << 24) | (where << 16) | ((v * 2) & 0xFFFF);
-                    return true;
-                }
-                op = G_MOVEWORD; w0 = ((uint32_t)G_MOVEWORD << 24) | ((uint32_t)index << 16) | (offset & 0xFFFF);
-                return true;
-            }
-            case F3DEX_G_POPMTX:
-                // Only the modelview stack pops (w1 = G_MTX_MODELVIEW), one level.
-                if (w1 != 0) return false;
-                op = G_POPMTX; w1 = 64;
-                return true;
-            case F3DEX_G_CULLDL: op = G_CULLDL; return true;
-            case F3DEX_G_TRI1:
-                // GBI1 carries the indices (x2) in w1; F3DEX2 in w0.
-                op = G_TRI1; w0 = ((uint32_t)G_TRI1 << 24) | (w1 & 0xFFFFFF);
-                return true;
-            case G_RDPNOOP: return false;
-            case G_EXTENDED: return true;   // RT64_EXTENDED_OPCODE is the same in both
-            default:
-                // 0x07, 0x02, 0x05 and 0xD6..0xE3 mean F3DEX2 commands only, which a
-                // GBI1 list never holds; everything else is an RDP command.
-                if (op < 0xC0) { stats->unknown++; return false; }
-                if (op >= G_DMA_IO && op <= G_SETOTHERMODE_H) { stats->unknown++; return false; }
-                return true;
+            case G_VTX: case kF3dexLow | F3DEX_G_VTX: return InterpreterStats::kProfVtx;
+            case G_TRI1: case G_TRI2: case G_QUAD: case F3DEX_G_TRI1: case F3DEX_G_TRI2: case F3DEX_G_QUAD: return InterpreterStats::kProfTri;
+            case G_MTX: case G_POPMTX: case kF3dexLow | F3DEX_G_MTX: case F3DEX_G_POPMTX: return InterpreterStats::kProfMtx;
+            case G_SETTIMG: case G_LOADBLOCK: case G_LOADTILE: case G_LOADTLUT: case G_SETTILE: case G_SETTILESIZE: case G_TEXTURE:
+                return InterpreterStats::kProfTex;
+            case G_TEXRECT: case G_TEXRECTFLIP: case G_FILLRECT: return InterpreterStats::kProfRect;
+            case G_DL: case G_ENDDL: case G_BRANCH_Z: case G_CULLDL:
+            case kF3dexLow | F3DEX_G_DL: case F3DEX_G_ENDDL: case F3DEX_G_BRANCH_Z: case F3DEX_G_CULLDL: return InterpreterStats::kProfFlow;
+            case G_EXTENDED: case G_SPNOOP: return InterpreterStats::kProfEx;
+            default: return InterpreterStats::kProfOther;
         }
     }
+    bool profile = false;
 
-    // ---- main loop
     bool run(uint32_t data_ptr) {
         tex_seq++;   // FrameRecord::tlut restarts: cached palette indices are stale
         uint32_t stack[kMaxDlDepth];
         int depth = 0;
         uint32_t pc = seg(data_ptr);
         bool fullsync = false;
+        ProfScope prof;
+        if (profile) { prof.prof = stats->prof; prof.t = prof_tick(); }
         for (uint32_t guard = 0; guard < 400000; guard++) {
             uint32_t w0 = r32(pc), w1 = r32(pc + 4);
-            uint8_t op = w0 >> 24;
+            uint8_t op = op_table[w0 >> 24];
             stats->commands++;
-            stats->op_hist[op]++;
-            if (gbi == Gbi::F3DEX && !translate_f3dex(op, w0, w1)) {
-                pc += 8;
-                continue;
-            }
+            stats->op_hist[w0 >> 24]++;
+            if (prof.prof != nullptr) prof.next(prof_kind(op));
 #ifndef __3DS__
             // Host tools: DL_TRACE=<first draw>,<last draw> prints the commands
             // that run while the frame has that many draws.
@@ -2128,7 +2477,7 @@ struct Interpreter::Impl {
             tex_seq += kTexOpTable.v[op];
             switch (op) {
                 case G_NOOP: case G_RDPNOOP: break;
-                case G_SPNOOP:
+                case G_SPNOOP: op_spnoop:
                     if ((w0 & 0xFFFFFF) == kHookMagic) {
                         uint32_t hop = w1 >> 28;
                         if (hop == 1) ex_enabled = true;
@@ -2151,7 +2500,7 @@ struct Interpreter::Impl {
                     load_vertices(seg(w1), n, v0);
                     break;
                 }
-                case G_MODIFYVTX: {
+                case G_MODIFYVTX: op_modifyvtx: {
                     int where = (w0 >> 16) & 0xFF;
                     int v = (w0 & 0xFFFF) / 2;
                     if (v < kMaxVerts) {
@@ -2163,18 +2512,31 @@ struct Interpreter::Impl {
                             slot_src[v] = (uint32_t)ip->lv.size();
                             ip->lv.push_back(q);
                         }
-                        if (where == 0x10) { vtx[v].r = w1 >> 24; vtx[v].g = w1 >> 16; vtx[v].b = w1 >> 8; vtx[v].a = w1; }
+                        // Deferred triangles: the triangles before keep the vertex as it was.
+                        if (defer_active && (where == 0x10 || where == 0x14)) {
+                            const LoadedVertex was = slot(v);
+                            new_slot(v) = was;
+                        }
+                        LoadedVertex& mv = slot(v);
+                        if (where == 0x10) { mv.r = w1 >> 24; mv.g = w1 >> 16; mv.b = w1 >> 8; mv.a = w1; }
                         else if (where == 0x14) {
                             // The vertex buffer holds coordinates already
                             // scaled by G_TEXTURE: the new ones go in as given.
-                            vtx[v].u = (float)(int16_t)(w1 >> 16) / 32.0f;
-                            vtx[v].v = (float)(int16_t)(w1 & 0xFFFF) / 32.0f;
+                            mv.u = (float)(int16_t)(w1 >> 16) / 32.0f;
+                            mv.v = (float)(int16_t)(w1 & 0xFFFF) / 32.0f;
+                            if (ip != nullptr && ip->recording && slot_src[v] < ip->lv.size()) {
+                                // ... and for the triangles that follow.
+                                Interpreter::Interp::LoadedVtx q = ip->lv[slot_src[v]];
+                                q.u = mv.u; q.v = mv.v;
+                                slot_src[v] = (uint32_t)ip->lv.size();
+                                ip->lv.push_back(q);
+                            }
                         }
                     }
                     break;
                 }
                 case G_CULLDL: stats->cull_dl++; break;
-                case G_BRANCH_Z: {
+                case G_BRANCH_Z: op_branch_z: {
                     // gSPBranchLessZ, the games' level of detail: jump to the
                     // list in RDPHALF_1 when the vertex's screen depth (the
                     // RSP's z/w * vscale + vtrans, 0..1023) is below w1/65536.
@@ -2184,8 +2546,11 @@ struct Interpreter::Impl {
                     // or gEXForceBranch): always the near model.
                     int vi = (w0 >> 1) & 0x7FF;
                     if (vi < kMaxVerts) {
-                        const auto& v = vtx[vi];
-                        float zw = 2.0f * v.z / (v.w != 0.0f ? v.w : 1e-6f) - 1.0f;
+                        // (Deferred vertices: its depth alone.)
+                        float vz, vw;
+                        if (defer_active) dfr->depth(dslot[vi], vz, vw);
+                        else { vz = vtx[vi].z; vw = vtx[vi].w; }
+                        float zw = 2.0f * vz / (vw != 0.0f ? vw : 1e-6f) - 1.0f;
                         if (force_branch_z || zw * vp.scale[2] + vp.trans[2] < (float)w1 / 65536.0f) {
                             next = seg(rdphalf1);
                             stats->branch_z_taken++;
@@ -2202,14 +2567,14 @@ struct Interpreter::Impl {
                     emit_tri(((w1 >> 16) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2, (w1 & 0xFF) / 2);
                     break;
                 case G_DMA_IO: case G_LOAD_UCODE: break;
-                case G_TEXTURE:
+                case G_TEXTURE: op_texture:
                     texture.level = (w0 >> 11) & 7;
                     texture.tile = (w0 >> 8) & 7;
                     texture.on = (w0 & 0xFF) != 0;
                     texture.scaleS = w1 >> 16;
                     texture.scaleT = w1 & 0xFFFF;
                     break;
-                case G_POPMTX: {
+                case G_POPMTX: op_popmtx: {
                     int n = (int)(w1 / 64);
                     mv_depth -= n;
                     if (mv_depth < 0) mv_depth = 0;
@@ -2220,14 +2585,14 @@ struct Interpreter::Impl {
                 case G_GEOMETRYMODE:
                     geometry_mode = (geometry_mode & (w0 & 0xFFFFFF)) | w1;
                     break;
-                case G_MTX: {
+                case G_MTX: op_mtx: {
                     Mtx m;
                     mtx_addr = seg(w1);
                     load_mtx(m, mtx_addr);
                     apply_matrix(m, (w0 & 0xFF) ^ 1);   // F3DEX2 inverts the push bit
                     break;
                 }
-                case G_MOVEWORD: {
+                case G_MOVEWORD: op_moveword: {
                     uint8_t index = (w0 >> 16) & 0xFF;
                     uint16_t offset = w0 & 0xFFFF;
                     switch (index) {
@@ -2243,7 +2608,7 @@ struct Interpreter::Impl {
                     }
                     break;
                 }
-                case G_MOVEMEM: {
+                case G_MOVEMEM: op_movemem: {
                     uint8_t index = w0 & 0xFF;
                     uint32_t offset = ((w0 >> 8) & 0xFF) * 8;
                     uint32_t addr = seg(w1);
@@ -2267,13 +2632,13 @@ struct Interpreter::Impl {
                     }
                     break;
                 }
-                case G_DL:
+                case G_DL: op_dl:
                     if (((w0 >> 16) & 0xFF) == 0) {
                         if (depth < kMaxDlDepth) stack[depth++] = next; else stats->dl_depth_overflow++;
                     }
                     next = seg(w1);
                     break;
-                case G_ENDDL:
+                case G_ENDDL: op_enddl:
                     if (depth == 0) return fullsync;
                     next = stack[--depth];
                     break;
@@ -2429,6 +2794,99 @@ struct Interpreter::Impl {
                     if (frame_copy && cur_rtt < 0 && cimg != zimg && cimg != screen_cimg) { screen_cimg = cimg; screen_drawn = false; }
                     out->color_image = cimg; out->color_width = cimg_width; out->depth_image = zimg;
                     break;
+                // F3DEX (GBI1) commands, in kF3dexOp's numbering: put into
+                // F3DEX2's form where it differs, then run as that.
+                case kF3dexLow | F3DEX_G_SPNOOP:
+                    // The RT64 hook rides on GBI1's no-op (RT64_HOOK_OPCODE 0x00).
+                    op = G_SPNOOP; w0 = ((uint32_t)G_SPNOOP << 24) | (w0 & 0xFFFFFF);
+                    goto op_spnoop;
+                case kF3dexLow | F3DEX_G_MTX: {
+                    // GBI1 flags: projection 1, load 2, push 4. F3DEX2 stores
+                    // projection 4, load 2, push 1, the push bit inverted.
+                    const uint32_t p = (w0 >> 16) & 0xFF;
+                    const uint32_t p2 = ((p & 1) ? 4u : 0u) | (p & 2) | ((p & 4) ? 1u : 0u);
+                    op = G_MTX; w0 = ((uint32_t)G_MTX << 24) | (p2 ^ 1);
+                    goto op_mtx;
+                }
+                case kF3dexLow | F3DEX_G_MOVEMEM: {
+                    const uint8_t index = (w0 >> 16) & 0xFF;
+                    uint32_t offset;   // F3DEX2 G_MV_LIGHT offset: look-at X, Y, then the lights
+                    if (index == F3DEX_G_MV_VIEWPORT) { op = G_MOVEMEM; w0 = ((uint32_t)G_MOVEMEM << 24) | 8; goto op_movemem; }
+                    if (index == F3DEX_G_MV_LOOKATX) offset = 0;
+                    else if (index == F3DEX_G_MV_LOOKATY) offset = 0x18;
+                    else if (index >= F3DEX_G_MV_L0 && index <= F3DEX_G_MV_L7) offset = 0x30 + (uint32_t)((index - F3DEX_G_MV_L0) / 2) * 0x18;
+                    else { stats->unknown++; break; }   // G_MV_MATRIX_* (forced matrices), G_MV_TXTATT
+                    op = G_MOVEMEM; w0 = ((uint32_t)G_MOVEMEM << 24) | ((offset / 8) << 8) | 10;
+                    goto op_movemem;
+                }
+                case kF3dexLow | F3DEX_G_VTX: {
+                    const uint32_t n = (w0 >> 10) & 0x3F, v0 = (w0 >> 17) & 0x7F;
+                    load_vertices(seg(w1), (int)n, (int)((v0 + n) & 0x7F) - (int)n);
+                    break;
+                }
+                case kF3dexLow | F3DEX_G_DL: op = G_DL; goto op_dl;
+                case F3DEX_G_LOAD_UCODE: break;
+                case F3DEX_G_BRANCH_Z: op = G_BRANCH_Z; goto op_branch_z;
+                case F3DEX_G_TRI2: case F3DEX_G_QUAD:
+                    // TRI2: two index triples (x2), as F3DEX2's. gSP1Quadrangle:
+                    // four indices (x2) in w1, drawn as a, b, c and a, c, d.
+                    // (L3DEX's G_LINE3D shares QUAD's number; Banjo draws no lines.)
+                    if (op == F3DEX_G_TRI2) {
+                        emit_tri(((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
+                        emit_tri(((w1 >> 16) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2, (w1 & 0xFF) / 2);
+                    }
+                    else {
+                        emit_tri(((w1 >> 24) & 0xFF) / 2, ((w1 >> 16) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2);
+                        emit_tri(((w1 >> 24) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2, (w1 & 0xFF) / 2);
+                    }
+                    break;
+                case F3DEX_G_TRI1:
+                    // GBI1 carries the indices (x2) in w1.
+                    emit_tri(((w1 >> 16) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2, (w1 & 0xFF) / 2);
+                    break;
+                case F3DEX_G_MODIFYVTX: op = G_MODIFYVTX; goto op_modifyvtx;   // same layout
+                case F3DEX_G_RDPHALF_1: rdphalf1 = w1; break;
+                case F3DEX_G_RDPHALF_2: rdphalf2 = w1; break;
+                case F3DEX_G_CLEARGEOMETRYMODE: geometry_mode &= ~f3dex_geometry_bits(w1); break;
+                case F3DEX_G_SETGEOMETRYMODE: geometry_mode |= f3dex_geometry_bits(w1); break;
+                case F3DEX_G_ENDDL: op = G_ENDDL; goto op_enddl;
+                case F3DEX_G_SETOTHERMODE_L: case F3DEX_G_SETOTHERMODE_H: {
+                    // GBI1 gives the shift and length; F3DEX2 32 - shift - len and len - 1.
+                    const uint32_t shift = (w0 >> 8) & 0xFF, len = w0 & 0xFF;
+                    const bool low = op == F3DEX_G_SETOTHERMODE_L;
+                    op = low ? G_SETOTHERMODE_L : G_SETOTHERMODE_H;
+                    w0 = ((uint32_t)op << 24) | (((32 - shift - len) & 0xFF) << 8) | ((len - 1) & 0xFF);
+                    set_othermode(low, w0, w1);
+                    break;
+                }
+                case F3DEX_G_TEXTURE: op = G_TEXTURE; goto op_texture;   // same fields
+                case F3DEX_G_MOVEWORD: {
+                    const uint8_t index = w0 & 0xFF;
+                    uint32_t offset = (w0 >> 8) & 0xFFFF;
+                    if (index == 0x02) {
+                        // NUMLIGHT: 0x80000000 + 32 * (lights + 1) -> F3DEX2's lights * 24.
+                        const int n = (int)((w1 - 0x80000000u) >> 5) - 1;
+                        w1 = (uint32_t)(n < 0 ? 0 : n) * 24;
+                    }
+                    else if (index == 0x0A) {
+                        // LIGHTCOL: GBI1 lights are 32 bytes apart in DMEM, F3DEX2's 24.
+                        offset = (offset / 32) * 24 + (offset % 32);
+                    }
+                    else if (index == F3DEX_G_MW_POINTS) {
+                        // gSPModifyVertex through G_MOVEWORD: offset = vertex * 40 + where.
+                        const uint32_t v = offset / 40, where = offset % 40;
+                        op = G_MODIFYVTX; w0 = ((uint32_t)G_MODIFYVTX << 24) | (where << 16) | ((v * 2) & 0xFFFF);
+                        goto op_modifyvtx;
+                    }
+                    op = G_MOVEWORD; w0 = ((uint32_t)G_MOVEWORD << 24) | ((uint32_t)index << 16) | (offset & 0xFFFF);
+                    goto op_moveword;
+                }
+                case F3DEX_G_POPMTX:
+                    // Only the modelview stack pops (w1 = G_MTX_MODELVIEW), one level.
+                    if (w1 != 0) break;
+                    op = G_POPMTX; w1 = 64;
+                    goto op_popmtx;
+                case F3DEX_G_CULLDL: stats->cull_dl++; break;
                 default:
                     stats->unknown++;
                     break;
@@ -2567,20 +3025,46 @@ bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
         ip->ctxs.clear();
         ip->lv.clear();
         ip->tris.clear();
+        ip->tri_states.clear();
+        ip->tri_uv.clear();
+        impl_->tri_key_draw = ~0u;
         ip->draw_remap.clear();
         for (uint32_t& s : impl_->slot_src) s = ~0u;
+    }
+    // Deferred triangles (not with merge_image_tiles: compact_rects
+    // renumbers the records). The vertex buffer as the list finds it.
+    const bool defer = dfr_ != nullptr && !impl_->image_tiles;
+    if (defer) {
+        // (Single thread: a list whose triangles nobody took. Else the
+        // renderer's drain is running already and the last finish put
+        // drain's side back.)
+        if (dfr_->pending) { FrameRecord scrap; dfr_->finish(scrap, stats_); dfr_->pending = false; }
+        dfr_->begin(impl_->screen_w, impl_->screen_h);
+        impl_->dfr = dfr_;
+        for (int i = 0; i < kMaxVerts; i++) impl_->new_slot(i) = impl_->vtx[i];
+        impl_->defer_open = -1;
+        impl_->defer_key_draw = ~0u;
+        impl_->defer_active = true;
     }
     impl_->begin_list(out);
     const bool fullsync = impl_->run(data_ptr);
     impl_->flush_rect_slices();
     if (impl_->image_tiles) impl_->compact_rects();
     impl_->end_list(fullsync);
-    impl_->unify_world_depth(out);
+    if (defer) {
+        // The vertex buffer as the list leaves it, for the lists after.
+        for (int i = 0; i < kMaxVerts; i++) impl_->vtx[i] = dfr_->resolve(impl_->dslot[i]);
+        impl_->defer_active = false;
+        impl_->defer_open = -1;
+        dfr_->pending = true;
+        dfr_->publish();     // all of it
+    }
+    else impl_->unify_world_depth(out);
     if (ip != nullptr) {
         ip->recording = false;
         ip->now().valid = fullsync;
         if (!ip->draw_remap.empty()) {
-            for (Interp::TriRec& t : ip->tris) if (t.draw < ip->draw_remap.size()) t.draw = ip->draw_remap[t.draw];
+            for (Interp::TriState& s : ip->tri_states) if (s.draw < ip->draw_remap.size()) s.draw = ip->draw_remap[s.draw];
         }
     }
     return fullsync;
@@ -2601,6 +3085,7 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
     // The records, as the game frame has them.
     o.draws = real.draws;
     o.tlut = real.tlut;
+    o.mips = real.mips;
     o.has_fullsync = real.has_fullsync;
     o.snapshot_request = real.snapshot_request;
     o.color_image = real.color_image; o.color_width = real.color_width; o.depth_image = real.depth_image;
@@ -2680,22 +3165,30 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
             }
             continue;
         }
-        while (ti < nt && ip->tris[ti].draw < di) ti++;
-        for (; ti < nt && ip->tris[ti].draw == di; ti++) {
+        while (ti < nt && ip->tri_states[ip->tris[ti].state].draw < di) ti++;
+        for (; ti < nt && ip->tri_states[ip->tris[ti].state].draw == di; ti++) {
             const Interp::TriRec& t = ip->tris[ti];
+            const Interp::TriState& s = ip->tri_states[t.state];
             if (t.src[0] >= ip->lv.size() || t.src[1] >= ip->lv.size() || t.src[2] >= ip->lv.size()) continue;
             Vtx3ds tri[3];
             float du = 0.0f, dv = 0.0f;
-            if (t.plain && t.tile >= 0 && (size_t)t.tile < L.tiles.size() && L.tiles[t.tile].interp) { du = L.tiles[t.tile].du[0]; dv = L.tiles[t.tile].dv[0]; }
+            if (s.plain && s.tile >= 0 && (size_t)s.tile < L.tiles.size() && L.tiles[s.tile].interp) { du = L.tiles[s.tile].du[0]; dv = L.tiles[s.tile].dv[0]; }
+            // Mapped texel coordinates: as stored; the vertices' own: as
+            // emit_tri worked them out, plus their move (v.u, v.v).
+            const float* uv = s.plain ? nullptr : &ip->tri_uv[s.uv_first + (size_t)(ti - s.first_tri) * 6];
             for (int k = 0; k < 3; k++) {
                 const Vtx3ds& v = vertex(t.src[k]);
                 Vtx3ds& q = tri[k];
                 q = v;
-                if (t.zprim >= 0.0f) q.z = t.zprim * v.w;
-                q.u = t.uv[k][0] - du + (t.plain ? v.u * t.ss : 0.0f);
-                q.v = t.uv[k][1] - dv + (t.plain ? v.v * t.st : 0.0f);
+                if (s.zprim >= 0.0f) q.z = s.zprim * v.w;
+                if (uv != nullptr) { q.u = uv[k * 2] - du; q.v = uv[k * 2 + 1] - dv; }
+                else {
+                    const Interp::LoadedVtx& lq = ip->lv[t.src[k]];
+                    q.u = (lq.u * s.ss - s.uls) - du + v.u * s.ss;
+                    q.v = (lq.v * s.st - s.ult) - dv + v.v * s.st;
+                }
             }
-            if (t.cull != 0) {
+            if (s.cull != 0) {
                 const Vtx3ds& a = tri[0]; const Vtx3ds& b = tri[1]; const Vtx3ds& c = tri[2];
                 const float ab = a.w * b.w, bc = b.w * c.w, ac = a.w * c.w;
                 const float ax = a.x * bc, ay = a.y * bc;
@@ -2703,8 +3196,8 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
                 const float cx = c.x * ab, cy = c.y * ab;
                 float cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
                 if (ab * c.w < 0.0f) cross = -cross;
-                if ((t.cull & G_CULL_BACK) && cross > 0.0f) continue;
-                if ((t.cull & G_CULL_FRONT) && cross < 0.0f) continue;
+                if ((s.cull & G_CULL_BACK) && cross > 0.0f) continue;
+                if ((s.cull & G_CULL_FRONT) && cross < 0.0f) continue;
             }
             emitted++;
             if (!impl_->inside_guard_band(tri[0]) || !impl_->inside_guard_band(tri[1]) || !impl_->inside_guard_band(tri[2])) {
@@ -2777,6 +3270,8 @@ bool Interpreter::run_inbetween(uint32_t data_ptr, FrameRecord& out, uint32_t* t
 
 bool Interpreter::last_list_plain() const { return impl_->list_plain; }
 
+void Interpreter::set_profile(bool on) { impl_->profile = on; if (before_ != nullptr) before_->profile = on; if (after_ != nullptr) after_->profile = on; }
+
 bool Interpreter::pass_over(uint32_t data_ptr, FrameRecord& scratch) {
     // A copy of the whole state (a few KB) to put back when the list turns
     // out to need drawing.
@@ -2797,11 +3292,29 @@ void Interpreter::set_world_proj_ids(const uint32_t* ids, int count) {
 }
 void Interpreter::set_split_untagged_ortho(bool on) { impl_->split_untagged_ortho = on; }
 void Interpreter::set_force_branch_z(bool on) { impl_->force_branch_z = on; }
-void Interpreter::set_gbi(Gbi gbi) { impl_->gbi = gbi; }
+void Interpreter::set_gbi(Gbi gbi) {
+    impl_->gbi = gbi;
+    impl_->op_table = gbi == Gbi::F3DEX ? kF3dexOp.v : kF3dex2Op.v;
+}
 void Interpreter::set_render_to_texture(bool on) { impl_->rtt_enabled = on; }
 void Interpreter::set_sample_drawn_frame(bool on) { impl_->frame_copy = on; }
 void Interpreter::set_primary_world_instance(bool on) { impl_->inst_track = on; }
 void Interpreter::set_unify_world_depth(bool on) { impl_->unify_depth = on; impl_->update_depth_terms(); }
+void Interpreter::set_defer_triangles(bool on, bool vertices, void (*notify)(void*), void* notify_arg) {
+    if (on && dfr_ == nullptr) dfr_ = new Defer();
+    else if (!on && dfr_ != nullptr) { delete dfr_; dfr_ = nullptr; impl_->dfr = nullptr; }
+    if (dfr_ != nullptr) { dfr_->vertices = vertices; dfr_->notify = notify; dfr_->notify_arg = notify_arg; }
+}
+void Interpreter::drain_triangles() {
+    if (dfr_ != nullptr) dfr_->drain();
+}
+bool Interpreter::finish_triangles(FrameRecord& out) {
+    if (dfr_ == nullptr || !dfr_->pending) return false;
+    dfr_->pending = false;
+    dfr_->finish(out, stats_);
+    impl_->unify_world_depth(out);
+    return true;
+}
 void Interpreter::set_fix_rect_lr(bool on) { impl_->fix_rect_lr = on; }
 void Interpreter::set_merge_rect_slices(bool on) { impl_->merge_rect_slices = on; }
 void Interpreter::set_hud_camera_id(uint32_t id) { impl_->hud_camera_id = id; }

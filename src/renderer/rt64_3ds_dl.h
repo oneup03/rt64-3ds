@@ -27,6 +27,10 @@ struct InterpreterStats {
     uint32_t image_fallbacks = 0;  // ... and those of such tiles that kept their tile (coordinates outside it)
     uint32_t image_rects = 0;      // rectangles sampled from a whole image
     uint32_t rects_compacted = 0;  // ... merged into the record before
+    // Interpreter::set_profile: run's time by kind of command (host ticks:
+    // svcGetSystemTick on the console), the triangles' own included in theirs.
+    enum { kProfVtx, kProfTri, kProfMtx, kProfTex, kProfRect, kProfFlow, kProfEx, kProfOther, kProfKinds };
+    uint64_t prof[kProfKinds] = {};
 };
 
 class Interpreter {
@@ -41,6 +45,10 @@ public:
     // presented framebuffer, or fills of the depth buffer; nothing into
     // off-screen images, frame copies or snapshots).
     bool last_list_plain() const;
+    // Time run's commands by kind into stats().prof (costs a tick read a
+    // command: for profiling only).
+    void set_profile(bool on);
+    void clear_profile() { for (uint64_t& v : stats_.prof) v = 0; }
     // The frame cap (Settings::frame_cap): runs a list for its state alone
     // (no vertices, triangles or rectangles: a fraction of run's cost) and
     // returns whether it was such a whole frame on the screen, which can go
@@ -90,6 +98,25 @@ public:
     // a wider image sample one texture of the image (TexDesc of its whole
     // width), so draws that differ only in the part they loaded merge.
     void set_merge_image_tiles(bool on);
+    // Deferred triangles: run records each triangle of a record whose texel
+    // coordinates are the vertices' own as the vertices it was loaded with,
+    // and finish_triangles, called after it, does the rest (culling, texel
+    // coordinates, clipping, the vertices). For a reader on one core and
+    // the drawing on another: run is what the game waits for. Not with
+    // merge_image_tiles (its compaction renumbers the records). `vertices`:
+    // the loads' transforms, lighting and fog wait too, each vertex done
+    // when first used (G_BRANCH_Z computes its depth alone); not while
+    // frame interpolation records the list. `notify(arg)` is called on
+    // run's thread each time run publishes triangles for drain_triangles.
+    void set_defer_triangles(bool on, bool vertices = true, void (*notify)(void*) = nullptr, void* notify_arg = nullptr);
+    // On another thread while run is running (the one that then calls
+    // finish_triangles): the output of the triangles run has published so
+    // far, so little is left once it returns.
+    void drain_triangles();
+    // After run: the deferred triangles' vertices into `out` (run's), the
+    // records' first and count, and unify_world_depth. False when run left
+    // none (deferral off, a pass_over, an in-between run).
+    bool finish_triangles(FrameRecord& out);
 
     // Frame interpolation (RenderDesc::frame_interpolation, Settings::
     // frame_cap 2). On, every run records the transforms the list draws
@@ -121,7 +148,9 @@ public:
 private:
     struct Impl;
     struct Interp;
+    struct Defer;
     Impl* impl_;
+    Defer* dfr_ = nullptr;      // set_defer_triangles
     Impl* saved_ = nullptr;     // pass_over's copy of the state, to put back
     Impl* before_ = nullptr;    // frame interpolation: the state the last run started from
     Impl* after_ = nullptr;     // ... and the state it left

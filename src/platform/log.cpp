@@ -13,6 +13,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
 #include <sys/reent.h>
 #include <sys/iosupport.h>
 
@@ -34,11 +35,36 @@ uint32_t g_dropped = 0;
 LightLock g_ring_lock;
 Thread g_writer = nullptr;
 volatile bool g_writer_run = false;
+// settings.ini's log_level (log_set_level): 2 everything, 1 without the
+// renderer's periodic reports and late-frame notes (and the stats line only
+// every 10 s, recomp3ds_run.cpp), 0 without the stats and synth lines too:
+// boot, warnings and exit. Each line costs a debug-string syscall, a copy
+// and its share of the card writes on core 0; an Old 3DS logs at 0.
+int g_level = 2;
+
+inline bool starts(const char* s, const char* p) { return strncmp(s, p, strlen(p)) == 0; }
+
+// Only the periodic figures go, by prefix. Everything that appears only
+// when something is wrong stays at every level, 0 included: the stall
+// watch's `recomp3ds: STALL` / `STALL over`, `recomp3ds: WATCHDOG`, errors.
+// A hard freeze leaves its trace through them.
+bool dropped_at_level(const char* l) {
+    if (g_level >= 2) return false;
+    if (starts(l, "rt64-3ds: late frame") || starts(l, "rt64-3ds: frame ") || starts(l, "rt64-3ds:   ")) return true;
+    if (g_level >= 1) return false;
+    return starts(l, "stats:") || starts(l, "dsp-synth ");
+}
+
+// When the card write under way began (0: none), for the stall watch: a
+// write that never returns stops the log without a word in it.
+volatile u64 g_write_since = 0;
 
 void write_file(const char* p, size_t n) {
     if (g_file != nullptr) {
+        g_write_since = svcGetSystemTick() | 1;
         fwrite(p, 1, n, g_file);
         fflush(g_file);
+        g_write_since = 0;
     }
 }
 
@@ -67,9 +93,19 @@ bool drain_ring() {
     }
 }
 
+// log_sync: what is written goes to the card itself at the next pass (a
+// freeze's lines would otherwise be lost with the power-off that ends it).
+volatile bool g_sync_request = false;
+
 void writer_thread(void*) {
     while (g_writer_run) {
         drain_ring();
+        if (g_sync_request && g_file != nullptr) {
+            g_sync_request = false;
+            g_write_since = svcGetSystemTick() | 1;
+            fsync(fileno(g_file));
+            g_write_since = 0;
+        }
         svcSleepThread(50 * 1000000ll);
     }
     drain_ring();
@@ -95,13 +131,14 @@ void queue_line(const char* p, size_t n) {
 }
 
 void flush_line() {
-    g_line[g_len] = '\n';
-    g_line[g_len + 1] = '\0';
-    svcOutputDebugString(g_line, g_len + 1);
     g_line[g_len] = '\0';
-    recomp3ds::autotest_scan_line(g_line);
-    g_line[g_len] = '\n';
-    queue_line(g_line, (size_t)g_len + 1);
+    recomp3ds::autotest_scan_line(g_line);      // test scripts see every line
+    if (!dropped_at_level(g_line)) {
+        g_line[g_len] = '\n';
+        g_line[g_len + 1] = '\0';
+        svcOutputDebugString(g_line, g_len + 1);
+        queue_line(g_line, (size_t)g_len + 1);
+    }
     g_len = 0;
 }
 
@@ -127,6 +164,7 @@ ssize_t stderr_write(struct _reent* r, void* fd, const char* ptr, size_t len) {
 // libctru's console device, taken before stdout is pointed at the log.
 const devoptab_t* g_screen = nullptr;
 LightLock g_screen_lock;
+volatile bool g_screen_dirty = false;   // the console drew since screen_flush
 
 const devoptab_t g_errtab = {
     .name = "recomp3ds_stderr",
@@ -169,8 +207,48 @@ void recomp3ds::screen_printf(const char* fmt, ...) {
     if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
     LightLock_Lock(&g_screen_lock);
     g_screen->write_r(_REENT, nullptr, buf, (size_t)n);
+    g_screen_dirty = true;
     LightLock_Unlock(&g_screen_lock);
 }
+
+// A line of its own at the bottom of the touch screen, in red (empty: clear
+// it), written and put on the display from any thread: the stall watch's,
+// when the main thread that does both otherwise may be the one stuck.
+// Skipped while another thread holds the console.
+void recomp3ds::screen_alert(const char* text, int row) {
+    if (g_screen == nullptr || LightLock_TryLock(&g_screen_lock) != 0) return;
+    char buf[64];
+    const int n = snprintf(buf, sizeof(buf), "\x1b[%d;0H\x1b[31m%-39.39s\x1b[0m", row, text);
+    g_screen->write_r(_REENT, nullptr, buf, (size_t)n);
+    LightLock_Unlock(&g_screen_lock);
+    u16 w = 0, h = 0;
+    u8* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &w, &h);
+    if (fb != nullptr) svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)fb, (u32)w * h * gspGetBytesPerPixel(gfxGetScreenFormat(GFX_BOTTOM)));
+}
+
+void recomp3ds::log_sync() { g_sync_request = true; }
+
+uint32_t recomp3ds::log_write_stuck_ms() {
+    const u64 since = g_write_since;
+    return since != 0 ? (uint32_t)((svcGetSystemTick() - since) / 268123ull) : 0;
+}
+
+// The console draws into the bottom framebuffer through the CPU's cache, and
+// the display reads memory: what it drew is written back here, with the
+// kernel's flush on this core (gfxFlushBuffers asks the GSP module on core
+// 1, and the renderer's frame end no longer flushes the whole linear heap).
+void recomp3ds::screen_flush() {
+    if (!g_screen_dirty) return;
+    g_screen_dirty = false;
+    u16 w = 0, h = 0;
+    u8* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &w, &h);
+    if (fb == nullptr) return;
+    const u32 bytes = (u32)w * h * gspGetBytesPerPixel(gfxGetScreenFormat(GFX_BOTTOM));
+    svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)fb, bytes);
+}
+
+void recomp3ds::log_set_level(int level) { g_level = level; }
+int recomp3ds::log_level() { return g_level; }
 
 void recomp3ds::log_line(const char* s) {
     fprintf(stderr, "%s\n", s);

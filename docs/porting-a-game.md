@@ -54,7 +54,7 @@ renderer can't find out from the display lists:
 
 | Field | What sets it |
 |---|---|
-| `gbi` | `Gbi::F3DEX` for F3DEX/F3DEX 1.x games (Banjo builds its patches with `-DF3DEX_GBI`). The default is F3DEX2. |
+| `gbi` | `Gbi::F3DEX` for F3DEX/F3DEX 1.x games (Banjo builds its patches with `-DF3DEX_GBI`). The default is F3DEX2. GBI1 commands run in the interpreter's single dispatch: `kF3dexOp` gives them numbers of their own, and each case rewrites the command into F3DEX2's form and jumps to that command's case. |
 | `vi_width`, `vi_height` | The game's framebuffer size (DK64 320x240, Banjo 292x216). The frame is placed on the 400x240 screen as RT64 places it: scaled uniformly to the height, centred, with widescreen margins in N64 units. Don't patch the game's framebuffer size. |
 | `render_to_texture` | On for games that draw the world into an off-screen colour image and then sample it (Banjo's jiggy transition and picture puzzles). A frame that ends on an off-screen image isn't presented, as on the VI. |
 | `snapshot_buffers` | The RDRAM addresses the game copies the presented frame into with rectangles (DK64's pause background). They're sampled from a copy of the screen. |
@@ -101,7 +101,12 @@ the one before it is on the screen (the game frame on a presenter thread,
 so the game does not wait). A list gets fewer in-betweens (the game frame
 then stays for the refreshes left) or none when they would not fit the
 game's frame (`INTERP_BUDGET.TXT`: percent of the frame, default 90, from
-the times measured as the game runs), and none when the
+the times measured as the game runs). After 30 lists dropped for the budget,
+it tries in-betweens anyway for 8 lists in a row to measure them again. A
+single try measures high, because the gfx thread waits out the builder,
+which in steady running overlaps the waits for the screen. A run that still
+doesn't fit doubles the wait before the next, up to 240 lists. No
+in-betweens are drawn when the
 presents run late (the game's 60 Hz against the screen's 59.83: a list held
 back by them, or with `early_drawn` one that waited more than 40% of the
 game's frame for the list before), after a
@@ -150,7 +155,85 @@ refresh; when the in-between's draws only started once its refresh came
 gfx thread took turns and a pair barely fitted two refreshes (40-46 frames
 a second on the console in motion, with both cores 30-40% busy). The last
 in-between's transfer is the presenter's, so the gfx thread never waits for
-the screen for it and the list is done a refresh sooner. Every fifth second
+the screen for it and the list is done a refresh sooner.
+On a New 3DS a builder thread on core 1 (below the audio task's thread there)
+matches the list with the one before (`match_previous`) and builds its first
+in-between (`build_inbetween`) while the gfx thread records the game's frame.
+The match cost the gfx thread about 4 ms a list in Banjo's file select
+(8,500 vertices). A camera cut, or nothing to move, then shows only when the
+gfx thread joins the build, so that list's game frame goes alone. Lists the
+budget doesn't afford are still matched on the gfx thread, because each
+match carries the transforms over to the next list. So the game's frame is recorded first, then the
+in-betweens are drawn, and both go to the presenter. The GPU still runs the
+in-betweens first, since it follows the order they are queued in. That is
+safe because every frame sets all of its state at its start: combiner
+stages, depth, blend, alpha test, scissor, textures, uniforms,
+framebuffer. Frames with a capture or screenshot pending keep the old order.
+`BUILDER_OFF.TXT` keeps the builds on the gfx thread. The `frame
+interpolation timing:` line gives the builds and what of them the gfx
+thread waited for. With `PROFILE.TXT` a `read profile per list:` line
+splits the list's read (what a game waiting for "parsed" waits for) by
+kind of command, plus the texture decoding.
+What a list's read records for the in-betweens is kept small, because the
+game waits for the read. A triangle stores its three vertices and the index
+of a state it shares with its neighbours (`TriState`: its record, tile,
+depth and culling). Its texel coordinates are worked out again in the build
+from the loaded vertex's own (`LoadedVtx::u/v`), unless they were mapped
+onto an image, frame or snapshot. Together with the single dispatch, this
+read a list in 9-13% fewer instructions and 16-24% fewer cycles on the PC,
+on Banjo and Goemon captures, with identical draws and in-betweens.
+Indexed triangle draws were tried: a vertex written once per run of
+triangles sharing it, culled before it was written. That cut Banjo's
+vertices by 44-47% and Goemon's by 16-27%, with identical pictures, but
+saved no time on the console. The triangle path costs the same per
+triangle either way, and the GPU's cost is fill, not vertices. So the
+renderer stays non-indexed.
+Textures go to VRAM, where the GPU reads them faster than from the linear
+heap (`TextureCache::set_vram`; `TEX_VRAM_OFF.TXT` keeps them linear). They
+are decoded into the linear heap as ever. Before a frame begins, the gfx
+thread copies up to 8 a frame into VRAM with `C3D_SyncTextureCopy`, each on
+a queue of its own. Inside a frame the copies overflowed citro3d's 32-entry
+GX queue on Banjo's title, a panic. A texture switches to VRAM only when its
+copy runs, so anything recorded earlier still reads the linear copy, which
+is freed after the next frame begin. VRAM is kept free for render targets
+made later, on demand (colour plus 24-bit depth): 1.5 MB with
+`render_to_texture` (Banjo's 512x256 jiggy transition), 640 KB with
+`sample_drawn_frame` (Goemon's 256x256 menu rims), 128 KB otherwise (every
+other target is made at start). A target that still finds no VRAM has the
+texture cache give some back (`make_vram_room`: textures leave VRAM least
+recently used first, freed three frames on), and raises the amount kept free
+to that target plus 128 KB; it tries again every four frames while it fails.
+When VRAM is short, textures unused for 30 frames make way (retired), and
+others stay linear. The frame line's
+`tex live N (K KB, V in VRAM, M mipmapped)` gives the split.
+Mipmaps come from the game's own levels. A draw counts as mipmapped
+(`lod_trilerp` in `rt64_3ds_record.h`) when it has G_TL_LOD in 2-cycle mode,
+no detail or sharpen texture, and a first cycle that lerps TEXEL0 to TEXEL1
+by LOD_FRACTION. The interpreter collects the tiles after the base, up to
+G_TEXTURE's level count; each must be exactly half the one before in size
+and texel scale, with the same format and palette (`describe_mips`;
+`FrameRecord::mips`, `TexDesc::levels`). The texture cache builds a PICA
+texture with those levels, down to 8x8 (the PICA's smallest), and the draw
+samples it with the mip filter (linear between levels when the tile is
+bilinear). The combiner reads TEXEL1 as TEXEL0, so the lerp falls away and
+no second texture is sampled. Before this, such draws read both tiles at
+every pixel and kept only the first (LOD_FRACTION was a constant 0).
+`MIPMAP_OFF.TXT` draws the base level alone; TEXEL1 is still left out.
+Banjo's level geometry is drawn this way: 32x32 RGBA16 with 16x16 and 8x8
+levels (and a 4x4 the PICA can't use). DK64's characters are too: faces,
+eyes and clothing in its intro, about 33 of 168 draws and 24 textures, all
+32x32 RGBA16. Goemon has none. `dl_test`'s `DL_DUMP` lists each
+draw's levels.
+Frame ends flush only their own command list (`C3D_FrameEnd(GX_CMDLIST_FLUSH)`):
+`C3D_FrameEnd(0)` flushes the whole linear heap with GSPGPU_FlushDataCache, a
+request to the GSP module on core 1 that waits for that core. With the
+builder and a DSP synth there, that cost several ms a frame on the gfx thread.
+What the CPU writes for the GPU is flushed where it is written instead,
+with the kernel's `svcFlushProcessDataCache` on the writing core
+(`flush_dcache`): the vertices in replay, textures as they are decoded, the
+recorded frame's command buffer, and the builder's vertices on core 1. Code
+that adds a buffer the GPU reads must flush it the same way: no frame end
+will. Every fifth second
 with "60 interp." a `pairs' gpu waits on the gfx thread:` line has what the
 in-between and the game's frame each waited for the GPU per pair, and with
 `double_eyes` what the presenter waited instead; compare `gpu_double_eyes=0`
@@ -219,6 +302,312 @@ reports it at once.
 Whatever the game's toolchain does, compile the recompiled functions,
 patches and microcode with `-fno-strict-aliasing`: the desktop builds do,
 and without it the scalar vector unit miscompiles.
+
+### The audio task's timing at the Old 3DS clock
+
+- `GameDesc.audio_async` (nmr patch 0026): the audio task reports its
+  completion as soon as it is submitted, and its samples reach the AI path
+  when it has actually run. An SDK-style audio manager waits for that
+  message before it builds the next frame, and the scheduler starts tasks
+  only at a retrace, so a 10-17 ms task (the interpreter at 268 MHz) locked
+  Goemon's manager to 30 tasks a second: music at half speed with the DSP
+  running dry. Only for a game whose samples reach the host through
+  `osAiSetNextBuffer` alone. Goemon sets it.
+- `GameDesc.audio_margin_frames`: video frames of samples the AI path keeps
+  in reserve (Goemon 4). Buffers of tasks still to run count as queued
+  before the margin (nmr 0027, `ultramodern::pending_audio_bytes`); without
+  that, the manager pinned its smallest frame and the DSP ran dry every
+  frame.
+- `aspmain_hle_set_low_quality` (aspMain only): half-rate resampling and
+  envelope mixing, reverb skipped, about a quarter cheaper. No menu row:
+  the DSP synthesizer below replaced it, and with it a per-game cap on the
+  synthesizer's physical voices (a hook on the function that fills
+  `ALSynConfig`) that Goemon had for the same purpose.
+
+### The DSP synthesizer (Audio engine: DSP)
+
+The interpreter still makes a CPU core run the game's whole audio pipeline.
+`GameDesc.synth` instead plays every voice the game's synthesizer starts on
+a channel of the 3DS DSP, which resamples and mixes it. The CPU only decodes
+each voice's VADPCM straight from the ROM, a few buffers ahead, on a thread
+on core 1 (`src/platform/dsp_synth.cpp`). The audio task is skipped, and
+the AI path still carries silence: its clock (`audio_frames_played`)
+schedules the voices' events, so the music keeps the game's tempo and
+latency. A game that sets it plays on the DSP by default; settings.ini's
+`audio_engine=0` (no menu row) runs the audio task instead, for
+comparisons.
+
+The game's recompiler config hooks its synthesizer's entry points at
+function entry. Each hook calls `recomp3ds_synth_hook(rdram, ctx, code)` and
+does nothing on the desktop:
+
+```toml
+[[patches.hook]]
+func = "alSynSetVol"          # n_alSynSetVol in n_audio games
+text = """
+#ifdef __3DS__
+    { extern void recomp3ds_synth_hook(uint8_t*, void*, int); recomp3ds_synth_hook(rdram, ctx, 3); }
+#endif
+"""
+```
+
+| code | libaudio | n_audio |
+|---|---|---|
+| 0 | `alSynStartVoice(s, v, w)` | `n_alSynStartVoice(v, w)` (DK64 has none) |
+| 1 | `alSynStartVoiceParams(s, v, w, pitch, vol, pan, fx, t)` | `n_alSynStartVoiceParams(v, w, pitch, vol, pan, fx, t)` (DK64: three more before t) |
+| 2 | `alSynStopVoice` | `n_alSynStopVoice` |
+| 3 | `alSynSetVol` | `n_alSynSetVol` |
+| 4 | `alSynSetPitch` | `n_alSynSetPitch` |
+| 5 | `alSynSetPan` | `n_alSynSetPan` |
+| 6 | `alSynSetFXMix` | `n_alSynSetFXMix` |
+| 7 | `alAudioFrame` | `n_alAudioFrame` |
+
+`GameDesc.synth` is a `SynthDesc`. `desc.synth = recomp3ds::SynthFlavor::Libaudio`
+(or `NAudio`) gives that flavor's stock layout; fields a game's build moved
+are set after it:
+
+| field | default | set by |
+|---|---|---|
+| `synth_global` | — | n_audio: the address of `n_syn` (Banjo 0x80276E84, DK64 0x807563E4) |
+| `param_samples`, `cur_samples`, `aux_bus` | 0x1C, 0x20, 0x34 | Banjo: 0x28, 0x2C, 0x40 (Rare's three player slots move the fields 0xC) |
+| `param_list`, `lame_list` | 0x2C, 0x14 | Banjo: 0x38, 0x20 |
+| `pvoice_offset` | libaudio 0xD8, n_audio 0x88 | the physical voice's steal delay |
+| `start_t_stack` | libaudio 28, n_audio 24 | DK64: 36 |
+| `fx`, `fx_lowpass` | `Embedded` / `Pointer`, true | DK64: `SynthFx::Dk64`, false |
+| `sound_modes` | 0 | DK64: 0x807FF0F0 (mono and headphones move pan) |
+
+What the synthesizers turned out to do, from their compiled code:
+- libaudio's envelope mixer **squares** the volume (`vol * vol >> 15`) and
+  ramps exponentially; n_audio's takes it as given and ramps linearly.
+  Getting this wrong was 6 dB too loud.
+- StartVoiceParams' last argument is the volume's ramp time **from
+  silence**, not a start delay. A plain start keeps the volume the voice
+  had; games set the attack before the start and the decay after it.
+- Every call is stamped with `paramSamples` plus the physical voice's steal
+  delay. Channels are keyed by the physical voice (`ALVoice + 8`), and a
+  call on a voice without one does nothing, as in the game. A start from
+  another voice on the same physical voice is a steal: the old sound fades
+  first, which no hooked call reports.
+- Loops resume at frame `loop.start / 16 + 1` from the loop's saved state.
+- Voices can live above the console's 8 MB (Banjo's do): pointer checks use
+  the runtime's RDRAM size.
+
+**The command list.** The frame function still builds a command list the
+skipped task would run: for Goemon that was 16-31 % of core 0 at the Old
+clock, all 16 voices pulled every frame. A second hook, where the frame
+function has run the players' handlers (`paramSamples &= ~0xF`) and is
+about to enter `while (outLen > 0)`, calls
+`recomp3ds_synth_skip_build(rdram, synth or 0, samples left, list end)`.
+When that returns non-zero, it has taken the frame's updates as the
+envelope mixers would have (stops reset the voice, frees move it to the
+lame list, the updates go back to the free list) and moved `curSamples` on.
+The hook then sets the samples left to 0 and moves the list's end past the
+one command written there. The list must not be empty: Goemon's audio
+manager takes an empty list for no task and then never hands the frame's
+buffer to the AI, whose clock the DSP's events keep (silence).
+
+| game | `before_vram` | synthesizer | samples left | list end |
+|---|---|---|---|---|
+| Goemon | 0x80047B40 | s1 | s3 | s4 |
+| Banjo | 0x8025C974 | 0 (`n_syn`) | s3 | s6 |
+| DK64 | 0x80739B90 | 0 (`n_syn`) | `MEM_W(0x4C, sp)` | `MEM_W(0x34, sp)` |
+
+N64Recomp emits a hook after the branch label at its address, so both paths
+into the build loop run it.
+
+Checking a game's synth:
+- The `dsp-synth ...` log line (a line of its own each second: the log cuts
+  lines at 512 characters) reports:
+  - playing channels, starts and events;
+  - the decoding thread's `busy` time;
+  - `starved` (a channel ran dry) and `ms late` (events applied after their
+    time), both 0;
+  - `remaps` (the AI clock jumped), 0;
+  - `callbacks` (about 204.5 a second);
+  - `lists skipped`, which equals the game's audio frames per second.
+- `DSP_SYNTH_TRACE.TXT` beside the executable (the number of seconds inside)
+  logs every event with its time and arguments.
+- Compare loudness and timing with the RSP engine by recording Azahar's own
+  audio stream: `pw-dump` gives the stream's `object.serial`, and
+  `pw-record --target <serial>` records it.
+
+Not done:
+- **Reverb.** libctru's ndsp stores an aux callback but never calls it, and
+  never moves the aux bus's samples between the DSP and the CPU. An enabled
+  bus mixes its raw sends back into the output. `dsp_reverb.cpp` keeps a
+  working effect engine (libaudio and n_audio's sections, with DK64's
+  layout) behind `kAuxReturn = false`, and `REVERB_OFF.TXT` is its A/B
+  switch.
+- **Sample-accurate starts.** Events land on DSP frames (4.9 ms).
+- **More channels.** There are 23 voice channels; Banjo's 24 and DK64's 30
+  physical voices share them, the least recently used going first.
+
+Measured at the Old clock (Goemon): the audio task's 400-700 ms/s on core 1
+is gone, the synth costs 8-16 % of core 1, and the audio thread's share of
+core 0 dropped from 16-31 % to the game's own sequencer.
+
+## CPU budget (Old 3DS)
+
+The **CPU speed** row runs a New 3DS at 268 MHz without L2 (the Old 3DS
+clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
+
+- **Where the time goes.** The stats line reports:
+  - `core0` / `core2` loads;
+  - `ucode ... ms/s` (the audio task);
+  - the renderer's `interp` and `replay` per frame (its frame line);
+  - per N64 thread, `threads IDLE / MAIN / SCHED / AUDIO / GAME` (nmr 0023,
+    `ultramodern::get_thread_loads`). IDLE there is slack (pause_self), not
+    CPU.
+
+  `PROFILE.TXT` adds the renderer's split by command kind. The touch
+  screen shows frames and each core's load. settings.ini's `debug_rows=1`
+  adds the thread shares and the audio rows. loadmon's calibrations follow
+  the CPU speed row's clock: 268 and 804 MHz, exactly 1:3.
+- **Logging.** settings.ini's `log_level` (log.cpp) has three levels:
+  - 2, the New 3DS default: everything.
+  - 1: no renderer reports or late-frame lines, and the stats and synth
+    lines only every 10 s.
+  - 0, the Old 3DS default: boot, warnings and exit only.
+
+  Each line costs a debug-string syscall, a copy and its share of the card
+  writes on core 0; `PROFILE.TXT` costs far more (about 18 % in Goemon).
+  Azahar buffers its own log and loses the tail when azahar-run.sh kills
+  it, so at low levels read the game's `log.txt` instead.
+- **32-bit registers.** `add_compile_definitions(RECOMP_GPR32=1)` (n64recomp
+  0004, nmr 0022) keeps the N64 registers 32-bit when the generated code
+  never needs 64; `rt64_3ds_check_gpr32(<generated dirs>)` fails the
+  configure step if it does. About 10 % less core-0 time in Goemon. DK64's
+  code uses 64-bit operations. Banjo has three hand-written MIPS III
+  functions (an 8-byte copy, an 8-byte fill, the checksum's shift register).
+  Its 3DS build stubs them in the game's recompilation (Makefile
+  `GPR32_STUBS`) and replaces them with 32-bit patches
+  (`patches/gpr32_patches.c`); its executable shrank by 18 %. Mods baked into
+  the build are compiled with the same definition, so the context layout
+  agrees; scan their generated code too.
+- **Preemption.** ultramodern delivers external messages (retraces, task
+  completions) only inside a message call or the idle thread. A game thread
+  computing for long held the scheduler and the audio thread back, and at
+  the Old clock Goemon lost half its audio frames. nmr 0025 raises
+  `ultramodern_preempt_pending`; Goemon's `TRACE_ENTRY` (include/trace.h,
+  run at every function's entry) tests it and calls `ultramodern_preempt`.
+  A game without such a hook needs the recompiler to emit the check.
+- **Freezes.** `stall_watch.cpp` runs above the game on core 0. It logs
+  `recomp3ds: STALL` with the game thread holding the core when the main
+  thread stops for 3 s. It also writes a red `STOPPED:` line at the bottom
+  of the touch screen while the main thread, the frames, or the log's card
+  write (`log_write_stuck_ms`) have stopped for 3 s, so a freeze the log
+  can't record still leaves something to photograph. If that line doesn't
+  appear and the status line freezes too, the whole console stopped.
+- **Timers.** ultramodern's timer thread runs above the game threads on
+  the game core. It used to order its timers by each OSTimer's own
+  timestamp, which `osSetTimer` rewrites at once. A game that restarts a
+  timer the thread still holds (Banjo, every frame) could corrupt the set
+  and leave the thread firing one timer forever: core 0 at 100%, game, main
+  thread and log writer starved, freezes after seconds to minutes. nmr patch
+  0029 gives the thread its own copy of each timer. Re-run `apply.sh` on
+  every game's runtime.
+- **ROM.** `rom_stream` (settings.ini: 0 auto, 1 in memory, 2 from the SD
+  card) streams the ROM through a 2 MB cache of 32 KB blocks. Auto streams
+  on an Old 3DS or when the heap is short. Every ROM read the runtime makes
+  goes through it.
+- **Cores.**
+  - On a New 3DS: game threads on core 0, the renderer on core 2, and the
+    audio task, the DSP synth's thread and the in-between builder on core 1.
+  - On an Old 3DS (no core 2) the game goes to core 1, and the renderer,
+    the audio task and the DSP synth to core 0, the core the system does not
+    share. The renderer is the larger load. Goemon at the Old clock with two
+    cores: 17.5 fps with the renderer squeezed into core 1's share, 24.4
+    swapped (three cores: 26.9).
+  - With two cores, `GameDesc::two_cores_game_on_core0` puts the game on
+    core 0 (whole) and the renderer, audio task and synth on core 1 (its
+    80 %). The larger load should get core 0: Goemon's renderer (off), but
+    Banjo's game (on), whose core was full at the Old clock.
+  - `GameDesc::two_cores_read_on_game_core` (with the game on core 0): each
+    display list's read, up to "parsed", runs on a reader thread on core 0
+    while the gfx thread on core 1 waits, then the gfx thread draws it
+    (`Settings::read_core`). It suits a game that waits on "parsed" every
+    frame (Banjo's `game_draw`): its frame is its own work plus the read, and
+    core 0 is idle during the read anyway. Banjo at the Old clock, both
+    layouts over about 17 minutes each: the same frame rate (16.3 and 16.1
+    lists a second where the game asks 20), because the read took 26 ms on
+    core 1 against about 21 on core 0. But with the game on core 1 the game made
+    only 90 % of its audio and underran 3361 times, against 98 % and 631.
+    The reader flushes the vertices it wrote from its own core. `READER_OFF.TXT`
+    keeps the read on the gfx thread. A game that does not wait on "parsed"
+    should leave it off: there the read on core 1 runs beside the game.
+    With the reader on core 0 (2026-10-07), Banjo got 16.8 and 19.2 lists a
+    second (from 16.3 and 18.7), core 0 at 95 % and core 1 at 35 %. The read
+    took 21 ms on core 0. At first the reader ran above the game's threads.
+    Banjo's audio thread then waited out each read, the game made 95 % of its
+    audio and it underran three times as often. So the reader now runs just
+    below them (`Settings::read_priority`, 0x31), as they ran beside the read
+    on core 1. It hands the list to the gfx thread before it sends "parsed";
+    otherwise the main thread, woken by "parsed", would hold the reader until
+    its next wait.
+  - With the reader, the triangles' output is deferred
+    (`Interpreter::set_defer_triangles`). The read logs every loaded vertex
+    and records each triangle of a plain record as three log entries, with
+    one run of state per record and `state_seq`. Then `finish_triangles`
+    runs on the gfx thread (core 1) after "parsed": culling, texel
+    coordinates, clipping and the vertices. Records that map their texel
+    coordinates (onto an image, a frame, a snapshot or a render texture) are
+    output in the read as before. It is off with `merge_image_tiles`, whose
+    compaction renumbers the records. On the host, Banjo's read got about
+    20 % shorter. `DL_DEFER=1` makes `dl_test` defer: the dumps and
+    in-betweens match without it. `TRIS_ON_READER.TXT` keeps the output in
+    the read.
+  - The vertex loads are deferred too. The read copies each vertex's 16 RDRAM
+    bytes and records its load's context: the matrix, texture scales and fog
+    terms, plus for a lit load its lighting (light directions and colours,
+    ambient, look-at, kept once while it stays the same). A vertex is
+    transformed, lit and fogged when something first uses it
+    (`Defer::resolve`). On the reader that means records output in the read,
+    vertex edits and the list's last 64 slots. `G_BRANCH_Z` computes the
+    depth alone. Everything else waits for `finish_triangles`. Both paths
+    share one inline function (`shade_vertex`), so results are
+    bit-identical (`dl_test DL_DEFER=1` against `DL_DEFER=tris` and no
+    deferral). It stays off while frame interpolation records the list,
+    which needs the lit colours then. `VERTS_ON_READER.TXT` keeps the
+    transforms in the read.
+  - The gfx thread does the deferred output while the read is still going
+    (`Interpreter::drain_triangles`). It would otherwise sit idle, and each
+    list goes through it in order: read wait, output, drawing. When that
+    sum outgrew the game's frame on Banjo, the next list waited for the
+    thread (9.7 ms a late frame), and moving the vertices made it 1 %
+    slower. The reader publishes every 128 triangles: the counts are stored
+    with release ordering and loaded with acquire, and a callback signals a
+    `LightEvent`. The deferral's arrays have a fixed size (about 6.5 MB,
+    made once) so nothing moves while both threads use them; when one is
+    full, a load is transformed in the read or a triangle is dropped. The
+    output goes to `Defer::out` and is copied after the frame's own
+    vertices at the end. A vertex both threads resolve is computed twice to
+    the same values, and its done flag goes up after the write.
+    `dl_test DL_DEFER=1 DL_DEFER_THREAD=1` reads on a second thread: dumps
+    identical, and ThreadSanitizer (`libtsan`) reports nothing. With the
+    orderings made relaxed it reports 63 races.
+  - Banjo at the Old clock, timed over the attract demos (frame-locked:
+    each demo between two jiggy transitions is the same lists in every run,
+    and whole-loop totals repeat to 0.2 %): 17.94 lists a second with the
+    game on core 0 and no reader; 18.41 with the reader; 18.91 with the
+    triangles' output on core 1; 18.73 adding the vertices; 19.40 with the
+    output drained during the read (+8.2 %). `-Os` game code gained
+    nothing. `PROFILE.TXT` reads the clock once per command, about 1.5 us
+    at the Old clock (16 % fewer frames), and most of that lands on
+    triangles, the most numerous commands.
+  - The Game page's **Cores** row (Auto / "2, game on 1" / "2, game on 0", key `cores`,
+    read at start) gives a New 3DS the Old 3DS's layout, to test it on one.
+    The renderer's in-between builder (core 1) is off without core 2
+    (`Settings::no_core2`), and the stats line then watches `core1` instead
+    of `core2`.
+  - Core 1 time: rt64-3ds asks for 80 % and steps down until the process
+    manager agrees (it refuses more than the exheader's MaxCpu). A New 3DS
+    accepted 90 without an error, as a CIA and as a `.3dsx`, and stayed at
+    80, so 80 is the ceiling.
+  - New 3DS core 3: a `.3dsx` from the Homebrew Launcher could create
+    threads there (2026-10-03). loadmon's idle thread got 74 % of core 0's
+    count on it, about core 1's share (76 %), and the system used 3-4 %
+    during play. Nothing runs there yet. A boot-log line records whether
+    the application was allowed.
 
 ## Mods
 

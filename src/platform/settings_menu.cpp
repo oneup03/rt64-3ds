@@ -33,7 +33,6 @@
 #include "rt64_3ds.h"
 #include "recomp3ds.h"
 #include "recomp3ds_internal.h"
-#include "aspmain_hle.h"
 #ifdef RECOMP_STATIC_MODS
 #include "librecomp/mods.hpp"
 #endif
@@ -106,17 +105,29 @@ int g_cpu_new = 1;
 const char* const kCpuNames[] = { "Old 3DS", "New 3DS" };
 void apply_cpu(int v) { recomp3ds::set_cpu_speed(v != 0); }
 
+// An Old 3DS's layout on a New 3DS (read at start; recomp3ds_run.cpp):
+// core 2 left unused, the game on core 1 and the rest on core 0, or the
+// other way round. Auto: three cores on a New 3DS, and on an Old 3DS the
+// game's own choice (GameDesc::two_cores_game_on_core0).
+const char* const kCoresNames[] = { "Auto", "2, game on 1", "2, game on 0" };
+int g_cores = 0;
+// settings.ini only: the touch screen's game-thread shares and audio rows.
+int g_debug_rows = 0;
+// settings.ini only: how much goes to log.txt (log.cpp), less on an Old 3DS.
+int g_log_level = 2;
+void apply_log_level(int v) { recomp3ds::log_set_level(v); }
+
 // Audio on or off: off skips the audio microcode, which the CPU runs here,
 // for speed (an Old 3DS).
 int g_audio_on = 1;
 const char* const kAudioNames[] = { "Off", "On" };
 void apply_audio(int v) { recomp3ds::audio_set_enabled(v != 0); }
-// The aspMain interpreter's low quality (aspmain_hle.h): half-rate synthesis
-// without the reverb, about a quarter less of its time. The default on an
-// Old 3DS.
-int g_audio_quality = 1;
-const char* const kAudioQualityNames[] = { "Low", "Full" };
-void apply_audio_quality(int v) { recomp3ds::aspmain_hle_set_low_quality(v == 0); }
+// Where the game's voices are made (GameDesc::synth): the DSP (dsp_synth.h),
+// or with settings.ini's audio_engine=0 the audio task (its microcode,
+// interpreted on the CPU). Not in the menu.
+int g_audio_engine = 1;
+const char* const kAudioEngineNames[] = { "RSP", "DSP" };
+void apply_audio_engine(int v) { recomp3ds::dsp_synth_set_enabled(v == 1); }
 
 // The frame cap (rt64_3ds::Settings::frame_cap): the game's own rate, or at
 // most 30 drawn frames a second while it asks for more (the game and its
@@ -588,9 +599,13 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
     if (is_new_3ds) add_row({ "cpu_speed", "CPU speed", 0, 1, &g_cpu_new, kCpuNames, false, nullptr, apply_cpu, PageGame, 1, nullptr });
-    if (desc.audio_hle && desc.audio_hle_family == recomp3ds::AudioHle::Aspmain) {
-        g_audio_quality = is_new_3ds ? 1 : 0;
-        add_row({ "audio_quality", "Audio quality", 0, 1, &g_audio_quality, kAudioQualityNames, false, nullptr, apply_audio_quality, PageGame, 1, nullptr });
+    add_row({ "cores", "Cores (at restart)", 0, 2, &g_cores, kCoresNames, false, nullptr, nullptr, PageGame, 1, nullptr });
+    add_row({ "debug_rows", "Debug rows", 0, 1, &g_debug_rows, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    g_log_level = is_new_3ds ? 2 : 0;
+    add_row({ "log_level", "Log level", 0, 2, &g_log_level, nullptr, false, nullptr, apply_log_level, recomp3ds::PageCount, 1, nullptr });
+    if (desc.synth.flavor != recomp3ds::SynthFlavor::None) {
+        // settings.ini only (audio_engine=0 runs the audio task as before).
+        add_row({ "audio_engine", "Audio engine", 0, 1, &g_audio_engine, kAudioEngineNames, false, nullptr, apply_audio_engine, recomp3ds::PageCount, 1, nullptr });
     }
     // The game's defaults, then what settings.ini holds.
     for (size_t d = 0; d < desc.menu_default_count; d++) {
@@ -610,6 +625,8 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
 }
 
 int recomp3ds::settings_rom_stream() { return g_rom_stream; }
+int recomp3ds::settings_cores() { return g_cores; }
+bool recomp3ds::settings_debug_rows() { return g_debug_rows != 0; }
 bool recomp3ds::settings_debug_capture() { return g_debug_capture != 0; }
 
 void recomp3ds::settings_menu_toggle() {

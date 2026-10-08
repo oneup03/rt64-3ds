@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <thread>
 #include <vector>
 
 #include "rt64_3ds_dl.h"
@@ -54,11 +56,33 @@ int main(int argc, char** argv) {
     // (DL_PREROLL=0: not; DL_PREROLL=1 without image tiles too).
     const bool image_tiles = getenv("DL_IMAGE_TILES") != nullptr;
     if (image_tiles) interp.set_merge_image_tiles(true);
+    // DL_DEFER: deferred triangles (Interpreter::set_defer_triangles, the
+    // console's reader on another core): every run is followed by
+    // finish_triangles, as the renderer does.
+    // DL_DEFER=tris: the triangles alone, the vertices transformed in the read.
+    const bool defer = getenv("DL_DEFER") != nullptr;
+    if (defer) interp.set_defer_triangles(true, strcmp(getenv("DL_DEFER"), "tris") != 0);
+    // DL_DEFER_THREAD (with DL_DEFER): run on a second thread while this one
+    // drains the triangles it publishes, as the console's reader and gfx
+    // thread do.
+    const bool defer_thread = defer && getenv("DL_DEFER_THREAD") != nullptr;
+    auto run_list = [&](uint32_t data_ptr, rt64_3ds::FrameRecord& f) {
+        bool r = false;
+        if (defer_thread) {
+            std::atomic<bool> ran{ false };
+            std::thread reader([&] { r = interp.run(data_ptr, f); ran.store(true, std::memory_order_release); });
+            while (!ran.load(std::memory_order_acquire)) interp.drain_triangles();
+            reader.join();
+        }
+        else r = interp.run(data_ptr, f);
+        interp.finish_triangles(f);
+        return r;
+    };
     rt64_3ds::FrameRecord frame;
     const char* preroll_env = getenv("DL_PREROLL");
     const bool preroll = preroll_env != nullptr ? atoi(preroll_env) != 0 : image_tiles;
     if (preroll) {
-        interp.run(task.t.data_ptr, frame);
+        run_list(task.t.data_ptr, frame);
         interp.note_presented_framebuffer(frame.color_image);
         frame.clear();
     }
@@ -75,7 +99,7 @@ int main(int argc, char** argv) {
     }
     // DL_EXTRA_RUNS=n: run the list n more times first (to compare the state
     // a pass_over leaves with what full runs leave).
-    if (const char* e = getenv("DL_EXTRA_RUNS")) for (int i = 0; i < atoi(e); i++) { frame.clear(); interp.run(task.t.data_ptr, frame); }
+    if (const char* e = getenv("DL_EXTRA_RUNS")) for (int i = 0; i < atoi(e); i++) { frame.clear(); run_list(task.t.data_ptr, frame); }
     frame.clear();
     // DL_INTERP: frame interpolation (RenderDesc::frame_interpolation). The
     // list is run once as the frame before, then as this one, and then as
@@ -96,7 +120,7 @@ int main(int argc, char** argv) {
             cur_rdram = rdram;
             if (fread(rdram.data(), 1, mem, pf) != mem) { fprintf(stderr, "short rdram in %s\n", prev); return 2; }
             fclose(pf);
-            interp.run(ptask.t.data_ptr, before);
+            run_list(ptask.t.data_ptr, before);
             if (const char* out = getenv("DL_PREV_RENDER")) {
                 RefOptions o;
                 o.geo = geo;
@@ -105,10 +129,10 @@ int main(int argc, char** argv) {
             }
             memcpy(rdram.data(), cur_rdram.data(), mem);
         }
-        else interp.run(task.t.data_ptr, before);
+        else run_list(task.t.data_ptr, before);
         interp.note_presented_framebuffer(before.color_image);
     }
-    bool present = interp.run(task.t.data_ptr, frame);
+    bool present = run_list(task.t.data_ptr, frame);
     // DL_INTERP_WEIGHT: the in-between's weight (default 0.5, a 30 fps
     // game frame's one in-between; 1/3 and 2/3 at 20 fps).
     const float interp_weight = getenv("DL_INTERP_WEIGHT") ? (float)atof(getenv("DL_INTERP_WEIGHT")) : 0.5f;
@@ -277,6 +301,36 @@ int main(int argc, char** argv) {
                    std::chrono::duration<double, std::milli>(b2 - b1).count() / n);
         }
     }
+    // DL_RUN_BENCH: the list's run on its own (what the game waits for, to
+    // "parsed"), with the interpolation records (DL_INTERP) or without.
+    if (getenv("DL_RUN_BENCH")) {
+        const int n = 50;
+        rt64_3ds::FrameRecord r;
+        auto b0 = std::chrono::steady_clock::now();
+        double fin = 0.0;
+        for (int i = 0; i < n; i++) {
+            r.clear();
+            interp.run(task.t.data_ptr, r);
+            auto f0 = std::chrono::steady_clock::now();
+            interp.finish_triangles(r);
+            fin += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
+        }
+        auto b1 = std::chrono::steady_clock::now();
+        printf("bench: run %.3f ms, of it finish_triangles %.3f ms (host, interpolation %s, deferred %s)\n",
+               std::chrono::duration<double, std::milli>(b1 - b0).count() / n, fin / n, interp_test ? "on" : "off", defer ? "on" : "off");
+        // DL_PROFILE: the runs' time by kind of command (Interpreter::set_profile).
+        if (getenv("DL_PROFILE")) {
+            interp.clear_profile();
+            interp.set_profile(true);
+            for (int i = 0; i < n; i++) { r.clear(); interp.run(task.t.data_ptr, r); interp.finish_triangles(r); }
+            interp.set_profile(false);
+            static const char* const kinds[] = { "vertices", "triangles", "matrices", "texture loads", "rects", "list flow", "extended", "other" };
+            const uint64_t* pr = interp.stats().prof;
+            printf("profile per run (host):");
+            for (int k = 0; k < rt64_3ds::InterpreterStats::kProfKinds; k++) printf(" %s %.3f", kinds[k], (double)pr[k] / 1e6 / n);
+            printf(" ms\n");
+        }
+    }
     const rt64_3ds::InterpreterStats& st = interp.stats();
     printf("task data_ptr %08x: fullsync %d, %zu draws, %zu verts, %u commands, %u tris, %u rects, unknown %u ex %u, unresolved tex %u\n",
            task.t.data_ptr, (int)present, frame.draws.size(), frame.verts.size(), st.commands, st.tris, st.rects, st.unknown, st.ex_unknown, st.tex_unresolved);
@@ -326,6 +380,14 @@ int main(int argc, char** argv) {
             if (d.tex[0].frame || d.tex[1].frame) fprintf(o, "  frame %d/%d\n", (int)d.tex[0].frame, (int)d.tex[1].frame);
             if (d.tex[0].wrap_rows || d.tex[1].wrap_rows) fprintf(o, "  wrap rows %u/%u\n", d.tex[0].wrap_rows, d.tex[1].wrap_rows);
             if (d.proj_inst) fprintf(o, "  projection instance %u\n", d.proj_inst);
+            if (d.tex[0].levels > 1) {
+                fprintf(o, "  mip levels %u:", d.tex[0].levels);
+                for (uint32_t k = 1; k < d.tex[0].levels; k++) {
+                    const auto& m = frame.mips[d.tex[0].mip_index + k - 1];
+                    fprintf(o, " %x %ux%u", m.addr, m.width, m.height);
+                }
+                fprintf(o, "\n");
+            }
         }
         for (size_t i = 0; i < frame.verts.size(); i++) {
             const auto& v = frame.verts[i];
@@ -398,7 +460,7 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < iterations; i++) {
         frame.clear();
-        interp.run(task.t.data_ptr, frame);
+        run_list(task.t.data_ptr, frame);
     }
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iterations;

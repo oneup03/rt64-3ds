@@ -92,7 +92,30 @@ struct TexDesc {
     bool block = false;
     uint16_t dxt = 0;
     uint16_t load_word = 0;
+    // Mipmaps (lod_trilerp): the PICA texture's levels, the base included
+    // (1 = none), and where the sources of the others sit in
+    // FrameRecord::mips (levels - 1 of them, each half the one before).
+    uint8_t levels = 1;
+    uint32_t mip_index = 0;
 };
+
+// The RDP's mipmapping as games use it: LOD on (G_TL_LOD) in 2-cycle mode
+// without detail or sharpen textures, the first cycle's colour lerping
+// TEXEL0 to TEXEL1 (the next level's tile) by LOD fraction, its alpha doing
+// the same or reading neither, the second cycle reading no TEXEL1. The
+// PICA's mipmap filter blends the levels itself: the combiner reads TEXEL1
+// as TEXEL0 (the lerp falls away) and no second texture is sampled.
+inline bool lod_trilerp(uint32_t w0, uint32_t w1, uint32_t othermode_h) {
+    if ((othermode_h & 0x10000) == 0 || ((othermode_h >> 20) & 3) != 1 || ((othermode_h >> 17) & 3) != 0) return false;
+    const uint32_t a0 = (w0 >> 20) & 0xF, c0 = (w0 >> 15) & 0x1F, b0 = (w1 >> 28) & 0xF, d0 = (w1 >> 15) & 7;
+    if (a0 != 2 || b0 != 1 || c0 != 13 || d0 != 1) return false;
+    const uint32_t Aa0 = (w0 >> 12) & 7, Ac0 = (w0 >> 9) & 7, Ab0 = (w1 >> 12) & 7, Ad0 = (w1 >> 9) & 7;
+    const bool alpha_lerp = Aa0 == 2 && Ab0 == 1 && Ac0 == 0 && Ad0 == 1;
+    if (!alpha_lerp && (Aa0 == 2 || Ab0 == 2 || Ac0 == 2 || Ad0 == 2)) return false;
+    const uint32_t a1 = (w0 >> 5) & 0xF, c1 = w0 & 0x1F, b1 = (w1 >> 24) & 0xF, d1 = (w1 >> 6) & 7;
+    const uint32_t Aa1 = (w1 >> 21) & 7, Ac1 = (w1 >> 18) & 7, Ab1 = (w1 >> 3) & 7, Ad1 = w1 & 7;
+    return a1 != 2 && b1 != 2 && c1 != 2 && c1 != 9 && d1 != 2 && Aa1 != 2 && Ab1 != 2 && Ac1 != 2 && Ad1 != 2;
+}
 
 // One draw of triangles or a rectangle with a snapshot of the RDP state that
 // matters for the PICA.
@@ -147,6 +170,7 @@ struct FrameRecord {
     VtxArray verts;
     std::vector<DrawRecord> draws;
     std::vector<uint16_t> tlut;         // palettes referenced by draws, 256 entries each
+    std::vector<TexDesc> mips;          // mipmap levels past the base (TexDesc::mip_index)
     bool has_fullsync = false;
     bool snapshot_request = false;      // copy the last presented frame before drawing this one
     uint32_t color_image = 0, color_width = 0, depth_image = 0;
@@ -174,6 +198,7 @@ struct FrameRecord {
         verts.swap(o.verts);
         draws.swap(o.draws);
         tlut.swap(o.tlut);
+        mips.swap(o.mips);
         std::swap(has_fullsync, o.has_fullsync);
         std::swap(snapshot_request, o.snapshot_request);
         std::swap(color_image, o.color_image);
@@ -193,6 +218,7 @@ struct FrameRecord {
         verts.clear();
         draws.clear();
         tlut.clear();
+        mips.clear();
         has_fullsync = false;
         snapshot_request = false;
         has_cam = false;

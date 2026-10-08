@@ -19,6 +19,7 @@
 #include "recomp3ds.h"
 #include "recomp3ds_internal.h"
 #include "naudio_hle.h"
+#include "dsp_synth.h"
 #include "aspmain_hle.h"
 #include "audio_hle_diff.h"
 
@@ -66,7 +67,9 @@ RspExitReason audio_off_ucode(uint8_t*, uint32_t) {
 }
 
 RspUcodeFunc* timed_get_ucode(const OSTask* task) {
-    if (task->t.type == M_AUDTASK && !recomp3ds::audio_enabled()) {
+    // Audio off, or the voices on the DSP (dsp_synth.h): the task does nothing
+    // and the AI stream carries silence, at the usual rate.
+    if (task->t.type == M_AUDTASK && (!recomp3ds::audio_enabled() || recomp3ds::dsp_synth_enabled())) {
         return audio_off_ucode;
     }
     RspUcodeFunc* f = g_game_get_ucode(task);
@@ -126,25 +129,43 @@ extern "C" void (*__system_retAddr)(void);   // libctru: set by aptExit to finis
 const recomp3ds::GameDesc* g_desc = nullptr;
 int g_sp_core = 2;
 int g_gfx_core = 2;                     // core 1 or 0 on an Old 3DS, which has no core 2
+int g_game_core = 0;                    // the N64 threads (the Cores row's "game on 1": core 1)
+int g_helper_core = 0;                  // the DSP synthesizer's decoding thread
+unsigned g_watch_cores = 1;             // the cores loadmon watches (bit n: core n)
+bool g_core3 = false;                   // a New 3DS lets the application run threads on core 3
+bool g_core1_granted = false;           // the system gives the application time on core 1
+volatile int g_main_stage = 0;          // recomp3ds::main_stage
 
 // Thread placement: game code on core 0, renderer on core 2 (on an Old 3DS
 // core 1 when the system grants time there, else 0), the audio task on
 // g_sp_core (core 1 when the system grants time there), pacing threads
-// above the game so their sleeps wake it.
+// above the game so their sleeps wake it, on its core. The Cores row's
+// "game on 1" swaps: the game on core 1, everything else on core 0.
 ultramodern::HostThreadSpec host_thread_spec(ultramodern::HostThreadKind kind) {
     using K = ultramodern::HostThreadKind;
     switch (kind) {
         case K::GameStart:
-        case K::Game:    return { 128 * 1024, 0x30, 0 };
+        case K::Game:    return { 128 * 1024, 0x30, g_game_core };
         case K::Gfx:     return { 256 * 1024, 0x2C, g_gfx_core };
         case K::SpTask:  return { 64 * 1024, 0x24, g_sp_core };
         case K::Vi:
-        case K::Timer:   return { 32 * 1024, 0x28, 0 };
-        default:         return { 32 * 1024, 0x30, 0 };
+        case K::Timer:   return { 32 * 1024, 0x28, g_game_core };
+        default:         return { 32 * 1024, 0x30, g_game_core };
     }
 }
 volatile bool g_exit_requested = false;
 void (*g_game_on_init)(uint8_t* rdram, recomp_context* ctx) = nullptr;
+
+}   // namespace
+
+int recomp3ds::helper_core() { return g_helper_core; }
+int recomp3ds::main_stage() { return g_main_stage; }
+const char* recomp3ds::main_stage_name(int stage) {
+    static const char* const kNames[] = { "sleep", "pad", "flush", "motion", "home", "select", "report", "watchdog", "apt" };
+    return stage >= 0 && stage < 9 ? kNames[stage] : "?";
+}
+
+namespace {
 
 void* create_gfx() { return nullptr; }
 
@@ -170,7 +191,9 @@ ultramodern::renderer::WindowHandle create_window(void*) {
     // when FS is torn down below.
     rt64_3ds::capture_stop(1500);
     recomp3ds::log_flush();
+    recomp3ds::stall_watch_stop();
     recomp3ds::loadmon_stop();
+    recomp3ds::dsp_synth_shutdown();
     recomp3ds::audio_shutdown();
     gfxExit();
     osSetSpeedupEnable(false);             // hand the system back at the clock it had
@@ -252,12 +275,19 @@ bool home_prompt() {
 void update_gfx_inner();
 void update_gfx(void*) {
     update_gfx_inner();
+    g_main_stage = 0;
     if (!g_exit_requested) svcSleepThread(15 * 1000000ll);
 }
 
 void update_gfx_inner() {
+    recomp3ds::stall_watch_beat();      // the main thread ran (stall_watch.cpp)
+    g_main_stage = 1;
     recomp3ds::settings_menu_update();  // scans the pad
+    g_main_stage = 2;
+    recomp3ds::screen_flush();
+    g_main_stage = 3;
     recomp3ds::input_motion_update();
+    g_main_stage = 4;
     // HOME opens the quit prompt (above) rather than the HOME Menu.
     if (!g_home_trapped) {
         aptSetHomeAllowed(false);
@@ -266,6 +296,7 @@ void update_gfx_inner() {
     if (!g_exit_requested && (aptCheckHomePressRejected() || recomp3ds::autotest_take_home())) {
         if (home_prompt()) g_exit_requested = true;
     }
+    g_main_stage = 5;
     {
         // SELECT (the game has no use for it): a tap opens or closes the
         // settings menu; held for a second it saves a screenshot (with
@@ -314,6 +345,7 @@ void update_gfx_inner() {
         }
         shown_shot = shot;
     }
+    g_main_stage = 6;
     // Once a second: frame rate and CPU load to the log and the touch screen.
     static u64 last_report = 0;
     u64 now = svcGetSystemTick();
@@ -323,8 +355,8 @@ void update_gfx_inner() {
     else if (now - last_report >= SYSCLOCK_ARM11) {
         const u64 interval = now - last_report;
         last_report = now;
-        int busy0 = -1, busy2 = -1;
-        recomp3ds::loadmon_sample(&busy0, &busy2);
+        const int busy0 = recomp3ds::loadmon_sample(0), busy1 = recomp3ds::loadmon_sample(1);
+        const int busy2 = recomp3ds::loadmon_sample(2), busy3 = recomp3ds::loadmon_sample(3);
         const rt64_3ds::FrameStats& st = rt64_3ds::stats();
         // Audio microcode cost over the last second: ms of CPU and task count.
         unsigned ucode_ms = (unsigned)(g_ucode_ticks * 1000 / SYSCLOCK_ARM11);
@@ -441,6 +473,15 @@ void update_gfx_inner() {
             memcpy(prev, loads, n * sizeof(loads[0]));
             prev_n = n;
         }
+        char dsp_stats[256] = "";
+        if (recomp3ds::dsp_synth_enabled()) {
+            const recomp3ds::DspSynthStats ds = recomp3ds::dsp_synth_take_stats();
+            snprintf(dsp_stats, sizeof(dsp_stats), " dsp-synth %lu playing, %lu starts, %lu events, busy %lu us (decode %lu, events %lu), %lu starved, %lu ms late, %lu remaps, %lu callbacks, %lu ndsp-dropped, reverb %lu us %lu gaps, %lu lists skipped",
+                     (unsigned long)ds.playing, (unsigned long)ds.starts, (unsigned long)ds.events, (unsigned long)ds.decode_us,
+                     (unsigned long)ds.decode_only_us, (unsigned long)ds.apply_us, (unsigned long)ds.starved, (unsigned long)ds.late,
+                     (unsigned long)ds.remaps, (unsigned long)ds.callbacks, (unsigned long)ds.ndsp_dropped,
+                     (unsigned long)ds.reverb_us, (unsigned long)ds.reverb_gaps, (unsigned long)ds.lists_skipped);
+        }
         char want_fps[240] = "";
         if (st.game_fps > 0) snprintf(want_fps, sizeof(want_fps), ", game asks %d", st.game_fps);
         if (st.dl_skipped_per_sec > 0) {
@@ -455,21 +496,35 @@ void update_gfx_inner() {
             snprintf(want_fps + used, sizeof(want_fps) - used, ", %d shown (%d in-between, %d without%s%s)", st.presented_per_sec, st.inbetween_per_sec,
                      st.inbetween_dropped_per_sec, st.inbetween_reasons[0] ? ": " : "", st.inbetween_reasons);
         }
-        fprintf(stderr, "stats: %d dl/s%s (late %d, max gap %.0f ms) core0 %d%% core2 %d%% ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu low water %lu heap %lu KB%s%s%s%s%s\n",
-                st.dl_per_sec, want_fps, st.late_frames, st.max_gap_ms, busy0, busy2, ucode_ms, ucode_tasks, recomp3ds::audio_frames_queued(),
+        // log_level 1 logs the figures every 10 s, 0 not at all (log.cpp).
+        static unsigned stats_tick = 0;
+        stats_tick++;
+        const int log_lv = recomp3ds::log_level();
+        const bool log_stats = log_lv >= 2 || (log_lv == 1 && stats_tick % 10 == 0);
+        // Core 2 when watched (not with two cores), and a New 3DS's core 3
+        // when the system lets the application use it.
+        char core2[16] = "", core3[16] = "";
+        if (busy2 >= 0) snprintf(core2, sizeof(core2), " core2 %d%%", busy2);
+        if (busy3 >= 0) snprintf(core3, sizeof(core3), " core3 %d%%", busy3);
+        if (log_stats) fprintf(stderr, "stats: %d dl/s%s (late %d, max gap %.0f ms) core0 %d%% core1 %d%%%s%s ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu low water %lu heap %lu KB%s%s%s%s%s%s\n",
+                st.dl_per_sec, want_fps, st.late_frames, st.max_gap_ms, busy0, busy1, core2, core3, ucode_ms, ucode_tasks, recomp3ds::audio_frames_queued(),
                 (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped, (unsigned long)(ac.low_water == 0xFFFFFFFFu ? 0u : ac.low_water),
-                (unsigned long)(mallinfo().arena / 1024), hle_stats, hle_ms.c_str(), rom_stats, game_stats, thread_stats.c_str());
-        // One 40-column row: the audio microcode's ms per second last.
+                (unsigned long)(mallinfo().arena / 1024), hle_stats, hle_ms.c_str(), "", rom_stats, game_stats, thread_stats.c_str());
+        // On a line of its own: the log cuts lines at 512 characters.
+        if (log_stats && dsp_stats[0] != '\0') fprintf(stderr, "%s\n", dsp_stats + 1);
+        // One 40-column row: frames drawn and each core's load.
         char line[64];
         // Frames drawn (the frame cap passes some over; frame interpolation
         // adds its in-betweens).
         const int shown_fps = rt64_3ds::settings().frame_cap == 2 && g_desc != nullptr && g_desc->render.frame_interpolation
                                   ? st.presented_per_sec : st.dl_per_sec - st.dl_skipped_per_sec;
-        // 39 columns: the audio interpreter's ms a second last, never cut.
-        if (busy2 >= 0) snprintf(line, sizeof(line), "%3d fps cpu0 %3d%% cpu2 %3d%% aud %4ums", shown_fps, busy0, busy2, ucode_ms);
-        else snprintf(line, sizeof(line), "%3d fps cpu0 %3d%% aud %4ums", shown_fps, busy0, ucode_ms);   // an Old 3DS: no core 2
+        if (busy2 >= 0) snprintf(line, sizeof(line), "%3d fps cpu0 %3d%% cpu1 %3d%% cpu2 %3d%%", shown_fps, busy0, busy1, busy2);
+        else snprintf(line, sizeof(line), "%3d fps cpu0 %3d%% cpu1 %3d%%", shown_fps, busy0, busy1);   // two cores
         recomp3ds::screen_printf("\x1b[2;0H%-39.39s\n", line);
-        recomp3ds::screen_printf("\x1b[3;0H%-39.39s", thread_row);   // the game threads' shares, wake-ups a second last
+        // settings.ini's debug_rows=1: the game threads' shares (wake-ups a
+        // second last) and the audio rows below.
+        const bool debug_rows = recomp3ds::settings_debug_rows();
+        if (debug_rows) recomp3ds::screen_printf("\x1b[3;0H%-39.39s", thread_row);
         // The audio pipeline's counters: tasks run a second, frames the game
         // handed over a second against the rate, frames the DSP still holds,
         // underruns and frames dropped for a full ring.
@@ -478,11 +533,14 @@ void update_gfx_inner() {
         const unsigned long low_water = ac.low_water == 0xFFFFFFFFu ? 0ul : (unsigned long)ac.low_water;
         snprintf(line, sizeof(line), "aud %ut in %lu q %zu lw %lu ur %lu", ucode_tasks, (unsigned long)ac.submitted,
                  recomp3ds::audio_frames_queued(), low_water, (unsigned long)ac.underruns);
-        recomp3ds::screen_printf("\x1b[27;0H%-39.39s", line);
-        recomp3ds::screen_printf("\x1b[29;0H%-39.39s", hle_row);   // the interpreter's ms a second by command
+        if (debug_rows) {
+            recomp3ds::screen_printf("\x1b[27;0H%-39.39s", line);
+            recomp3ds::screen_printf("\x1b[29;0H%-39.39s", hle_row);   // the interpreter's ms a second by command
+        }
     }
     // Watchdog: a frame that stays in the replay or the GPU wait for 4 s is
     // a hung GPU; say which draw it was on, once.
+    g_main_stage = 7;
     {
         static u32 last_frames = 0; static u64 since = 0; static bool reported = false;
         const rt64_3ds::Progress& pg = rt64_3ds::progress();
@@ -493,6 +551,7 @@ void update_gfx_inner() {
             rt64_3ds::dump_progress();
         }
     }
+    g_main_stage = 8;
     if (!aptMainLoop() || g_exit_requested) {
         static bool quitting = false;
         if (!quitting) {
@@ -634,6 +693,9 @@ u32 measure_load_ns() {
 
 u32 log_cpu(const char* when) {
     u32 mhz = measure_cpu_mhz();
+    // loadmon's calibrations hold at the clock they were taken at: the
+    // two clocks are 268 and 804 MHz (exactly 1:3).
+    recomp3ds::loadmon_set_mhz(mhz > 500 ? 804 : 268);
     fprintf(stderr, "recomp3ds: %s: CPU ~%lu MHz, 1 MB load walk %lu ns/load\n", when,
             (unsigned long)mhz, (unsigned long)measure_load_ns());
     return mhz;
@@ -820,20 +882,32 @@ int recomp3ds::run(const GameDesc& desc) {
     // outranks it there, so every audio task stalls a frame. Core 1 (the
     // system core, time-limited for applications) takes it when available.
     // AUDIO_CORE.TXT holds 1 or 2 to force a core.
+    // The game's N64 threads go to core 1 and the renderer, the audio task
+    // and the DSP synthesizer to core 0 on an Old 3DS, which has no core 2:
+    // the renderer is the larger load, and core 0 is the core the system
+    // does not share. Goemon at the Old clock with two cores drew 17.5
+    // frames a second with the renderer squeezed into core 1's share and
+    // 24.4 swapped (three cores: 26.9; New 3DS, CPU speed Old 3DS,
+    // 2026-10-03). The Cores row (settings.ini cores, read at start) picks
+    // that layout on a New 3DS too, to test an Old 3DS on one.
     {
         (void)cpu_mhz;
         int want = 1;
         char path[192];
         snprintf(path, sizeof(path), "%s/AUDIO_CORE.TXT", g_base_path);
         if (FILE* f = fopen(path, "r")) { if (fscanf(f, "%d", &want) != 1) want = 1; fclose(f); }
-        // An Old 3DS has no core 2: what would go there shares core 1, or
-        // core 0 when the system grants no time on core 1.
-        const int no_core1 = is_new_3ds ? 2 : 0;
-        g_sp_core = no_core1;
-        g_gfx_core = is_new_3ds ? 2 : no_core1;
-        if (want == 1 || !is_new_3ds) {
+        const int cores_row = recomp3ds::settings_cores();
+        const bool two_cores = !is_new_3ds || cores_row != 0;
+        const bool core2 = !two_cores;
+        // With two cores, which one the game gets (GameDesc::two_cores_game_on_core0).
+        const bool game_on_0 = cores_row == 2 || (cores_row == 0 && desc.two_cores_game_on_core0);
+        g_sp_core = core2 ? 2 : 0;
+        g_gfx_core = core2 ? 2 : 0;
+        g_watch_cores = core2 ? 0x5 : 0x1;
+        if (want == 1 || two_cores) {
             // PM refuses a limit above the exheader's MaxCpu (low 7 bits):
-            // take the highest it accepts.
+            // take the highest it accepts. More than 80 is accepted and
+            // ignored (a New 3DS, as a CIA and as a .3dsx).
             u32 limit = 0;
             Result rc = -1;
             static const u32 kTry[] = { 80, 70, 60, 50, 40, 30, 25, 20 };
@@ -846,17 +920,44 @@ int recomp3ds::run(const GameDesc& desc) {
             if (probe != nullptr) {
                 threadJoin(probe, UINT64_MAX);
                 threadFree(probe);
-                g_sp_core = 1;
-                if (!is_new_3ds) g_gfx_core = 1;
+                g_core1_granted = true;
+                g_watch_cores |= 0x2;
+                if (core2) g_sp_core = 1;               // the audio task beside the renderer's core
+                else if (game_on_0) g_gfx_core = g_sp_core = 1;   // two cores: the rest on core 1
+                else g_game_core = 1;                   // two cores: the game on core 1
             }
-            fprintf(stderr, "recomp3ds: core 1 time limit %lu%% (rc %08lx), audio task on core %d, renderer on core %d\n",
-                    (unsigned long)limit, (unsigned long)rc, g_sp_core, g_gfx_core);
+            // Without time on core 1 everything shares core 0.
+            g_helper_core = (core2 || game_on_0) && g_core1_granted ? 1 : 0;
+            fprintf(stderr, "recomp3ds: core 1 time limit %lu%% (rc %08lx); %s: game on core %d, audio task on core %d, renderer on core %d, synth on core %d\n",
+                    (unsigned long)limit, (unsigned long)rc, core2 ? "three cores" : "two cores",
+                    g_game_core, g_sp_core, g_gfx_core, g_helper_core);
         }
         else {
+            g_helper_core = 0;
             fprintf(stderr, "recomp3ds: audio task on core 2\n");
         }
+        if (is_new_3ds) {
+            // Core 3 is the system's (head tracking and other services): an
+            // application's threads are refused there. Logged as evidence.
+            // A .3dsx from the Homebrew Launcher was allowed (2026-10-03):
+            // loadmon then watches it too, its calibration showing how much
+            // of it the system leaves (against core 0's).
+            Thread probe3 = threadCreate([](void*) {}, nullptr, 4096, 0x30, 3, false);
+            fprintf(stderr, "recomp3ds: a thread on core 3: %s\n", probe3 != nullptr ? "created" : "refused");
+            if (probe3 != nullptr) { threadJoin(probe3, UINT64_MAX); threadFree(probe3); g_core3 = true; g_watch_cores |= 0x8; }
+        }
+        // The renderer's own core-1 helper (the in-between builder) is a
+        // New 3DS's extra: none when core 2 is left out.
+        rt64_3ds::settings().no_core2 = two_cores;
+        // GameDesc::two_cores_read_on_game_core: the lists' read on core 0
+        // with the game, the renderer on core 1.
+        rt64_3ds::settings().read_core = (two_cores && desc.two_cores_read_on_game_core && g_game_core == 0 && g_gfx_core == 1) ? 0 : -1;
+        // Just below the game's threads (host_thread_spec): they go first.
+        rt64_3ds::settings().read_priority = 0x31;
         ultramodern::set_host_thread_spec_callback(host_thread_spec);
     }
+    // The DSP synthesizer's decoding thread wants core 1, granted just above.
+    if (desc.synth.flavor != recomp3ds::SynthFlavor::None) recomp3ds::dsp_synth_init(desc.synth);
     {
         // Debug: the FPU control state threads start with (rounding mode in
         // bits 22-23, flush-to-zero in bit 24, default NaN in bit 25).
@@ -875,7 +976,8 @@ int recomp3ds::run(const GameDesc& desc) {
         recomp3ds::rom_stream_install(2u << 20);
     }
     recomp::start_game(desc.game_id, game_mode);
-    recomp3ds::loadmon_start(is_new_3ds);
+    recomp3ds::loadmon_start(g_watch_cores);
+    recomp3ds::stall_watch_start(&g_rdram, &desc);
     log_memory("before start");
     recomp3ds::log_start_writer();
     recomp::start(cfg);        // returns when the game has quit

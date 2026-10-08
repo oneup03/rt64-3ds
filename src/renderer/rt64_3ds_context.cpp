@@ -34,6 +34,13 @@ constexpr uint32_t kVboVerts = 65536;
 
 using GpuVertex = rt64_3ds::Vtx3ds;   // the record's vertex is the PICA's attribute layout
 
+// What the CPU wrote for the GPU, out of the data cache: the kernel's own
+// flush on the calling core (GSPGPU_FlushDataCache is a request to the GSP
+// module on core 1, which waits for that core to be free).
+inline void flush_dcache(const void* p, size_t bytes) {
+    if (bytes != 0) svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)p, bytes);
+}
+
 #define g_stats rt64_3ds::mutable_stats()
 
 // Frame read-back (rt64_3ds::read_back_frame): while the game is in first
@@ -397,6 +404,8 @@ public:
     // process closes (C3D_Fini waits for the render queue).
     void shutdown() override {
         if (!ok_) return;
+        stop_reader();
+        stop_builder();
         stop_presenter();
         ok_ = false;
         aptUnhook(&g_apt_cookie);
@@ -432,8 +441,8 @@ public:
                 if (gap > max_gap_) max_gap_ = gap;
                 if (late_logged_ < 200) {
                     late_logged_++;
-                    fprintf(stderr, "rt64-3ds: late frame %u: %.1f ms since the previous list (that one: interp %.1f replay %.1f ms)\n",
-                            frames_, gap, last_interp_ms_, last_replay_ms_);
+                    fprintf(stderr, "rt64-3ds: late frame %u: %.1f ms since the previous list (that one: read %.1f, tris %.1f, interp %.1f, replay %.1f ms, triangles drained in the read %.1f; this one waited %.1f)\n",
+                            frames_, gap, last_read_ms_, last_tris_ms_, last_interp_ms_, last_replay_ms_, last_drain_ms_, (float)wait * 1000.0f / (float)SYSCLOCK_ARM11);
                 }
             }
         }
@@ -461,8 +470,9 @@ public:
         const bool behind = interp_mode_ && (queued || resync_);
         behind_resync_ = resync_;
         resync_ = false;
-        if (pass_over(task)) {
-            ultramodern::extensions::on_displaylist_parsed(task->t.data_ptr);
+        // The read, up to "parsed" (on the reader thread when there is one).
+        const ReadOutcome read = read_list(task);
+        if (read == ReadOutcome::PassedOver) {
             g_progress.phase = 0;
             const u64 tp = svcGetSystemTick();
             acc_pass_ += tp - t0;
@@ -471,27 +481,16 @@ public:
             report_window(t0, tp);
             return;
         }
-        frame_.clear();
-        vbo_idx_ ^= 1;
-        frame_.verts.set_storage((rt64_3ds::Vtx3ds*)vbo_[vbo_idx_], kVboVerts);
-        g_progress.phase = 1;
-        maybe_capture(task);
-        // In first person the reticle's quads must stay one per record.
-        interp_.set_split_untagged_ortho(rt64_3ds::first_person_scene());
-        bool present = interp_.run(task->t.data_ptr, frame_);
-        pass_next_ = present && interp_.last_list_plain();
-        // Everything the replay reads from RDRAM is read by now once the
-        // textures are decoded: let a game waiting on "parsed" (Banjo's
-        // game_draw, which blocks on it every frame) go on before anything
-        // else, the in-between and the wait for the presenter included.
-        // Decoding needs no wait for the presenter: it allocates linear
-        // memory and never touches the GX queue, and a texture rewritten in
-        // place is retired (freed three frames later), never overwritten.
-        prefetch_textures();
-        ultramodern::extensions::on_displaylist_parsed(task->t.data_ptr);
-        // RenderDesc::early_drawn: and drawn, so a game that waits for that
-        // before its next frame does not wait for the screen below too.
-        if (rt64_3ds::render_desc().early_drawn) ultramodern::renderer::report_list_drawn();
+        const bool present = read == ReadOutcome::Drawn;
+        // The triangles the reader left for this thread (deferred triangles,
+        // with a reader): their vertices, after "parsed".
+        const u64 t_read = svcGetSystemTick();
+        if (interp_.finish_triangles(frame_)) {
+            const u64 tt = svcGetSystemTick() - t_read;
+            acc_tris_ += tt;
+            last_tris_ms_ = (float)tt * 1000.0f / (float)SYSCLOCK_ARM11;
+        }
+        else last_tris_ms_ = 0.0f;
         // Frame interpolation: the in-betweens, from the list's records alone
         // (no RDRAM). They draw the game frame's draws with its textures.
         const u64 t_run = svcGetSystemTick(), tb0 = t_run;
@@ -565,9 +564,37 @@ public:
                     // the GPU, into the other in-between vertex buffer (the
                     // one before that is done: its successor's frame began
                     // after it).
-                    const u64 tr0 = svcGetSystemTick(), w0 = acc_vsync_;
+                    // With the builder (core 1) building the first in-between,
+                    // the game's frame is recorded first, meanwhile, then the
+                    // in-betweens, and both go to the presenter: the GPU runs
+                    // them in the order they are queued (the in-betweens',
+                    // then the game frame's, which the presenter queues), not
+                    // the order they were recorded in, and each frame sets
+                    // all of its state at its start.
+                    const bool game_first = build_busy_;
                     u64 waited_first = 0, built = 0;
                     pair_ = true;
+                    if (game_first) {
+                        const u64 ta0 = svcGetSystemTick();
+                        record_only_ = true;
+                        replay_and_present(Present::Paced, true);
+                        record_only_ = false;
+                        replay_real = svcGetSystemTick() - ta0;
+                        // What of the build the recording did not cover.
+                        const u64 tj0 = svcGetSystemTick();
+                        const bool ok = join_build();
+                        built = svcGetSystemTick() - tj0;
+                        acc_build_wait_ += built;
+                        builds_++;
+                        if (!ok) {
+                            if (build_skip_ == 1) inb_cut_++;
+                            else if (build_skip_ == 2) inb_nothing_++;
+                            else inb_diverged_++;
+                            inb_count_ = 0;
+                        }
+                    }
+                    const u64 tr0 = svcGetSystemTick(), w0 = acc_vsync_;
+                    u64 built_here = 0;
                     for (int k = 1; k <= inb_count_; k++) {
                         if (k > 1) {
                             const u64 tk0 = svcGetSystemTick();
@@ -575,12 +602,12 @@ public:
                             inter_.clear();
                             inter_.verts.set_storage((rt64_3ds::Vtx3ds*)vbo_[2 + ((k - 1) & 1)], kVboVerts);
                             const bool ok = interp_.build_inbetween(frame_, inter_);
-                            built += svcGetSystemTick() - tk0;
+                            built_here += svcGetSystemTick() - tk0;
                             if (!ok) { inb_diverged_++; break; }
                         }
-                        // The last in-between is held open for the presenter
-                        // (double eyes): its wait for the screen is the
-                        // presenter's, not this thread's.
+                        // The last in-between's transfer is the presenter's
+                        // (double eyes): its wait for the screen is not this
+                        // thread's.
                         const bool hold = k == inb_count_ && double_eyes_ && presenter_ != nullptr;
                         const u64 wk0 = acc_vsync_;
                         swap_inbetween();
@@ -591,7 +618,8 @@ public:
                         inbs++;
                     }
                     const u64 waited = acc_vsync_ - w0;
-                    replay_inb = svcGetSystemTick() - tr0 - waited - built;
+                    replay_inb = svcGetSystemTick() - tr0 - waited - built_here;
+                    built += built_here;
                     acc_inb_replay_ += replay_inb;
                     acc_inb_interp_ += built;
                     inb_built_ = built;
@@ -602,10 +630,13 @@ public:
                     // which brings them a refresh nearer. (The ones after wait
                     // for the in-between before them by design.)
                     if (waited_first > (u64)SYSCLOCK_ARM11 * 8 / 1000) resync_ = true;
-                    const u64 ta0 = svcGetSystemTick(), wa0 = acc_vsync_;
-                    handed = replay_and_present(Present::Paced, presenter_ != nullptr);
+                    if (game_first) handed = hand_off_recorded(inbs > 0);
+                    else {
+                        const u64 ta0 = svcGetSystemTick(), wa0 = acc_vsync_;
+                        handed = replay_and_present(Present::Paced, presenter_ != nullptr);
+                        replay_real = svcGetSystemTick() - ta0 - (acc_vsync_ - wa0);
+                    }
                     pair_ = false;
-                    replay_real = svcGetSystemTick() - ta0 - (acc_vsync_ - wa0);
                 }
                 else {
                     const u64 ta0 = svcGetSystemTick(), wa0 = acc_vsync_;
@@ -615,12 +646,16 @@ public:
             }
             if (!handed) LightLock_Unlock(&g_gpu_lock);
         }
+        // A build begun for a list not drawn after all (the GPU away, quitting).
+        if (build_busy_) join_build();
         if (g_debug_gfx_delay_ms > 0) svcSleepThread((s64)g_debug_gfx_delay_ms * 1000000);
         g_progress.phase = 0;
         u64 t2 = svcGetSystemTick();
         acc_list_busy_ += t2 - t0;
         if (t2 - t0 > max_list_busy_) max_list_busy_ = t2 - t0;
-        acc_list_read_ += t_run - t0;
+        acc_list_read_ += t_read - t0;
+        if (t_read - t0 > max_list_read_) max_list_read_ = t_read - t0;
+        last_read_ms_ = (float)(t_read - t0) * 1000.0f / (float)SYSCLOCK_ARM11;
         acc_list_wait_ += wait;
         if (wait > max_list_wait_) max_list_wait_ = wait;
         if (engaged_) last_pair_end_ = t2;
@@ -694,24 +729,28 @@ public:
                 const uint32_t lists = dl_count_ - passed_count_;
                 snprintf(interp_line_, sizeof(interp_line_),
                          "rt64-3ds:   frame interpolation %s: last second %u frames shown, %u in-between (interp+match %.1f ms, replay %.1f ms each), "
-                         "%u lists without one (late %u [%u to resync with the screen, the rest %s], over budget %u, unsafe %u, "
-                         "after a 60 or unsafe list %u, camera cut %u, nothing tagged %u, diverged %u); "
-                         "waits for the screen %.1f ms per list, gfx thread %.1f ms per list (max %.1f; reading it %.1f), lists waited %.1f ms for the one before (max %.1f), "
-                         "pair %.1f ms (expected %.1f); "
-                         "last match: transforms %u/%u/%u (vertices %u), projections %u/%u/%u, tiles %u/%u",
+                         "%u lists without one (late %u [%u to resync with the screen, the rest %s], over budget %u [%u runs tried anyway, next after %u], unsafe %u, "
+                         "after a 60 or unsafe list %u, camera cut %u, nothing tagged %u, diverged %u)\n"
+                         "rt64-3ds:   frame interpolation timing: waits for the screen %.1f ms per list, gfx thread %.1f ms per list (max %.1f; reading it %.1f, max %.1f), lists waited %.1f ms for the one before (max %.1f), "
+                         "pair %.1f ms (expected %.1f); first in-betweens matched and built on core 1 %u (%.1f ms each, %.1f of it waited for here)\n"
+                         "rt64-3ds:   frame interpolation last match: transforms %u/%u/%u (vertices %u), projections %u/%u/%u, tiles %u/%u",
                          interp_mode_ ? "on" : "off", presented_, inb_drawn_, (float)(acc_inb_interp_) * per_inb, (float)acc_inb_replay_ * per_inb,
                          inb_missed, inb_late_, inb_late_resync_,
                          rt64_3ds::render_desc().early_drawn ? "waited too long for the one before" : "arrived while the last one was still drawn",
-                         inb_budget_, inb_unsafe_, inb_unrelated_, inb_cut_, inb_nothing_, inb_diverged_,
+                         inb_budget_, probes_, probe_every_, inb_unsafe_, inb_unrelated_, inb_cut_, inb_nothing_, inb_diverged_,
                          lists ? (float)(acc_vsync_ + (u64)presenter_wait_us_ * SYSCLOCK_ARM11 / 1000000ull) * ms / (float)lists : 0.0f,
                          lists ? (float)acc_list_busy_ * ms / (float)lists : 0.0f, (float)max_list_busy_ * ms,
-                         lists ? (float)acc_list_read_ * ms / (float)lists : 0.0f,
+                         lists ? (float)acc_list_read_ * ms / (float)lists : 0.0f, (float)max_list_read_ * ms,
                          lists ? (float)acc_list_wait_ * ms / (float)lists : 0.0f, (float)max_list_wait_ * ms, pair_ms_, pair_ema_,
+                         builds_, builds_ ? (float)build_ticks_ * ms / (float)builds_ : 0.0f, builds_ ? (float)acc_build_wait_ * ms / (float)builds_ : 0.0f,
                          last_match_.xf, last_match_.xf_matched, last_match_.xf_interp, last_match_.vert_entries,
                          last_match_.pj, last_match_.pj_matched, last_match_.pj_interp, last_match_.tiles, last_match_.tiles_interp);
                 presented_ = inb_drawn_ = inb_late_ = inb_budget_ = inb_unsafe_ = inb_unrelated_ = inb_cut_ = inb_nothing_ = inb_diverged_ = 0;
-                inb_late_resync_ = 0;
-                acc_list_busy_ = max_list_busy_ = acc_list_read_ = acc_list_wait_ = max_list_wait_ = 0;
+                inb_late_resync_ = probes_ = 0;
+                acc_list_busy_ = max_list_busy_ = acc_list_read_ = max_list_read_ = acc_list_wait_ = max_list_wait_ = 0;
+                acc_build_wait_ = 0;
+                build_ticks_ = 0;
+                builds_ = 0;
                 acc_inb_interp_ = acc_inb_replay_ = acc_match_ = acc_vsync_ = 0;
                 presenter_wait_us_ = 0;
                 vsync_at_dl_ = 0;
@@ -729,12 +768,25 @@ public:
             if (++report_ % 5 == 1) {
                 float fpw = (float)(frames_ - frames_at_profile_ > 0 ? frames_ - frames_at_profile_ : 1);
                 frames_at_profile_ = frames_;
+                if (prof_on_) {
+                    // The list's read by kind of command (what the game waits
+                    // for, to "parsed"), per list drawn.
+                    const uint64_t* rp = interp_.stats().prof;
+                    const float pl = 1000.0f / (float)SYSCLOCK_ARM11 / fpw;
+                    fprintf(stderr, "rt64-3ds:   read profile per list: vertices %.1f triangles %.1f matrices %.1f texture loads %.1f rects %.1f "
+                                    "list flow %.1f extended %.1f other %.1f, texture decoding %.1f ms; deferred triangles %.1f ms after it\n",
+                            (float)rp[0] * pl, (float)rp[1] * pl, (float)rp[2] * pl, (float)rp[3] * pl, (float)rp[4] * pl, (float)rp[5] * pl,
+                            (float)rp[6] * pl, (float)rp[7] * pl, (float)acc_prefetch_ * pl, (float)acc_tris_ * pl);
+                    interp_.clear_profile();
+                    acc_prefetch_ = 0;
+                    acc_tris_ = 0;
+                }
                 if (prof_on_) fprintf(stderr, "rt64-3ds:   replay profile per frame: textures %.1f tev %.1f state %.1f flush %.1f draw %.1f ms\n",
                         (float)prof_[0] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[1] * 1000.0f / SYSCLOCK_ARM11 / fpw,
                         (float)prof_[2] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[4] * 1000.0f / SYSCLOCK_ARM11 / fpw,
                         (float)prof_[3] * 1000.0f / SYSCLOCK_ARM11 / fpw);
-                fprintf(stderr, "rt64-3ds: frame %u: %u draws %u verts, interp %.1f ms replay %.1f ms (gpu wait %.1f, end %.1f, depth %.1f), tex live %u (%u KB) %u uploads/frame, linear free %u KB, unknown ops %u ex %u, tev fallbacks %d, cimg %06x w%u, snapshots %u, lod branches %u/%u, culldl %u\n",
-                        frames_, (unsigned)last_draws_, (unsigned)last_verts_, g_stats.gfx_ms, g_stats.replay_ms, wait_ms_, end_ms_, depth_ms_, textures_.live(), textures_.bytes() / 1024, last_uploads_,
+                fprintf(stderr, "rt64-3ds: frame %u: %u draws %u verts, interp %.1f ms replay %.1f ms (gpu wait %.1f, end %.1f, depth %.1f), tex live %u (%u KB, %u in VRAM, %u mipmapped) %u uploads/frame, linear free %u KB, unknown ops %u ex %u, tev fallbacks %d, cimg %06x w%u, snapshots %u, lod branches %u/%u, culldl %u\n",
+                        frames_, (unsigned)last_draws_, (unsigned)last_verts_, g_stats.gfx_ms, g_stats.replay_ms, wait_ms_, end_ms_, depth_ms_, textures_.live(), textures_.bytes() / 1024, textures_.vram_bytes() / 1024, textures_.mipmapped(), last_uploads_,
                         (unsigned)(linearSpaceFree() / 1024), is.unknown, is.ex_unknown, g_stats.combiner_fallbacks, frame_.color_image, frame_.color_width, snapshots_,
                         is.branch_z_taken, is.branch_z_taken + is.branch_z_not, is.cull_dl);
                 {
@@ -902,6 +954,159 @@ public:
         return false;
     }
 
+    // A list's read (send_dl): the interpreter's run over it and its
+    // textures' decoding, up to "parsed" (tell_parsed), after which the game
+    // may change anything the list points at.
+    enum class ReadOutcome { PassedOver, Drawn, NotDrawn };
+    ReadOutcome read_here(const OSTask* task) {
+        if (pass_over(task)) return ReadOutcome::PassedOver;
+        frame_.clear();
+        vbo_idx_ ^= 1;
+        frame_.verts.set_storage((rt64_3ds::Vtx3ds*)vbo_[vbo_idx_], kVboVerts);
+        g_progress.phase = 1;
+        maybe_capture(task);
+        // In first person the reticle's quads must stay one per record.
+        interp_.set_split_untagged_ortho(rt64_3ds::first_person_scene());
+        const bool present = interp_.run(task->t.data_ptr, frame_);
+        pass_next_ = present && interp_.last_list_plain();
+        // Everything the replay reads from RDRAM is read by now once the
+        // textures are decoded: let a game waiting on "parsed" (Banjo's
+        // game_draw, which blocks on it every frame) go on before anything
+        // else, the in-between and the wait for the presenter included.
+        // Decoding needs no wait for the presenter: it allocates linear
+        // memory and never touches the GX queue, and a texture rewritten in
+        // place is retired (freed three frames later), never overwritten.
+        const u64 tpf0 = svcGetSystemTick();
+        prefetch_textures();
+        acc_prefetch_ += svcGetSystemTick() - tpf0;
+        // The reader's core wrote the vertices: flushed from it (the
+        // replay's flush, on the gfx thread's core, covers what that core
+        // writes). The textures flush themselves as they are decoded.
+        if (reader_ != nullptr) flush_dcache(frame_.verts.data(), frame_.verts.size() * sizeof(GpuVertex));
+        return present ? ReadOutcome::Drawn : ReadOutcome::NotDrawn;
+    }
+    void tell_parsed(uint32_t data_ptr, ReadOutcome read) {
+        ultramodern::extensions::on_displaylist_parsed(data_ptr);
+        // RenderDesc::early_drawn: and drawn, so a game that waits for that
+        // before its next frame does not wait for the screen below too.
+        if (read != ReadOutcome::PassedOver && rt64_3ds::render_desc().early_drawn) ultramodern::renderer::report_list_drawn();
+    }
+
+    // ---- the reader thread (Settings::read_core): a list's read on another
+    // core while the gfx thread waits for it. For a game that waits on
+    // "parsed" every frame with its own core idle meanwhile and faster than
+    // this one's (two cores, the game on core 0, the renderer on core 1 with
+    // the system's 20% and the synthesizer): Banjo's read took 26 ms on core
+    // 1 against about 21 on core 0, and its frame is its own work plus the read.
+    // The gfx thread does nothing while it waits, so the read touches what
+    // it always did, one thread at a time; the presenter (core 1) runs
+    // beside it as it did beside the gfx thread's read. READER_OFF.TXT keeps
+    // the read on the gfx thread.
+    // Its priority (Settings::read_priority) is just below the game's
+    // threads: they go first while the game's main thread waits, as they
+    // did beside the read on core 1. Above them, Banjo's audio thread waited
+    // out each read (21 ms) and the game made 95% of its audio, underrunning
+    // three times as often. The game's work and the read share core 0
+    // either way. The gfx thread has the list before "parsed" goes out: the
+    // game's main thread, woken by it, would otherwise hold the reader (and
+    // the drawing on core 1) until its next wait.
+    Thread reader_ = nullptr;
+    LightEvent read_progress_;         // the reader published triangles, or is done
+    float last_drain_ms_ = 0.0f;       // the list's triangles output during its read (read_list)
+    bool defer_tris_ = false;          // the triangles' output left to the gfx thread
+    bool defer_verts_ = false;         // ... and the vertices' transforms
+    LightSemaphore read_go_, read_done_;
+    volatile bool reader_stop_ = false;
+    const OSTask* read_task_ = nullptr;
+    ReadOutcome read_outcome_ = ReadOutcome::NotDrawn;
+    static void reader_main(void* arg) {
+        C3dRenderContext* self = static_cast<C3dRenderContext*>(arg);
+        for (;;) {
+            LightSemaphore_Acquire(&self->read_go_, 1);
+            if (self->reader_stop_) break;
+            __dmb();
+            const uint32_t data_ptr = self->read_task_->t.data_ptr;
+            const ReadOutcome read = self->read_here(self->read_task_);
+            self->read_outcome_ = read;
+            __dmb();
+            LightSemaphore_Release(&self->read_done_, 1);
+            LightEvent_Signal(&self->read_progress_);   // (a gfx thread draining meanwhile)
+            self->tell_parsed(data_ptr, read);
+        }
+    }
+    void start_reader() {
+        const int core = rt64_3ds::settings().read_core;
+        if (core < 0) return;
+        if (FILE* f = rt64_3ds::data_fopen("READER_OFF.TXT", "r")) {
+            fclose(f);
+            fprintf(stderr, "rt64-3ds: list reader off (READER_OFF.TXT)\n");
+            return;
+        }
+        LightSemaphore_Init(&read_go_, 0, 1);
+        LightSemaphore_Init(&read_done_, 0, 1);
+        // The gfx thread's stack; the priority the platform gives (else the
+        // gfx thread's).
+        s32 prio = 0x2C;
+        svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+        if (rt64_3ds::settings().read_priority > 0) prio = rt64_3ds::settings().read_priority;
+        reader_ = threadCreate(reader_main, this, 256 * 1024, prio, core, true);
+        // The triangles' output (culling, texel coordinates, clipping, the
+        // vertices: about a third of the read) and the vertices' transforms
+        // after "parsed", here (Interpreter::set_defer_triangles).
+        // TRIS_ON_READER.TXT keeps both in the read, VERTS_ON_READER.TXT the
+        // transforms.
+        if (reader_ != nullptr) {
+            defer_tris_ = true;
+            defer_verts_ = true;
+            if (FILE* f = rt64_3ds::data_fopen("TRIS_ON_READER.TXT", "r")) { fclose(f); defer_tris_ = false; }
+            if (FILE* f = rt64_3ds::data_fopen("VERTS_ON_READER.TXT", "r")) { fclose(f); defer_verts_ = false; }
+            LightEvent_Init(&read_progress_, RESET_ONESHOT);
+            interp_.set_defer_triangles(defer_tris_, defer_verts_, &read_progress, this);
+        }
+        fprintf(stderr, "rt64-3ds: list reader %s (priority 0x%lx, core %d), triangles' output %s, vertex transforms %s\n",
+                reader_ != nullptr ? "up" : "FAILED: lists read on this thread", (unsigned long)prio, core,
+                defer_tris_ ? "on the gfx thread" : "in the read", defer_tris_ && defer_verts_ ? "on the gfx thread" : "in the read");
+    }
+    // The reader published triangles (Interpreter::set_defer_triangles).
+    static void read_progress(void* arg) { LightEvent_Signal(&static_cast<C3dRenderContext*>(arg)->read_progress_); }
+    ReadOutcome read_list(const OSTask* task) {
+        if (reader_ == nullptr) {
+            const ReadOutcome read = read_here(task);
+            tell_parsed(task->t.data_ptr, read);
+            return read;
+        }
+        read_task_ = task;
+        __dmb();
+        LightSemaphore_Release(&read_go_, 1);
+        last_drain_ms_ = 0.0f;
+        if (defer_tris_) {
+            // Meanwhile, the output of the triangles the reader has recorded
+            // so far (Interpreter::drain_triangles), so little of it is left
+            // once the read is done.
+            u64 drained = 0;
+            for (;;) {
+                const u64 d0 = svcGetSystemTick();
+                interp_.drain_triangles();
+                drained += svcGetSystemTick() - d0;
+                if (LightSemaphore_TryAcquire(&read_done_, 1) == 0) break;
+                LightEvent_Wait(&read_progress_);
+            }
+            acc_tris_ += drained;
+            last_drain_ms_ = (float)drained * 1000.0f / (float)SYSCLOCK_ARM11;
+        }
+        else LightSemaphore_Acquire(&read_done_, 1);
+        __dmb();
+        return read_outcome_;
+    }
+    void stop_reader() {
+        if (reader_ == nullptr) return;
+        reader_stop_ = true;
+        __dmb();
+        LightSemaphore_Release(&read_go_, 1);
+        threadJoin(reader_, 1000000000ull);
+        reader_ = nullptr;
+    }
+
 private:
     void init() {
         if (!C3D_Init(C3D_DEFAULT_CMDBUF_SIZE * 2)) {
@@ -911,6 +1116,27 @@ private:
         LightLock_Init(&g_gpu_lock);
         aptHook(&g_apt_cookie, apt_hook, nullptr);
         textures_.set_compact_intensity(rt64_3ds::settings().gpu_textures16 != 0);
+        // Textures in VRAM (TextureCache::set_vram); TEX_VRAM_OFF.TXT keeps
+        // them in the linear heap.
+        {
+            bool vram = true;
+            if (FILE* f = rt64_3ds::data_fopen("TEX_VRAM_OFF.TXT", "r")) { fclose(f); vram = false; }
+            // Off-screen images' targets (colour and 24-bit depth) are the VRAM
+            // made later, on demand: render_to_texture (Banjo's jiggy
+            // transition, 512x256: 1 MB) and sample_drawn_frame (Goemon's menu
+            // rims, 256x256: 512 KB). Everything else is made at start.
+            const rt64_3ds::RenderDesc& rd = rt64_3ds::render_desc();
+            const uint32_t reserve = rd.render_to_texture ? 1536u * 1024 : rd.sample_drawn_frame ? 640u * 1024 : 128u * 1024;
+            textures_.set_vram(vram, reserve);
+            fprintf(stderr, "rt64-3ds: textures in %s, %u KB kept free\n", vram ? "VRAM (as room allows)" : "the linear heap (TEX_VRAM_OFF.TXT)", (unsigned)(reserve / 1024));
+        }
+        // The game's own mipmap levels (TexDesc::levels); MIPMAP_OFF.TXT
+        // draws the base level alone.
+        if (FILE* f = rt64_3ds::data_fopen("MIPMAP_OFF.TXT", "r")) {
+            fclose(f);
+            textures_.set_mipmaps(false);
+            fprintf(stderr, "rt64-3ds: mipmaps off (MIPMAP_OFF.TXT)\n");
+        }
         fill_clear_ = rt64_3ds::settings().gpu_fill_clear != 0;
         // The eyes' formats (RenderDesc::eye_color16 / eye_depth16 through
         // Settings::gpu_color16 / gpu_depth16).
@@ -978,7 +1204,7 @@ private:
         // (the emulator does not).
         if (C3D_TexInit(&white_, 8, 8, GPU_RGBA5551)) {
             memset(white_.data, 0xFF, 8 * 8 * 2);
-            GSPGPU_FlushDataCache(white_.data, 8 * 8 * 2);
+            flush_dcache(white_.data, 8 * 8 * 2);
             C3D_TexSetFilter(&white_, GPU_NEAREST, GPU_NEAREST);
         }
 
@@ -1049,6 +1275,7 @@ private:
         Mtx_OrthoTilt(&proj_, -geo_.x0, (float)geo_.w + geo_.x0, (float)geo_.h, 0.0f, 0.0f, 1.0f, true);
         C3D_DepthMap(true, -1.0f, 0.0f);
         C3D_CullFace(GPU_CULL_NONE);
+        start_reader();
         ok_ = true;
         // GPU_DEBUG.TXT: "<start frame> <frame count> <sync 0/1> <every N frames>" (defaults 0, all, 1, 1).
         if (FILE* f = rt64_3ds::data_fopen("GPU_DEBUG.TXT", "r")) {
@@ -1060,6 +1287,7 @@ private:
             fprintf(stderr, "rt64-3ds: GPU debug mode from frame %u for %u frames, sync %d, every %u\n", debug_from_, debug_count_, (int)debug_sync_, debug_step_);
         }
         if (FILE* f = rt64_3ds::data_fopen("PROFILE.TXT", "r")) { prof_on_ = true; fclose(f); }
+        interp_.set_profile(prof_on_);
         // DRAW_RANGE.TXT: "<first> <last>": replay only those draws of every
         // frame (to find which draw goes wrong against the host reference).
         if (FILE* f = rt64_3ds::data_fopen("DRAW_RANGE.TXT", "r")) {
@@ -1124,8 +1352,10 @@ private:
         // frame's start (copies out of the last frame, the capture and
         // screenshot reads, a change of the screen's output, the GPU debug
         // mode) keeps a frame begun as ever.
-        const bool defer = double_eyes_ && pair_ && kind == Present::Paced && handoff && !debug_frame && !fb_capture_pending_ &&
-                           !g_shot_request && !frame_.snapshot_request && !vi_blanked_;
+        // record_only_ (send_dl, with the builder): recorded on its own
+        // whatever comes up meanwhile (it was checked before the build began).
+        const bool defer = record_only_ || (double_eyes_ && pair_ && kind == Present::Paced && handoff && !debug_frame && !fb_capture_pending_ &&
+                                            !g_shot_request && !frame_.snapshot_request && !vi_blanked_);
         if (inb_pending_ && !defer) flush_pending_inbetween();
         const int set = (double_eyes_ && inbetween) ? 1 : 0;
         cur_eye_[0] = set != 0 ? inb_l_ : top_;
@@ -1138,6 +1368,9 @@ private:
             update_vi_blank();
             u64 tb0 = svcGetSystemTick();
             retire_rtt_targets();
+            // Textures' copies to VRAM, ahead of this frame's draws (out of a
+            // frame: see TextureCache::upload_pending).
+            textures_.upload_pending();
             C3D_FrameBegin(0);
             const u64 waited = svcGetSystemTick() - tb0;
             acc_wait_ += waited;
@@ -1222,7 +1455,9 @@ private:
         size_t n = frame_.verts.size();
         // A full-screen quad after the frame's vertices, for the ghost pass.
         const bool ghost = n + 6 <= kVboVerts && write_ghost_quad(vb + n);
-        GSPGPU_FlushDataCache(vb, (n + (ghost ? 6 : 0)) * sizeof(GpuVertex));
+        // The kernel's flush, on this core: GSPGPU_FlushDataCache is a
+        // request to the GSP module on core 1, which waits for that core.
+        flush_dcache(vb, (n + (ghost ? 6 : 0)) * sizeof(GpuVertex));
         C3D_BufInfo* bi = C3D_GetBufInfo();
         BufInfo_Init(bi);
         BufInfo_Add(bi, vb, sizeof(GpuVertex), 3, 0x210);
@@ -1375,6 +1610,17 @@ private:
         g_stats.tris = (int)(frame_.verts.size() / 3);
         presented_++;
         if (!offscreen_frame) { last_eye_[0] = cur_eye_[0]; last_eye_[1] = cur_eye_[1]; }
+        if (record_only_) {
+            // The in-betweens are drawn next; hand_off_recorded() does this
+            // frame's bookkeeping and hands it over after them.
+            end_deferred();
+            rec_sfd_ = sfd;
+            rec_eyes_ = eyes;
+            rec_fill_ = fill_skip >= 0;
+            rec_eye_[0] = last_eye_[0];
+            rec_eye_[1] = last_eye_[1];
+            return false;
+        }
         if (defer) {
             end_deferred();
             // The in-between's GPU time is the presenter's to read now (no
@@ -1410,8 +1656,13 @@ private:
             // citro3d's frame end transfers nothing and asks for no swap.
             cur_eye_[0]->used = false;
             if (cur_eye_[1] != nullptr) cur_eye_[1]->used = false;
+            // GX_CMDLIST_FLUSH: what the GPU reads that the CPU wrote is
+            // flushed where it is written (vertices below in this function,
+            // textures as they are decoded, the recorded frame's command
+            // buffer), not the whole linear heap at every frame end, which
+            // took milliseconds a frame on the console.
             u64 te0 = svcGetSystemTick();
-            C3D_FrameEnd(0);
+            C3D_FrameEnd(GX_CMDLIST_FLUSH);
             acc_end_ += svcGetSystemTick() - te0;
             inb_pending_ = true;
             inb_stereo_ = eyes == 2;
@@ -1423,10 +1674,45 @@ private:
         }
         if (kind != Present::Normal) wait_present_slot();
         u64 te0 = svcGetSystemTick();
-        C3D_FrameEnd(0);
+        C3D_FrameEnd(GX_CMDLIST_FLUSH);     // (see the in-between's above)
         acc_end_ += svcGetSystemTick() - te0;
         finish_frame_bookkeeping(inbetween, sfd);
         return false;
+    }
+
+    // The game's frame recorded before its in-betweens (send_dl, with the
+    // builder): what replay_and_present left for hand_off_recorded.
+    bool record_only_ = false;
+    rt64_3ds::StereoFrame rec_sfd_{};
+    int rec_eyes_ = 1;
+    bool rec_fill_ = false;
+    C3D_RenderTarget* rec_eye_[2] = {};
+    // ... and, once the in-betweens are drawn (the last one waiting for its
+    // transfer), its bookkeeping as replay_and_present would have done it
+    // and the presenter's job: the last in-between's transfer, then this
+    // frame. drew_inb: an in-between was drawn (its GPU time is the
+    // presenter's to read).
+    bool hand_off_recorded(bool drew_inb) {
+        dinb_kind_ = drew_inb ? gpu_pending_kind_ : -1;
+        dinb_eyes_ = gpu_pending_eyes_;
+        dinb_fill_ = gpu_pending_fill_;
+        gpu_pending_kind_ = 0;
+        gpu_pending_eyes_ = rec_eyes_;
+        gpu_pending_fill_ = rec_fill_;
+        // Snapshots, captures and the read-back read the game's frame.
+        last_eye_[0] = rec_eye_[0];
+        last_eye_[1] = rec_eye_[1];
+        finish_frame_bookkeeping(false, rec_sfd_);
+        job_deferred_ = true;
+        job_stereo_ = rec_eyes_ == 2;
+        job_inb_ = inb_pending_;
+        job_inb_stereo_ = inb_stereo_;
+        inb_pending_ = false;
+        LightEvent_Clear(&inb_free_);
+        deferred_frames_++;
+        present_busy_ = true;
+        LightSemaphore_Release(&present_go_, 1);
+        return true;
     }
 
     bool shown_inbetween_ = false;              // the frame presented last is an in-between (captures say so)
@@ -1478,7 +1764,7 @@ private:
                 const u64 w0 = svcGetSystemTick();
                 for (int i = 0; i < 400 && gspIsPresentPending(GSP_SCREEN_TOP); i++) svcSleepThread(100000);
                 const u64 w1 = svcGetSystemTick();
-                C3D_FrameEnd(0);
+                C3D_FrameEnd(GX_CMDLIST_FLUSH);
                 self->presenter_wait_us_ += (uint32_t)((w1 - w0) * 1000000ull / SYSCLOCK_ARM11);
             }
             LightLock_Unlock(&g_gpu_lock);
@@ -1512,7 +1798,7 @@ private:
             if (op.fill != nullptr) C3D_RenderTargetClear(op.fill, op.bits, op.color, 0);
             else GX_ProcessCommandList(op.list, op.words * 4, 0);
         }
-        C3D_FrameEnd(0);
+        C3D_FrameEnd(GX_CMDLIST_FLUSH);       // the recording was flushed as it ended (end_deferred)
         const u64 w0 = svcGetSystemTick();
         for (int i = 0; i < 400 && gspIsPresentPending(GSP_SCREEN_TOP); i++) svcSleepThread(100000);
         const u64 w1 = svcGetSystemTick();
@@ -1615,6 +1901,77 @@ private:
         presenter_ = nullptr;
     }
 
+    // ---- the builder thread (double eyes, New 3DS): builds a list's first
+    // in-between on core 1 while this thread records the game's frame (see
+    // send_dl), work core 2 did in turn before. build_inbetween reads the
+    // list's records and the interpreter's records of its triangles, which
+    // nothing changes until the next list's run; the recording only reads
+    // them too. BUILDER_OFF.TXT keeps it all on this thread.
+    Thread builder_ = nullptr;
+    LightSemaphore build_go_, build_done_;
+    volatile bool builder_stop_ = false;
+    bool build_busy_ = false;                   // gfx thread: the builder has inter_ (join_build)
+    volatile bool build_ok_ = false;
+    float build_weight_ = 0.0f;                 // the first in-between's weight, for the builder's match
+    int build_skip_ = 0;                        // the builder's match found: 1 a camera cut, 2 nothing to move
+    volatile u64 build_ticks_ = 0;              // the builder's time, this report
+    static void builder_main(void* arg) {
+        C3dRenderContext* self = static_cast<C3dRenderContext*>(arg);
+        for (;;) {
+            LightSemaphore_Acquire(&self->build_go_, 1);
+            if (self->builder_stop_) break;
+            __dmb();
+            const u64 t0 = svcGetSystemTick();
+            self->last_match_ = self->interp_.match_previous(self->build_weight_);
+            const rt64_3ds::interp::MatchResult& m = self->last_match_;
+            self->build_skip_ = m.camera_cut ? 1 : (m.xf_interp + m.pj_interp + m.tiles_interp == 0) ? 2 : 0;
+            self->build_ok_ = self->build_skip_ == 0 && self->interp_.build_inbetween(self->frame_, self->inter_);
+            // Written on this core: flushed from it.
+            if (self->inter_.verts.size() != 0) flush_dcache(self->inter_.verts.data(), self->inter_.verts.size() * sizeof(GpuVertex));
+            self->build_ticks_ = self->build_ticks_ + (svcGetSystemTick() - t0);
+            __dmb();
+            LightSemaphore_Release(&self->build_done_, 1);
+        }
+    }
+    void start_builder() {
+        bool n3ds = false;
+        if (R_FAILED(APT_CheckNew3DS(&n3ds)) || !n3ds) return;
+        if (rt64_3ds::settings().no_core2) {
+            fprintf(stderr, "rt64-3ds: in-between builder off (two cores)\n");
+            return;
+        }
+        if (FILE* f = rt64_3ds::data_fopen("BUILDER_OFF.TXT", "r")) {
+            fclose(f);
+            fprintf(stderr, "rt64-3ds: in-between builder off (BUILDER_OFF.TXT)\n");
+            return;
+        }
+        LightSemaphore_Init(&build_go_, 0, 1);
+        LightSemaphore_Init(&build_done_, 0, 1);
+        // Core 1, below the audio task's thread there (0x24).
+        builder_ = threadCreate(builder_main, this, 32 * 1024, 0x2E, 1, true);
+        fprintf(stderr, "rt64-3ds: in-between builder %s (core 1)\n", builder_ != nullptr ? "up" : "FAILED: in-betweens built on this thread");
+    }
+    void kick_build() {
+        build_busy_ = true;
+        __dmb();
+        LightSemaphore_Release(&build_go_, 1);
+    }
+    bool join_build() {
+        if (!build_busy_) return true;
+        LightSemaphore_Acquire(&build_done_, 1);
+        __dmb();
+        build_busy_ = false;
+        return build_ok_;
+    }
+    void stop_builder() {
+        if (builder_ == nullptr) return;
+        join_build();
+        builder_stop_ = true;
+        LightSemaphore_Release(&build_go_, 1);
+        threadJoin(builder_, 1000000000ull);
+        builder_ = nullptr;
+    }
+
     // Frame interpolation: wait until the frame presented before has been
     // put on the screen (its swap is processed at the next VBlank). Drawing
     // the next one into the back buffer before that would replace it.
@@ -1687,13 +2044,42 @@ private:
         }
         const float budget = (float)budget_pct_ / 100.0f * 1000.0f / (float)rate;
         // As many in-betweens as the budget affords (fewer show the game's
-        // frame for the refreshes left). Over budget for a second: try one
-        // anyway, to measure it again.
+        // frame for the refreshes left). Over budget for a while: try them
+        // anyway, for kProbeLists lists in a row, to measure them again. One
+        // alone measures high: the gfx thread waits out the builder, which in
+        // steady running overlaps the waits for the screen (Banjo's file
+        // select: 33.8 ms alone, 23.8 running). A run that still doesn't fit
+        // makes the next wait twice as long, up to kProbeEveryMax lists.
         int n = wanted;
         while (n > 1 && real_ema_ + (float)n * inb_ema_ > budget) n--;
-        const bool afford = !behind && (real_ema_ + (float)n * inb_ema_ <= budget || budget_drops_ >= 30);
-        if (afford) budget_drops_ = 0;
+        const bool fits = real_ema_ + (float)n * inb_ema_ <= budget;
+        if (fits) { budget_drops_ = 0; probe_left_ = 0; probe_every_ = kProbeEvery; }
+        else if (probe_left_ == 0 && budget_drops_ >= probe_every_) {
+            probe_left_ = kProbeLists;
+            budget_drops_ = 0;
+            probe_every_ = std::min(probe_every_ * 2, kProbeEveryMax);
+            probes_++;
+        }
+        const bool probing = !fits && probe_left_ > 0;
+        if (probing) probe_left_--;
+        const bool afford = !behind && (fits || probing);
         inb_count_ = n;
+        // On the builder (core 1) while this thread records the game's frame
+        // (send_dl), when that frame will be recorded on its own: the match
+        // with the list before and the first in-between's build, both. Not
+        // for a frame something reads back (captures, screenshots, the GPU
+        // debug mode), which a frame of citro3d's records as ever. A camera
+        // cut, or nothing to move, then shows at join_build (build_skip_):
+        // the game's frame goes alone.
+        if (afford && builder_ != nullptr && double_eyes_ && presenter_ != nullptr && !gpu_debug_ && !fb_capture_pending_ && !g_shot_request &&
+            g_seq_request == 0 && !(seq_count_ > 0 && (int)frames_ + 1 >= seq_first_ && (int)frames_ < seq_first_ + seq_count_)) {
+            wait_inbetween_vbo();
+            inter_.clear();
+            inter_.verts.set_storage((rt64_3ds::Vtx3ds*)vbo_[2], kVboVerts);
+            build_weight_ = 1.0f / (float)(n + 1);
+            kick_build();
+            return true;
+        }
         const u64 tm0 = svcGetSystemTick();
         last_match_ = interp_.match_previous(afford ? 1.0f / (float)(n + 1) : -1.0f);
         acc_match_ += svcGetSystemTick() - tm0;
@@ -1701,18 +2087,22 @@ private:
         if (!afford) { inb_budget_++; budget_drops_++; return false; }
         if (last_match_.camera_cut) { inb_cut_++; return false; }
         if (last_match_.xf_interp + last_match_.pj_interp + last_match_.tiles_interp == 0) { inb_nothing_++; return false; }
-        // Double eyes: the last in-between may still be on the GPU (the
-        // game's frame after it was handed over without waiting for it).
-        if (present_busy_ && job_deferred_) {
-            const u64 tw = svcGetSystemTick();
-            LightEvent_WaitTimeout(&inb_free_, 200 * 1000000ll);
-            acc_vbo_wait_ += svcGetSystemTick() - tw;
-        }
+        wait_inbetween_vbo();
         inter_.clear();
         inter_.verts.set_storage((rt64_3ds::Vtx3ds*)vbo_[2], kVboVerts);
         (void)task;
         if (!interp_.build_inbetween(frame_, inter_)) { inb_diverged_++; return false; }
         return true;
+    }
+    // Double eyes: the last in-between may still be on the GPU (the game's
+    // frame after it was handed over without waiting for it), reading the
+    // vertices the next one is built into.
+    void wait_inbetween_vbo() {
+        if (present_busy_ && job_deferred_) {
+            const u64 tw = svcGetSystemTick();
+            LightEvent_WaitTimeout(&inb_free_, 200 * 1000000ll);
+            acc_vbo_wait_ += svcGetSystemTick() - tw;
+        }
     }
 
     // Frame read-back (see read_back_frame): the previous frame's left eye
@@ -1969,6 +2359,7 @@ private:
                     uint32_t param = (uint32_t)f | ((uint32_t)ws << 4) | ((uint32_t)wt << 8);
                     if (b.tex != last_tex_[t] || param != last_tex_param_[t] || b.fresh) {
                         C3D_TexSetFilter(b.tex, f, f);
+                        if (b.tex->maxLevel > 0) C3D_TexSetFilterMipmap(b.tex, f);   // between levels as within them
                         C3D_TexSetWrap(b.tex, ws, wt);
                         C3D_TexBind(t, b.tex);
                         last_tex_[t] = b.tex; last_tex_param_[t] = param;
@@ -2727,7 +3118,8 @@ public:
                 const rt64_3ds::TexDesc& td = d.tex[t];
                 if (!td.valid || td.snapshot || td.frame || td.rtt >= 0) continue;
                 const uint16_t* pal = (td.fmt == 2 && td.tlut_index + 256 <= frame_.tlut.size()) ? &frame_.tlut[td.tlut_index] : nullptr;
-                rt64_3ds::BoundTex b = textures_.get(td, pal);
+                const rt64_3ds::TexDesc* mips = (td.levels > 1 && td.mip_index + td.levels - 1 <= frame_.mips.size()) ? &frame_.mips[td.mip_index] : nullptr;
+                rt64_3ds::BoundTex b = textures_.get(td, pal, mips);
                 // Every texture is in the cache before the replay starts and
                 // it binds from white_ at the frame's start: no address of a
                 // texture freed during the replay to tell apart.
@@ -2748,6 +3140,7 @@ public:
         uint32_t clear_frame = ~0u;
     };
     RttTarget rtt_[rt64_3ds::kMaxRtt];
+    uint32_t rtt_room_frame_ = ~0u - 8;          // the texture cache last gave VRAM back for a target
     int cur_target_ = -1;                        // the RTT slot drawn into, -1 = the eye
     RttTarget* ensure_rtt(int i) {
         const rt64_3ds::RttImage& img = frame_.rtts[i];
@@ -2757,13 +3150,19 @@ public:
             // the GPU may still read it): retire it until the next frame start.
             if (t.rt != nullptr) { retired_rtt_.push_back({ t.rt, t.tex }); t.rt = nullptr; }
             if (img.pot_w == 0 || img.pot_h == 0) return nullptr;
+            // Short of VRAM (textures took it): the texture cache gives some
+            // back (free three frames on) and keeps it free; again every four
+            // frames the target still fails.
+            const uint32_t need = (uint32_t)img.pot_w * img.pot_h * 8;   // RGBA8 + D24S8
             if (!C3D_TexInitVRAM(&t.tex, img.pot_w, img.pot_h, GPU_RGBA8)) {
+                if (frames_ - rtt_room_frame_ >= 4) { textures_.make_vram_room(need); rtt_room_frame_ = frames_; }
                 fprintf(stderr, "rt64-3ds: no VRAM for a %ux%u render texture\n", (unsigned)img.pot_w, (unsigned)img.pot_h);
                 return nullptr;
             }
             t.rt = C3D_RenderTargetCreateFromTex(&t.tex, GPU_TEXFACE_2D, 0, GPU_RB_DEPTH24_STENCIL8);
             if (t.rt == nullptr) {
                 C3D_TexDelete(&t.tex);
+                if (frames_ - rtt_room_frame_ >= 4) { textures_.make_vram_room(need); rtt_room_frame_ = frames_; }
                 fprintf(stderr, "rt64-3ds: render target for a %ux%u texture failed\n", (unsigned)img.pot_w, (unsigned)img.pot_h);
                 return nullptr;
             }
@@ -2909,6 +3308,7 @@ public:
         fprintf(stderr, "rt64-3ds: double eyes on: in-between eye targets %u KB (VRAM free %u -> %u KB), game-frame command buffer %u KB (linear free %u KB)\n",
                 (unsigned)(need / 1024), (unsigned)(free0 / 1024), (unsigned)(vramSpaceFree() / 1024), (unsigned)(kDeferBytes / 1024),
                 (unsigned)(linearSpaceFree() / 1024));
+        start_builder();
     }
 
     // The screen's outputs follow the set the frame draws into (double eyes;
@@ -2934,7 +3334,7 @@ public:
         defer_split();
         const u32 used = (u32)(gpuCmdBuf - dbuf_);  // words: each split moved the buffer past its list
         if (used > dbuf_used_max_) dbuf_used_max_ = used;
-        GSPGPU_FlushDataCache(dbuf_, used * 4);
+        flush_dcache(dbuf_, used * 4);
         GPUCMD_SetBuffer(nullptr, 0, 0);
         deferring_ = false;
     }
@@ -2964,7 +3364,7 @@ public:
         C3D_SetViewport(0, 0, t->frameBuf.width, t->frameBuf.height);
     }
     void frame_split() {
-        if (!deferring_) C3D_FrameSplit(0);
+        if (!deferring_) C3D_FrameSplit(GX_CMDLIST_FLUSH);   // frame ends flush only their own list
         else defer_split();
     }
     // The eyes' formats (RenderDesc::eye_color16 / eye_depth16), their
@@ -3043,7 +3443,11 @@ public:
     float pair_ms_ = 0.0f, pair_ema_ = 0.0f;    // what a pair (in-betweens + frame) costs, last and expected, without the waits
     float real_ema_ = 0.0f, inb_ema_ = 0.0f;    // ... of which the game's frame and the in-between
     float inb_share_ = 0.0f;                    // the in-between's cost as a share of the game frame's
-    uint32_t budget_drops_ = 0;                 // lists in a row that went without one for the budget
+    uint32_t budget_drops_ = 0;                 // lists that went without one for the budget since the last try
+    // Trying in-betweens over budget (make_inbetween): lists left in this
+    // run, lists to drop before the next, runs this report.
+    static constexpr uint32_t kProbeLists = 8, kProbeEvery = 30, kProbeEveryMax = 240;
+    uint32_t probe_left_ = 0, probe_every_ = kProbeEvery, probes_ = 0;
     int budget_pct_ = -1;                       // INTERP_BUDGET.TXT
     uint32_t inb_snapshot_ = 0, inb_rtt_ = 0, inb_offscreen_ = 0, inb_blank_ = 0, inb_depth_ = 0;   // unsafe, by what
     uint32_t inb_after60_ = 0, inb_after_unsafe_ = 0;   // unrelated: the list before asked 60 / was unsafe
@@ -3052,10 +3456,14 @@ public:
     uint32_t inb_late_resync_ = 0;              // ... of inb_late_, dropped to resync with the screen (resync_)
     bool behind_resync_ = false;                // this list's `behind` came from resync_
     u64 acc_list_busy_ = 0, max_list_busy_ = 0; // the gfx thread's time per drawn list, dequeue to done
-    u64 acc_list_read_ = 0;                     // ... of which reading it (to "parsed")
+    u64 acc_list_read_ = 0, max_list_read_ = 0; // ... of which reading it (to "parsed": the game waits for that)
+    float last_read_ms_ = 0.0f;
+    float last_tris_ms_ = 0.0f;   // the list's deferred triangles (finish_triangles), on this thread
     u64 acc_list_wait_ = 0, max_list_wait_ = 0; // its wait for the gfx thread (queued behind the one before)
+    u64 acc_build_wait_ = 0;                    // the builder: what of its builds this thread waited for
+    uint32_t builds_ = 0;
     uint32_t inb_cut_ = 0, inb_nothing_ = 0, inb_diverged_ = 0;
-    char interp_line_[1000] = "";
+    char interp_line_[1100] = "";
     uint32_t frames_ = 0, report_ = 0;
     u64 last_dl_tick_ = 0;                      // when the game submitted the last list
     uint32_t late_ = 0, late_logged_ = 0;
@@ -3067,6 +3475,8 @@ public:
     float wait_ms_ = 0, end_ms_ = 0, depth_ms_ = 0;
     u64 prof_[5] = {};
     bool prof_on_ = false;   // PROFILE.TXT: time the replay's sections (a syscall per sample)
+    u64 acc_tris_ = 0;       // the lists' deferred triangles (finish_triangles), for the read profile
+    u64 acc_prefetch_ = 0;   // the lists' texture decoding (prefetch_textures), for the read profile
     u64 tick() const { return prof_on_ ? svcGetSystemTick() : 0; }
     uint32_t frames_at_profile_ = 0, frames_at_stereo_ = 0;
     C3D_Tex* last_tex_[2] = { nullptr, nullptr };

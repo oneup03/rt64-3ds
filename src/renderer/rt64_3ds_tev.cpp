@@ -220,6 +220,14 @@ void plan_tev(const DrawRecord& d, TevPlan& plan) {
     Src Aa1 = map_a_abd((w1 >> 21) & 7), Ac1 = map_a_c((w1 >> 18) & 7);
     Src d0 = map_rgb_d((w1 >> 15) & 7), Ab0 = map_a_abd((w1 >> 12) & 7), Ad0 = map_a_abd((w1 >> 9) & 7);
     Src d1 = map_rgb_d((w1 >> 6) & 7), Ab1 = map_a_abd((w1 >> 3) & 7), Ad1 = map_a_abd(w1 & 7);
+    if (lod_trilerp(w0, w1, d.othermode_h)) {
+        // The PICA blends the mip levels: TEXEL1 reads as TEXEL0, and the
+        // lerp between them leaves TEXEL0.
+        for (Src* s : { &a0, &b0, &c0, &d0, &Aa0, &Ab0, &Ac0, &Ad0 }) {
+            if (*s == S_TEX1) *s = S_TEX0;
+            else if (*s == S_TEX1_A) *s = S_TEX0_A;
+        }
+    }
 
     int cycles = (cyc == 1) ? 2 : 1;
     for (int cy = 0; cy < cycles; cy++) {

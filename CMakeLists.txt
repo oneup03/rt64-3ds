@@ -114,8 +114,11 @@ add_library(recomp_3ds STATIC
     src/platform/naudio_hle.cpp
     src/platform/aspmain_hle.cpp
     src/platform/audio_hle_diff.cpp
+    src/platform/dsp_synth.cpp
+    src/platform/dsp_reverb.cpp
     src/platform/input_hid.cpp
     src/platform/loadmon.cpp
+    src/platform/stall_watch.cpp
     src/platform/log.cpp
     src/platform/autotest.cpp
 )

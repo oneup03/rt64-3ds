@@ -9,6 +9,7 @@
 #include "librecomp/rsp.hpp"
 #include "ultramodern/input.hpp"
 #include "naudio_hle.h"
+#include "dsp_synth.h"
 #include "aspmain_hle.h"
 #include "rt64_3ds.h"
 
@@ -98,6 +99,25 @@ struct GameDesc {
     // the interpreter takes most of one. Needs every task's output to reach
     // the host through osAiSetNextBuffer alone.
     bool audio_async = false;
+    // With two cores (an Old 3DS, or the Cores row's two-core layouts on a
+    // New 3DS): the game on core 0, which the application has whole, and the
+    // renderer, the audio task and the synthesizer on core 1 (its share,
+    // 80%). Off: the game on core 1 and the rest on core 0. The larger load
+    // wants core 0: Goemon's renderer (24.4 fps at the Old clock against 17.5
+    // the other way round), Banjo's game (its core full at 13-20 fps).
+    bool two_cores_game_on_core0 = false;
+    // With two cores and the game on core 0, for a game that waits on
+    // "parsed" every frame (Banjo's game_draw): each display list is read on
+    // core 0, idle while the game waits for exactly that, and drawn on core 1
+    // (rt64_3ds::Settings::read_core). Banjo's read took 26 ms on core 1
+    // against about 21 on core 0, all of it in the game's frame; with the
+    // triangles' output on core 1 too (Interpreter::set_defer_triangles),
+    // 8% more frames at the Old clock.
+    bool two_cores_read_on_game_core = false;
+    // The game's synthesizer on the DSP (dsp_synth.h): the flavor of its
+    // synthesizer, whose entry points the game's recompiler config hooks
+    // (recomp3ds_synth_hook). Offers the Audio engine row (RSP / DSP).
+    SynthDesc synth = SynthFlavor::None;
     recomp3ds::NaudioVariant audio_hle_variant = recomp3ds::NaudioVariant::Dk64;   // naudio: which build of n_aspMain the game has
     // Called once when audio tasks stop arriving for 2 s after having run:
     // the game can log its scheduler/audio state (debugging lost wake-ups).

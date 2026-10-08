@@ -10,6 +10,7 @@
 #include "ultramodern/ultramodern.hpp"
 #include "recomp3ds_internal.h"
 #include "recomp3ds.h"
+#include "dsp_synth.h"
 
 namespace {
 
@@ -21,11 +22,13 @@ uint32_t g_rate = 32000;
 int g_margin_frames = 1;   // video frames reported fewer than are queued (GameDesc::audio_margin_frames)
 ndspWaveBuf g_bufs[kNumBufs];
 int16_t* g_storage[kNumBufs];
+int16_t* g_silence = nullptr;   // a buffer's worth of zeros that every silent buffer queues
 int g_next = 0;
 float g_volume = 1.0f;
 std::atomic<bool> g_enabled{ true };     // the menu's Audio setting
 bool g_started = false;
 volatile uint32_t g_submitted = 0, g_dropped = 0, g_underruns = 0;
+volatile uint32_t g_added = 0;          // frames handed to the channel since init (the AI clock)
 volatile uint32_t g_low_water = 0xFFFFFFFFu;
 
 // AUDIO_WAV.TXT beside the executable ("<start s> <length s>"): the game's
@@ -94,6 +97,11 @@ bool recomp3ds::audio_init() {
         memset(&g_bufs[i], 0, sizeof(g_bufs[i]));
         g_bufs[i].status = NDSP_WBUF_DONE;
     }
+    g_silence = (int16_t*)linearAlloc(kMaxFramesPerBuf * 2 * sizeof(int16_t));
+    if (g_silence != nullptr) {
+        memset(g_silence, 0, kMaxFramesPerBuf * 2 * sizeof(int16_t));
+        svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)g_silence, kMaxFramesPerBuf * 2 * sizeof(int16_t));
+    }
     g_ready = true;
     return true;
 }
@@ -151,19 +159,33 @@ void recomp3ds::audio_queue_samples(int16_t* samples, size_t sample_count) {
         }
         int16_t* dst = g_storage[g_next];
         const int16_t* src = samples + done * 2;
-        // With audio off the task that fills `samples` was skipped: silence,
-        // queued all the same so the game's pacing does not change.
-        const float vol = g_enabled ? g_volume : 0.0f;
-        for (size_t i = 0; i < n; i++) {
-            // Swap the pair: RDRAM halfwords are stored xor 2, so L and R arrive reversed.
-            dst[i * 2 + 0] = (int16_t)(src[i * 2 + 1] * vol);
-            dst[i * 2 + 1] = (int16_t)(src[i * 2 + 0] * vol);
+        // With audio off the task that fills `samples` was skipped, and with
+        // the voices on the DSP (dsp_synth.h) too: silence, queued all the
+        // same so the game's pacing (and the DSP synthesizer's clock) does
+        // not change, from the one buffer of zeros (no copy, no flush).
+        if ((!g_enabled || recomp3ds::dsp_synth_enabled()) && g_silence != nullptr) {
+            dst = g_silence;
         }
-        DSP_FlushDataCache(dst, n * 2 * sizeof(int16_t));
+        else {
+            const float vol = g_enabled ? g_volume : 0.0f;
+            for (size_t i = 0; i < n; i++) {
+                // Swap the pair: RDRAM halfwords are stored xor 2, so L and R arrive reversed.
+                dst[i * 2 + 0] = (int16_t)(src[i * 2 + 1] * vol);
+                dst[i * 2 + 1] = (int16_t)(src[i * 2 + 0] * vol);
+            }
+            // The kernel's own flush: DSP_FlushDataCache is a request to the
+            // DSP module on core 1, which the game's audio thread then waited
+            // on (dsp_synth.cpp found it costing whole frames).
+            svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)dst, n * 2 * sizeof(int16_t));
+        }
         wb->data_pcm16 = dst;
         wb->nsamples = (u32)n;
         wb->looping = false;
         ndspChnWaveBufAdd(kChannel, wb);
+        // After the add: a reader that sees the new count sees the buffer
+        // queued, so the played count (added minus queued) never runs ahead.
+        __sync_synchronize();
+        g_added = g_added + (uint32_t)n;
         g_next = (g_next + 1) % kNumBufs;
         done += n;
     }
@@ -189,6 +211,16 @@ size_t recomp3ds::audio_frames_queued() {
     }
     return queued;
 }
+
+uint32_t recomp3ds::audio_frames_added() { return g_added; }
+
+uint32_t recomp3ds::audio_frames_played() {
+    const uint32_t added = g_added;
+    __sync_synchronize();
+    return added - (uint32_t)audio_frames_queued();
+}
+
+uint32_t recomp3ds::audio_rate() { return g_rate; }
 
 size_t recomp3ds::audio_frames_remaining() {
     // Like the desktop: report a margin's worth less (one VI unless the game
