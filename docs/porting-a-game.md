@@ -70,7 +70,7 @@ renderer can't find out from the display lists:
 | `frame_interpolation` | Offers "60 interp." on the Frame rate row (`frame_cap=2`): for games whose patches tag their transforms for RT64's high frame rate (`gEXMatrixGroup*`). Goemon. See below. |
 | `eye_color16`, `eye_depth16`, `intensity_textures16`, `fill_clear` | The GPU's share of a frame: RGB565 eye colour buffers (snapshots then have no alpha; no dithering, so some banding), 16-bit eye depth, I/IA textures as LA8 (identical texels, half the size), and a frame's leading full-screen fill rectangle (the game's own clear) turned into the eyes' clear colour instead of a screen of fragments. Off by default (DK64, Banjo); Goemon sets all but `eye_color16`. Each is also a `settings.ini` key read at start (`gpu_color16`, `gpu_depth16`, `gpu_textures16`, `gpu_fill_clear`) for A/B tests on the console. |
 | `double_eyes` | With `frame_interpolation`: the in-betweens draw into eye targets of their own (two more 240x400 colour + depth buffers, 1125 KB of VRAM at RGBA8/D16, taken after everything else and skipped when there isn't room), and the game's frame of each pair is recorded into a command buffer of its own while the GPU still draws the in-between; the presenter thread queues it. Off by default; Goemon sets it. Also `gpu_double_eyes` in `settings.ini`. See below. |
-| `early_drawn` | The game hears a display list drawn (the RDP's completion) once the renderer has read it, at "parsed", not when the renderer is done with it (nmr patch 0028, `ultramodern::renderer::report_list_drawn`). For a game that waits for the RDP before its next frame (Banjo's frame limiter does, every frame): with frame interpolation the renderer's waits for the screen otherwise come out of the game's frame time, and it misses retraces (Banjo's cutscenes fell behind their music). A list may then wait for the one before; `list_wait_us` says how long. Not with `depth_to_rdram` (that depth is written while the next list is drawn). Banjo sets it. |
+| `early_drawn` | The game hears a display list drawn (the RDP's completion) once the renderer has read it, at "parsed", not when the renderer is done with it (nmr patch 0028, `ultramodern::renderer::report_list_drawn`). For a game that waits for the RDP before its next frame (Banjo's frame limiter does, every frame): with frame interpolation the renderer's waits for the screen otherwise come out of the game's frame time, and it misses retraces (Banjo's cutscenes fell behind their music). A list may then wait for the one before; `list_wait_us` says how long. With `depth_to_rdram` the game hears it a little later: once the last game frame's depth is in RDRAM, after the read and once the presenter is done with that frame, since the game must not run while its depth buffer is written. Banjo and DK64 set it. |
 
 The player's **Frame rate** row (Game page, `frame_cap` in `settings.ini`)
 caps the drawn frames at 30 a second while the game asks for more
@@ -200,6 +200,31 @@ screen's status row shows core 3's load as `c3` when the system lets the
 application use the core. With `PROFILE.TXT` a `read profile per list:` line
 splits the list's read (what a game waiting for "parsed" waits for) by
 kind of command, plus the texture decoding.
+
+The gfx thread records every frame twice with 3D on, once for each eye
+(1-2.8 ms an eye in DK64's heavy scenes). The right eye now reuses the
+left eye's commands. The vertex shader takes the eye's sign as a uniform
+(`eye`, x' = x + e(a w + b)), and every class's shift is odd in the eye,
+so a draw's commands are the same for both eyes. The left eye's draws
+are a command list of their own, set all their state themselves from
+emptied caches (`forget_draw_state`), and are queued a second time after
+the right eye's target and sign (`close_segment`, `queue_again`). That
+leaves the GPU where citro3d thinks it is, apart from what the ghost
+pass sets anyway. Frames that draw into other targets between the
+eyes' draws (off-screen images, `sample_drawn_frame`'s frame copy) and
+the GPU debug mode record both eyes as before, and so does
+`EYE_REPLAY_OFF.TXT`. The stereo line gives `the right eye from the
+left's commands in N of M frames`.
+
+The game frame's depth (the stereo statistics, the aim sampler,
+`depth_to_rdram`) was read by the CPU from VRAM, about a millisecond a
+frame for the grid. The GPU now copies the left eye's depth buffer to
+linear memory once that eye's draws are queued (`queue_depth_copy`), and
+the reads use the copy. The first eight copies, one every 300th frame,
+are checked against VRAM in the log (`depth copy check`). With
+`DEPTH_COPY_OFF.TXT` the reads use VRAM. `depth_to_rdram` writes the
+game's depth buffer a word (two pixels) at a time.
+
 What a list's read records for the in-betweens is kept small, because the
 game waits for the read. A triangle stores its three vertices and the index
 of a state it shares with its neighbours (`TriState`: its record, tile,

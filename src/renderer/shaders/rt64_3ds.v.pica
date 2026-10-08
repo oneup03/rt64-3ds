@@ -3,13 +3,17 @@
 ; Vertices arrive in N64 screen homogeneous space: (x, y) / w are N64 pixels
 ; (the viewport already applied on the CPU), z / w in [0, 1] near to far.
 ; `xform` is the Mtx_OrthoTilt over the N64 screen for the render target
-; being drawn. `stereo` = (a, b): x' = x + a*w + b, the per-draw eye shift
-; (zero for mono). `uvscale` turns texel coordinates into normalized ones
-; for the PICA texture actually bound (power-of-two padded). `uv1` maps
-; them to the second texture's normalized coordinates: itc * uv1.xy + uv1.zw.
+; being drawn. `stereo` = (a, b) and `eye` = (e): x' = x + e*(a*w + b), the
+; per-draw shift (zero for mono) for the eye being drawn, e = +1 left, -1
+; right; a draw's (a, b) is the same for both eyes, so the right eye can run
+; the left eye's commands again. `uvscale` turns texel coordinates into
+; normalized ones for the PICA texture actually bound (power-of-two padded).
+; `uv1` maps them to the second texture's normalized coordinates:
+; itc * uv1.xy + uv1.zw.
 
 .fvec xform[4]
 .fvec stereo
+.fvec eye
 .fvec uvscale
 .fvec uv1
 
@@ -27,8 +31,9 @@
 .proc main
 	mov r0, ipos
 	mul r1.x, stereo.x, ipos.w
+	add r1.x, stereo.y, r1.x
+	mul r1.x, eye.x, r1.x
 	add r0.x, r0.x, r1.x
-	add r0.x, stereo.y, r0.x
 
 	dp4 opos.x, xform[0], r0
 	dp4 opos.y, xform[1], r0

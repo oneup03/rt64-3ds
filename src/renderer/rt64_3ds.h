@@ -221,8 +221,9 @@ struct RenderDesc {
     // pair on a refresh of its own) then stay off the game's frame time: a
     // game that waits for the RDP before its next frame (Banjo's frame
     // limiter does, every frame) keeps its own pace, and its cutscenes keep
-    // to their music. Not with depth_to_rdram: that depth is written while
-    // the next list is drawn.
+    // to their music. With depth_to_rdram the game hears it once the last
+    // game frame's depth is in RDRAM, after the read and once the presenter
+    // is done with that frame (the game must not run while it is written).
     bool early_drawn = false;
 
     // ---- Frame rate.

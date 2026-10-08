@@ -12,6 +12,7 @@
 #include <cstring>
 #include <sys/stat.h>
 #include <ctime>
+#include <unordered_map>
 #include <vector>
 
 #include "rt64_3ds.h"
@@ -423,6 +424,7 @@ public:
         if (g_quitting) return;
         u64 t0 = svcGetSystemTick();
         vsync_at_dl_ = acc_vsync_;
+        list_seq_++;
         // How long the list waited for this thread (it was queued while the
         // one before was still drawn: with RenderDesc::early_drawn the game
         // does not wait for that), and when the game submitted it.
@@ -464,7 +466,7 @@ public:
         // on and a list may wait for the one before a while; one that waited
         // more than 40% of the game's frame time would soon hold the game on
         // "parsed" (its next frame is built once this one is read).
-        const bool queued = rt64_3ds::render_desc().early_drawn
+        const bool queued = early_drawn_
                                 ? (float)wait * 1000.0f / (float)SYSCLOCK_ARM11 > 0.4f * period_ms
                                 : last_pair_end_ != 0 && t0 - last_pair_end_ < SYSCLOCK_ARM11 / 1000;
         // While a probe runs (make_inbetween, over budget), a list that only
@@ -478,6 +480,7 @@ public:
         behind_resync_ = resync_;
         resync_ = false;
         // The read, up to "parsed" (on the reader thread when there is one).
+        depth_read_early_ = false;
         const ReadOutcome read = read_list(task);
         if (read == ReadOutcome::PassedOver) {
             g_progress.phase = 0;
@@ -509,6 +512,7 @@ public:
             inter_bound_ = bound_;
         }
         await_presenter();
+        early_depth();
         if (seq_rtt_count_ > 0 && frames_ > 10) {
             for (const rt64_3ds::DrawRecord& d : frame_.draws) {
                 if (d.rtt >= 0) { seq_first_ = (int)frames_ + 1; seq_count_ = seq_rtt_count_; seq_rtt_count_ = 0; break; }
@@ -744,7 +748,7 @@ public:
                          "rt64-3ds:   frame interpolation last match: transforms %u/%u/%u (vertices %u), projections %u/%u/%u, tiles %u/%u",
                          interp_mode_ ? "on" : "off", presented_, inb_drawn_, (float)(acc_inb_interp_) * per_inb, (float)acc_inb_replay_ * per_inb,
                          inb_missed, inb_late_, inb_late_resync_,
-                         rt64_3ds::render_desc().early_drawn ? "waited too long for the one before" : "arrived while the last one was still drawn",
+                         early_drawn_ ? "waited too long for the one before" : "arrived while the last one was still drawn",
                          inb_budget_, probes_, probe_every_, inb_unsafe_, inb_unrelated_, inb_cut_, inb_nothing_, inb_diverged_,
                          lists ? (float)(acc_vsync_ + (u64)presenter_wait_us_ * SYSCLOCK_ARM11 / 1000000ull) * ms / (float)lists : 0.0f,
                          lists ? (float)acc_list_busy_ * ms / (float)lists : 0.0f, (float)max_list_busy_ * ms,
@@ -762,7 +766,8 @@ public:
                 build_ticks_ = 0;
                 builds_ = 0;
                 helper_.jobs = 0;
-                helper_.run_ticks = helper_.wait_ticks = 0;
+                helper_.run_ticks = 0;
+                helper_.wait_ticks = 0;
                 acc_inb_interp_ = acc_inb_replay_ = acc_match_ = acc_vsync_ = 0;
                 presenter_wait_us_ = 0;
                 vsync_at_dl_ = 0;
@@ -872,12 +877,15 @@ public:
                                 primary_inst_, inst_table_n_, buf, inst_table_n_ > kInstTable ? " ..." : "", hudcam_world_frames_, hudcam_frames_, covering_hud_);
                         covering_hud_ = hudcam_world_frames_ = hudcam_frames_ = 0;
                     }
-                    fprintf(stderr, "rt64-3ds:   stereo %s: slider %.2f sep %d (%.3f) conv %.1f (manual %.1f%s) near %.1f hud %d%s aim %.1f, replay per frame left %.1f right %.1f ms\n",
+                    fprintf(stderr, "rt64-3ds:   stereo %s: slider %.2f sep %d (%.3f) conv %.1f (manual %.1f%s) near %.1f hud %d%s aim %.1f, replay per frame left %.1f right %.1f ms "
+                            "(the right eye from the left's commands in %u of %u frames)\n",
                             s3d_on_ ? "on" : "off", slider_, st.sep_slider, (float)st.sep_slider * 0.002f * slider_ * st.slider_gain,
                             applied_conv_, (float)st.convergence_hundredths * 0.2f, st.auto_convergence ? ", auto" : "", near_z_, st.hud_depth,
                             rt64_3ds::first_person_scene() ? " first-person" : "", aim_z_,
-                            (float)acc_left_ * 1000.0f / SYSCLOCK_ARM11 / fw, (float)acc_right_ * 1000.0f / SYSCLOCK_ARM11 / fw);
+                            (float)acc_left_ * 1000.0f / SYSCLOCK_ARM11 / fw, (float)acc_right_ * 1000.0f / SYSCLOCK_ARM11 / fw,
+                            eye_replays_, eye_frames_);
                     acc_left_ = acc_right_ = 0;
+                    eye_replays_ = eye_frames_ = 0;
                 }
                 if (rt64_3ds::render_desc().sample_drawn_frame) {
                     const uint32_t fw = frames_ - frames_at_fc_;
@@ -1000,9 +1008,16 @@ public:
     void tell_parsed(uint32_t data_ptr, ReadOutcome read) {
         ultramodern::extensions::on_displaylist_parsed(data_ptr);
         // RenderDesc::early_drawn: and drawn, so a game that waits for that
-        // before its next frame does not wait for the screen below too.
-        if (read != ReadOutcome::PassedOver && rt64_3ds::render_desc().early_drawn) ultramodern::renderer::report_list_drawn();
+        // before its next frame does not wait for the screen below too. With
+        // depth_to_rdram, once the last game frame's depth is in RDRAM
+        // (early_depth, send_dl): the game must not run while it is written.
+        if (read == ReadOutcome::PassedOver || !early_drawn_) return;
+        if (read == ReadOutcome::Drawn && rt64_3ds::render_desc().depth_to_rdram) drawn_after_depth_ = true;
+        else ultramodern::renderer::report_list_drawn();
     }
+    bool early_drawn_ = false;                  // RenderDesc::early_drawn, unless EARLY_DRAWN_OFF.TXT
+    bool drawn_after_depth_ = false;            // tell_parsed left "drawn" to early_depth
+    bool depth_read_early_ = false;             // this list's game frame has its depth grid (early_depth)
 
     // ---- the reader thread (Settings::read_core): a list's read on another
     // core while the gfx thread waits for it. For a game that waits on
@@ -1142,6 +1157,29 @@ private:
             textures_.set_vram(vram, reserve);
             fprintf(stderr, "rt64-3ds: textures in %s, %u KB kept free\n", vram ? "VRAM (as room allows)" : "the linear heap (TEX_VRAM_OFF.TXT)", (unsigned)(reserve / 1024));
         }
+        // "Drawn" as soon as the list is read (RenderDesc::early_drawn);
+        // EARLY_DRAWN_OFF.TXT: once the renderer is done with it, for A/B.
+        early_drawn_ = rt64_3ds::render_desc().early_drawn;
+        if (early_drawn_) {
+            if (FILE* f = rt64_3ds::data_fopen("EARLY_DRAWN_OFF.TXT", "r")) {
+                fclose(f);
+                early_drawn_ = false;
+                fprintf(stderr, "rt64-3ds: lists reported drawn once done with (EARLY_DRAWN_OFF.TXT)\n");
+            }
+        }
+        // In-between and game-frame checks of the flat draws (the log names
+        // one that jumped for a frame).
+        if (FILE* f = rt64_3ds::data_fopen("INTERP_CHECK.TXT", "r")) {
+            fclose(f);
+            interp_check_ = true;
+            fprintf(stderr, "rt64-3ds: flat draws checked against their frames (INTERP_CHECK.TXT)\n");
+        }
+        // The right eye from the left eye's commands (replay_and_present).
+        if (FILE* f = rt64_3ds::data_fopen("EYE_REPLAY_OFF.TXT", "r")) {
+            fclose(f);
+            eye_replay_on_ = false;
+            fprintf(stderr, "rt64-3ds: both eyes' draws recorded (EYE_REPLAY_OFF.TXT)\n");
+        }
         // The game's own mipmap levels (TexDesc::levels); MIPMAP_OFF.TXT
         // draws the base level alone.
         if (FILE* f = rt64_3ds::data_fopen("MIPMAP_OFF.TXT", "r")) {
@@ -1177,6 +1215,16 @@ private:
         cur_eye_[1] = last_eye_[1] = top_r_;
         fprintf(stderr, "rt64-3ds: eye targets: %s colour, %s depth (VRAM left %u KB)\n", color16_ ? "RGB565" : "RGBA8",
                 depth16_ ? "16-bit" : "24-bit + stencil", (unsigned)(vramSpaceFree() / 1024));
+        // The game frame's depth, copied by the GPU after its left eye's draws
+        // (queue_depth_copy), for the depth reads (read_depth_zp): the CPU
+        // reads VRAM slowly (the grid's 1200 texels took about a millisecond
+        // a frame on the console). DEPTH_COPY_OFF.TXT reads VRAM as before.
+        if (FILE* f = rt64_3ds::data_fopen("DEPTH_COPY_OFF.TXT", "r")) fclose(f);
+        else {
+            depth_copy_bytes_ = C3D_CalcDepthBufSize(240, 400, eye_depth);
+            depth_copy_ = (u8*)linearAlloc(depth_copy_bytes_);
+        }
+        fprintf(stderr, "rt64-3ds: depth read %s\n", depth_copy_ != nullptr ? "from a GPU copy in linear memory" : "from VRAM");
         gfxSet3D(false);
 
         dvlb_ = DVLB_ParseFile((u32*)rt64_3ds_shbin, rt64_3ds_shbin_size);
@@ -1185,6 +1233,7 @@ private:
         C3D_BindProgram(&prog_);
         u_xform_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "xform");
         u_stereo_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "stereo");
+        u_eye_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "eye");
         u_uvscale_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "uvscale");
         u_uv1_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "uv1");
 
@@ -1409,15 +1458,17 @@ private:
             // The finished frame's depth, read once on a grid: the game's
             // RDRAM depth buffer and the stereo near statistic both use it.
             u64 td = svcGetSystemTick();
-            bool rdram = rt64_3ds::render_desc().depth_to_rdram && prev_depth_image_ != 0 && !inbetween;
-            if (!inbetween && (rdram || stereo_wants_depth_)) {
-                read_depth_grid();
-                if (rdram) depth_to_rdram(prev_depth_image_);
-            }
+            const bool rdram = rt64_3ds::render_desc().depth_to_rdram && prev_depth_image_ != 0 && !inbetween;
+            if (!inbetween && depth_read_early_) depth_read_early_ = false;     // read before "drawn" (early_depth)
+            else if (!inbetween && (rdram || stereo_wants_depth_)) read_game_depth(rdram);
             acc_depth_ += svcGetSystemTick() - td;
         }
         const rt64_3ds::StereoFrame sfd = finish_stereo_frame(sf, inbetween);
         classify_frame(sfd);
+        if (interp_check_) {
+            if (inbetween) check_inbetween_flat();
+            else note_flat_boxes();
+        }
         g_progress.phase = 3;
         for (const rt64_3ds::DrawRecord& d : frame_.draws) {
             if (d.tex[0].valid && d.tex[0].snapshot) {
@@ -1449,6 +1500,7 @@ private:
         C3D_BindProgram(&prog_);
         C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &proj_);
         C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, 0.0f, 0.0f, 0.0f, 0.0f);
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, u_eye_, 1.0f, 0.0f, 0.0f, 0.0f);
         last_sa_ = last_sb_ = 0.0f;
         C3D_TexBind(0, &white_);
         C3D_TexBind(1, &white_);
@@ -1481,6 +1533,18 @@ private:
         // mid-frame (see replay_split below).
         const bool split = frame_.frame_sample_last >= 0 && frame_rt_ != nullptr && !offscreen_frame;
         if (split) fc_frames_++;
+        // The right eye from the left eye's commands: the left eye's draws
+        // are a command list of their own (they set all their state
+        // themselves, from caches emptied at its start), queued a second time
+        // after the right eye's target and sign. Not for frames that draw
+        // into other targets between the eyes' draws (off-screen images, the
+        // frame copy), nor in the GPU debug mode. EYE_REPLAY_OFF.TXT: both
+        // eyes recorded, as before.
+        bool eye_replay = eyes == 2 && eye_replay_on_ && !split && !(debug_frame && debug_sync_);
+        if (eye_replay) for (const rt64_3ds::DrawRecord& d : frame_.draws) if (d.rtt >= 0) { eye_replay = false; break; }
+        u32* left_list = nullptr;
+        u32 left_words = 0;
+        if (eyes == 2) eye_frames_++;
         for (int pass = 0; pass < eyes; pass++) {
         const int eye = pass == 0 ? 1 : -1;       // +1 left, -1 right
         if (pass == 1) {
@@ -1491,6 +1555,26 @@ private:
             cur_target_ = -1;
             frame_viewport_ = false;
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &proj_);
+        }
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, u_eye_, (float)eye, 0.0f, 0.0f, 0.0f);
+        if (pass == 1 && left_list != nullptr) {
+            // The right eye's target and sign to the GPU, then the left
+            // eye's draws again. They leave the GPU as they left it after the
+            // left eye, which is what citro3d holds apart from the target and
+            // the sign (the ghost pass, between them, sets all it uses).
+            C3Di_UpdateContext();
+            close_segment();
+            queue_again(left_list, left_words);
+            eye_replays_++;
+            forget_draw_state();
+            if (ghost && sfd.on && !offscreen_frame) ghost_pass((uint32_t)n);
+            continue;
+        }
+        if (eye_replay) {
+            // The frame's setup and the left target, apart from the draws.
+            C3Di_UpdateContext();
+            close_segment();
+            forget_draw_state();
         }
         // One record into one target (-1 the eye, kFrameTarget the copy of
         // the eye's frame, >= 0 an off-screen image).
@@ -1506,10 +1590,13 @@ private:
             }
             apply_state(d, i, (pass == 0 && tgt != kFrameTarget) ? &fallbacks : nullptr);
             {
+                // The left eye's shift: the shader multiplies it by the
+                // eye's sign (u_eye_), so a draw's commands are the same for
+                // both eyes (every class's shift is odd in the eye).
                 float sa = 0.0f, sb = 0.0f;
                 if (sfd.on && d.rtt < 0) {
-                    if (classes_[i] == kReticle) sa = -(float)eye * sfd.aim_ndc * 200.0f;
-                    else rt64_3ds::stereo_shift(sfd, (rt64_3ds::StereoClass)classes_[i], d, eye, &sa, &sb);
+                    if (classes_[i] == kReticle) sa = -sfd.aim_ndc * 200.0f;
+                    else rt64_3ds::stereo_shift(sfd, (rt64_3ds::StereoClass)classes_[i], d, 1, &sa, &sb);
                 }
                 if (sa != last_sa_ || sb != last_sb_) {
                     C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, sa, sb, 0.0f, 0.0f);
@@ -1536,6 +1623,7 @@ private:
                 g_progress.phase = 3;
                 C3D_BindProgram(&prog_);
                 C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, last_sa_, last_sb_, 0.0f, 0.0f);
+                C3D_FVUnifSet(GPU_VERTEX_SHADER, u_eye_, (float)eye, 0.0f, 0.0f, 0.0f);
                 C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uvscale_, last_us_, last_vs_, 0.0f, 0.0f);
                 C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uv1_, last_uv1_[0], last_uv1_[1], last_uv1_[2], last_uv1_[3]);
                 bi = C3D_GetBufInfo();
@@ -1602,6 +1690,17 @@ private:
         }
         if (cur_target_ != -1 && !offscreen_frame) {
             bind_target(-1, pass);
+        }
+        // The left eye's draws, a command list kept for the right eye.
+        if (eye_replay && pass == 0) close_segment(&left_list, &left_words);
+        // A game frame's depth, copied once its left eye's draws are queued
+        // (the next game frame reads it).
+        if (pass == 0 && !inbetween) {
+            depth_copy_ready_ = depth_copy_ != nullptr && !offscreen_frame;
+            if (depth_copy_ready_) {
+                if (!eye_replay) close_segment();
+                queue_depth_copy();
+            }
         }
         if (ghost && sfd.on && !offscreen_frame) ghost_pass((uint32_t)n);
         }   // eye passes
@@ -1808,6 +1907,7 @@ private:
         for (int i = 0; i < dop_count_; i++) {
             const DeferredOp& op = dops_[i];
             if (op.fill != nullptr) C3D_RenderTargetClear(op.fill, op.bits, op.color, 0);
+            else if (op.copy_dst != nullptr) copy_depth(op.copy_src, op.copy_dst, op.copy_bytes);
             else GX_ProcessCommandList(op.list, op.words * 4, 0);
         }
         C3D_FrameEnd(GX_CMDLIST_FLUSH);       // the recording was flushed as it ended (end_deferred)
@@ -2065,6 +2165,149 @@ private:
         acc_vsync_ += svcGetSystemTick() - w0;
     }
 
+    // ---- diagnostics (INTERP_CHECK.TXT): a flat draw (orthographic
+    // triangles, or a rectangle) shown in another place or size for one
+    // frame, as DK64's first-person scope and crosshair were seen in a small
+    // box near the top-left (an in-between pairing its projection with
+    // another scale's). Off by default: the checks cost the gfx thread
+    // every frame.
+    bool interp_check_ = false;
+    // Draws are matched between frames by what they are (kind, vertex
+    // count, projection tag, texture address, and which occurrence of
+    // those), not by their place in the list: sprites coming and going (a
+    // lens flare) shift the rest. Not by vertex address: DK64 builds its
+    // vertices into a buffer of each frame's. Boxes, not vertices: clipping
+    // may order a draw's vertices differently; and only draws near the
+    // screen, as a box clipped at the guard band is no measure.
+    struct FlatBox { float b[4]; uint64_t sig; uint8_t kind; bool persp, on; uint32_t proj_id; };
+    static uint64_t flat_sig(const rt64_3ds::DrawRecord& d) {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+        mix(d.kind); mix(d.count); mix(d.proj_id); mix(d.tex[0].valid ? d.tex[0].addr : 0);
+        return h;
+    }
+    // The flat draws of a frame (the in-between, its game frame).
+    static void flat_boxes(const rt64_3ds::FrameRecord& f, std::vector<FlatBox>& out) {
+        out.assign(f.draws.size(), FlatBox{ { 0, 0, 0, 0 }, 0, 0, false, false, 0 });
+        std::unordered_map<uint64_t, uint32_t> seen;
+        for (size_t i = 0; i < f.draws.size(); i++) {
+            const rt64_3ds::DrawRecord& d = f.draws[i];
+            if ((d.kind == rt64_3ds::DrawRecord::Tris && d.perspective) || d.count == 0 || d.first + d.count > f.verts.size()) continue;
+            FlatBox& h = out[i];
+            const uint64_t base = flat_sig(d);
+            h.sig = base ^ ((uint64_t)(seen[base]++) * 0x9E3779B97F4A7C15ull);
+            h.b[0] = h.b[1] = 1e9f; h.b[2] = h.b[3] = -1e9f;
+            h.kind = (uint8_t)d.kind; h.persp = d.perspective; h.proj_id = d.proj_id;
+            for (uint32_t k = d.first; k < d.first + d.count; k++) {
+                const rt64_3ds::Vtx3ds& v = f.verts[k];
+                if (!(v.w > 0.0f)) continue;
+                const float x = v.x / v.w, y = v.y / v.w;
+                h.b[0] = std::min(h.b[0], x); h.b[1] = std::min(h.b[1], y);
+                h.b[2] = std::max(h.b[2], x); h.b[3] = std::max(h.b[3], y);
+                h.on = true;
+            }
+            if (!(h.b[0] > -200.0f && h.b[1] > -200.0f && h.b[2] < 600.0f && h.b[3] < 450.0f)) h.on = false;
+        }
+    }
+    static const FlatBox* find_flat(const std::vector<FlatBox>& v, uint64_t sig) {
+        for (const FlatBox& h : v) if (h.on && h.sig == sig) return &h;
+        return nullptr;
+    }
+    static void box_text(const FlatBox* h, char* out, size_t n) {
+        if (h == nullptr) snprintf(out, n, "-");
+        else snprintf(out, n, "%.0f,%.0f-%.0f,%.0f", h->b[0], h->b[1], h->b[2], h->b[3]);
+    }
+    std::vector<FlatBox> flat_[3];              // game frames: [2] the last, [1] the one before, [0] the one before that
+    uint32_t flat_seq_[3] = {}, flat_frame_[3] = {};
+    uint32_t list_seq_ = 0;                     // lists sent, ever
+    uint32_t flat_logged_ = 0;                  // lines this session (at most 60)
+    // A game frame's flat boxes (replay_and_present), then its check.
+    void note_flat_boxes() {
+        if (flat_logged_ >= 60) return;
+        flat_[0].swap(flat_[1]); flat_[1].swap(flat_[2]);
+        flat_seq_[0] = flat_seq_[1]; flat_seq_[1] = flat_seq_[2];
+        flat_frame_[0] = flat_frame_[1]; flat_frame_[1] = flat_frame_[2];
+        flat_boxes(frame_, flat_[2]);
+        flat_seq_[2] = list_seq_;
+        flat_frame_[2] = frames_;
+        check_flat_blips();
+    }
+    // Game frames: the same box two game frames apart, another between.
+    void check_flat_blips() {
+        if (flat_frame_[0] == 0) return;
+        const std::vector<FlatBox>& b = flat_[1];
+        int blips = 0;
+        const FlatBox* x = nullptr;
+        const FlatBox* y = nullptr;
+        for (const FlatBox& m : b) {
+            if (!m.on) continue;
+            const FlatBox* a = find_flat(flat_[0], m.sig);
+            const FlatBox* c = find_flat(flat_[2], m.sig);
+            if (a == nullptr || c == nullptr) continue;
+            float same = 0.0f, off = 0.0f;
+            for (int e = 0; e < 4; e++) {
+                same = std::max(same, std::fabs(a->b[e] - c->b[e]));
+                off = std::max(off, std::min(std::fabs(m.b[e] - a->b[e]), std::fabs(m.b[e] - c->b[e])));
+            }
+            if (same > 2.0f || off <= 8.0f) continue;
+            if (blips++ == 0) { x = &m; y = c; }
+        }
+        if (blips == 0) return;
+        flat_logged_++;
+        char t0[64], t1[64];
+        box_text(x, t0, sizeof(t0)); box_text(y, t1, sizeof(t1));
+        fprintf(stderr, "rt64-3ds: game frame %u drew %d flat draw%s differently from the frames on either side (first: %s, projection id %lx): %s there, %s around it\n",
+                flat_frame_[1], blips, blips == 1 ? "" : "s",
+                x->kind == rt64_3ds::DrawRecord::Tris ? "triangles" : x->kind == rt64_3ds::DrawRecord::TexRect ? "texture rectangle" : "fill rectangle",
+                (unsigned long)x->proj_id, t0, t1);
+    }
+    // In-betweens: each flat draw between where the game frames on either
+    // side put it (6 pixels' slack on each edge of its box); without the
+    // one before (the draw is new), no more than a quarter larger or
+    // smaller than in its game frame (32 pixels or more across). Not the
+    // world's or the sky's (a lens flare's sprites animate). In
+    // replay_and_present, the in-between swapped into frame_ and its game
+    // frame in inter_.
+    void check_inbetween_flat() {
+        if (flat_logged_ >= 60) return;
+        // The game frame before this list's: the last one noted, unless that
+        // is this list's own (recorded before its in-betweens).
+        const std::vector<FlatBox>& before = flat_seq_[2] == list_seq_ ? flat_[1] : flat_[2];
+        std::vector<FlatBox> game, inb;
+        flat_boxes(inter_, game);
+        flat_boxes(frame_, inb);
+        for (size_t i = 0; i < inb.size() && i < game.size(); i++) {
+            const FlatBox& n = inb[i];
+            const FlatBox& g = game[i];
+            if (!n.on || !g.on) continue;
+            if (i < classes_.size() && (classes_[i] == (uint8_t)rt64_3ds::StereoClass::World || classes_[i] == (uint8_t)rt64_3ds::StereoClass::Infinity)) continue;
+            const FlatBox* p = find_flat(before, g.sig);
+            float out = 0.0f;
+            if (p != nullptr) {
+                for (int e = 0; e < 4; e++) {
+                    const float lo = std::min(p->b[e], g.b[e]) - 6.0f, hi = std::max(p->b[e], g.b[e]) + 6.0f;
+                    out = std::max(out, std::max(lo - n.b[e], n.b[e] - hi));
+                }
+            }
+            else {
+                const float gw = g.b[2] - g.b[0], gh = g.b[3] - g.b[1], nw = n.b[2] - n.b[0], nh = n.b[3] - n.b[1];
+                if (gw >= 32.0f && gh >= 32.0f && (nw < gw * 0.75f || nw > gw * 1.25f || nh < gh * 0.75f || nh > gh * 1.25f)) out = std::max(std::fabs(nw - gw), std::fabs(nh - gh));
+            }
+            if (out <= 0.0f) continue;
+            flat_logged_++;
+            char t0[64], t1[64], t2[64];
+            box_text(p, t0, sizeof(t0)); box_text(&n, t1, sizeof(t1)); box_text(&g, t2, sizeof(t2));
+            const rt64_3ds::DrawRecord& d = frame_.draws[i];
+            fprintf(stderr, "rt64-3ds: in-between put flat draw %zu of %zu %.0f px outside its game frames (frame %u, class %d, projection id %lx%s, %u verts): "
+                            "before %s, in-between %s, game frame %s\n",
+                    i, inb.size(), out, frames_, i < classes_.size() ? (classes_[i] == kReticle ? -1 : (int)classes_[i]) : -2,
+                    (unsigned long)d.proj_id, d.mv_auto ? ", modelview untagged" : "", d.count, t0, t1, t2);
+            char why[600];
+            interp_.describe_inbetween_draw((uint32_t)i, why, sizeof(why));
+            fprintf(stderr, "rt64-3ds:   %s\n", why);
+            if (flat_logged_ >= 60) return;
+        }
+    }
     // The in-between frame and its textures take the place of the game's
     // frame for its replay (and back).
     void swap_inbetween() {
@@ -2886,13 +3129,59 @@ public:
         const int r = sx, c = 239 - sy;
         const uint32_t tile = (uint32_t)(r >> 3) * 30 + (uint32_t)(c >> 3);
         const uint32_t mo = (c & 1) | ((r & 1) << 1) | ((c & 2) << 1) | ((r & 2) << 2) | ((c & 4) << 2) | ((r & 4) << 3);
+        const void* buf = depth_read_ != nullptr ? depth_read_ : top_->frameBuf.depthBuf;
         if (depth16_) {
             // RenderDesc::eye_depth16.
-            const uint32_t d = ((const u16*)top_->frameBuf.depthBuf)[tile * 64 + mo];
+            const uint32_t d = ((const u16*)buf)[tile * 64 + mo];
             return 1.0f - (float)d * (1.0f / 65535.0f);
         }
-        const uint32_t d = ((const uint32_t*)top_->frameBuf.depthBuf)[tile * 64 + mo] & 0xFFFFFF;
+        const uint32_t d = ((const uint32_t*)buf)[tile * 64 + mo] & 0xFFFFFF;
         return 1.0f - (float)d * (1.0f / 16777215.0f);
+    }
+    // The last game frame's depth on the grid (RenderDesc::depth_to_rdram
+    // and the stereo statistics), and with `rdram` in the game's depth
+    // buffer.
+    void read_game_depth(bool rdram) {
+        // The last game frame's copy (written by the GPU: dropped from
+        // this core's cache first), else its eye in VRAM.
+        if (depth_copy_ != nullptr && depth_copy_ready_) {
+            svcInvalidateProcessDataCache(CUR_PROCESS_HANDLE, (u32)depth_copy_, depth_copy_bytes_);
+            depth_read_ = depth_copy_;
+        }
+        else depth_read_ = nullptr;
+        read_depth_grid();
+        // Copies checked now and then against the eye itself, which
+        // still holds the same frame (the first 8, every 300th frame).
+        if (depth_read_ != nullptr && depth_checks_ < 8 && double_eyes_ && frames_ % 300 == 0) {
+            depth_checks_++;
+            float grid[kGridColsMax * kGridRowsMax];
+            memcpy(grid, depth_grid_, sizeof(grid));
+            depth_read_ = nullptr;
+            read_depth_grid();
+            int differ = 0, drawn = 0;
+            for (int k = 0; k < grid_cols_ * grid_rows_; k++) { differ += grid[k] != depth_grid_[k]; drawn += grid[k] < 1.0f; }
+            fprintf(stderr, "rt64-3ds: depth copy check %u: %d of %d grid texels differ from VRAM (%d with something drawn)\n",
+                    depth_checks_, differ, grid_cols_ * grid_rows_, drawn);
+            memcpy(depth_grid_, grid, sizeof(grid));
+            depth_read_ = depth_copy_;
+        }
+        if (rdram) depth_to_rdram(prev_depth_image_);
+    }
+    // RenderDesc::early_drawn with depth_to_rdram: the last game frame's depth
+    // into RDRAM once the presenter is done with that frame (its draws and
+    // its depth copy are on the GPU's side of it), then "drawn": the game
+    // goes on with its next frame only once its depth buffer holds it. The
+    // grid serves this list's game frame (its stereo statistics) too.
+    void early_depth() {
+        if (!drawn_after_depth_) return;
+        drawn_after_depth_ = false;
+        const u64 td = svcGetSystemTick();
+        if (prev_depth_image_ != 0) {
+            read_game_depth(true);
+            depth_read_early_ = true;
+        }
+        acc_depth_ += svcGetSystemTick() - td;
+        ultramodern::renderer::report_list_drawn();
     }
     // The grid: one texel per 8x8 block of the game's frame, at the block
     // centre (VRAM reads by the CPU are slow on the console).
@@ -2908,6 +3197,11 @@ public:
         const uint32_t pitch = (uint32_t)geo_.w * 2;
         if ((zimg & 0xFFFFFF) + pitch * (uint32_t)geo_.h > 16u * 1024 * 1024) return;
         uint8_t* z = rdram_ + (zimg & 0xFFFFFF);
+        // A block is one value, so a word holds a pixel pair whichever half
+        // each pixel is in (RDRAM's halves are swapped, ^2): word stores, a
+        // quarter of the stores pixel by pixel took (needs an aligned buffer
+        // and an even width; else pixel by pixel).
+        const bool words = (zimg & 3) == 0 && (pitch & 3) == 0;
         for (int gy = 0; gy < grid_rows_; gy++) {
             for (int gx = 0; gx < grid_cols_; gx++) {
                 // Nothing drawn there: the RDP's clear value (0xFFFC), which
@@ -2916,9 +3210,13 @@ public:
                 // encodes lower (0xF800).
                 const float zp = depth_grid_[gy * grid_cols_ + gx];
                 const uint16_t v = zp >= 1.0f ? 0xFFFC : n64_depth(zp);
+                const uint32_t vv = (uint32_t)v | ((uint32_t)v << 16);
+                const int x0 = gx * 8, x1 = std::min(x0 + 8, geo_.w);
                 for (int y = gy * 8; y < gy * 8 + 8 && y < geo_.h; y++) {
                     uint8_t* row = z + (uint32_t)y * pitch;
-                    for (int x = gx * 8; x < gx * 8 + 8 && x < geo_.w; x++) *(uint16_t*)(row + ((x * 2) ^ 2)) = v;
+                    int x = x0;
+                    if (words) for (; x + 1 < x1; x += 2) *(uint32_t*)(row + x * 2) = vv;
+                    for (; x < x1; x++) *(uint16_t*)(row + ((x * 2) ^ 2)) = v;
                 }
             }
         }
@@ -3321,12 +3619,15 @@ public:
     int linked_set_ = 0;                        // what citro3d transfers to the screen: 0 top_/top_r_, 1 the in-betweens', -1 black_
     bool pair_ = false;                         // send_dl: replaying an interpolated pair
     static constexpr u32 kDeferBytes = C3D_DEFAULT_CMDBUF_SIZE * 2;   // as citro3d's own (C3D_Init above)
-    struct DeferredOp {                         // in GX queue order: a command list, or a clear (fill)
+    struct DeferredOp {                         // in GX queue order: a command list, a clear (fill), or a copy
         u32* list;
         u32 words;
         C3D_RenderTarget* fill;
         C3D_ClearBits bits;
         u32 color;
+        const void* copy_src = nullptr;         // a copy: copy_bytes from copy_src to copy_dst (copy_depth)
+        void* copy_dst = nullptr;
+        u32 copy_bytes = 0;
     };
     static constexpr int kMaxDeferredOps = 30;  // citro3d's GX queue takes 32 a frame
     u32* dbuf_ = nullptr;                       // the game frame's command buffer (linear)
@@ -3444,6 +3745,63 @@ public:
         if (!deferring_) C3D_FrameSplit(GX_CMDLIST_FLUSH);   // frame ends flush only their own list
         else defer_split();
     }
+    // The commands since the last split, as a command list of their own on
+    // the GX queue (or the deferred frame's ops); keep_*: where it is, to
+    // queue it again (queue_again). The kernel's flush on this core, as for
+    // everything else the GPU reads.
+    void close_segment(u32** keep_list = nullptr, u32* keep_words = nullptr) {
+        u32* list = nullptr;
+        u32 words = 0;
+        if (!C3Di_SplitFrame(&list, &words)) return;
+        if (deferring_) push_op(DeferredOp{ list, words, nullptr, C3D_CLEAR_ALL, 0 });
+        else {
+            flush_dcache(list, words * 4);
+            GX_ProcessCommandList(list, words * 4, 0);
+        }
+        if (keep_list != nullptr) { *keep_list = list; *keep_words = words; }
+    }
+    void queue_again(u32* list, u32 words) {
+        if (deferring_) push_op(DeferredOp{ list, words, nullptr, C3D_CLEAR_ALL, 0 });
+        else GX_ProcessCommandList(list, words * 4, 0);    // flushed when it was first queued
+    }
+    // The game frame's left-eye depth to depth_copy_ (texture-copy mode,
+    // rows of tiles as they are), after its draws on the GX queue: on the
+    // queue now, or with the deferred frame's ops for the presenter.
+    static void copy_depth(const void* src, void* dst, u32 bytes) {
+        constexpr u32 kTextureCopyMode = BIT(3);
+        const u32 dim = GX_BUFFER_DIM(240 * 8 * 2 / 16, 0);    // no gaps: any line length will do
+        GX_TextureCopy((u32*)src, dim, (u32*)dst, dim, bytes, kTextureCopyMode);
+    }
+    void queue_depth_copy() {
+        const void* src = cur_eye_[0]->frameBuf.depthBuf;
+        if (deferring_) {
+            DeferredOp op{ nullptr, 0, nullptr, C3D_CLEAR_ALL, 0 };
+            op.copy_src = src;
+            op.copy_dst = depth_copy_;
+            op.copy_bytes = depth_copy_bytes_;
+            push_op(op);
+        }
+        else copy_depth(src, depth_copy_, depth_copy_bytes_);
+    }
+    u8* depth_copy_ = nullptr;                  // the last game frame's depth (linear), or null: read VRAM
+    u32 depth_copy_bytes_ = 0;
+    bool depth_copy_ready_ = false;             // the last game frame queued its copy
+    const void* depth_read_ = nullptr;          // what read_depth_zp reads this frame
+    uint32_t depth_checks_ = 0;                 // copies checked against VRAM (the first few)
+    // What apply_state and the shift cache: forgotten, so the next draw sets
+    // all of its state itself.
+    void forget_draw_state() {
+        last_tex_[0] = last_tex_[1] = nullptr;
+        last_tex_param_[0] = last_tex_param_[1] = 0xFFFFFFFFu;
+        last_us_ = last_vs_ = -1.0f;
+        last_uv1_[0] = -1.0f;
+        last_cc_[0] = last_cc_[1] = 0xFFFFFFFFu;
+        last_plan_.stages = -1;
+        misc_valid_ = false;
+        last_sa_ = last_sb_ = 1e30f;
+    }
+    bool eye_replay_on_ = true;                 // EYE_REPLAY_OFF.TXT: false
+    uint32_t eye_frames_ = 0, eye_replays_ = 0; // frames drawn for two eyes / the right eye from the left's commands, this report
     // The eyes' formats (RenderDesc::eye_color16 / eye_depth16), their
     // display transfer to the screen and their clear value.
     bool color16_ = false, depth16_ = false;
@@ -3499,7 +3857,7 @@ public:
     uint32_t debug_from_ = 0, debug_count_ = 0, debug_step_ = 1;
     DVLB_s* dvlb_ = nullptr;
     shaderProgram_s prog_{};
-    int u_xform_ = -1, u_stereo_ = -1, u_uvscale_ = -1, u_uv1_ = -1;
+    int u_xform_ = -1, u_stereo_ = -1, u_eye_ = -1, u_uvscale_ = -1, u_uv1_ = -1;
     float last_uv1_[4] = { -1.0f, -1.0f, -1.0f, -1.0f };
     C3D_Mtx proj_{};
     GpuVertex* vbo_[4] = { nullptr, nullptr, nullptr, nullptr };
