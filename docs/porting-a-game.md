@@ -100,11 +100,16 @@ the GPU, alternating between two vertex buffers. Each frame waits until
 the one before it is on the screen (the game frame on a presenter thread,
 so the game does not wait). A list gets fewer in-betweens (the game frame
 then stays for the refreshes left) or none when they would not fit the
-game's frame (`INTERP_BUDGET.TXT`: percent of the frame, default 90, from
-the times measured as the game runs). After 30 lists dropped for the budget,
+game's frame (all of it, from the times measured as the game runs; Banjo's
+console tests of 70 to 100 % found 100 % best once probes ramp up, so the
+setting and `INTERP_BUDGET.TXT` went). After 30 lists dropped for the budget,
 it tries in-betweens anyway for 8 lists in a row to measure them again. A
 single try measures high, because the gfx thread waits out the builder,
-which in steady running overlaps the waits for the screen. A run that still
+which in steady running overlaps the waits for the screen. So during a probe
+a list that only waited for the one before keeps its in-between (a resync
+with the screen still drops it): otherwise every late list broke the run,
+and a borderline scene (Banjo's file select: 25-27 ms a pair running,
+31-38 ms alone) never measured its steady cost again. A run that still
 doesn't fit doubles the wait before the next, up to 240 lists. No
 in-betweens are drawn when the
 presents run late (the game's 60 Hz against the screen's 59.83: a list held
@@ -525,7 +530,11 @@ clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   - `GameDesc::two_cores_read_on_game_core` (with the game on core 0): each
     display list's read, up to "parsed", runs on a reader thread on core 0
     while the gfx thread on core 1 waits, then the gfx thread draws it
-    (`Settings::read_core`). It suits a game that waits on "parsed" every
+    (`Settings::read_core`). Not with three cores: tried for Banjo's 60
+    interp. on a New 3DS (2026-10-08), the read took 14 ms on core 0
+    against 13 on core 2. With interpolation recording the list, the
+    vertex transforms stay in the read, and the triangles' hand-over cost
+    about what it saved. It suits a game that waits on "parsed" every
     frame (Banjo's `game_draw`): its frame is its own work plus the read, and
     core 0 is idle during the read anyway. Banjo at the Old clock, both
     layouts over about 17 minutes each: the same frame rate (16.3 and 16.1

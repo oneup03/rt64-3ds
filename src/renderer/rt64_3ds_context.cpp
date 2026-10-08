@@ -467,7 +467,14 @@ public:
         const bool queued = rt64_3ds::render_desc().early_drawn
                                 ? (float)wait * 1000.0f / (float)SYSCLOCK_ARM11 > 0.4f * period_ms
                                 : last_pair_end_ != 0 && t0 - last_pair_end_ < SYSCLOCK_ARM11 / 1000;
-        const bool behind = interp_mode_ && (queued || resync_);
+        // While a probe runs (make_inbetween, over budget), a list that only
+        // waited for the one before still gets its in-between: the probe's
+        // first pairs overrun, before the builder's work hides in the waits
+        // for the screen, so the lists after them wait; skipping those kept
+        // probes from reaching the steady running they are there to measure
+        // (Banjo's file select: 25-27 ms a pair running, 31-38 alone). A
+        // resync with the screen still counts.
+        const bool behind = interp_mode_ && ((queued && probe_left_ == 0) || resync_);
         behind_resync_ = resync_;
         resync_ = false;
         // The read, up to "parsed" (on the reader thread when there is one).
@@ -2031,18 +2038,11 @@ private:
         if (!rate_ok) return false;
         if (!safe) { inb_unsafe_++; (*unsafe)++; return false; }
         if (!related) { inb_unrelated_++; (prev_60 ? inb_after60_ : inb_after_unsafe_)++; return false; }
-        // INTERP_BUDGET.TXT: the share of the game's frame time the pair may
-        // take, in percent (default 90).
-        if (budget_pct_ < 0) {
-            budget_pct_ = 90;
-            if (FILE* f = rt64_3ds::data_fopen("INTERP_BUDGET.TXT", "r")) {
-                int v = 0;
-                if (fscanf(f, "%d", &v) == 1 && v > 0) budget_pct_ = v;
-                fclose(f);
-                fprintf(stderr, "rt64-3ds: frame interpolation budget %d%% of the game's frame\n", budget_pct_);
-            }
-        }
-        const float budget = (float)budget_pct_ / 100.0f * 1000.0f / (float)rate;
+        // The pair may take the game's whole frame time. Tried on a console
+        // with a setting from 70 to 100% (Banjo, New 3DS, 2026-10-08): with
+        // probes that ramp up (send_dl's behind), 100% kept 60 in 158 of 186
+        // seconds, the file select included.
+        const float budget = 1000.0f / (float)rate;
         // As many in-betweens as the budget affords (fewer show the game's
         // frame for the refreshes left). Over budget for a while: try them
         // anyway, for kProbeLists lists in a row, to measure them again. One
@@ -3448,7 +3448,6 @@ public:
     // run, lists to drop before the next, runs this report.
     static constexpr uint32_t kProbeLists = 8, kProbeEvery = 30, kProbeEveryMax = 240;
     uint32_t probe_left_ = 0, probe_every_ = kProbeEvery, probes_ = 0;
-    int budget_pct_ = -1;                       // INTERP_BUDGET.TXT
     uint32_t inb_snapshot_ = 0, inb_rtt_ = 0, inb_offscreen_ = 0, inb_blank_ = 0, inb_depth_ = 0;   // unsafe, by what
     uint32_t inb_after60_ = 0, inb_after_unsafe_ = 0;   // unrelated: the list before asked 60 / was unsafe
     u64 acc_vsync_ = 0, vsync_at_dl_ = 0, acc_inb_interp_ = 0, acc_inb_replay_ = 0, acc_match_ = 0;
