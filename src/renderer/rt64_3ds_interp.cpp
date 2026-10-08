@@ -447,8 +447,8 @@ bool tiles_compatible(const TileParams& a, const TileParams& b) {
 
 // The k-th occurrence of each key in cur with the k-th in prev: pairs of
 // (cur index, prev index) in cur's order.
-template <typename F>
-void match_linear(std::vector<std::pair<uint32_t, uint32_t>>& c, std::vector<std::pair<uint32_t, uint32_t>>& p, F&& on_pair) {
+template <typename K, typename F>
+void match_linear(std::vector<std::pair<K, uint32_t>>& c, std::vector<std::pair<K, uint32_t>>& p, F&& on_pair) {
     std::stable_sort(c.begin(), c.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     std::stable_sort(p.begin(), p.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     size_t i = 0, j = 0;
@@ -551,16 +551,40 @@ MatchResult match(const FrameLog& prev, FrameLog& cur, float w, bool (*world)(ui
         }
     }
     // ---- projections: the k-th of each id with the k-th of the previous
-    // frame (RT64 pairs them per scene, in order, when the ids agree).
+    // frame (RT64 pairs them per scene, in order, when the ids agree), and
+    // here of each kind too. A perspective paired with an ortho blends into
+    // neither (w mixed in: everything drawn with it shrinks toward the
+    // screen's corner), and a game may load more of one kind under an id in
+    // some frames: DK64's world camera is reloaded under the tag its scope
+    // and crosshair (ortho) are drawn with, which then took the camera's
+    // projection for a partner and showed in a small box for an in-between.
+    // An ortho's scale is part of the key too: orthos of other scales are
+    // other spaces, and DK64's HUD has two under that tag (over 320x240,
+    // and over four times that), so an element of the finer one appearing
+    // paired the scope's ortho with it, blending the two scales to 62%
+    // (the scope and crosshair pulled toward the top-left corner). A
+    // perspective's field of view may change (a zoom): those still pair.
     {
-        std::vector<std::pair<uint32_t, uint32_t>> c, p;
+        auto key = [](const Group& g, const PjEntry& e) {
+            uint64_t k = ((uint64_t)g.id << 1) | (e.perspective ? 1u : 0u);
+            if (!e.perspective) {
+                // log2 of each axis's scale in eighths: a 9% step.
+                auto q = [](float v) -> uint64_t {
+                    v = std::fabs(v);
+                    return v > 1e-12f ? (uint64_t)(std::lround(std::log2(v) * 8.0f) & 0xFFF) : 0u;
+                };
+                k |= (q(e.proj.m[0][0]) << 40) | (q(e.proj.m[1][1]) << 52);
+            }
+            return k;
+        };
+        std::vector<std::pair<uint64_t, uint32_t>> c, p;
         for (uint32_t i = 0; i < cur.pj.size(); i++) {
             const Group& g = cur.groups[cur.pj[i].group];
-            if (g.id != kIdIgnore) c.emplace_back(g.id, i);
+            if (g.id != kIdIgnore) c.emplace_back(key(g, cur.pj[i]), i);
         }
         for (uint32_t j = 0; j < prev.pj.size(); j++) {
             const Group& g = prev.groups[prev.pj[j].group];
-            if (g.id != kIdIgnore) p.emplace_back(g.id, j);
+            if (g.id != kIdIgnore) p.emplace_back(key(g, prev.pj[j]), j);
         }
         match_linear(c, p, [&](uint32_t i, uint32_t j) {
             PjEntry& e = cur.pj[i];
