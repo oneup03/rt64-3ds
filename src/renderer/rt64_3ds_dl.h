@@ -156,6 +156,11 @@ public:
         virtual ~Helper() = default;
     };
     void set_inbetween_helper(Helper* helper) { helper_ = helper; }
+    // For the log: what interpolates record `draw` of the list run last (its
+    // first triangle's transform and projection, their group ids, what they
+    // were paired with and their scale and offset before, now and in the
+    // in-between), as text into out.
+    void describe_inbetween_draw(uint32_t draw, char* out, size_t n) const;
 
 private:
     struct Impl;

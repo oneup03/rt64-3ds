@@ -183,6 +183,17 @@ int main(int argc, char** argv) {
         }
         printf("rebuilt in-between: ok %d, %.3f ms, %u triangles, %zu draws %zu verts; same layout as the second run %d, worst difference %.6f, %zu vertices differ\n",
                (int)rok, std::chrono::duration<double, std::milli>(t4 - t3).count(), rtris, rebuilt.draws.size(), rebuilt.verts.size(), (int)same_layout, rworst, rdiffer);
+        // DL_DESCRIBE=<draw>[,<draw>...]: what interpolates those records
+        // (Interpreter::describe_inbetween_draw, as the console's log does).
+        if (const char* e = getenv("DL_DESCRIBE")) {
+            for (const char* q = e; *q != 0;) {
+                const unsigned long d = strtoul(q, (char**)&q, 10);
+                char buf[700];
+                interp.describe_inbetween_draw((uint32_t)d, buf, sizeof(buf));
+                printf("draw %lu: %s\n", d, buf);
+                if (*q == ',') q++; else break;
+            }
+        }
         // DL_SPLIT: the same in-between built with a helper thread
         // (Interpreter::set_inbetween_helper, the console's core 3), against
         // the one above: the vertices and records must be byte for byte the

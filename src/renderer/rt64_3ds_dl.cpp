@@ -3285,6 +3285,48 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
     return true;
 }
 
+void Interpreter::describe_inbetween_draw(uint32_t draw, char* out, size_t n) const {
+    out[0] = 0;
+    const Interp* ip = impl_->ip;
+    if (ip == nullptr || n == 0) return;
+    const interp::FrameLog& L = ip->logs[ip->cur];
+    const interp::FrameLog& P = ip->logs[ip->cur ^ 1];
+    size_t ti = 0;
+    while (ti < ip->tris.size() && ip->tri_states[ip->tris[ti].state].draw != draw) ti++;
+    if (ti == ip->tris.size() || ip->tris[ti].src[0] >= ip->lv.size()) { snprintf(out, n, "no triangles recorded"); return; }
+    const Interp::LoadCtx& lc = ip->ctxs[ip->lv[ip->tris[ti].src[0]].ctx];
+    // A matrix's scale (its first two rows' lengths) and offset.
+    auto sc = [](const interp::M4& m, float* r) {
+        r[0] = sqrtf(m.m[0][0] * m.m[0][0] + m.m[0][1] * m.m[0][1] + m.m[0][2] * m.m[0][2]);
+        r[1] = sqrtf(m.m[1][0] * m.m[1][0] + m.m[1][1] * m.m[1][1] + m.m[1][2] * m.m[1][2]);
+        r[2] = m.m[3][0]; r[3] = m.m[3][1];
+    };
+    size_t at = 0;
+    if (lc.xf >= 0 && (size_t)lc.xf < L.xf.size()) {
+        const interp::XfEntry& e = L.xf[lc.xf];
+        const interp::Group& g = L.groups[e.group];
+        float c[4], b[4] = {}, l[4] = {};
+        sc(e.m, c);
+        if (e.prev >= 0 && (size_t)e.prev < P.xf.size()) sc(P.xf[e.prev].m, b);
+        if (e.interp) sc(e.lerped, l);
+        at += snprintf(out + at, n - at, "transform %d id %lx order %u decompose %d paired with %d (key %08lx/%08lx) interp %d: scale,offset before %.3g,%.3g %.4g,%.4g now %.3g,%.3g %.4g,%.4g in-between %.3g,%.3g %.4g,%.4g",
+                       lc.xf, (unsigned long)g.id, (unsigned)g.order, (int)g.decompose, e.prev, (unsigned long)e.key,
+                       (unsigned long)(e.prev >= 0 && (size_t)e.prev < P.xf.size() ? P.xf[e.prev].key : 0), (int)e.interp,
+                       b[0], b[1], b[2], b[3], c[0], c[1], c[2], c[3], l[0], l[1], l[2], l[3]);
+    }
+    if (lc.pj >= 0 && (size_t)lc.pj < L.pj.size() && at < n) {
+        const interp::PjEntry& e = L.pj[lc.pj];
+        const interp::Group& g = L.groups[e.group];
+        float c[4], b[4] = {}, l[4] = {};
+        sc(e.full, c);
+        if (e.prev >= 0 && (size_t)e.prev < P.pj.size()) sc(P.pj[e.prev].full, b);
+        if (e.interp) sc(e.lerped, l);
+        snprintf(out + at, n - at, "; projection %d id %lx %s paired with %d interp %d: scale,offset before %.3g,%.3g %.4g,%.4g now %.3g,%.3g %.4g,%.4g in-between %.3g,%.3g %.4g,%.4g",
+                 lc.pj, (unsigned long)g.id, e.perspective ? "perspective" : "ortho", e.prev, (int)e.interp,
+                 b[0], b[1], b[2], b[3], c[0], c[1], c[2], c[3], l[0], l[1], l[2], l[3]);
+    }
+}
+
 void Interpreter::set_interpolation(bool on) {
     if (on && ip_ == nullptr) {
         ip_ = new Interp();
