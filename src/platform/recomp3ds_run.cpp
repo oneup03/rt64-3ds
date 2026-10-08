@@ -518,7 +518,10 @@ void update_gfx_inner() {
         // adds its in-betweens).
         const int shown_fps = rt64_3ds::settings().frame_cap == 2 && g_desc != nullptr && g_desc->render.frame_interpolation
                                   ? st.presented_per_sec : st.dl_per_sec - st.dl_skipped_per_sec;
-        if (busy2 >= 0) snprintf(line, sizeof(line), "%3d fps cpu0 %3d%% cpu1 %3d%% cpu2 %3d%%", shown_fps, busy0, busy1, busy2);
+        // All four cores (a New 3DS's core 3 when the system lets the
+        // application use it) fit the row only as c0-c3.
+        if (busy2 >= 0 && busy3 >= 0) snprintf(line, sizeof(line), "%3d fps c0 %3d%% c1 %3d%% c2 %3d%% c3 %3d%%", shown_fps, busy0, busy1, busy2, busy3);
+        else if (busy2 >= 0) snprintf(line, sizeof(line), "%3d fps cpu0 %3d%% cpu1 %3d%% cpu2 %3d%%", shown_fps, busy0, busy1, busy2);
         else snprintf(line, sizeof(line), "%3d fps cpu0 %3d%% cpu1 %3d%%", shown_fps, busy0, busy1);   // two cores
         recomp3ds::screen_printf("\x1b[2;0H%-39.39s\n", line);
         // settings.ini's debug_rows=1: the game threads' shares (wake-ups a
