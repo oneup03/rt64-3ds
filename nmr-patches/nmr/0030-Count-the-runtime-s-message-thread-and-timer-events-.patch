@@ -1,0 +1,160 @@
+From dff99ef31f50cdc5a673971b918663c1560cbeed Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Wed, 7 Oct 2026 23:47:48 -0500
+Subject: [PATCH] Count the runtime's message, thread and timer events for a
+ host
+
+A host's stall watch (rt64-3ds stall_watch.cpp) shows what the runtime is
+doing when a game stops making frames. ultramodern_dbg_counts[8] holds
+counts that are only ever incremented: 0 external messages queued, 1
+external messages that could not be delivered (their queue full), 2 game
+threads resumed, 3 timer thread passes, 4 VI thread passes, 5 idle waits
+for an external message, 6 blocking receives that waited, 7 blocking sends
+that waited. The host samples them once a second; differences give rates.
+A requeue spin shows as large 1 and 5 counts, a stuck timer or VI thread as
+3 or 4 standing still.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ultramodern/src/events.cpp    |  3 +++
+ ultramodern/src/mesgqueue.cpp | 23 +++++++++++++++++++----
+ ultramodern/src/threads.cpp   |  3 +++
+ ultramodern/src/timer.cpp     |  3 +++
+ 4 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 790c710..9a0ec0f 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -187,6 +187,8 @@ extern moodycamel::LightweightSemaphore graphics_shutdown_ready;
+ 
+ void set_dummy_vi(bool odd);
+ 
++extern "C" volatile uint32_t ultramodern_dbg_counts[8];   // mesgqueue.cpp
++
+ void vi_thread_func() {
+     ultramodern::set_native_thread_name("VI Thread");
+     // This thread should be prioritized over every other thread in the application, as it's what allows
+@@ -197,6 +199,7 @@ void vi_thread_func() {
+     int remaining_retraces = 1;
+ 
+     while (!exited) {
++        ultramodern_dbg_counts[4] = ultramodern_dbg_counts[4] + 1;
+         // Determine the next VI time (more accurate than adding 16ms each VI interrupt)
+         auto next = ultramodern::get_start() + (total_vis * 1000000us) / (60 * ultramodern::get_speed_multiplier());
+         //if (next > std::chrono::high_resolution_clock::now()) {
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
+index 8f56efa..3659f88 100644
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
+@@ -27,17 +27,27 @@ void ultramodern::set_message_queue_control(const ultramodern::MessageQueueContr
+     requeue_enabled.set(static_cast<int>(EventMessageSource::Dp), mqc.requeue_dp);
+ }
+ 
++// Diagnostic counts for a host's stall watch (rt64-3ds stall_watch.cpp), each
++// only ever incremented: 0 external messages queued, 1 external messages that
++// could not be sent (queue full), 2 game threads resumed, 3 timer thread
++// passes, 4 VI thread passes, 5 idle waits for an external message,
++// 6 blocking receives that waited, 7 blocking sends that waited.
++extern "C" volatile uint32_t ultramodern_dbg_counts[8] = {};
++#define DBG_COUNT(i) (ultramodern_dbg_counts[i] = ultramodern_dbg_counts[i] + 1)
++
+ // Raised after every external message is queued (see ultramodern.hpp); the
+ // running game thread's next preemption check delivers the queue. Cleared
+ // before the queue is drained, so a message queued meanwhile raises it again.
+ extern "C" uint32_t ultramodern_preempt_pending = 0;
+ 
+ void ultramodern::enqueue_external_message_src(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, EventMessageSource src) {
++    DBG_COUNT(0);
+     external_messages.enqueue({mq, msg, jam, requeue_enabled[static_cast<int>(src)]});
+     __atomic_store_n(&ultramodern_preempt_pending, 1u, __ATOMIC_RELEASE);
+ }
+ 
+ void ultramodern::enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked) {
++    DBG_COUNT(0);
+     external_messages.enqueue({mq, msg, jam, requeue_if_blocked});
+     __atomic_store_n(&ultramodern_preempt_pending, 1u, __ATOMIC_RELEASE);
+ }
+@@ -48,8 +58,9 @@ void dequeue_external_messages(RDRAM_ARG1) {
+     QueuedMessage to_send;
+     std::vector<QueuedMessage> requeued_messages{};
+     while (external_messages.try_dequeue(to_send)) {
+-        if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-            requeued_messages.push_back(to_send);
++        if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false)) {
++            DBG_COUNT(1);
++            if (to_send.requeue_if_blocked) requeued_messages.push_back(to_send);
+         }
+     }
+     for (QueuedMessage& cur_mesg : requeued_messages) {
+@@ -81,9 +92,11 @@ extern "C" void ultramodern_preempt(uint8_t* rdram) {
+ 
+ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
+     QueuedMessage to_send;
++    DBG_COUNT(5);
+     external_messages.wait_dequeue(to_send);
+-    if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-        external_messages.enqueue(to_send);
++    if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false)) {
++        DBG_COUNT(1);
++        if (to_send.requeue_if_blocked) external_messages.enqueue(to_send);
+     }
+ }
+ 
+@@ -129,6 +142,7 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
+     else {
+         // Otherwise, yield this thread until the queue has room.
+         while (MQ_IS_FULL(mq)) {
++            DBG_COUNT(7);
+             debug_printf("[Message Queue] Thread %d is blocked on send\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
+             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_send), ultramodern::this_thread());
+             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
+@@ -167,6 +181,7 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
+     } else {
+         // Otherwise, yield this thread in a loop until the queue is no longer full
+         while (MQ_IS_EMPTY(mq)) {
++            DBG_COUNT(6);
+             debug_printf("[Message Queue] Thread %d is blocked on receive\n", TO_PTR(OSThread, ultramodern::this_thread())->id);
+             ultramodern::thread_queue_insert(PASS_RDRAM GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv), ultramodern::this_thread());
+             ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index 45eb587..11e167f 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -238,9 +238,12 @@ void ultramodern::set_native_thread_name(const std::string& name) {
+ void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
+ #endif
+ 
++extern "C" volatile uint32_t ultramodern_dbg_counts[8];
++
+ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
+     load_stop(thread_context);
+     thread_context->running.wait();
++    ultramodern_dbg_counts[2] = ultramodern_dbg_counts[2] + 1;
+     load_start(thread_context);
+     // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
+     // This will trigger thread cleanup instead.
+diff --git a/ultramodern/src/timer.cpp b/ultramodern/src/timer.cpp
+index 28e76c0..73a4275 100644
+--- a/ultramodern/src/timer.cpp
++++ b/ultramodern/src/timer.cpp
+@@ -79,6 +79,8 @@ uint64_t time_now() {
+     return duration_to_ticks(std::chrono::high_resolution_clock::now() - start_time);
+ }
+ 
++extern "C" volatile uint32_t ultramodern_dbg_counts[8];   // mesgqueue.cpp
++
+ void timer_thread(RDRAM_ARG1) {
+     ultramodern::set_native_thread_name("Timer Thread");
+     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::VeryHigh);
+@@ -116,6 +118,7 @@ void timer_thread(RDRAM_ARG1) {
+     };
+ 
+     while (true) {
++        ultramodern_dbg_counts[3] = ultramodern_dbg_counts[3] + 1;
+         // Empty the action queue
+         Action cur_action;
+         while (timer_context.action_queue.try_dequeue(cur_action)) {
+-- 
+2.55.0
+

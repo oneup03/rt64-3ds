@@ -1,0 +1,171 @@
+From 223f90314f1d6c14c4953e1f7ec6d8a6f0f00520 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Wed, 7 Oct 2026 16:12:29 -0500
+Subject: [PATCH] Keep the timer thread's own copy of each timer
+
+The timer thread kept the active timers in a set ordered by each OSTimer's
+timestamp, read from the game's struct at every comparison, and read the
+struct's message queue and message when a timer fired. osSetTimer writes
+the struct at once while its add action waits in the queue, so a game that
+stops and restarts the same timer while the thread still holds it (Banjo's
+scheduler does so every frame, its stop processed later) changed the key of
+an element inside the set. An erase could then miss and leave a fired
+one-shot timer at the set's front, fired again at once without end: the
+thread, above the game threads, spun and the game stopped (seen on the 3DS:
+core 0 full, the game and the main thread starved, after seconds to minutes).
+
+The add action now carries the timestamp, interval, queue and message, and
+the thread keeps its own copy per timer, ordered by (timestamp, timer).
+Setting an active timer replaces it; the thread never reads the struct.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ultramodern/src/timer.cpp | 82 +++++++++++++++++++++++----------------
+ 1 file changed, 49 insertions(+), 33 deletions(-)
+
+diff --git a/ultramodern/src/timer.cpp b/ultramodern/src/timer.cpp
+index 50e4684..28e76c0 100644
+--- a/ultramodern/src/timer.cpp
++++ b/ultramodern/src/timer.cpp
+@@ -1,4 +1,6 @@
++#include <map>
+ #include <thread>
++#include <utility>
+ #include <variant>
+ #include <set>
+ #include "blockingconcurrentqueue.h"
+@@ -29,8 +31,19 @@ struct OSTimer {
+     OSMesg msg;
+ };
+ 
++// The timer as osSetTimer set it. The timer thread keeps its own copy and
++// never reads the game's OSTimer: the game may rewrite that struct while the
++// thread still holds the timer (stopping and restarting the same timer each
++// frame, the stop processed later), and a set ordered by the struct's own
++// timestamp then broke. An erase that missed left a fired one-shot timer at
++// its front, fired again at once without end: the thread spun above the game
++// threads and the game stopped (Banjo-Kazooie on the 3DS).
+ struct AddTimerAction {
+     PTR(OSTimer) timer;
++    OSTime timestamp;
++    OSTime interval;
++    PTR(OSMesgQueue) mq;
++    OSMesg msg;
+ };
+ 
+ struct RemoveTimerAction {
+@@ -70,30 +83,35 @@ void timer_thread(RDRAM_ARG1) {
+     ultramodern::set_native_thread_name("Timer Thread");
+     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::VeryHigh);
+ 
+-    // Lambda comparator function to keep the set ordered
+-    auto timer_sort = [PASS_RDRAM1](PTR(OSTimer) a_, PTR(OSTimer) b_) {
+-        OSTimer* a = TO_PTR(OSTimer, a_);
+-        OSTimer* b = TO_PTR(OSTimer, b_);
+-
+-        // Order by timestamp if the timers have different timestamps
+-        if (a->timestamp != b->timestamp) {
+-            return a->timestamp < b->timestamp;
++    // The active timers by timer, and in firing order (timestamp, then
++    // timer), both from the copies the actions carry.
++    struct ActiveTimer {
++        OSTime timestamp;
++        OSTime interval;
++        PTR(OSMesgQueue) mq;
++        OSMesg msg;
++    };
++    std::map<PTR(OSTimer), ActiveTimer> active_timers;
++    std::set<std::pair<OSTime, PTR(OSTimer)>> firing_order;
++
++    auto remove_timer = [&](PTR(OSTimer) timer) {
++        auto it = active_timers.find(timer);
++        if (it != active_timers.end()) {
++            firing_order.erase({ it->second.timestamp, timer });
++            active_timers.erase(it);
+         }
+-
+-        // If they have the exact same timestamp then order by address instead
+-        return a < b;
+     };
+ 
+-    // Ordered set of timers that are currently active
+-    std::set<PTR(OSTimer), decltype(timer_sort)> active_timers{timer_sort};
+-    
+     // Lambda to process a timer action to handle adding and removing timers
+     auto process_timer_action = [&](const Action& action) {
+         // Determine the action type and act on it
+         if (const auto* add_action = std::get_if<AddTimerAction>(&action)) {
+-            active_timers.insert(add_action->timer);
++            // Setting a timer that is still active replaces it.
++            remove_timer(add_action->timer);
++            active_timers[add_action->timer] = ActiveTimer{ add_action->timestamp, add_action->interval, add_action->mq, add_action->msg };
++            firing_order.insert({ add_action->timestamp, add_action->timer });
+         } else if (const auto* remove_action = std::get_if<RemoveTimerAction>(&action)) {
+-            active_timers.erase(remove_action->timer);
++            remove_timer(remove_action->timer);
+         }
+     };
+ 
+@@ -105,36 +123,34 @@ void timer_thread(RDRAM_ARG1) {
+         }
+ 
+         // If there's no timer to act on, wait for one to come in from the action queue
+-        while (active_timers.empty()) {
++        while (firing_order.empty()) {
+             timer_context.action_queue.wait_dequeue(cur_action);
+             process_timer_action(cur_action);
+         }
+ 
+-        // Get the timer that's closest to running out
+-        PTR(OSTimer) cur_timer_ = *active_timers.begin();
+-        OSTimer* cur_timer = TO_PTR(OSTimer, cur_timer_);
+-
+-        // Remove the timer from the queue (it may get readded if waiting is interrupted)
+-        active_timers.erase(cur_timer_);
++        // The timer that's closest to running out
++        const OSTime timestamp = firing_order.begin()->first;
++        const PTR(OSTimer) cur_timer_ = firing_order.begin()->second;
+ 
+         // Determine how long to wait to reach the timer's timestamp
+-        auto wait_duration = ticks_to_timepoint(cur_timer->timestamp) - std::chrono::high_resolution_clock::now();
++        auto wait_duration = ticks_to_timepoint(timestamp) - std::chrono::high_resolution_clock::now();
+ 
+         // Wait for either the duration to complete or a new action to come through
+         if (wait_duration.count() >= 0 && timer_context.action_queue.wait_dequeue_timed(cur_action, wait_duration)) {
+-            // Timer was interrupted by a new action 
+-            // Add the current timer back to the queue (done first in case the action is to remove this timer)
+-            active_timers.insert(cur_timer_);
+-            // Process the new action
++            // Timer was interrupted by a new action: process it, then look again
+             process_timer_action(cur_action);
+         }
+         else {
+             // Waiting for the timer completed, so send the timer's message to its message queue
+-            ultramodern::enqueue_external_message_src(cur_timer->mq, cur_timer->msg, false, ultramodern::EventMessageSource::Timer);
++            ActiveTimer fired = active_timers[cur_timer_];
++            firing_order.erase(firing_order.begin());
++            active_timers.erase(cur_timer_);
++            ultramodern::enqueue_external_message_src(fired.mq, fired.msg, false, ultramodern::EventMessageSource::Timer);
+             // If the timer has a specified interval then reload it with that value
+-            if (cur_timer->interval != 0) {
+-                cur_timer->timestamp = cur_timer->interval + time_now();
+-                active_timers.insert(cur_timer_);
++            if (fired.interval != 0) {
++                fired.timestamp = fired.interval + time_now();
++                active_timers[cur_timer_] = fired;
++                firing_order.insert({ fired.timestamp, cur_timer_ });
+             }
+         }
+     }
+@@ -192,7 +208,7 @@ extern "C" int osSetTimer(RDRAM_ARG PTR(OSTimer) t_, OSTime countdown, OSTime in
+     t->mq = mq;
+     t->msg = msg;
+ 
+-    timer_context.action_queue.enqueue(AddTimerAction{ t_ });
++    timer_context.action_queue.enqueue(AddTimerAction{ t_, t->timestamp, interval, mq, msg });
+ 
+     return 0;
+ }
+-- 
+2.55.0
+
