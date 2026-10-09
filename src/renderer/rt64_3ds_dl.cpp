@@ -791,8 +791,24 @@ struct Interpreter::Impl {
     // The primitive depth as z' (0 near .. 1 far): the RDP's 15-bit screen z.
     float prim_z() const { return (float)(prim_depth_z > 0x7FFF ? 0x7FFF : prim_depth_z) / 32767.0f; }
     uint16_t tlut[256]{};
-    uint32_t tlut_hash = 1;
-    uint32_t tlut_frame_hash = 0, tlut_frame_index = 0;
+    // Bumped by every LOADTLUT that changes an entry. Not a hash of the
+    // load: the same palette loaded into another slot (Banjo's two eyes,
+    // palettes 4 and 0) changes TMEM all the same.
+    uint32_t tlut_seq = 1;
+    uint32_t tlut_frame_seq = 0, tlut_frame_index = 0;
+    // Hashes of [p] 4-bit palette p's 16 entries, [16] all 256, as of
+    // tlut_seq pal_hash_seq[p].
+    uint32_t pal_hash[17]{}, pal_hash_seq[17]{};
+    uint32_t palette_hash(int p) {
+        if (pal_hash_seq[p] != tlut_seq) {
+            const int first = p < 16 ? p * 16 : 0, n = p < 16 ? 16 : 256;
+            uint32_t h = 2166136261u;
+            for (int i = 0; i < n; i++) h = (h ^ tlut[first + i]) * 16777619u;
+            pal_hash[p] = h;
+            pal_hash_seq[p] = tlut_seq;
+        }
+        return pal_hash[p];
+    }
     uint32_t state_seq = 1;    // bumped by every command that changes draw state
     // TexDescs of the current texture tile pair, recomputed only when a
     // texture-affecting command ran (tex_seq) or the tile index changed.
@@ -1542,12 +1558,14 @@ struct Interpreter::Impl {
         d.block = best->block;
         d.dxt = best->dxt;
         d.load_word = (uint16_t)(tl.tmem - best->tmem);
-        d.tlut_hash = (d.fmt == 2) ? tlut_hash : 0;
+        // The entries this draw reads: a 4-bit texture's palette, else all
+        // 256 (the texture cache's key).
+        d.tlut_hash = (d.fmt == 2) ? palette_hash(d.siz == 0 ? (d.palette & 15) : 16) : 0;
         d.tlut_index = 0;
         if (d.fmt == 2) {
             // Palettes change within a frame: keep the one this draw uses.
-            if (tlut_frame_hash != tlut_hash) {
-                tlut_frame_hash = tlut_hash;
+            if (tlut_frame_seq != tlut_seq) {
+                tlut_frame_seq = tlut_seq;
                 tlut_frame_index = (uint32_t)out->tlut.size();
                 out->tlut.insert(out->tlut.end(), tlut, tlut + 256);
             }
@@ -2689,14 +2707,13 @@ struct Interpreter::Impl {
                     int base = (int)tl.tmem - 256;
                     const uint32_t row_bytes = ((uint32_t)timg.width << timg.siz) >> 1;
                     uint32_t src = timg.addr + ((((uint32_t)tl.uls >> 2) << timg.siz) >> 1) + row_bytes * ((uint32_t)tl.ult >> 2);
-                    uint32_t h = 2166136261u;
+                    bool changed = false;
                     for (int i = 0; i < count; i++) {
                         int idx = base + i;
                         uint16_t v = ru16(src + i * 2);
-                        if (idx >= 0 && idx < 256) tlut[idx] = v;
-                        h = (h ^ v) * 16777619u;
+                        if (idx >= 0 && idx < 256 && tlut[idx] != v) { tlut[idx] = v; changed = true; }
                     }
-                    tlut_hash = h;
+                    if (changed) tlut_seq++;
                     break;
                 }
                 case G_SETTILESIZE: {
@@ -2964,7 +2981,7 @@ struct Interpreter::Impl {
         othermode_depth = combine_depth = geometry_depth = proj_depth = 0;
         for (int& d : color_depth) d = 0;
         load_count = 0;
-        tlut_frame_hash = 0;
+        tlut_frame_seq = 0;
         for (int i = 0; i < kMaxRtt; i++) o.rtts[i] = rtt_images[i];
         for (auto& L : loads) L.valid = false;
         rect_slices.clear();

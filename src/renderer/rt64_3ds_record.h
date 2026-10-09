@@ -73,7 +73,7 @@ struct TexDesc {
     uint8_t masks = 0, maskt = 0, cms = 0, cmt = 0;
     uint8_t palette = 0;
     uint8_t nibble = 0;     // 4-bit formats: the first texel is the low nibble of its byte
-    uint32_t tlut_hash = 0; // of the palette in use (CI formats)
+    uint32_t tlut_hash = 0; // of the palette entries it reads (CI formats)
     uint32_t tlut_index = 0;// offset of that palette's 256 entries in FrameRecord::tlut
     uint16_t tlut_mode = 0; // G_TT_* (0 none, 2 RGBA16, 3 IA16)
     bool bilerp = false;
