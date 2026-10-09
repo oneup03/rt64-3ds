@@ -169,12 +169,20 @@ uint32_t primary_world_instance(const DrawRecord* draws, size_t count, const Ren
     constexpr int kMax = 64;
     InstanceCount inst[kMax];
     int n = 0;
+    // Triangles the rules place as World under any scissor: a world scene in
+    // a window (Goemon's pause map) is no candidate, but a HUD camera with no
+    // more triangles than it (that screen's two 3D icons) doesn't become the
+    // world over it.
+    uint32_t world_tris = 0;
     for (size_t i = 0; i < count; i++) {
         const DrawRecord& d = draws[i];
-        if (d.kind != DrawRecord::Tris || !d.perspective || d.rtt >= 0 || d.proj_inst == 0) continue;
-        if (!(d.scissor[0] <= 0 && d.scissor[2] >= frame_w)) continue;      // full width
+        if (d.kind != DrawRecord::Tris || !d.perspective || d.rtt >= 0) continue;
         const bool hud = desc.hud_camera_id != 0 && d.proj_id == desc.hud_camera_id;
-        if (!hud && classify_draw(d, desc) != StereoClass::World) continue;
+        const bool world = !hud && classify_draw(d, desc) == StereoClass::World;
+        if (world) world_tris += d.count / 3;
+        if (d.proj_inst == 0) continue;
+        if (!(d.scissor[0] <= 0 && d.scissor[2] >= frame_w)) continue;      // full width
+        if (!hud && !world) continue;
         int k = n - 1;
         while (k >= 0 && inst[k].inst != d.proj_inst) k--;
         if (k < 0) {
@@ -192,7 +200,10 @@ uint32_t primary_world_instance(const DrawRecord* draws, size_t count, const Ren
     // of 2 triangles, one per texture) the world and put the curtain at the
     // HUD's depth. In play the world camera has far more of both.
     int best = -1;
-    for (int k = 0; k < n; k++) if (best < 0 || inst[k].tris > inst[best].tris) best = k;
+    for (int k = 0; k < n; k++) {
+        if (desc.hud_camera_id != 0 && inst[k].proj_id == desc.hud_camera_id && inst[k].tris <= world_tris) continue;
+        if (best < 0 || inst[k].tris > inst[best].tris) best = k;
+    }
     if (table != nullptr) {
         const int m = n < table_max ? n : table_max;
         for (int k = 0; k < m; k++) table[k] = inst[k];

@@ -73,7 +73,9 @@ bool hud_camera_is_world(const DrawRecord* draws, size_t count, const RenderDesc
 // instance (DrawRecord::proj_inst), 0 = none: of the full-width perspective
 // triangle records outside images that are placed as World or drawn under
 // the HUD camera, the instance with the most triangles (the first one on a
-// tie; the desktop counts draw calls, see the .cpp). *hud_cam says whether it is a HUD-camera instance. The table, when
+// tie; the desktop counts draw calls, see the .cpp). A HUD-camera instance
+// counts only with more triangles than the frame's World draws under any
+// scissor. *hud_cam says whether it is a HUD-camera instance. The table, when
 // given, receives up to table_max instances for logging.
 struct InstanceCount { uint32_t inst = 0, proj_id = 0, records = 0, tris = 0; };
 uint32_t primary_world_instance(const DrawRecord* draws, size_t count, const RenderDesc& desc, int frame_w, bool* hud_cam,
