@@ -101,8 +101,8 @@ namespace recomp3ds {
     void log_sync();
     void log_line(const char* s);
     // settings.ini's log_level: 2 everything, 1 a summary (no renderer
-    // reports, the stats line every 10 s), 0 boot, warnings and exit (an
-    // Old 3DS's default).
+    // reports, the stats line every 10 s; the New 3DS default), 0 boot,
+    // warnings and exit (the Old 3DS default).
     void log_set_level(int level);
     int log_level();
 

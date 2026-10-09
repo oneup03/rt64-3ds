@@ -62,6 +62,9 @@ struct MenuOption {
 struct MenuDefault {
     const char* key;
     int value;
+    // Only on one kind of console (a log level that an Old 3DS keeps lower,
+    // say); later entries win.
+    enum : uint8_t { AnyConsole, New3dsOnly, Old3dsOnly } console = AnyConsole;
 };
 
 struct GameDesc {

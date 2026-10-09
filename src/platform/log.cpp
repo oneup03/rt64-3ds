@@ -39,7 +39,8 @@ volatile bool g_writer_run = false;
 // renderer's periodic reports and late-frame notes (and the stats line only
 // every 10 s, recomp3ds_run.cpp), 0 without the stats and synth lines too:
 // boot, warnings and exit. Each line costs a debug-string syscall, a copy
-// and its share of the card writes on core 0; an Old 3DS logs at 0.
+// and its share of the card writes on core 0; the default is 1, 0 on an
+// Old 3DS (settings_menu.cpp).
 int g_level = 2;
 
 inline bool starts(const char* s, const char* p) { return strncmp(s, p, strlen(p)) == 0; }

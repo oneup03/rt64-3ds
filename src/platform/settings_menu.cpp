@@ -113,8 +113,10 @@ const char* const kCoresNames[] = { "Auto", "2, game on 1", "2, game on 0" };
 int g_cores = 0;
 // settings.ini only: the touch screen's game-thread shares and audio rows.
 int g_debug_rows = 0;
-// settings.ini only: how much goes to log.txt (log.cpp), less on an Old 3DS.
-int g_log_level = 2;
+// settings.ini only: how much goes to log.txt (log.cpp): the summary (1),
+// on an Old 3DS (core 0 full) boot, warnings and exit only (0), unless a
+// game or the file asks otherwise.
+int g_log_level = 1;
 void apply_log_level(int v) { recomp3ds::log_set_level(v); }
 
 // Audio on or off: off skips the audio microcode, which the CPU runs here,
@@ -583,6 +585,8 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "frame_cap", "Frame rate", 0, desc.render.frame_interpolation ? 2 : 1, &st.frame_cap, kFrameCapNames, false, nullptr, nullptr, PageGame, 1, nullptr });
     add_row({ "rom_stream", "ROM stream", 0, 2, &g_rom_stream, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "debug_capture", "Debug capture", 0, 1, &g_debug_capture, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    bool is_new_3ds = false;
+    APT_CheckNew3DS(&is_new_3ds);
     // The renderer's GPU-cost choices (RenderDesc::eye_color16 and so on),
     // settings.ini only and read at start: the game's choice unless the file
     // says otherwise, for A/B tests on the console.
@@ -590,18 +594,20 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     st.gpu_depth16 = desc.render.eye_depth16 ? 1 : 0;
     st.gpu_textures16 = desc.render.intensity_textures16 ? 1 : 0;
     st.gpu_fill_clear = desc.render.fill_clear ? 1 : 0;
-    st.gpu_double_eyes = desc.render.double_eyes ? 1 : 0;
+    // The in-betweens' own eye targets serve "60 interp." alone, which an Old
+    // 3DS does not run by default (GameDesc::old3ds_frame_cap): there they
+    // would hold 1125 KB of VRAM (room for textures) and a 512 KB command
+    // buffer of linear memory for nothing.
+    st.gpu_double_eyes = desc.render.double_eyes && is_new_3ds ? 1 : 0;
     add_row({ "gpu_color16", "GPU 16-bit colour", 0, 1, &st.gpu_color16, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "gpu_depth16", "GPU 16-bit depth", 0, 1, &st.gpu_depth16, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "gpu_textures16", "GPU 16-bit I/IA textures", 0, 1, &st.gpu_textures16, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "gpu_fill_clear", "GPU fill clears", 0, 1, &st.gpu_fill_clear, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "gpu_double_eyes", "GPU double eye targets", 0, 1, &st.gpu_double_eyes, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
-    bool is_new_3ds = false;
-    APT_CheckNew3DS(&is_new_3ds);
     if (is_new_3ds) add_row({ "cpu_speed", "CPU speed", 0, 1, &g_cpu_new, kCpuNames, false, nullptr, apply_cpu, PageGame, 1, nullptr });
     add_row({ "cores", "Cores (at restart)", 0, 2, &g_cores, kCoresNames, false, nullptr, nullptr, PageGame, 1, nullptr });
     add_row({ "debug_rows", "Debug rows", 0, 1, &g_debug_rows, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
-    g_log_level = is_new_3ds ? 2 : 0;
+    g_log_level = is_new_3ds ? 1 : 0;
     add_row({ "log_level", "Log level", 0, 2, &g_log_level, nullptr, false, nullptr, apply_log_level, recomp3ds::PageCount, 1, nullptr });
     if (desc.synth.flavor != recomp3ds::SynthFlavor::None) {
         // settings.ini only (audio_engine=0 runs the audio task as before).
@@ -610,6 +616,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     // The game's defaults, then what settings.ini holds.
     for (size_t d = 0; d < desc.menu_default_count; d++) {
         const MenuDefault& md = desc.menu_defaults[d];
+        if ((md.console == MenuDefault::New3dsOnly && !is_new_3ds) || (md.console == MenuDefault::Old3dsOnly && is_new_3ds)) continue;
         for (int i = 0; i < g_row_count; i++) {
             const Row& r = g_rows[i];
             if (strcmp(md.key, r.key) == 0) *r.value = md.value < r.lo ? r.lo : md.value > r.hi ? r.hi : md.value;

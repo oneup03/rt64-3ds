@@ -69,7 +69,7 @@ renderer can't find out from the display lists:
 | `merge_image_tiles` | Triangles textured from `LOADTILE` cuts of one wider image sample one texture of the whole image, so draws that differ only in the part they loaded become one. Goemon's sky cylinder (a 32-texel column of its panorama per quad: 280 draws become one). Only where it samples the same texels (TEXEL0 alone, 8/16-bit, coordinates inside the loaded rectangle). |
 | `frame_interpolation` | Offers "60 interp." on the Frame rate row (`frame_cap=2`): for games whose patches tag their transforms for RT64's high frame rate (`gEXMatrixGroup*`). Goemon, DK64 and Banjo. A game's default of `frame_cap=2` (`GameDesc::menu_defaults`) becomes `GameDesc::old3ds_frame_cap` on an Old 3DS, which can't afford the in-betweens: 1, the 30 fps cap, by default (Goemon), or 0, the game's own rate (DK64, Banjo); `settings.ini` still decides. See below. |
 | `eye_color16`, `eye_depth16`, `intensity_textures16`, `fill_clear` | The GPU's share of a frame: RGB565 eye colour buffers (snapshots then have no alpha; no dithering, so some banding), 16-bit eye depth, I/IA textures as LA8 (identical texels, half the size), and a frame's leading full-screen fill rectangle (the game's own clear) turned into the eyes' clear colour instead of a screen of fragments. Off by default (DK64, Banjo); Goemon sets all but `eye_color16`. Each is also a `settings.ini` key read at start (`gpu_color16`, `gpu_depth16`, `gpu_textures16`, `gpu_fill_clear`) for A/B tests on the console. |
-| `double_eyes` | With `frame_interpolation`: the in-betweens draw into eye targets of their own (two more 240x400 colour + depth buffers, 1125 KB of VRAM at RGBA8/D16, taken after everything else and skipped when there isn't room), and the game's frame of each pair is recorded into a command buffer of its own while the GPU still draws the in-between; the presenter thread queues it. Off by default; Goemon sets it. Also `gpu_double_eyes` in `settings.ini`. See below. |
+| `double_eyes` | With `frame_interpolation`: the in-betweens draw into eye targets of their own (two more 240x400 colour + depth buffers, 1125 KB of VRAM at RGBA8/D16, taken after everything else and skipped when there isn't room), and the game's frame of each pair is recorded into a command buffer of its own while the GPU still draws the in-between; the presenter thread queues it. Off by default; Goemon sets it. Also `gpu_double_eyes` in `settings.ini`, which defaults to off on an Old 3DS: "60 interp." is not its default there (`old3ds_frame_cap`), and the targets would hold 1125 KB of VRAM and a 512 KB command buffer for nothing. See below. |
 | `early_drawn` | The game hears a display list drawn (the RDP's completion) once the renderer has read it, at "parsed", not when the renderer is done with it (nmr patch 0028, `ultramodern::renderer::report_list_drawn`). For a game that waits for the RDP before its next frame (Banjo's frame limiter does, every frame): with frame interpolation the renderer's waits for the screen otherwise come out of the game's frame time, and it misses retraces (Banjo's cutscenes fell behind their music). A list may then wait for the one before; `list_wait_us` says how long. With `depth_to_rdram` the game hears it a little later: once the last game frame's depth is in RDRAM, after the read and once the presenter is done with that frame, since the game must not run while its depth buffer is written. Banjo and DK64 set it. |
 
 The player's **Frame rate** row (Game page, `frame_cap` in `settings.ini`)
@@ -515,10 +515,15 @@ clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   adds the thread shares and the audio rows. loadmon's calibrations follow
   the CPU speed row's clock: 268 and 804 MHz, exactly 1:3.
 - **Logging.** settings.ini's `log_level` (log.cpp) has three levels:
-  - 2, the New 3DS default: everything.
-  - 1: no renderer reports or late-frame lines, and the stats and synth
-    lines only every 10 s.
-  - 0, the Old 3DS default: boot, warnings and exit only.
+  - 2: everything (for tests).
+  - 1, the New 3DS default: no renderer reports or late-frame lines, and
+    the stats and synth lines only every 10 s.
+  - 0, the Old 3DS default (its core 0 is full): boot, warnings and exit
+    only.
+
+  A game can set its own default (`GameDesc::menu_defaults`); an entry
+  marked `MenuDefault::New3dsOnly` or `Old3dsOnly` applies only on that
+  console (later entries win).
 
   Each line costs a debug-string syscall, a copy and its share of the card
   writes on core 0; `PROFILE.TXT` costs far more (about 18 % in Goemon).
