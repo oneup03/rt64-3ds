@@ -51,6 +51,8 @@ int main(int argc, char** argv) {
     }
     // RenderDesc::fix_rect_lr and merge_rect_slices (Goemon's settings).
     if (getenv("DL_RECT_PARITY")) { interp.set_fix_rect_lr(true); interp.set_merge_rect_slices(true); }
+    // RenderDesc::scissor_edge_slack (Goemon: 5).
+    if (const char* e = getenv("DL_SCISSOR_SLACK")) interp.set_scissor_edge_slack(atoi(e));
     // RenderDesc::merge_image_tiles (Goemon's sky). The rows of an image
     // texture come from the list before, so the task is run once first, as
     // the console runs the frame before it, and its frame presented

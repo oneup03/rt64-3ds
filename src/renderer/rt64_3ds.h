@@ -102,6 +102,11 @@ struct RenderDesc {
     // Games draw full-screen rectangles to x = 319 under a 320-wide scissor;
     // extended, they cover the width and are stretched over the wide screen.
     bool fix_rect_lr = false;
+    // Scissor edges (G_SETSCISSOR) within this many pixels of the frame's own
+    // edges are taken as the frame's: the scissor then counts as covering the
+    // width, and is opened to the wide screen. Goemon's files 22 and 23 set
+    // (0,0)-(319,239). 0 takes them as they are.
+    int scissor_edge_slack = 0;
     // Plain-origin rectangles of one run of rectangles (no triangles between
     // them, one colour image) that share their rows (uly, lry) and together
     // reach both edges of the frame are stretched over the wide screen like

@@ -90,6 +90,8 @@ public:
     // RenderDesc::fix_rect_lr and merge_rect_slices (rectangle edges and
     // widescreen detection as the desktop fork has them; both off by default).
     void set_fix_rect_lr(bool on);
+    // RenderDesc::scissor_edge_slack (0 = scissors as the list sets them).
+    void set_scissor_edge_slack(int px);
     void set_merge_rect_slices(bool on);
     // RenderDesc::hud_camera_id: the first perspective projection loaded under
     // this group is kept in FrameRecord::hud_cam (0 = none).

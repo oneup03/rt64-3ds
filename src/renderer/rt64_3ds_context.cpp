@@ -1340,6 +1340,7 @@ private:
             interp_.set_primary_world_instance(desc.primary_world_instance);
             interp_.set_unify_world_depth(desc.unify_world_depth);
             interp_.set_fix_rect_lr(desc.fix_rect_lr);
+            interp_.set_scissor_edge_slack(desc.scissor_edge_slack);
             interp_.set_merge_rect_slices(desc.merge_rect_slices);
             interp_.set_hud_camera_id(desc.hud_camera_id);
             interp_.set_merge_image_tiles(desc.merge_image_tiles);

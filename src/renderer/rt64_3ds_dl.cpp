@@ -738,6 +738,7 @@ struct Interpreter::Impl {
     bool split_untagged_ortho = false;
     bool force_branch_z = true;        // RenderDesc::force_lod_branch, or gEXForceBranch
     bool fix_rect_lr = false;          // RenderDesc::fix_rect_lr
+    int scissor_slack = 0;             // RenderDesc::scissor_edge_slack
     bool merge_rect_slices = false;    // RenderDesc::merge_rect_slices
     uint32_t hud_camera_id = 0;        // RenderDesc::hud_camera_id (0 = none)
     Gbi gbi = Gbi::F3DEX2;
@@ -2688,6 +2689,13 @@ struct Interpreter::Impl {
                 case G_SETSCISSOR:
                     scissor[0] = ((w0 >> 12) & 0xFFF) / 4; scissor[1] = (w0 & 0xFFF) / 4;
                     scissor[2] = ((w1 >> 12) & 0xFFF) / 4; scissor[3] = (w1 & 0xFFF) / 4;
+                    if (scissor_slack > 0) {
+                        // RenderDesc::scissor_edge_slack: the frame's edges.
+                        if (scissor[0] <= scissor_slack) scissor[0] = 0;
+                        if (scissor[1] <= scissor_slack) scissor[1] = 0;
+                        if (scissor[2] >= screen_w - scissor_slack && scissor[2] < screen_w) scissor[2] = (int16_t)screen_w;
+                        if (scissor[3] >= screen_h - scissor_slack && scissor[3] < screen_h) scissor[3] = (int16_t)screen_h;
+                    }
                     break;
                 case G_SETPRIMDEPTH: prim_depth_z = (uint16_t)(w1 >> 16); break;
                 case G_LOADTLUT: {
@@ -3443,6 +3451,7 @@ bool Interpreter::finish_triangles(FrameRecord& out) {
     return true;
 }
 void Interpreter::set_fix_rect_lr(bool on) { impl_->fix_rect_lr = on; }
+void Interpreter::set_scissor_edge_slack(int px) { impl_->scissor_slack = px; }
 void Interpreter::set_merge_rect_slices(bool on) { impl_->merge_rect_slices = on; }
 void Interpreter::set_hud_camera_id(uint32_t id) { impl_->hud_camera_id = id; }
 void Interpreter::set_merge_image_tiles(bool on) { impl_->image_tiles = on; }
