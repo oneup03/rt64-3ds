@@ -615,6 +615,10 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
             if (strcmp(md.key, r.key) == 0) *r.value = md.value < r.lo ? r.lo : md.value > r.hi ? r.hi : md.value;
         }
     }
+    // An Old 3DS can't afford in-betweens (no core 2 for the builder, and
+    // the games run below their own rate there): a game's default of
+    // "60 interp." is its old3ds_frame_cap there. settings.ini still decides.
+    if (!is_new_3ds && st.frame_cap == 2) st.frame_cap = desc.old3ds_frame_cap < 0 ? 0 : desc.old3ds_frame_cap > 1 ? 1 : desc.old3ds_frame_cap;
     load();
     for (int i = 0; i < g_row_count; i++) {
         if (g_rows[i].on_change != nullptr) g_rows[i].on_change(*g_rows[i].value);

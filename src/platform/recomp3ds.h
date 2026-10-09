@@ -134,6 +134,11 @@ struct GameDesc {
     // Optional: the game's defaults for rows, the library's included.
     const MenuDefault* menu_defaults = nullptr;
     size_t menu_default_count = 0;
+    // What a default of "60 interp." (frame_cap 2) becomes on an Old 3DS,
+    // which can't afford the in-betweens: 1, the 30 fps cap (60 interp.
+    // without the frames in between; Goemon), or 0, the game's own rate
+    // (DK64, Banjo). settings.ini still decides.
+    int old3ds_frame_cap = 1;
     // What the runtime reports plugged into controller 1. Goemon saves to
     // the Controller Pak and refuses to start a game unless one is reported
     // at boot (the desktop frontends report a Rumble Pak).
