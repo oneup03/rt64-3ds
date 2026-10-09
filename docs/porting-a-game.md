@@ -651,6 +651,17 @@ clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
     `dl_test DL_DEFER=1 DL_DEFER_THREAD=1` reads on a second thread: dumps
     identical, and ThreadSanitizer (`libtsan`) reports nothing. With the
     orderings made relaxed it reports 63 races.
+  - Texture decoding is deferred too (`TextureCache::set_defer_decode`). The
+    read still looks up every texture, since the lookup's fingerprint must
+    see RDRAM before the game changes it. A texture not in the cache has
+    the bytes its decode reads (`texel_span`) and its palette copied, and
+    the gfx thread decodes the copies once the read is over
+    (`decode_pending`). That is up to ~5 ms a list where a scene changes, and
+    little in steady play. `dl_test DL_COPY_CHECK=1` decodes every texture
+    from such a copy and from RDRAM and compares: identical on 18 Banjo and
+    DK64 captures. Within a list a texture asked for again gets the first
+    answer (`TextureCache::begin_list`): Banjo repeats 40-60 % of them.
+    `DECODE_ON_READER.TXT` keeps the decoding in the read.
   - Banjo at the Old clock, timed over the attract demos (frame-locked:
     each demo between two jiggy transitions is the same lists in every run,
     and whole-loop totals repeat to 0.2 %): 17.94 lists a second with the

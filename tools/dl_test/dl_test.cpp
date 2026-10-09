@@ -13,6 +13,7 @@
 
 #include "rt64_3ds_dl.h"
 #include "refrender.h"
+#include "rt64_3ds_texdecode.h"
 #include "ultramodern/ultra64.h"
 
 int main(int argc, char** argv) {
@@ -479,6 +480,39 @@ int main(int argc, char** argv) {
         o.model_images = getenv("DL_REF_RTT") != nullptr || getenv("DL_FRAME_COPY") != nullptr;
         printf("reference render -> %s: %s\n", out, ref_render(rdram.data(), frame, o, out) ? "ok" : "failed");
     }
+    // DL_COPY_CHECK: every texture (and mip level) decoded from a copy of
+    // its texel_span, as the texture cache's deferred decoding does, against
+    // the decode straight from RDRAM.
+    if (getenv("DL_COPY_CHECK")) {
+        size_t checked = 0, differ = 0, bytes = 0;
+        auto check = [&](const rt64_3ds::TexDesc& d, const uint16_t* pal) {
+            if (!d.valid || d.width == 0 || d.height == 0 || d.snapshot || d.frame || d.rtt >= 0) return;
+            uint32_t lo, hi;
+            rt64_3ds::texel_span(d, lo, hi);
+            std::vector<uint8_t> copy(rdram.begin() + lo, rdram.begin() + hi);
+            copy.resize(copy.size() + 64, 0xCD);    // a read past the span shows as a difference
+            rt64_3ds::TexDesc c = d;
+            c.addr = (d.addr & 0xFFFFFF) - lo;
+            std::vector<uint32_t> a((size_t)d.width * d.height), b(a.size());
+            rt64_3ds::decode_rgba8(rdram.data(), d, pal, a.data());
+            rt64_3ds::decode_rgba8(copy.data(), c, pal, b.data());
+            checked++;
+            bytes += hi - lo;
+            if (a != b) {
+                differ++;
+                printf("copy check: texture %06x %ux%u fmt %u/%u pitch %u differs\n", d.addr, d.width, d.height, d.fmt, d.siz, d.pitch);
+            }
+        };
+        for (const rt64_3ds::DrawRecord& dr : frame.draws) {
+            for (int t = 0; t < 2; t++) {
+                const rt64_3ds::TexDesc& d = dr.tex[t];
+                const uint16_t* pal = (d.fmt == 2 && d.tlut_index + 256 <= frame.tlut.size()) ? &frame.tlut[d.tlut_index] : nullptr;
+                check(d, pal);
+                for (uint32_t k = 1; k < d.levels && d.mip_index + k - 1 < frame.mips.size(); k++) check(frame.mips[d.mip_index + k - 1], pal);
+            }
+        }
+        printf("copy check: %zu textures, %zu differ, %zu bytes copied\n", checked, differ, bytes);
+    }
     if (const char* list = getenv("DL_TEXDUMP")) {
         // "draw[,draw...]": write both textures of those draws as PPM.
         const char* dir = getenv("DL_TEXDIR") ? getenv("DL_TEXDIR") : ".";
@@ -504,5 +538,6 @@ int main(int argc, char** argv) {
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iterations;
     printf("%.3f ms per interpretation on this host (%d iterations)\n", ms, iterations);
+    printf("palette snapshots: %zu (%zu KB)\n", frame.tlut.size() / 256, frame.tlut.size() * 2 / 1024);
     return 0;
 }

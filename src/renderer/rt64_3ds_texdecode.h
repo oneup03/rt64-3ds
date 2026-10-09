@@ -99,6 +99,19 @@ inline uint32_t rgba5551_to_rgba8(uint16_t p) {   // 0xRRGGBBAA
     return (r << 24) | (g << 16) | (b << 8) | a;
 }
 
+// The RDRAM bytes decode_texels reads for d, as [lo, hi), both 4-aligned
+// (a copy of them keeps RDRAM's word layout): its rows from d.addr, each up
+// to its texels' bytes (and a 4-bit texture's first nibble) plus the odd-row
+// swap.
+inline void texel_span(const TexDesc& d, uint32_t& lo, uint32_t& hi) {
+    const uint32_t addr = d.addr & 0xFFFFFF;
+    const uint32_t rows = (d.wrap_rows != 0 && d.wrap_rows < d.height) ? d.wrap_rows : d.height;
+    const uint32_t bytes = ((((uint32_t)d.width + d.nibble) << d.siz) + 1) / 2;
+    lo = addr & ~3u;
+    hi = (addr + (rows > 0 ? rows - 1 : 0) * d.pitch + bytes + 8 + 3) & ~3u;
+    if (hi > 0x1000000) hi = 0x1000000;
+}
+
 // Whole tile to 0xRRGGBBAA texels (width * height).
 inline void decode_rgba8(const uint8_t* rdram, const TexDesc& d, const uint16_t* pal, uint32_t* out) {
     decode_texels(rdram, d, pal, [&](uint32_t x, uint32_t y, bool have16, uint16_t p16, uint32_t r, uint32_t g, uint32_t b, uint32_t a) {

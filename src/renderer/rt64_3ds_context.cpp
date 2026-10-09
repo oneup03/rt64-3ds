@@ -492,6 +492,7 @@ public:
             return;
         }
         const bool present = read == ReadOutcome::Drawn;
+        decode_copied_textures();
         // The triangles the reader left for this thread (deferred triangles,
         // with a reader): their vertices, after "parsed".
         const u64 t_read = svcGetSystemTick();
@@ -1089,10 +1090,17 @@ public:
             if (FILE* f = rt64_3ds::data_fopen("VERTS_ON_READER.TXT", "r")) { fclose(f); defer_verts_ = false; }
             LightEvent_Init(&read_progress_, RESET_ONESHOT);
             interp_.set_defer_triangles(defer_tris_, defer_verts_, &read_progress, this);
+            // New textures: copied in the read, decoded here after it
+            // (TextureCache::set_defer_decode). DECODE_ON_READER.TXT keeps
+            // the decoding in the read.
+            defer_decode_ = true;
+            if (FILE* f = rt64_3ds::data_fopen("DECODE_ON_READER.TXT", "r")) { fclose(f); defer_decode_ = false; }
+            textures_.set_defer_decode(defer_decode_);
         }
-        fprintf(stderr, "rt64-3ds: list reader %s (priority 0x%lx, core %d), triangles' output %s, vertex transforms %s\n",
+        fprintf(stderr, "rt64-3ds: list reader %s (priority 0x%lx, core %d), triangles' output %s, vertex transforms %s, texture decoding %s\n",
                 reader_ != nullptr ? "up" : "FAILED: lists read on this thread", (unsigned long)prio, core,
-                defer_tris_ ? "on the gfx thread" : "in the read", defer_tris_ && defer_verts_ ? "on the gfx thread" : "in the read");
+                defer_tris_ ? "on the gfx thread" : "in the read", defer_tris_ && defer_verts_ ? "on the gfx thread" : "in the read",
+                defer_decode_ ? "on the gfx thread" : "in the read");
     }
     // The reader published triangles (Interpreter::set_defer_triangles).
     static void read_progress(void* arg) { LightEvent_Signal(&static_cast<C3dRenderContext*>(arg)->read_progress_); }
@@ -3487,6 +3495,7 @@ public:
     std::vector<rt64_3ds::BoundTex> bound_;
     void prefetch_textures() {
         bound_.assign(frame_.draws.size() * 2, rt64_3ds::BoundTex{});
+        textures_.begin_list();
         for (size_t i = 0; i < frame_.draws.size(); i++) {
             const rt64_3ds::DrawRecord& d = frame_.draws[i];
             for (int t = 0; t < 2; t++) {
@@ -3502,6 +3511,21 @@ public:
                 bound_[i * 2 + t] = b;
             }
         }
+        textures_.end_list();
+    }
+    // The textures the read only copied (TextureCache::set_defer_decode,
+    // with a reader), decoded on this thread before anything binds them.
+    bool defer_decode_ = false;
+    std::vector<rt64_3ds::BoundTex> decoded_;
+    void decode_copied_textures() {
+        const u64 t0 = svcGetSystemTick();
+        if (textures_.decode_pending(decoded_) == 0) return;
+        for (rt64_3ds::BoundTex& b : bound_) {
+            if (b.pending < 0) continue;
+            b = decoded_[b.pending];
+            b.fresh = false;
+        }
+        acc_prefetch_ += svcGetSystemTick() - t0;
     }
 
     // Render to texture: one target per off-screen image slot

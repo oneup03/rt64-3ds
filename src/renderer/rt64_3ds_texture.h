@@ -5,6 +5,7 @@
 #include <3ds.h>
 #include <citro3d.h>
 #include <cstdint>
+#include <vector>
 
 #include "rt64_3ds_record.h"
 
@@ -16,6 +17,9 @@ struct BoundTex {
     // Created by this call: the C3D_Tex may sit at the address of one freed
     // earlier this frame, so a pointer comparison cannot skip its bind.
     bool fresh = false;
+    // Its decode deferred (TextureCache::set_defer_decode): tex is null
+    // until decode_pending gives entry `pending` of its list.
+    int32_t pending = -1;
 };
 
 class TextureCache {
@@ -25,6 +29,22 @@ public:
     // CI formats (256 entries) or nullptr; `mips` the sources of its levels
     // past the base (d.levels - 1 of them, FrameRecord::mips) or nullptr.
     BoundTex get(const TexDesc& d, const uint16_t* tlut, const TexDesc* mips = nullptr);
+    // A list's lookups start: from here to the next call, a texture asked
+    // for again gets the first answer without reading RDRAM again (nothing
+    // a list reads changes during its read: the game waits for "parsed",
+    // or else a second look would be no better). Banjo asks again for 40-60%
+    // of its textures within a list. end_list: the answers are forgotten.
+    void begin_list();
+    void end_list();
+    // Deferred decoding (with a reader thread, rt64_3ds_context.cpp): a
+    // texture not in the cache has the RDRAM rows its decode reads and its
+    // palette copied, and comes back with tex null and `pending` set;
+    // decode_pending, on the drawing thread once the read is over, decodes
+    // the copies into the cache and gives their BoundTex, by `pending`. The
+    // read leaves the decoding (up to ~5 ms a list where a scene changes)
+    // to the core that draws.
+    void set_defer_decode(bool on) { defer_ = on; }
+    size_t decode_pending(std::vector<BoundTex>& out);
     // Mipmaps (TexDesc::levels): on by default; off, a mipmapped draw's
     // texture is its base level alone.
     void set_mipmaps(bool on) { mipmaps_ = on; }
@@ -65,6 +85,11 @@ private:
     uint32_t uploads_ = 0, live_ = 0, bytes_ = 0, vram_bytes_ = 0;
     void to_vram(uint64_t key, struct Entry& e);
     void sweep_vram();
+    // Decodes `d` (its texels read from `src`, laid out as RDRAM) into a new
+    // entry under `key`.
+    BoundTex decode_into(uint64_t key, uint32_t content, const uint8_t* src, const TexDesc& d, const uint16_t* tlut,
+                         const TexDesc* mips, uint32_t levels, uint32_t rdram_addr);
+    bool defer_ = false;
     bool compact_ = false;
     bool mipmaps_ = true;
 };

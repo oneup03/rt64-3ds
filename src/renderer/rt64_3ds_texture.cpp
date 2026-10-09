@@ -92,6 +92,26 @@ struct TextureCache::Impl {
     uint32_t swept_frame = ~0u;
     std::vector<uint16_t> stage16;
     std::vector<uint32_t> stage32;
+    // begin_list: the list's answers by key before the fingerprint, in an
+    // open-addressed table (no allocation on the reading thread); a slot
+    // whose gen is not memo_gen is free.
+    static constexpr uint32_t kMemo = 512;
+    struct Memo { uint64_t dkey = 0; uint32_t gen = 0; BoundTex b; };
+    std::vector<Memo> memo;
+    uint32_t memo_gen = 0;
+    bool memo_on = false;
+    // set_defer_decode: the textures waiting for decode_pending, their
+    // descriptions moved onto `copies` (RDRAM's bytes, in its layout).
+    struct Waiting {
+        uint64_t key;
+        uint32_t content, levels, rdram_addr;
+        bool pal;
+        TexDesc d;
+        TexDesc mips[7];
+        uint16_t tlut[256];
+    };
+    std::vector<Waiting> waiting;
+    std::vector<uint8_t> copies;
 };
 
 TextureCache::TextureCache(const uint8_t* rdram) : impl_(new Impl()), rdram_(rdram) {}
@@ -118,6 +138,30 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut, const TexDesc
     };
     // The rows really read from RDRAM (TMEM may wrap: TexDesc::wrap_rows).
     const uint32_t rows_read = (d.wrap_rows != 0 && d.wrap_rows < d.height) ? d.wrap_rows : d.height;
+    uint64_t dkey = mix(0, d.addr);
+    dkey = mix(dkey, (uint64_t)d.fmt | ((uint64_t)d.siz << 4) | ((uint64_t)d.width << 8) | ((uint64_t)d.height << 24) | ((uint64_t)d.pitch << 40));
+    dkey = mix(dkey, (uint64_t)d.tlut_hash | ((uint64_t)d.palette << 32) | ((uint64_t)d.nibble << 40) | ((uint64_t)d.block << 48) | ((uint64_t)d.tlut_mode << 56));
+    if (d.block) dkey = mix(dkey, (uint64_t)d.dxt | ((uint64_t)d.load_word << 32));
+    if (d.wrap_rows != 0) dkey = mix(dkey, d.wrap_rows);
+    for (uint32_t k = 1; k < levels; k++) dkey = mix(dkey, (uint64_t)mips[k - 1].addr | ((uint64_t)mips[k - 1].load_word << 32) | ((uint64_t)k << 48));
+    // Asked for already in this list (begin_list): the same answer. Else
+    // the free slot it will go in (none after 8 taken ones: not kept).
+    Impl::Memo* memo = nullptr;
+    if (impl_->memo_on) {
+        const uint32_t mask = Impl::kMemo - 1;
+        for (uint32_t i = (uint32_t)(dkey ^ (dkey >> 32)) & mask, n = 0; n < 8; i = (i + 1) & mask, n++) {
+            Impl::Memo& m = impl_->memo[i];
+            if (m.gen != impl_->memo_gen) { memo = &m; break; }
+            if (m.dkey == dkey) return m.b;
+        }
+    }
+    auto keep = [&](const BoundTex& r) {
+        if (memo == nullptr) return;
+        memo->dkey = dkey;
+        memo->gen = impl_->memo_gen;
+        memo->b = r;
+        memo->b.fresh = false;
+    };
     uint32_t fp = 2166136261u;
     for (uint32_t j = 0; j < 4; j++) {
         const uint32_t row = d.addr + (2 * j + 1) * rows_read / 8 * d.pitch;
@@ -126,13 +170,7 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut, const TexDesc
             fp *= 16777619u;
         }
     }
-    uint64_t key = mix(0, d.addr);
-    key = mix(key, (uint64_t)d.fmt | ((uint64_t)d.siz << 4) | ((uint64_t)d.width << 8) | ((uint64_t)d.height << 24) | ((uint64_t)d.pitch << 40));
-    key = mix(key, (uint64_t)d.tlut_hash | ((uint64_t)d.palette << 32) | ((uint64_t)d.nibble << 40) | ((uint64_t)d.block << 48));
-    if (d.block) key = mix(key, (uint64_t)d.dxt | ((uint64_t)d.load_word << 32));
-    if (d.wrap_rows != 0) key = mix(key, d.wrap_rows);
-    for (uint32_t k = 1; k < levels; k++) key = mix(key, (uint64_t)mips[k - 1].addr | ((uint64_t)mips[k - 1].load_word << 32) | ((uint64_t)k << 48));
-    key = mix(key, fp);
+    const uint64_t key = mix(dkey, fp);
     auto content_hash = [&]() {
         // A fixed sample: up to 8 rows spread over the texture, up to 8 words
         // spread over each, plus the row's last word. A texture reloaded into
@@ -178,12 +216,70 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut, const TexDesc
             b.tex = &e.tex;
             b.uscale = 1.0f / (float)e.potw;
             b.vscale = 1.0f / (float)e.poth;
+            keep(b);
             return b;
         }
     }
-    uint32_t h = content_hash();
+    const uint32_t h = content_hash();
+    if (!defer_) {
+        b = decode_into(key, h, rdram_, d, tlut, mips, levels, d.addr);
+        keep(b);
+        return b;
+    }
 
-    // Decode.
+    // Deferred: copy the bytes each level's decode reads (texel_span) and
+    // the palette.
+    Impl::Waiting& w = impl_->waiting.emplace_back();
+    auto copy = [&](TexDesc& ld) {
+        uint32_t lo, hi;
+        texel_span(ld, lo, hi);
+        const uint32_t at = (uint32_t)impl_->copies.size();
+        impl_->copies.resize(at + (hi - lo));
+        memcpy(impl_->copies.data() + at, rdram_ + lo, hi - lo);
+        ld.addr = at + ((ld.addr & 0xFFFFFF) - lo);
+    };
+    w.key = key;
+    w.content = h;
+    w.levels = levels;
+    w.rdram_addr = d.addr;
+    w.d = d;
+    copy(w.d);
+    for (uint32_t k = 1; k < levels; k++) { w.mips[k - 1] = mips[k - 1]; copy(w.mips[k - 1]); }
+    w.pal = tlut != nullptr;
+    if (w.pal) memcpy(w.tlut, tlut, sizeof(w.tlut));
+    b.pending = (int32_t)(impl_->waiting.size() - 1);
+    b.uscale = 1.0f / (float)pot(d.width);
+    b.vscale = 1.0f / (float)pot(d.height);
+    keep(b);
+    return b;
+}
+
+void TextureCache::begin_list() {
+    if (impl_->memo.empty()) impl_->memo.resize(Impl::kMemo);
+    if (++impl_->memo_gen == 0) {
+        for (Impl::Memo& m : impl_->memo) m.gen = 0;
+        impl_->memo_gen = 1;
+    }
+    impl_->memo_on = true;
+}
+
+void TextureCache::end_list() { impl_->memo_on = false; }
+
+size_t TextureCache::decode_pending(std::vector<BoundTex>& out) {
+    const size_t n = impl_->waiting.size();
+    out.resize(n);
+    for (size_t i = 0; i < n; i++) {
+        const Impl::Waiting& w = impl_->waiting[i];
+        out[i] = decode_into(w.key, w.content, impl_->copies.data(), w.d, w.pal ? w.tlut : nullptr, w.levels > 1 ? w.mips : nullptr, w.levels, w.rdram_addr);
+    }
+    impl_->waiting.clear();
+    impl_->copies.clear();
+    return n;
+}
+
+BoundTex TextureCache::decode_into(uint64_t key, uint32_t h, const uint8_t* src, const TexDesc& d, const uint16_t* tlut,
+                                   const TexDesc* mips, uint32_t levels, uint32_t rdram_addr) {
+    BoundTex b;
     uint32_t potw = pot(d.width), poth = pot(d.height);
     bool wide = (d.fmt == 0 && d.siz == 3) || d.fmt == 3 || d.fmt == 4 || (d.fmt == 2 && d.tlut_mode == 3);
     // Intensity texels (r = g = b from the decoder) as LA8: L in the high
@@ -194,7 +290,7 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut, const TexDesc
     GPU_TEXCOLOR fmt = wide ? GPU_RGBA8 : la8 ? GPU_LA8 : GPU_RGBA5551;
     // Decodes a level into the stage, rows `stride` texels apart.
     auto decode_level = [&](const TexDesc& ld, uint32_t stride) {
-        decode_texels(rdram_, ld, tlut, [&](uint32_t xt, uint32_t y, bool have16, uint16_t p16, uint32_t r, uint32_t g, uint32_t bl, uint32_t a) {
+        decode_texels(src, ld, tlut, [&](uint32_t xt, uint32_t y, bool have16, uint16_t p16, uint32_t r, uint32_t g, uint32_t bl, uint32_t a) {
             if (wide) impl_->stage32[y * stride + xt] = have16 ? rgba5551_to_rgba8(p16) : ((r << 24) | (g << 16) | (bl << 8) | a);
             else if (la8) impl_->stage16[y * stride + xt] = have16 ? (uint16_t)0xFFFF : (uint16_t)((r << 8) | a);
             else impl_->stage16[y * stride + xt] = have16 ? p16 : ia_to_rgba5551((uint8_t)r, (uint8_t)a);
@@ -225,7 +321,7 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut, const TexDesc
         dump_state = f ? 1 : 0;
         if (f) { if (fscanf(f, "%d %x", &dump_from, &dump_addr) < 1) dump_from = 0; fclose(f); }
     }
-    if (dump_state == 1 && dumped < 40 && (int)impl_->frame >= dump_from && (dump_addr == 0 || (d.addr & 0xFFFFFF) == (dump_addr & 0xFFFFFF))) {
+    if (dump_state == 1 && dumped < 40 && (int)impl_->frame >= dump_from && (dump_addr == 0 || (rdram_addr & 0xFFFFFF) == (dump_addr & 0xFFFFFF))) {
         char path[96];
         char name[24];
         snprintf(name, sizeof(name), "tex_%02d.ppm", dumped);
@@ -243,7 +339,7 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut, const TexDesc
             fclose(f);
         }
         fprintf(stderr, "texdump %02d: addr %06x pitch %u fmt %u siz %u %ux%u masks %u/%u cm %u/%u pal %u tlut %u\n", dumped,
-                d.addr, d.pitch, d.fmt, d.siz, d.width, d.height, d.masks, d.maskt, d.cms, d.cmt, d.palette, d.tlut_mode);
+                rdram_addr, d.pitch, d.fmt, d.siz, d.width, d.height, d.masks, d.maskt, d.cms, d.cmt, d.palette, d.tlut_mode);
         dumped++;
     }
 
