@@ -85,8 +85,9 @@ inline bool raw_ok(uint32_t a, uint32_t bytes) { return (a & 3) == 0 && (a & 0xF
 // (2ab + 0x8000) >> 16, saturated: VMULF.
 inline int16_t vmulf(int32_t a, int32_t b) { return clamp16((a * b + 0x4000) >> 15); }
 
-// RSP DMA as librecomp implements it: an inclusive length, the RDRAM address
-// aligned down to 8, DMEM wrapping at 4 KB.
+// RSP DMA as librecomp implements it, for an exact byte count (librecomp
+// passes its inclusive count less one): the RDRAM address aligned down to 8,
+// DMEM wrapping at 4 KB.
 void dma_read(const uint8_t* rdram, uint32_t dmem, uint32_t dram, uint32_t len) {
     dram &= 0xFFFFF8;
     if ((dmem & 3) == 0 && dmem + len <= 0x1000) {

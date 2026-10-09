@@ -190,6 +190,7 @@ ultramodern::renderer::WindowHandle create_window(void*) {
     // (its file stays incomplete): nothing of ours is in flight on the card
     // when FS is torn down below.
     rt64_3ds::capture_stop(1500);
+    recomp3ds::settings_flush();           // a change inside the save's one-second debounce
     recomp3ds::log_flush();
     recomp3ds::stall_watch_stop();
     recomp3ds::loadmon_stop();
@@ -235,6 +236,7 @@ void draw_home_prompt(bool show) {
 bool home_prompt() {
     fprintf(stderr, "recomp3ds: HOME - quit prompt\n");
     rt64_3ds::set_paused(true);
+    recomp3ds::stall_watch_pause(true);    // the main thread and the frames stop here by design
     recomp3ds::input_set_blocked(true);
     ndspSetMasterVol(0.0f);
     draw_home_prompt(true);
@@ -261,6 +263,7 @@ bool home_prompt() {
         }
     }
     draw_home_prompt(false);
+    recomp3ds::stall_watch_pause(false);
     recomp3ds::settings_menu_redraw();
     ndspSetMasterVol(1.0f);
     recomp3ds::input_set_blocked(false);

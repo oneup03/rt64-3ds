@@ -12,17 +12,9 @@ join_event_threads never returned.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- N64Recomp                  | 2 +-
  ultramodern/src/events.cpp | 9 +++++++++
- 2 files changed, 10 insertions(+), 1 deletion(-)
+ 1 file changed, 9 insertions(+)
 
-diff --git a/N64Recomp b/N64Recomp
-index e4928d1..2f94055 160000
---- a/N64Recomp
-+++ b/N64Recomp
-@@ -1 +1 @@
--Subproject commit e4928d1e8c92a9f061d7841c47cbb90e331bc9c8
-+Subproject commit 2f9405564b8080e96eedb236a9bfea89ef7d38d3
 diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
 index a8221ce..311aee6 100644
 --- a/ultramodern/src/events.cpp

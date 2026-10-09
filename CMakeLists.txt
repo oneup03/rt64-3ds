@@ -50,11 +50,12 @@ endfunction()
 # rt64_3ds_check_gpr32(<dir>...): RECOMP_GPR32 (32-bit N64 registers; see
 # N64Recomp's recomp.h) is only sound for generated code that holds no 64-bit
 # register instruction: doubleword arithmetic and shifts, ld/sd/ldl/ldr/sdl/sdr
-# of a register, dmult/ddiv, dmtc1/dmfc1. Call it with the directories of the
+# of a register, dmult/ddiv, dmtc1/dmfc1, lwu, and the 64-bit add/sub forms with
+# $zero or a relocated immediate as an operand. Call it with the directories of the
 # recompiled sources (RecompiledFuncs, RecompiledPatches); it fails the
 # configure step naming the offending lines.
 function(rt64_3ds_check_gpr32)
-    set(pattern "ctx->r[0-9]+ = LD\\(|SD\\(ctx->r[0-9]+,|do_ldl|do_ldr|do_sdl|do_sdr|DMULT|DDIV|<< 32|\\+ 32\\)|= ctx->r[0-9]+ << [0-9(]|= ctx->r[0-9]+ >> [0-9(]|ctx->r[0-9]+ = SIGNED\\(ctx->r[0-9]+\\) >>|= ctx->r[0-9]+ [-+] ctx->r[0-9]+;|= ctx->r[0-9]+ [-+] -?0X[0-9A-F]+;|\\.u64 = ctx->r|ctx->r[0-9]+ = [^;]*\\.u64")
+    set(pattern "ctx->r[0-9]+ = LD\\(|SD\\(ctx->r[0-9]+,|do_ldl|do_ldr|do_sdl|do_sdr|DMULT|DDIV|<< 32|\\+ 32\\)|= ctx->r[0-9]+ << [0-9(]|= ctx->r[0-9]+ >> [0-9(]|ctx->r[0-9]+ = SIGNED\\(ctx->r[0-9]+\\) >>|= ctx->r[0-9]+ [-+] ctx->r[0-9]+;|= ctx->r[0-9]+ [-+] -?0X[0-9A-F]+;|\\.u64 = ctx->r|ctx->r[0-9]+ = [^;]*\\.u64|= 0 [-+] ctx->r[0-9]+;|= ctx->r[0-9]+ [-+] 0;|= ctx->r[0-9]+ [-+] \\(int16_t\\)|MEM_WU\\(")
     set(sources)
     foreach(dir ${ARGN})
         file(GLOB dir_sources "${dir}/*.c")

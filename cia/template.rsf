@@ -1,11 +1,17 @@
-# makerom RSF for the @TITLE@ CIA (installable title).
+# makerom RSF for the @TITLE@ CIA (installable title). rt64-3ds's
+# cmake/Cia.cmake (add_cia) fills in @TITLE@, @PRODUCT@ and @UNIQUEID@ from
+# the game's CMakeLists.txt.
 #
-# Why a CIA at all: the Homebrew Launcher cannot hand a .3dsx the New 3DS
-# 804 MHz clock + L2 cache (PTM accepts the request but the kernel ignores it
-# for a process whose title header does not ask for it). A title's exheader
-# can, so the CIA is the build to install on a New 3DS. Based on the standard
-# homebrew template (Steveice10/buildtools); the three lines that matter are
-# SystemModeExt / CpuSpeed / EnableL2Cache.
+# Why a CIA at all: an installable title the HOME Menu starts, with the
+# memory mode its exheader asks for (SystemModeExt 124MB on a New 3DS,
+# SystemMode 64MB on an Old). The New 3DS clock + L2 cache come from
+# osSetSpeedupEnable(true) at start (recomp3ds_run.cpp), for the CIA and the
+# .3dsx alike: neither launch path applies CpuSpeed/EnableL2Cache by itself
+# (measured on Luma3DS, 2026-09-28). Based on the standard homebrew template
+# (Steveice10/buildtools). The lines that matter: SystemModeExt / SystemMode,
+# CpuSpeed / EnableL2Cache, StackSize, AffinityMask / MaxCpu / CanAccessCore2
+# (threads on cores 1 and 2), and the service list (dsp::DSP for ndsp,
+# ptm:sysm for the clock, nwm::UDS and soc:U for networking).
 BasicInfo:
   Title                   : "@TITLE@"
   ProductCode             : "@PRODUCT@"
@@ -250,7 +256,7 @@ AccessControlInfo:
 SystemControlInfo:
   SaveDataSize: 0KB # Change if the app uses savedata
   RemasterVersion: 0
-  StackSize: 0x80000   # 512 KB, same as __stacksize__ in platform_3ds.c
+  StackSize: 0x80000   # 512 KB, same as __stacksize__ in src/platform/recomp3ds_run.cpp
 
   # Modules that run services listed above should be included below
   # Maximum 48 dependencies

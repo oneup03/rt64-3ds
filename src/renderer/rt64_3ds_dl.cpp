@@ -2423,10 +2423,10 @@ struct Interpreter::Impl {
         return out;
     }
 
-    // Rewrites an F3DEX command in place as the F3DEX2 command that does the
-    // same (the RDP commands are shared). Returns false when the command was
-    // carried out here and the F3DEX2 decoder must skip it.
-    // ---- main loop
+    // ---- main loop: one dispatch for both GBIs. F3DEX commands get numbers
+    // of their own (kF3dexOp), and each one's case rewrites the command into
+    // F3DEX2's form and jumps to that command's case (the RDP commands are
+    // shared).
     // Interpreter::set_profile: each command's time goes to its kind when
     // the next one starts (and at the end of the run).
     struct ProfScope {

@@ -1,3 +1,12 @@
 tools/dl_test/dl_test
 build/
 tools/tev_test/tev_test
+# Host tool binaries and anything ROM-derived the tools or a game write here
+tools/naudio_test/naudio_test
+tools/naudio_test/audio_fuzz
+tools/naudio_test/*.bin
+tools/dl_bench_3ds/build/
+azahar-out/
+*.ppm
+gfx_task*.bin
+audio_task_*.bin

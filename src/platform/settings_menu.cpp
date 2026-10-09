@@ -24,6 +24,7 @@
 // (GameDesc::on_mod_switched).
 #include <3ds.h>
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
 #include <map>
 #include <deque>
@@ -271,20 +272,47 @@ std::map<std::string, int> g_mod_values;
 std::string g_game_mode;
 LightLock g_file_lock;
 
+// settings.ini is replaced, never truncated in place: written to a .part
+// file first, then moved over (the SD card's rename refuses an existing
+// destination, so the old file goes first; a power-off between the two
+// leaves the .part, which load() takes). A failed write keeps the old file.
 void save() {
     LightLock_Lock(&g_file_lock);
-    if (FILE* f = fopen(g_path, "w")) {
+    char tmp[sizeof(g_path) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.part", g_path);
+    bool ok = false;
+    if (FILE* f = fopen(tmp, "w")) {
+        ok = true;
+        auto put = [&](int n) { if (n < 0) ok = false; };
         for (int i = 0; i < g_row_count; i++) {
-            if (!g_rows[i].no_save) fprintf(f, "%s=%d\n", g_rows[i].key, *g_rows[i].value);
+            if (!g_rows[i].no_save) put(fprintf(f, "%s=%d\n", g_rows[i].key, *g_rows[i].value));
         }
-        for (const auto& [key, v] : g_mod_values) fprintf(f, "%s=%d\n", key.c_str(), v);
-        if (!g_game_mode.empty()) fprintf(f, "game_mode=%s\n", g_game_mode.c_str());
-        fclose(f);
+        for (const auto& [key, v] : g_mod_values) put(fprintf(f, "%s=%d\n", key.c_str(), v));
+        if (!g_game_mode.empty()) put(fprintf(f, "game_mode=%s\n", g_game_mode.c_str()));
+        if (fclose(f) != 0) ok = false;
+        if (ok) {
+            remove(g_path);
+            if (rename(tmp, g_path) != 0) ok = false;    // the .part stays: load() recovers it
+        }
+        else remove(tmp);
+    }
+    if (!ok) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            fprintf(stderr, "recomp3ds: settings.ini could not be written (%s)\n", strerror(errno));
+        }
     }
     LightLock_Unlock(&g_file_lock);
 }
 
 void load() {
+    // A save interrupted between removing the old file and moving the new
+    // one over leaves only the .part: take it.
+    char tmp[sizeof(g_path) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.part", g_path);
+    if (FILE* probe = fopen(g_path, "r")) fclose(probe);
+    else if (rename(tmp, g_path) == 0) fprintf(stderr, "recomp3ds: settings.ini recovered from its .part file\n");
     FILE* f = fopen(g_path, "r");
     if (f == nullptr) return;
     char line[192];
@@ -742,4 +770,8 @@ void recomp3ds::settings_menu_update() {
     prev = keys;
     // Written a second after the last change, not on every step.
     if (g_dirty && now - g_changed_at > SYSCLOCK_ARM11) { save(); g_dirty = false; }
+}
+
+void recomp3ds::settings_flush() {
+    if (g_dirty) { save(); g_dirty = false; }
 }

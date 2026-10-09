@@ -228,7 +228,17 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut, const TexDesc
     }
 
     // Deferred: copy the bytes each level's decode reads (texel_span) and
-    // the palette.
+    // the palette. Asked for already in this list but past the memo's reach:
+    // the same pending decode (a second one would be decoded for nothing).
+    for (size_t i = 0; i < impl_->waiting.size(); i++) {
+        if (impl_->waiting[i].key == key) {
+            b.pending = (int32_t)i;
+            b.uscale = 1.0f / (float)pot(d.width);
+            b.vscale = 1.0f / (float)pot(d.height);
+            keep(b);
+            return b;
+        }
+    }
     Impl::Waiting& w = impl_->waiting.emplace_back();
     auto copy = [&](TexDesc& ld) {
         uint32_t lo, hi;
@@ -365,12 +375,22 @@ BoundTex TextureCache::decode_into(uint64_t key, uint32_t h, const uint8_t* src,
     // the GSP module on core 1, which waits for that core).
     svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)e.tex.data, bytes);
     e.potw = potw; e.poth = poth; e.bytes = bytes; e.last_frame = impl_->frame; e.checked_frame = impl_->frame; e.content = h;
-    uploads_++;
-    live_++;
-    bytes_ += bytes;
     auto ins = impl_->map.emplace(key, e);
-    if (impl_->vram) to_vram(key, ins.first->second);
-    b.tex = &ins.first->second.tex;
+    if (ins.second) {
+        uploads_++;
+        live_++;
+        bytes_ += bytes;
+    }
+    else {
+        // Decoded twice (the same texture asked for again in one list past
+        // the memo's reach, both decoded after the read): the first stays.
+        C3D_TexDelete(&e.tex);
+        static bool said = false;
+        if (!said) { said = true; fprintf(stderr, "rt64-3ds: a texture was decoded twice in one list (the second copy freed)\n"); }
+    }
+    Entry& kept = ins.first->second;
+    if (impl_->vram && !kept.vram && !kept.vram_pending) to_vram(key, kept);
+    b.tex = &kept.tex;
     b.fresh = true;
     b.uscale = 1.0f / (float)potw;
     b.vscale = 1.0f / (float)poth;

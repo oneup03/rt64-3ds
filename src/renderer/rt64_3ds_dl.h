@@ -126,7 +126,7 @@ public:
     // After run: pairs the list's transforms with the list's before as RT64
     // does and computes the in-between frame's at `weight` (0..1 from the
     // previous list to this one; < 0 matches without computing them).
-    // world(id, perspective) names the world cameras for the cut test.
+    // set_world_proj_ids names the world cameras for the cut test.
     interp::MatchResult match_previous(float weight);
     // The next in-between of the same pair (a game frame of three or four
     // refreshes has two or three): the matches match_previous made, at a

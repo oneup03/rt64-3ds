@@ -6,7 +6,7 @@
 //     <frame> <frames> TOUCH x y   touch at (x, y) for <frames>
 //     <frame> SHOT <name>          log "AUTOTEST shot <name>" (the harness screenshots)
 //     <frame> LOG <text>           log the text
-//     <frame> EXIT                 exit(0)
+//     <frame> EXIT                 quit (as the HOME prompt's A does)
 //     <frame> HOME                 a HOME button press
 //   Frames count from the start of the current phase.
 #include <3ds.h>

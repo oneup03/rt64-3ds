@@ -137,6 +137,7 @@ namespace recomp3ds {
     void settings_set_game_mode(const std::string& mod_id);
     bool settings_debug_capture();      // settings.ini's debug_capture: a SELECT hold saves a frame capture
     void settings_menu_redraw();        // after something else wrote over the console
+    void settings_flush();              // write settings.ini now if a change is pending (at exit)
     u32  settings_menu_keys();          // 3DS keys the open menu keeps from the game
 
     void loadmon_start(unsigned core_mask);     // the cores to watch (bit n: core n)
@@ -158,6 +159,7 @@ namespace recomp3ds {
     int main_stage();
     const char* main_stage_name(int stage);
     void stall_watch_beat();
+    void stall_watch_pause(bool paused);   // the HOME prompt holds the game: no alert, no report meanwhile
     void stall_watch_stop();
 }
 

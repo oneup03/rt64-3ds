@@ -1,6 +1,7 @@
 // The citro3d renderer: interprets each display list into a FrameRecord and
-// replays it onto the top screen (mono for now; the stereo pair follows the
-// same replay with per-draw shifts).
+// replays it onto the top screen, once for each eye with 3D on (the right
+// eye from the left eye's commands), with in-between frames between the
+// game's for the frame interpolation.
 #include <3ds.h>
 #include <citro3d.h>
 #include <algorithm>
@@ -852,6 +853,10 @@ public:
                 pair_frames_ = deferred_frames_ = 0;
                 held_presented_ = held_flushed_ = 0;
                 dbuf_used_max_ = 0;
+                if (early_depth_late_ != 0) {
+                    fprintf(stderr, "rt64-3ds:   early depth left to the frame begin for %u lists (the last game frame was still on the GPU)\n", early_depth_late_);
+                    early_depth_late_ = 0;
+                }
                 if (last_passed_ != 0 || last_refused_ != 0 || rt64_3ds::settings().frame_cap == 1) {
                     fprintf(stderr, "rt64-3ds:   frame cap %s: last second %u of %u lists drawn, %u passed over (%.1f ms each), %u could not be (not a whole frame on the screen); game asks %u\n",
                             rt64_3ds::settings().frame_cap == 1 ? "30 fps" : "off", (unsigned)(g_stats.dl_per_sec - (int)last_passed_), (unsigned)g_stats.dl_per_sec,
@@ -1019,6 +1024,8 @@ public:
     bool early_drawn_ = false;                  // RenderDesc::early_drawn, unless EARLY_DRAWN_OFF.TXT
     bool drawn_after_depth_ = false;            // tell_parsed left "drawn" to early_depth
     bool depth_read_early_ = false;             // this list's game frame has its depth grid (early_depth)
+    bool last_game_gpu_done_ = false;           // the last game frame's draws and depth copy were waited for (present_deferred): early_depth may read them
+    uint32_t early_depth_late_ = 0;             // lists whose early depth read was left to the frame begin (the report)
 
     // ---- the reader thread (Settings::read_core): a list's read on another
     // core while the gfx thread waits for it. For a game that waits on
@@ -1758,6 +1765,9 @@ private:
             // presenter.
             finish_frame_bookkeeping(inbetween, sfd);
             job_deferred_ = defer;
+            // The presenter waits for a deferred frame's draws (present_deferred),
+            // not for a frame it only ends.
+            if (!inbetween) last_game_gpu_done_ = defer;
             job_stereo_ = eyes == 2;
             job_inb_ = inb_pending_;    // transferred by the presenter, ahead of this frame
             job_inb_stereo_ = inb_stereo_;
@@ -1796,6 +1806,7 @@ private:
         C3D_FrameEnd(GX_CMDLIST_FLUSH);     // (see the in-between's above)
         acc_end_ += svcGetSystemTick() - te0;
         finish_frame_bookkeeping(inbetween, sfd);
+        if (!inbetween) last_game_gpu_done_ = false;    // its GPU work starts now; nothing waits for it
         return false;
     }
 
@@ -1823,6 +1834,7 @@ private:
         last_eye_[1] = rec_eye_[1];
         finish_frame_bookkeeping(false, rec_sfd_);
         job_deferred_ = true;
+        last_game_gpu_done_ = true;         // present_deferred waits for its draws
         job_stereo_ = rec_eyes_ == 2;
         job_inb_ = inb_pending_;
         job_inb_stereo_ = inb_stereo_;
@@ -1906,8 +1918,14 @@ private:
         C3D_FrameBegin(0);
         // citro3d asks for the in-between's swap (and stops its GPU clock)
         // in the queue's completion callback, just after the wait above can
-        // return: the back buffer moves on then.
-        for (int i = 0; i < 400 && (const void*)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr) == inb_fb_; i++) svcSleepThread(25000);
+        // return: the back buffer moves on then. Only when an in-between was
+        // transferred since the last game frame (transfer_inbetween sets
+        // inb_fb_): with none, a stale pointer matched the back buffer every
+        // other frame and this waited the whole 10 ms for nothing.
+        if (inb_fb_ != nullptr) {
+            for (int i = 0; i < 400 && (const void*)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr) == inb_fb_; i++) svcSleepThread(25000);
+            inb_fb_ = nullptr;
+        }
         const u64 t1 = svcGetSystemTick();
         job_inb_gpu_ms_ = C3D_GetDrawingTime() + job_inb_draw_ms_;   // its transfer, and its draws before it
         job_inb_draw_ms_ = 0.0f;
@@ -3183,6 +3201,17 @@ public:
     void early_depth() {
         if (!drawn_after_depth_) return;
         drawn_after_depth_ = false;
+        if (prev_depth_image_ != 0 && !last_game_gpu_done_) {
+            // The last game frame ended inline, or with a plain frame end on
+            // the presenter: its draws and its depth copy may still be on the
+            // GPU (citro3d starts the queue at the frame end and nothing has
+            // waited for it). Its depth is read at the next frame begin
+            // instead, which waits for them (replay_and_present), and the
+            // runtime reports this list drawn when send_dl returns, as it
+            // does without early_drawn.
+            early_depth_late_++;
+            return;
+        }
         const u64 td = svcGetSystemTick();
         if (prev_depth_image_ != 0) {
             read_game_depth(true);

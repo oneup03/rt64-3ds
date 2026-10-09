@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # azahar-run.sh — run a .3dsx in the Azahar flatpak unattended and collect
 #
-# Generic copy kept with the port-stereo-game-to-3ds skill. The game side must
-# implement the AUTOTEST.TXT / AUTOTEST.LOG hooks described in SKILL.md §9;
-# pass the .3dsx by its path INSIDE the emulator's virtual SD card, since the
-# script file is copied next to it and the log is read from there.
+# The game side's AUTOTEST.TXT hooks are rt64-3ds's src/platform/autotest.cpp
+# (the port-stereo-game-to-3ds skill keeps a copy of this script for other
+# ports); pass the .3dsx by its path INSIDE the emulator's virtual SD card,
+# since the script file is copied next to it and the log is read from there.
 # evidence: the emulator log (which carries the game's stderr via
 # svcOutputDebugString) and periodic screenshots of the emulator window.
 #
@@ -22,8 +22,8 @@
 #   --gdb     enable the gdb stub on PORT (emulation waits for a debugger)
 #   --until   stop early once the log matches this extended regex
 #   --movie   play a TAS movie (.ctm) for scripted input
-#   --script  copy this AUTOTEST.TXT next to the .3dsx for the run (see
-#             platform_3ds.c for the format); without it any existing one stays
+#   --script  copy this AUTOTEST.TXT next to the .3dsx for the run (the format
+#             is in src/platform/autotest.cpp); without it any existing one stays
 #
 # Exit status: 0 if --until matched (or no --until given and the run
 # completed), 2 if the emulator died early, 3 on timeout with --until unmet.

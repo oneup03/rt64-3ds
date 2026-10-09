@@ -23,8 +23,8 @@
 #include "ultramodern/ultramodern.hpp"
 #include "rt64_3ds.h"
 
-// The runtime's diagnostic counts (a Banjo runtime change; absent elsewhere,
-// hence weak): 0 external messages queued, 1 not sent (queue full), 2 game
+// The runtime's diagnostic counts (nmr patch 0030; weak so a runtime
+// without it still links): 0 external messages queued, 1 not sent (queue full), 2 game
 // thread resumes, 3 timer thread passes, 4 VI thread passes, 5 idle waits,
 // 6 blocking receives that waited, 7 blocking sends that waited.
 extern "C" __attribute__((weak)) volatile uint32_t ultramodern_dbg_counts[8];
@@ -34,6 +34,7 @@ namespace {
 std::atomic<uint32_t> g_beat{ 0 };
 Thread g_thread = nullptr;
 volatile bool g_run = false;
+std::atomic<bool> g_paused{ false };     // stall_watch_pause: the HOME prompt holds the game
 uint8_t* const* g_watch_rdram = nullptr;     // the host's pointer to RDRAM (set once the game runs)
 const recomp3ds::GameDesc* g_watch_desc = nullptr;
 
@@ -172,7 +173,11 @@ void watch(void*) {
         const uint32_t beat = g_beat.load();
         const u64 now = svcGetSystemTick();
         const uint32_t frames = rt64_3ds::progress().frames;
-        if (frames != last_frames || frames == 0 || beat == 0 || !aptIsActive()) { last_frames = frames; frames_since = now; }
+        // Not while the HOME prompt holds the game (stall_watch_pause) or the
+        // HOME Menu or sleep has the application: the main thread and the
+        // frames stop there by design.
+        const bool quiet = g_paused.load(std::memory_order_relaxed) || !aptIsActive();
+        if (frames != last_frames || frames == 0 || beat == 0 || quiet) { last_frames = frames; frames_since = now; }
         const int busy0 = recomp3ds::loadmon_peek(0), busy1 = recomp3ds::loadmon_peek(1), busy2 = recomp3ds::loadmon_peek(2);
         // The runtime's counts a second since the last pass: e queued
         // external messages, f not sent, r game thread resumes, t timer
@@ -191,14 +196,14 @@ void watch(void*) {
             for (int i = 0; i < 8; i++) prev[i] = cur[i];
             prev_t = now;
         }
-        if (beat != 0) alert(aptIsActive() && beat == last ? now - since : 0, now - frames_since, recomp3ds::log_write_stuck_ms(), busy0, busy1, busy2, rates);
+        if (beat != 0) alert(!quiet && beat == last ? now - since : 0, now - frames_since, recomp3ds::log_write_stuck_ms(), busy0, busy1, busy2, rates);
         // Not before the main thread's loop has begun (the runtime's start,
         // the renderer's, run on it first).
         if (beat == 0) {
             since = now;
             continue;
         }
-        if (beat != last) {
+        if (beat != last || quiet) {
             if (reported) fprintf(stderr, "recomp3ds: STALL over: the main thread ran again after %.1f s\n", (float)(now - since) / (float)SYSCLOCK_ARM11);
             last = beat;
             since = now;
@@ -243,10 +248,14 @@ void recomp3ds::stall_watch_start(uint8_t* const* rdram, const GameDesc* desc) {
     g_thread = threadCreate(watch, nullptr, 16 * 1024, 0x20, -2, false);
 }
 
+void recomp3ds::stall_watch_pause(bool paused) {
+    g_paused.store(paused, std::memory_order_relaxed);
+}
+
 void recomp3ds::stall_watch_stop() {
     if (g_thread == nullptr) return;
     g_run = false;
-    threadJoin(g_thread, 1000000000ull);
-    threadFree(g_thread);
+    // A thread that did not finish is left to the exit, not freed under itself.
+    if (R_SUCCEEDED(threadJoin(g_thread, 1000000000ull))) threadFree(g_thread);
     g_thread = nullptr;
 }

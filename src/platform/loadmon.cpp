@@ -100,12 +100,16 @@ void recomp3ds::loadmon_set_mhz(unsigned mhz) {
     if (mhz != 0) g_mhz = mhz;
 }
 
+// At exit. An idle thread runs at the lowest priority, so on a core a game
+// thread is spinning on (the forced exit's case) it never sees g_running
+// drop: a bounded wait, and a thread that did not finish is left to die
+// with the process rather than joined forever.
 void recomp3ds::loadmon_stop() {
     g_running = false;
     for (int c = 0; c < kCores; c++) {
         if (g_mon[c].thread != nullptr) {
-            threadJoin(g_mon[c].thread, UINT64_MAX);
-            threadFree(g_mon[c].thread);
+            if (R_SUCCEEDED(threadJoin(g_mon[c].thread, 200 * 1000000ull))) threadFree(g_mon[c].thread);
+            else fprintf(stderr, "loadmon: core %d's idle thread did not finish (left to the exit)\n", c);
             g_mon[c].thread = nullptr;
         }
     }
