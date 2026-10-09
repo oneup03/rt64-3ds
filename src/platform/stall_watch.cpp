@@ -46,6 +46,23 @@ std::string thread_name(PTR(OSThread) thread) {
     return std::to_string(thread);
 }
 
+// How long a game thread has been running. UltraThreadContext::load_since
+// holds only the tick's low 32 bits, which come round every 16 s, so a run
+// is timed from the first pass that saw it (they come every 250 ms).
+u64 running_ticks(PTR(OSThread) thread, uint32_t load_since) {
+    struct Seen { PTR(OSThread) thread; uint32_t since; u64 start; };
+    static Seen seen[4] = {};
+    static int next = 0;
+    const u64 now = svcGetSystemTick();
+    for (const Seen& s : seen) {
+        if (s.thread == thread && s.since == load_since) return now - s.start;
+    }
+    Seen& s = seen[next];
+    next = (next + 1) % 4;
+    s = { thread, load_since, now - (uint32_t)((uint32_t)now - load_since) };
+    return now - s.start;
+}
+
 // Which game thread is running and since when (UltraThreadContext::
 // load_since: the tick it last started running, 0 while it waits), and the
 // others' wake-ups since the stall began.
@@ -55,7 +72,6 @@ void report(u64 stalled, const ultramodern::ThreadLoad* before, size_t before_n)
     if (*g_watch_rdram != nullptr) {
         ultramodern::ThreadLoad loads[32];
         const size_t n = ultramodern::get_thread_loads(loads, 32);
-        const uint32_t now = (uint32_t)svcGetSystemTick();
         for (size_t i = 0; i < n; i++) {
             const OSThread* t = reinterpret_cast<const OSThread*>(*g_watch_rdram + (loads[i].thread & 0x7FFFFFFFu));
             const UltraThreadContext* c = t->context;
@@ -66,7 +82,7 @@ void report(u64 stalled, const ultramodern::ThreadLoad* before, size_t before_n)
             char item[96];
             if (c != nullptr && c->load_since != 0) {
                 snprintf(item, sizeof(item), "%s%s (priority %d) for %.0f ms", running.empty() ? "" : ", ", thread_name(loads[i].thread).c_str(),
-                         (int)t->priority, (float)(now - c->load_since) * ms);
+                         (int)t->priority, (float)running_ticks(loads[i].thread, c->load_since) * ms);
                 running += item;
             }
             else {
@@ -87,13 +103,12 @@ void running_game_thread(char* out, size_t size) {
     if (*g_watch_rdram == nullptr) return;
     ultramodern::ThreadLoad loads[32];
     const size_t n = ultramodern::get_thread_loads(loads, 32);
-    const uint32_t now = (uint32_t)svcGetSystemTick();
     int more = -1;
     for (size_t i = 0; i < n; i++) {
         const OSThread* t = reinterpret_cast<const OSThread*>(*g_watch_rdram + (loads[i].thread & 0x7FFFFFFFu));
         const UltraThreadContext* c = t->context;
         if (c != nullptr && c->load_since != 0) {
-            if (++more == 0) snprintf(out, size, "%s %.0fs", thread_name(loads[i].thread).c_str(), (float)(now - c->load_since) / (float)SYSCLOCK_ARM11);
+            if (++more == 0) snprintf(out, size, "%s %.0fs", thread_name(loads[i].thread).c_str(), (float)running_ticks(loads[i].thread, c->load_since) / (float)SYSCLOCK_ARM11);
         }
     }
     if (more > 0) {
@@ -223,7 +238,8 @@ void recomp3ds::stall_watch_start(uint8_t* const* rdram, const GameDesc* desc) {
     g_watch_desc = desc;
     g_run = true;
     // Above the game threads and the main thread (0x30); the log writer
-    // (0x2F) is above them too, so the report reaches the card.
+    // (0x27) is above them and the VI and timer threads, so the report
+    // reaches the card.
     g_thread = threadCreate(watch, nullptr, 16 * 1024, 0x20, -2, false);
 }
 

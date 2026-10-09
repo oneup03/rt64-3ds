@@ -557,6 +557,17 @@ clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   thread and log writer starved, freezes after seconds to minutes. nmr patch
   0029 gives the thread its own copy of each timer. Re-run `apply.sh` on
   every game's runtime.
+- **Spinning waits.** The 3DS does not time-slice, so a thread that spins
+  waiting for a lower-priority thread on its own core waits forever.
+  moodycamel's `LightweightSemaphore` did this after a timed wait ran out
+  while a `signal()` was halfway done: it spun until the signal finished.
+  The timer thread's waits run out all the time, and its signals come from
+  the game threads below it on the same core. Once in a long while the
+  timeout landed inside a game thread's `osSetTimer`, and the console froze
+  as above (Banjo, minutes to hours in; the stall watch named the game
+  thread running for the whole stall, VI and timer counts at 0). nmr patch
+  0031 makes the timed-out waiter block until the signal finishes instead.
+  Check any new wait loop on the 3DS for the same pattern.
 - **ROM.** `rom_stream` (settings.ini: 0 auto, 1 in memory, 2 from the SD
   card) streams the ROM through a 2 MB cache of 32 KB blocks. Auto streams
   on an Old 3DS or when the heap is short. Every ROM read the runtime makes

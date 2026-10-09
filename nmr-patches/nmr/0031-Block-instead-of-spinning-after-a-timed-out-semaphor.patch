@@ -1,0 +1,58 @@
+From 0a14ec9817599cfbdb99fca42f321220cb799807 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Thu, 8 Oct 2026 18:38:21 -0500
+Subject: [PATCH] Block instead of spinning after a timed-out semaphore wait on
+ the 3DS
+
+LightweightSemaphore's timed wait, once it runs out, spins until any
+signal() that has already counted it in releases the inner semaphore. On a
+scheduler without time slicing (the 3DS) that signal() may come from a
+lower-priority thread on the same core that the waiter preempted between
+its two steps, which never runs again while the waiter spins. ultramodern's
+timer thread waits with a timeout above the game threads on their core, and
+they signal it in osSetTimer and osStopTimer: when a timeout landed in that
+window, the timer thread spun forever and starved the VI thread, the game,
+the main thread and the log writer (a hard freeze, minutes to hours in).
+
+On the 3DS the timed-out waiter now blocks on the inner semaphore when the
+count says a release is on its way, as it must be: the same condition the
+spin waited out.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ thirdparty/concurrentqueue/lightweightsemaphore.h | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/thirdparty/concurrentqueue/lightweightsemaphore.h b/thirdparty/concurrentqueue/lightweightsemaphore.h
+index 98defab..2d2b810 100644
+--- a/thirdparty/concurrentqueue/lightweightsemaphore.h
++++ b/thirdparty/concurrentqueue/lightweightsemaphore.h
+@@ -423,6 +423,14 @@ private:
+ 				return true;
+ 			if (oldCount < 0 && m_count.compare_exchange_strong(oldCount, oldCount + 1, std::memory_order_relaxed, std::memory_order_relaxed))
+ 				return false;
++#if defined(__3DS__)
++			// A signal() has counted us in but not released m_sema yet. Its
++			// thread may be one this thread preempted on the same core, which
++			// the 3DS (no time slicing) never resumes while this one spins:
++			// wait for the release instead.
++			if (oldCount >= 0 && m_sema.wait())
++				return true;
++#endif
+ 		}
+ 	}
+ 
+@@ -454,6 +462,10 @@ private:
+ 						break;
+ 					if (oldCount < 0 && m_count.compare_exchange_strong(oldCount, oldCount + 1, std::memory_order_relaxed, std::memory_order_relaxed))
+ 						return 0;
++#if defined(__3DS__)
++					if (oldCount >= 0 && m_sema.wait())	// as in waitWithPartialSpinning
++						break;
++#endif
+ 				}
+ 			}
+ 		}
+-- 
+2.55.0
+

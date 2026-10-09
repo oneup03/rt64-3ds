@@ -255,12 +255,14 @@ void recomp3ds::log_line(const char* s) {
 }
 
 // From here on lines go through the writer thread. It sits just above the
-// game threads: it needs almost no CPU (it mostly waits on the card), and
-// below them it starved whenever the game kept core 0 busy.
+// runtime's VI and timer threads (0x28), and so above the game threads: it
+// needs almost no CPU (it mostly waits on the card); below the game it
+// starved whenever the game kept core 0 busy, and below the timer thread the
+// stall watch's report of that thread spinning never reached the card.
 void recomp3ds::log_start_writer() {
     if (g_writer != nullptr || g_file == nullptr) return;
     g_writer_run = true;
-    g_writer = threadCreate(writer_thread, nullptr, 16 * 1024, 0x2F, 0, false);
+    g_writer = threadCreate(writer_thread, nullptr, 16 * 1024, 0x27, 0, false);
 }
 
 // Everything logged so far onto the card, and synchronous from then on
