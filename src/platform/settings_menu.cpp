@@ -273,6 +273,7 @@ void draw() {
 std::map<std::string, int> g_mod_values;
 std::string g_game_mode;
 std::vector<std::string> g_required_mods;     // GameDesc::required_mods
+std::string g_required_mods_hint;
 bool mod_required(const std::string& id) {
     for (const std::string& r : g_required_mods) if (r == id) return true;
     return false;
@@ -579,9 +580,9 @@ void recomp3ds::settings_apply_mods() {
     }
     // A required mod whose file is not on the card (GameDesc::required_mods).
     for (const std::string& id : missing) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "%s is part of this game but its file is missing: put %s.nrm in %s/mods/ and start again.",
-                 id.c_str(), id.c_str(), recomp3ds::base_path());
+        char msg[512];
+        snprintf(msg, sizeof(msg), "%s is part of this game but its file is missing: put %s.nrm in %s/mods/ and start again. %s",
+                 id.c_str(), id.c_str(), recomp3ds::base_path(), g_required_mods_hint.c_str());
         fprintf(stderr, "recomp3ds: %s\n", msg);
         ultramodern::error_handling::message_box(msg);
         recomp3ds::request_exit();

@@ -78,6 +78,7 @@ struct GameDesc {
     // :embed needs its .nrm in mods/). Ids as in their manifests.
     const char* const* required_mods = nullptr;
     size_t required_mod_count = 0;
+    const char* required_mods_hint = nullptr;   // appended to the missing-file message (where to get it)
     // Built-in mods (RT64_3DS_STATIC_MODS) left out when a game mode is
     // played, whatever is enabled: ones that replace a function the game
     // modes replace too (the mode would not load), or that assume the
