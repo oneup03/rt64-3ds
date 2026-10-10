@@ -3251,8 +3251,10 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
     o.tlut = real.tlut;
     o.mips = real.mips;
     o.has_fullsync = real.has_fullsync;
-    o.snapshot_request = real.snapshot_request;
-    o.snapshot_store = real.snapshot_store;
+    // The in-between stores nothing: the game's copy of the screen is the
+    // real frame's, taken when that frame began.
+    o.snapshot_request = false;
+    o.snapshot_store = 0;
     o.color_image = real.color_image; o.color_width = real.color_width; o.depth_image = real.depth_image;
     o.frame_w = real.frame_w; o.frame_h = real.frame_h;
     o.has_cam = real.has_cam; o.cam_is_world = real.cam_is_world;

@@ -311,8 +311,11 @@ and the lines every fifth second, with `frame_cap=2` and 3D on:
 
 - **`stats:`** `... N shown (I in-between, D without: reasons), game asks R`.
   The reasons: `late` (the presents ran late, or the list waited for the one
-  before), `budget`, `snapshot`, `rtt`, `offscreen`, `blanked`, `depth`
-  (`depth_to_rdram` without `double_eyes`), `after60` (the game asked 60 or
+  before), `budget`, `snapshot` (the list stored the screen; without
+  `double_eyes` only: with it the copy comes out of the game frames' own
+  set and an in-between stores nothing, so Dinosaur Planet, which stores
+  every frame, still gets its in-betweens), `rtt`, `offscreen`, `blanked`,
+  `depth` (`depth_to_rdram` without `double_eyes`), `after60` (the game asked 60 or
   more), `after-unsafe`, `cut`, `untagged`, `diverged` (the match failed).
   `game asks` is what `gEXSetRefreshRate` asked for; log it beside the
   achieved rate, since Banjo asks 20 in many cutscenes.
@@ -558,7 +561,9 @@ Check a frame on the host before blaming the console: set
 captures (about 11 s for the 16 MB on the console) while the game plays on;
 one asked for meanwhile is refused, and the touch screen says so. Then
 `tools/dl_test` renders it with the RDP's own formulas (`DL_GBI=f3dex
-DL_SCREEN=292x216 DL_RTT=1 DL_RENDER=out.ppm`), `DL_DUMP` lists every draw,
+DL_SCREEN=292x216 DL_RTT=1 DL_RENDER=out.ppm`; `DL_VI_ORIGINS=a023f4,a983f4`
+names the VI origins the log noted, for a game whose presented buffers sit
+above the 8 MB mark), `DL_DUMP` lists every draw,
 and `DL_TEXDUMP` writes chosen draws' textures (`DL_IMAGE_TILES` for
 `merge_image_tiles`, `DL_PASS_OVER` times the frame cap's state-only run,
 `DL_DEFER=1` and `DL_DEFER_THREAD=1` the reader's deferrals, `DL_COPY_CHECK=1`
@@ -1118,6 +1123,7 @@ described.
 | `GFX_CAPTURE.TXT` | A frame number, `pair <frame>` or `seq`: writes that frame's RDRAM and task to `gfx_task.bin` for `dl_test` (`seq`: every frame put on the screen). |
 | `CAPTURE_THROTTLE.TXT` | Milliseconds of sleep per capture request, to emulate a slow card. |
 | `STORE_DEBUG.TXT` | Logs every draw of the frame three frames after each store of the screen. |
+| `FRAME_TRACE.TXT` | `<first> <count>`: a log line per replayed frame from `first` with the replay's decisions (draws recorded and issued, colour image, snapshot store, off-screen, fill skip, eyes, geometry, eye set), to find frames that come out black. |
 | `DRAW_RANGE.TXT` | `<first> <last>`: replays only those draws of every frame (to find the one that breaks a picture). |
 | `NO_SCISSOR.TXT` | No scissor, to see draws a wrong clip would hide. |
 | `GPU_DEBUG.TXT` | `<start frame> <frame count> <sync 0/1> <every N frames>`: the GPU debug mode (a sync per draw, to find the draw that hangs the GPU). |

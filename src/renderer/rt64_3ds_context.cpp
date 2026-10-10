@@ -2406,12 +2406,17 @@ private:
         // eyes (the in-betweens draw into their own) the last game frame's,
         // as without interpolation.
         const rt64_3ds::RenderDesc& desc = rt64_3ds::render_desc();
+        // With double eyes a snapshot is copied out of the game frames'
+        // own set (snapshot_source), which the in-betweens never draw into,
+        // and an in-between stores nothing itself (build_inbetween clears
+        // the request): a frame that stores the screen is safe then
+        // (Dinosaur Planet stores every frame for its effects).
         uint32_t* unsafe = nullptr;
-        if (frame_.snapshot_request) unsafe = &inb_snapshot_;
+        if (frame_.snapshot_request && !double_eyes_) unsafe = &inb_snapshot_;
         else if (frame_resized_) unsafe = &inb_resize_;
         else if (desc.depth_to_rdram && !double_eyes_) unsafe = &inb_depth_;
         else if (vi_blanked_) unsafe = &inb_blank_;
-        if (unsafe == nullptr && desc.render_to_texture) for (const rt64_3ds::DrawRecord& d : frame_.draws) if (d.rtt >= 0) { unsafe = &inb_rtt_; break; }
+        if (unsafe == nullptr && desc.render_to_texture && !desc.inbetween_offscreen) for (const rt64_3ds::DrawRecord& d : frame_.draws) if (d.rtt >= 0) { unsafe = &inb_rtt_; break; }
         if (unsafe == nullptr) for (const rt64_3ds::RttImage& img : frame_.rtts) if (img.addr != 0 && img.addr == frame_.color_image) unsafe = &inb_offscreen_;
         const bool safe = unsafe == nullptr;
         const bool prev_60 = inbetweens_for(prev_rate_) == 0;
@@ -2507,7 +2512,7 @@ private:
         const u32 kFlags = GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
                            GX_TRANSFER_IN_FORMAT(color16_ ? GX_TRANSFER_FMT_RGB565 : GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB5A1) |
                            GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO);
-        C3D_SyncDisplayTransfer((u32*)last_eye_[0]->frameBuf.colorBuf, GX_BUFFER_DIM(240, 400),
+        C3D_SyncDisplayTransfer((u32*)snapshot_source()->frameBuf.colorBuf, GX_BUFFER_DIM(240, 400),
                                 (u32*)g_readback[next], GX_BUFFER_DIM(240, 400), kFlags);
         readback_next_ = next;
         return true;
@@ -2538,6 +2543,10 @@ private:
     // Every storage buffer this frame stores into gets the last presented
     // frame (FrameRecord::snapshot_store; the first slot when the record
     // predates the slots).
+    // The eye a snapshot copies: the last presented frame's, which with
+    // double eyes is the last game frame's (the in-betweens draw into their
+    // own set; the game reads the frame it drew, not what was shown between).
+    C3D_RenderTarget* snapshot_source() const { return double_eyes_ ? top_ : last_eye_[0]; }
     void copy_snapshot() {
         const uint8_t store = frame_.snapshot_store != 0 ? frame_.snapshot_store : 1;
         for (int slot = 0; slot < rt64_3ds::kMaxSnapshots; slot++) {
@@ -2571,7 +2580,7 @@ private:
                 if (f) fclose(f);
             }
             if (cpu_copy == 1) {
-                const u8* src = (const u8*)last_eye_[0]->frameBuf.colorBuf;
+                const u8* src = (const u8*)snapshot_source()->frameBuf.colorBuf;
                 u8* dst = (u8*)snapshot_[slot].data;
                 for (u32 tr = 0; tr < 400 / 8; tr++) memcpy(dst + tr * (row + gap), src + tr * row, row);
             }
@@ -2581,7 +2590,7 @@ private:
                 // transfer with whatever dimensions the last one left (our
                 // RGB8 screen output): the scrambled snapshot.
                 constexpr u32 kTextureCopyMode = BIT(3);
-                C3D_SyncTextureCopy((u32*)last_eye_[0]->frameBuf.colorBuf, GX_BUFFER_DIM(row / 16, 0),
+                C3D_SyncTextureCopy((u32*)snapshot_source()->frameBuf.colorBuf, GX_BUFFER_DIM(row / 16, 0),
                                     (u32*)snapshot_[slot].data, GX_BUFFER_DIM(row / 16, gap / 16), 240 * 400 * bpp,
                                     kTextureCopyMode);
             }

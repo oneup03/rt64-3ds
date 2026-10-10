@@ -90,6 +90,13 @@ struct RenderDesc {
     // picture puzzles render the world into such an image. Off, off-screen
     // draws are dropped (copies of the presented frame use the snapshot).
     bool render_to_texture = false;
+    // With render_to_texture: the game draws its off-screen images anew in
+    // every frame (Dinosaur Planet's shadow textures), so an in-between may
+    // draw its own versions of them and a list drawing off screen keeps its
+    // in-betweens. Off (the default) a list drawing off screen gets none,
+    // since an image drawn once and sampled for many frames (Banjo's jiggy
+    // transition) must not be redrawn by an in-between.
+    bool inbetween_offscreen = false;
     // The game copies parts of the frame it is still drawing into small
     // images of its own (texture rectangles out of the colour image, after
     // drawing into it) and draws with those copies in the same frame
