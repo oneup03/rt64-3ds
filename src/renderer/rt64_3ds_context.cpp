@@ -3467,6 +3467,14 @@ public:
                 frame_.cam_is_world = true;
             }
         }
+        // RenderDesc::stretch_tint_quads, with 3D on or off: on the vertices
+        // replayed for both eyes, as the cover zoom below.
+        if (desc.stretch_tint_quads) {
+            tint_.assign(frame_.draws.size(), 0);
+            for (size_t i = 0; i < frame_.draws.size(); i++) {
+                if (rt64_3ds::stretch_tint_quad(frame_.draws[i], frame_.verts.data(), geo_)) tint_[i] = 1;
+            }
+        }
         if (!sf.on) return;
         const rt64_3ds::Vtx3ds* verts = frame_.verts.data();
         // RenderDesc::infinity_rect_cover_zoom. The vertices are recorded
@@ -3482,6 +3490,8 @@ public:
                 (!desc.primary_world_instance || d.proj_inst == primary_inst_)) {
                 cls = rt64_3ds::StereoClass::World;
             }
+            // A stretched screen tint stays on the glass, as full-screen rectangles do.
+            if (desc.stretch_tint_quads && tint_[i]) cls = rt64_3ds::StereoClass::ScreenOverlay;
             if (cls == rt64_3ds::StereoClass::Infinity && d.kind != rt64_3ds::DrawRecord::Tris && desc.infinity_rect_cover_zoom && d.rtt < 0) {
                 rt64_3ds::cover_zoom(d, frame_.verts.data(), cover, geo_);
             }
@@ -3509,6 +3519,7 @@ public:
     }
 
     static constexpr uint8_t kReticle = 0xFF;
+    std::vector<uint8_t> tint_;     // this frame's draws stretched as screen tints (RenderDesc::stretch_tint_quads)
     // The depth grid: 8x8 blocks of the game's frame (40x30 for 320x240).
     static constexpr int kGridColsMax = 50, kGridRowsMax = 30;
     rt64_3ds::ScreenGeometry geo_ = rt64_3ds::ScreenGeometry::make(320, 240);

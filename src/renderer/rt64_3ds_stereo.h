@@ -84,6 +84,22 @@ uint32_t primary_world_instance(const DrawRecord* draws, size_t count, const Ren
 // A rectangle covering the whole frame (N64 units, either axis).
 bool rect_covers_frame(const DrawRecord& d, const Vtx3ds* verts, int frame_w, int frame_h);
 
+// RenderDesc::stretch_tint_quads: a screen tint drawn as triangles (Goemon's
+// Impact battle flashes and smoke: one quad under a perspective camera,
+// sized to the 4:3 frame, its edges up to 10 pixels inside it where the TV's
+// overscan hid them) is stretched to cover the wide screen. The draw
+// qualifies when it is at most two triangles, untextured, on the screen, a
+// screen-aligned rectangle (every vertex at a corner of its bounds) and
+// covers the frame to within kTintQuadMargin N64 pixels on every side, but
+// not yet the wide screen (so a second call leaves it be). A textured one
+// qualifies when its textures repeat both ways (an overlay pattern, such as
+// the battles' smoke, not a picture), and keeps its texel size: the pattern
+// continues into the added area. Its bounds then go one pixel past the wide
+// screen's sides, and an edge inside the frame's top or bottom one past that
+// edge. Returns whether it was stretched.
+constexpr float kTintQuadMargin = 12.0f;
+bool stretch_tint_quad(const DrawRecord& d, Vtx3ds* verts, const ScreenGeometry& geo);
+
 // Positive view distance of a depth sample z' (= (ndc z + 1) / 2) under the
 // world projection's m[2][2] and m[3][2]; <= 0 when invalid.
 float view_depth(float zp, float m22, float m32);

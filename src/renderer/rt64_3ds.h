@@ -107,6 +107,13 @@ struct RenderDesc {
     // width, and is opened to the wide screen. Goemon's files 22 and 23 set
     // (0,0)-(319,239). 0 takes them as they are.
     int scissor_edge_slack = 0;
+    // Screen tints drawn as triangles: one screen-aligned quad, untextured or
+    // with a texture that repeats both ways, covering the frame to within a
+    // few pixels (Goemon's Impact battle flashes and smoke, a quad in front
+    // of a perspective camera sized to the 4:3 frame), is stretched to cover
+    // the wide screen and kept on the screen plane, as full-screen rectangles
+    // are; a texture keeps its texel size (stereo's stretch_tint_quad).
+    bool stretch_tint_quads = false;
     // Plain-origin rectangles of one run of rectangles (no triangles between
     // them, one colour image) that share their rows (uly, lry) and together
     // reach both edges of the frame are stretched over the wide screen like

@@ -213,6 +213,67 @@ uint32_t primary_world_instance(const DrawRecord* draws, size_t count, const Ren
     return best >= 0 ? inst[best].inst : 0;
 }
 
+// A texture that repeats in both directions (wrapped or mirrored by a mask,
+// no clamp): an overlay pattern rather than a picture.
+static bool tiles_both_ways(const TexDesc& t) {
+    return !t.valid || (t.masks != 0 && t.maskt != 0 && !(t.cms & 2) && !(t.cmt & 2));
+}
+
+bool stretch_tint_quad(const DrawRecord& d, Vtx3ds* verts, const ScreenGeometry& geo) {
+    if (d.kind != DrawRecord::Tris || d.count == 0 || d.count > 6 || d.rtt >= 0) return false;
+    const bool textured = d.tex[0].valid || d.tex[1].valid;
+    if (!tiles_both_ways(d.tex[0]) || !tiles_both_ways(d.tex[1])) return false;
+    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+    for (uint32_t i = d.first; i < d.first + d.count; i++) {
+        const Vtx3ds& v = verts[i];
+        if (!(v.w > 0.0f)) return false;
+        const float x = v.x / v.w, y = v.y / v.w;
+        x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y);
+    }
+    const float w = (float)geo.w, h = (float)geo.h;
+    if (x0 > kTintQuadMargin || x1 < w - kTintQuadMargin || y0 > kTintQuadMargin || y1 < h - kTintQuadMargin) return false;
+    if (x0 <= -geo.x0 && x1 >= w + geo.x0) return false;      // covers the wide screen already
+    // A screen-aligned rectangle: each vertex on a corner of the bounds.
+    for (uint32_t i = d.first; i < d.first + d.count; i++) {
+        const Vtx3ds& v = verts[i];
+        const float x = v.x / v.w, y = v.y / v.w;
+        if (std::min(std::fabs(x - x0), std::fabs(x - x1)) > 1.0f || std::min(std::fabs(y - y0), std::fabs(y - y1)) > 1.0f) return false;
+    }
+    // A textured quad keeps its texel size, its pattern repeating into the new
+    // area: the texture coordinates as an affine function of the screen
+    // position (u = ux x + uy y + u0), from the corners at (x0, y0), (x1, y0)
+    // and (x0, y1), extend with it.
+    float ux = 0.0f, uy = 0.0f, vx = 0.0f, vy = 0.0f;
+    if (textured) {
+        const Vtx3ds* c[3] = {};
+        const float cx[3] = { x0, x1, x0 }, cy[3] = { y0, y0, y1 };
+        for (uint32_t i = d.first; i < d.first + d.count; i++) {
+            const Vtx3ds& v = verts[i];
+            const float x = v.x / v.w, y = v.y / v.w;
+            for (int k = 0; k < 3; k++) if (c[k] == nullptr && std::fabs(x - cx[k]) <= 1.0f && std::fabs(y - cy[k]) <= 1.0f) c[k] = &v;
+        }
+        if (c[0] == nullptr || c[1] == nullptr || c[2] == nullptr) return false;
+        ux = (c[1]->u - c[0]->u) / (x1 - x0); vx = (c[1]->v - c[0]->v) / (x1 - x0);
+        uy = (c[2]->u - c[0]->u) / (y1 - y0); vy = (c[2]->v - c[0]->v) / (y1 - y0);
+    }
+    // The bounds mapped onto the target in screen terms, x' = a x + b, on the
+    // homogeneous coordinates (x' w = a x w + b w).
+    const float tx0 = -geo.x0 - 1.0f, tx1 = w + geo.x0 + 1.0f;
+    const float ty0 = std::min(y0, -1.0f), ty1 = std::max(y1, h + 1.0f);
+    const float ax = (tx1 - tx0) / (x1 - x0), bx = tx0 - x0 * ax;
+    const float ay = (ty1 - ty0) / (y1 - y0), by = ty0 - y0 * ay;
+    for (uint32_t i = d.first; i < d.first + d.count; i++) {
+        Vtx3ds& v = verts[i];
+        const float x = v.x / v.w, y = v.y / v.w;
+        const float dx = (x * ax + bx) - x, dy = (y * ay + by) - y;
+        v.x = v.x * ax + bx * v.w;
+        v.y = v.y * ay + by * v.w;
+        v.u += ux * dx + uy * dy;
+        v.v += vx * dx + vy * dy;
+    }
+    return true;
+}
+
 bool rect_covers_frame(const DrawRecord& d, const Vtx3ds* verts, int frame_w, int frame_h) {
     float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
     for (uint32_t i = d.first; i < d.first + d.count; i++) {
