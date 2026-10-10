@@ -72,6 +72,12 @@ struct GameDesc {
     const char* sd_dir = "";            // folder under sdmc:/3ds/ holding the ROM, saves and settings
     recomp::GameEntry entry;            // hash, save type, entrypoint, on_init_callback
     recomp::Version project_version{};  // the game's version, which mods check (minimum_recomp_version)
+    // Mods baked in that are part of the game: on whatever settings.ini says,
+    // no on/off row on the Mods page (their options still show), and a
+    // message plus exit when one's file is not on the card (a mod without
+    // :embed needs its .nrm in mods/). Ids as in their manifests.
+    const char* const* required_mods = nullptr;
+    size_t required_mod_count = 0;
     // Built-in mods (RT64_3DS_STATIC_MODS) left out when a game mode is
     // played, whatever is enabled: ones that replace a function the game
     // modes replace too (the mode would not load), or that assume the

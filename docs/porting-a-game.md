@@ -1212,6 +1212,10 @@ fed from tables compiled into the executable.
   then offers those N64 buttons (the D-pad's directions, L) on the touch
   screen while the settings are closed; a touch holds one. Banjo does that
   by default, and can remap the D-pad and ZL instead ("Mod buttons").
+- **`GameDesc.required_mods`**: mods that are part of the game (Dinosaur
+  Planet's Dinomod Enhanced): on whatever `settings.ini` says, no on/off
+  row on the Mods page (their options still show), and a message plus exit
+  at start when one's file is not in `mods/`.
 - **`GameDesc.project_version`**: set it to the desktop's version. Mods
   refuse to load against an older one.
 - Mods baked in are compiled with the game's `RECOMP_GPR32` setting; a mod

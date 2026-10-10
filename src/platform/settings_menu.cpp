@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cerrno>
 #include <cstring>
+#include <algorithm>
 #include <map>
 #include <deque>
 #include <string>
@@ -36,6 +37,7 @@
 #include "recomp3ds_internal.h"
 #ifdef RECOMP_STATIC_MODS
 #include "librecomp/mods.hpp"
+#include "ultramodern/error_handling.hpp"
 #endif
 
 namespace {
@@ -270,6 +272,11 @@ void draw() {
 // mods in game modes); and "game_mode", the picker's last choice.
 std::map<std::string, int> g_mod_values;
 std::string g_game_mode;
+std::vector<std::string> g_required_mods;     // GameDesc::required_mods
+bool mod_required(const std::string& id) {
+    for (const std::string& r : g_required_mods) if (r == id) return true;
+    return false;
+}
 LightLock g_file_lock;
 
 // settings.ini is replaced, never truncated in place: written to a .part
@@ -501,12 +508,14 @@ void add_mod_rows() {
     for (const recomp::mods::ModDetails& d : mods) {
         if (d.custom_gamemode) continue;    // chosen at start, not toggled
         if (recomp3ds::mod_left_out(d.mod_id)) continue;   // not with this game mode
-        ModRow toggle;
-        toggle.mod_id = d.mod_id;
-        toggle.key = "mod." + d.mod_id;
-        toggle.label = clip(d.display_name, kLabelWidth);
-        toggle.value = recomp::mods::is_mod_enabled(d.mod_id) ? 1 : 0;
-        add(std::move(toggle), 0, 1, kModOffOn);
+        if (!mod_required(d.mod_id)) {
+            ModRow toggle;
+            toggle.mod_id = d.mod_id;
+            toggle.key = "mod." + d.mod_id;
+            toggle.label = clip(d.display_name, kLabelWidth);
+            toggle.value = recomp::mods::is_mod_enabled(d.mod_id) ? 1 : 0;
+            add(std::move(toggle), 0, 1, kModOffOn);
+        }
         const recomp::config::ConfigSchema& schema = recomp::mods::get_mod_config_schema(d.mod_id);
         for (const recomp::config::ConfigOption& o : schema.options) {
             if (o.hidden) continue;
@@ -554,10 +563,12 @@ void add_mod_rows() {}
 // Before the mods load (the game's init, after the runtime's scan): every
 // built-in code mod as settings.ini has it, off unless saved on.
 void recomp3ds::settings_apply_mods() {
+    std::vector<std::string> missing = g_required_mods;
     for (const recomp::mods::ModDetails& d : recomp::mods::get_all_mod_details(g_mod_game_id)) {
         if (d.custom_gamemode) continue;
+        missing.erase(std::remove(missing.begin(), missing.end(), d.mod_id), missing.end());
         const auto on = g_mod_values.find("mod." + d.mod_id);
-        recomp::mods::enable_mod(d.mod_id, on != g_mod_values.end() && on->second != 0);
+        recomp::mods::enable_mod(d.mod_id, mod_required(d.mod_id) || (on != g_mod_values.end() && on->second != 0));
         const recomp::config::ConfigSchema& schema = recomp::mods::get_mod_config_schema(d.mod_id);
         for (const recomp::config::ConfigOption& o : schema.options) {
             const auto saved = g_mod_values.find("mod." + d.mod_id + "." + o.id);
@@ -565,6 +576,15 @@ void recomp3ds::settings_apply_mods() {
             const recomp::config::ConfigValueVariant value = mod_option_value(o, saved->second);
             if (!std::holds_alternative<std::monostate>(value)) recomp::mods::set_mod_config_value(d.mod_id, o.id, value);
         }
+    }
+    // A required mod whose file is not on the card (GameDesc::required_mods).
+    for (const std::string& id : missing) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "%s is part of this game but its file is missing: put %s.nrm in %s/mods/ and start again.",
+                 id.c_str(), id.c_str(), recomp3ds::base_path());
+        fprintf(stderr, "recomp3ds: %s\n", msg);
+        ultramodern::error_handling::message_box(msg);
+        recomp3ds::request_exit();
     }
 }
 #else
