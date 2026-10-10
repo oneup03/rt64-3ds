@@ -490,6 +490,13 @@ struct Interpreter::Interp {
     std::vector<TriState> tri_states;
     std::vector<float> tri_uv;
     std::vector<uint32_t> draw_remap;   // compact_rects: old record index -> new
+    // The rectangles' vertices as the list left them (rect_first: each
+    // record's first in rect_verts, ~0u for triangles). The renderer changes
+    // the game frame's in place (the cover zoom of backdrops at infinity)
+    // while the builder copies them, and once more for each in-between: the
+    // in-betweens take them from here.
+    std::vector<Vtx3ds> rect_verts;
+    std::vector<uint32_t> rect_first;
     std::vector<interp::M4> ctx_m;      // build_inbetween: each load's matrix in the in-between frame
     // ... and its loaded vertices as transformed (when a triangle first uses
     // them), one cache for each thread building (the helper's second).
@@ -969,7 +976,7 @@ struct Interpreter::Impl {
         if (plain_cimg == 0) plain_cimg = cimg;
         else if (cimg != plain_cimg) plain = false;
     }
-    int16_t rect_align[4]{};   // left/top/right/bottom offsets (extended)
+    float rect_align[4]{};     // left/top/right/bottom offsets (extended), pixels
     uint32_t rect_lorigin = 0x800, rect_rorigin = 0x800;
     uint8_t rect_aspect = 0;
 
@@ -994,6 +1001,7 @@ struct Interpreter::Impl {
     // Planet's effects keep two snapshots and its pause a third, DK64 one.
     struct SnapSlot { uint32_t base = 0; bool valid = false; uint32_t list = 0; };
     SnapSlot snaps[kMaxSnapshots];
+    int dbg_snap_miss = 0;
     int snap_slot_for(uint32_t base) {
         int pick = -1;
         for (int i = 0; i < kMaxSnapshots; i++) {
@@ -1596,6 +1604,14 @@ struct Interpreter::Impl {
         const int snap = d.frame ? -1 : snap_of_load(d.addr);
         d.snapshot = snap >= 0 && !best->block && best->pitch == (uint32_t)screen_w * 2 && tl.siz == 2;
         d.snap_slot = d.snapshot ? (uint8_t)snap : 0;
+        if (!d.snapshot && dbg_snap_miss < 6) {
+            for (int i = 0; i < kMaxSnapshots; i++) {
+                if (snaps[i].base == 0 || d.addr < snaps[i].base || d.addr >= snaps[i].base + (uint32_t)(screen_w * screen_h * 2)) continue;
+                dbg_snap_miss++;
+                fprintf(stderr, "rt64-3ds: load at %06x inside snapshot slot %d (base %06x valid %d) is not a snapshot read: block %d pitch %u (screen %d) siz %u frame %d tile %dx%d\n",
+                        d.addr, i, snaps[i].base, snaps[i].valid ? 1 : 0, best->block ? 1 : 0, best->pitch, screen_w, tl.siz, d.frame ? 1 : 0, w, h);
+            }
+        }
         d.rtt = -1;
         // With sample_drawn_frame a block load of whole rows of an image
         // reads it too (the rims load their strips with LOADBLOCK), but only
@@ -2017,7 +2033,7 @@ struct Interpreter::Impl {
     // plain_origins: neither edge is anchored to a screen edge (the only
     // rectangles RT64 stretches for covering the width).
     void emit_rect_aligned(float ulx, float uly, float lrx, float lry, bool textured, int tile, float s, float t, float dsdx, float dtdy, bool flip,
-                           float lshift, float rshift, const int16_t* align, bool plain_origins) {
+                           float lshift, float rshift, const float* align, bool plain_origins) {
         ulx += align[0]; uly += align[1];
         lrx += align[2]; lry += align[3];
         uint32_t cyc = (othermode_h >> 20) & 3;
@@ -2263,8 +2279,11 @@ struct Interpreter::Impl {
             case EX_SETRECTALIGN: {
                 rect_lorigin = w1 & 0xFFF; rect_rorigin = (w1 >> 12) & 0xFFF;
                 uint32_t a = r32(pc + 8), b = r32(pc + 12);
-                rect_align[0] = (int16_t)(a >> 16); rect_align[1] = (int16_t)(a & 0xFFFF);
-                rect_align[2] = (int16_t)(b >> 16); rect_align[3] = (int16_t)(b & 0xFFFF);
+                // The offsets are in the rectangle's own units, quarter pixels
+                // (RT64 adds them to the 10.2 coordinates; Dinosaur Planet's
+                // front end centres its 640-wide backgrounds with -/+ 320 * 4).
+                rect_align[0] = (float)(int16_t)(a >> 16) * 0.25f; rect_align[1] = (float)(int16_t)(a & 0xFFFF) * 0.25f;
+                rect_align[2] = (float)(int16_t)(b >> 16) * 0.25f; rect_align[3] = (float)(int16_t)(b & 0xFFFF) * 0.25f;
                 return 1;
             }
             case EX_SETVIEWPORTALIGN: {
@@ -2312,7 +2331,7 @@ struct Interpreter::Impl {
                 float lrx = (int16_t)(b >> 16) / 4.0f, lry = (int16_t)(b & 0xFFFF) / 4.0f;
                 float s = (int16_t)(c >> 16) / 32.0f, t = (int16_t)(c & 0xFFFF) / 32.0f;
                 float dsdx = (int16_t)(d >> 16) / 1024.0f, dtdy = (int16_t)(d & 0xFFFF) / 1024.0f;
-                static const int16_t none[4] = { 0, 0, 0, 0 };
+                static const float none[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
                 emit_rect_aligned(ulx, uly, lrx, lry, true, tile, s, t, dsdx, dtdy, flip, origin_x(lorigin), origin_x(rorigin), none,
                                   lorigin == 0x800 && rorigin == 0x800);
                 return 2;
@@ -2322,7 +2341,7 @@ struct Interpreter::Impl {
                 uint32_t a = r32(pc + 8), b = r32(pc + 12);
                 float ulx = (int16_t)(a >> 16) / 4.0f, uly = (int16_t)(a & 0xFFFF) / 4.0f;
                 float lrx = (int16_t)(b >> 16) / 4.0f, lry = (int16_t)(b & 0xFFFF) / 4.0f;
-                static const int16_t none[4] = { 0, 0, 0, 0 };
+                static const float none[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
                 emit_rect_aligned(ulx, uly, lrx, lry, false, 0, 0, 0, 0, 0, false, origin_x(lorigin), origin_x(rorigin), none,
                                   lorigin == 0x800 && rorigin == 0x800);
                 return 1;
@@ -3196,6 +3215,14 @@ bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
         if (!ip->draw_remap.empty()) {
             for (Interp::TriState& s : ip->tri_states) if (s.draw < ip->draw_remap.size()) s.draw = ip->draw_remap[s.draw];
         }
+        ip->rect_verts.clear();
+        ip->rect_first.assign(out.draws.size(), ~0u);
+        for (size_t i = 0; i < out.draws.size(); i++) {
+            const DrawRecord& d = out.draws[i];
+            if (d.kind == DrawRecord::Tris || d.first + d.count > out.verts.size()) continue;
+            ip->rect_first[i] = (uint32_t)ip->rect_verts.size();
+            ip->rect_verts.insert(ip->rect_verts.end(), &out.verts[d.first], &out.verts[d.first] + d.count);
+        }
     }
     return fullsync;
 }
@@ -3310,8 +3337,15 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
                 d.first = out.size();
                 d.count = 0;
                 if (d.kind != DrawRecord::Tris) {
+                    // The list's own copy (Interp::rect_verts), not the game
+                    // frame's, which the renderer may have changed already.
                     Vtx3ds* dst = out.append(real_count);
-                    if (dst != nullptr && real_first + real_count <= r.real->verts.size()) {
+                    const uint32_t src = di < ip->rect_first.size() ? ip->rect_first[di] : ~0u;
+                    if (dst != nullptr && src != ~0u && src + real_count <= ip->rect_verts.size()) {
+                        memcpy(dst, &ip->rect_verts[src], real_count * sizeof(Vtx3ds));
+                        d.count = real_count;
+                    }
+                    else if (dst != nullptr && real_first + real_count <= r.real->verts.size()) {
                         memcpy(dst, &r.real->verts[real_first], real_count * sizeof(Vtx3ds));
                         d.count = real_count;
                     }

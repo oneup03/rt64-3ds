@@ -1241,6 +1241,10 @@ private:
         // (queue_depth_copy), for the depth reads (read_depth_zp): the CPU
         // reads VRAM slowly (the grid's 1200 texels took about a millisecond
         // a frame on the console). DEPTH_COPY_OFF.TXT reads VRAM as before.
+        if (FILE* f = rt64_3ds::data_fopen("FRAME_TRACE.TXT", "r")) {
+            if (fscanf(f, "%d %d", &frame_trace_first_, &frame_trace_count_) != 2) frame_trace_count_ = 0;
+            fclose(f);
+        }
         if (FILE* f = rt64_3ds::data_fopen("DEPTH_COPY_OFF.TXT", "r")) fclose(f);
         else {
             depth_copy_bytes_ = C3D_CalcDepthBufSize(240, 400, eye_depth);
@@ -1564,6 +1568,7 @@ private:
         BufInfo_Add(bi, vb, sizeof(GpuVertex), 3, 0x210);
 
         int fallbacks = 0;
+        int dbg_issued = 0;             // FRAME_TRACE.TXT: draws sent to the GPU
         u64 tl0 = svcGetSystemTick(), tl_split = 0;
         const int eyes = (sfd.on && !offscreen_frame) ? 2 : 1;
         // RenderDesc::sample_drawn_frame: this frame copies parts of itself
@@ -1645,6 +1650,7 @@ private:
             u64 tf = tick();
             prof_[4] += tf - td;
             C3D_DrawArrays(GPU_TRIANGLES, d.first, d.count);
+            dbg_issued++;
             prof_[3] += tick() - tf;
             if (debug_frame && debug_sync_) {
                 // Finish the frame here and start it again: FrameBegin waits
@@ -1741,6 +1747,14 @@ private:
         }
         if (ghost && sfd.on && !offscreen_frame) ghost_pass((uint32_t)n);
         }   // eye passes
+        // FRAME_TRACE.TXT "<first> <count>": the replay's decisions, a line a
+        // frame, for frames first..first+count.
+        if (frame_trace_count_ > 0 && (int)frames_ >= frame_trace_first_ && (int)frames_ < frame_trace_first_ + frame_trace_count_) {
+            fprintf(stderr, "rt64-3ds: trace frame %u: %s %zu draws (%d issued, %zu verts), cimg %06x w%u, snapshot req %d store %02x, offscreen %d, fill_skip %d, eyes %d, geo %dx%d, eye set %d, blanked %d\n",
+                    frames_, inbetween ? "inb" : "game", frame_.draws.size(), dbg_issued, n, frame_.color_image, frame_.color_width,
+                    frame_.snapshot_request ? 1 : 0, frame_.snapshot_store, offscreen_frame ? 1 : 0, fill_skip, eyes, geo_.w, geo_.h,
+                    cur_eye_[0] == top_ ? 0 : 1, vi_blanked_ ? 1 : 0);
+        }
         {
             u64 tl1 = svcGetSystemTick();
             if (tl_split != 0) { acc_left_ += tl_split - tl0; acc_right_ += tl1 - tl_split; }
@@ -3658,6 +3672,7 @@ public:
     }
     uint32_t vi_width_logged_ = 0;
     uint32_t dbg_tasks_ = 0;
+    int frame_trace_first_ = 0, frame_trace_count_ = 0;    // FRAME_TRACE.TXT
     // On the gfx thread, before anything of this list is placed: the
     // geometry it was read at.
     void apply_frame_geometry() {

@@ -12,8 +12,8 @@
 namespace rt64_3ds {
 
 inline uint8_t tex_rb(const uint8_t* rdram, uint32_t a) { return rdram[(a & kRdramMask) ^ 3]; }
-inline uint16_t tex_rh(const uint8_t* rdram, uint32_t a) { return *(const uint16_t*)(rdram + ((a & 0xFFFFFE) ^ 2)); }
-inline uint32_t tex_rw(const uint8_t* rdram, uint32_t a) { return *(const uint32_t*)(rdram + (a & 0xFFFFFC)); }
+inline uint16_t tex_rh(const uint8_t* rdram, uint32_t a) { return *(const uint16_t*)(rdram + ((a & kRdramMask & ~1u) ^ 2)); }
+inline uint32_t tex_rw(const uint8_t* rdram, uint32_t a) { return *(const uint32_t*)(rdram + (a & kRdramMask & ~3u)); }
 
 // Calls sink(x, y, have16, p16, r, g, b, a) for every texel of the tile:
 // have16 = the texel is an exact RGBA5551 value (RGBA16, CI with an RGBA16
