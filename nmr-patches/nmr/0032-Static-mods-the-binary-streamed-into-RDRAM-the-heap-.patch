@@ -1,0 +1,234 @@
+From d874e8b2f9d520d9cd2e07609dd12b23a8f18f14 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 10 Oct 2026 05:48:59 -0500
+Subject: [PATCH] Static mods: the binary streamed into RDRAM, the heap's
+ address
+
+- ModFileHandle::read_file_to streams a file to a sink; the zip handle
+  uses miniz's extract-to-callback. init_mod_code streams the mod binary's
+  sections straight into RDRAM at their load addresses and hashes the bytes
+  as they pass (the built-in version check), instead of holding the whole
+  file in memory first (Dinosaur Planet's mod is 42 MB; a console has no
+  room for it beside its RDRAM). The symbol parser gets no binary.
+- recomp::heap_rdram_address(): where the heap starts once the mods are
+  loaded (a game's own allocator treats pointers below it as mod data).
+---
+ librecomp/include/librecomp/addresses.hpp |  1 +
+ librecomp/include/librecomp/mods.hpp      |  8 ++++
+ librecomp/src/heap.cpp                    |  6 +++
+ librecomp/src/mod_manifest.cpp            | 42 ++++++++++++++++
+ librecomp/src/mods.cpp                    | 58 ++++++++++++++++++++++-
+ 5 files changed, 113 insertions(+), 2 deletions(-)
+
+diff --git a/librecomp/include/librecomp/addresses.hpp b/librecomp/include/librecomp/addresses.hpp
+index 2e8efa6..522ff3d 100644
+--- a/librecomp/include/librecomp/addresses.hpp
++++ b/librecomp/include/librecomp/addresses.hpp
+@@ -51,6 +51,7 @@ namespace recomp {
+     constexpr uint32_t drive_base = 0x06000000;
+ 
+     void register_heap_exports();
++    uint32_t heap_rdram_address();
+     void init_heap(uint8_t* rdram, uint32_t address);
+     void* alloc(uint8_t* rdram, size_t size);
+     void free(uint8_t* rdram, void* mem);
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index a0c9465..0695f34 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -185,6 +185,12 @@ namespace recomp {
+             virtual ~ModFileHandle() = default;
+             virtual std::vector<char> read_file(const std::string& filepath, bool& exists) const = 0;
+             virtual bool file_exists(const std::string& filepath) const = 0;
++            // The file's bytes to `sink(opaque, file offset, bytes, count)` as they
++            // are read, never all in memory at once (a 42 MB mod binary on a
++            // console); `size` is the file's size. The sink returns false to stop
++            // early, which is not a failure. The default goes through read_file.
++            typedef bool (*Sink)(void* opaque, uint64_t file_offset, const void* bytes, size_t count);
++            virtual bool read_file_to(const std::string& filepath, Sink sink, void* opaque, bool& exists, uint64_t& size) const;
+         };
+ 
+         struct ZipModFileHandle final : public ModFileHandle {
+@@ -198,6 +204,7 @@ namespace recomp {
+ 
+             std::vector<char> read_file(const std::string& filepath, bool& exists) const final;
+             bool file_exists(const std::string& filepath) const final;
++            bool read_file_to(const std::string& filepath, Sink sink, void* opaque, bool& exists, uint64_t& size) const final;
+         };
+ 
+         struct LooseModFileHandle final : public ModFileHandle {
+@@ -481,6 +488,7 @@ namespace recomp {
+             std::unique_ptr<ModCodeHandle> code_handle;
+             std::unique_ptr<N64Recomp::Context> recompiler_context;
+             std::vector<uint32_t> section_load_addresses;
++            uint64_t streamed_binary_hash = 0;   // static builds: recomp_static_mod_hash of the binary streamed into RDRAM
+             // Content types present in this mod.
+             std::vector<ModContentTypeId> content_types;
+             std::vector<char> thumbnail;
+diff --git a/librecomp/src/heap.cpp b/librecomp/src/heap.cpp
+index 35618aa..81457b9 100644
+--- a/librecomp/src/heap.cpp
++++ b/librecomp/src/heap.cpp
+@@ -28,6 +28,12 @@ extern "C" void recomp_free(uint8_t* rdram, recomp_context* ctx) {
+     recomp::free(rdram, TO_PTR(void, to_free));
+ }
+ 
++// Where the heap starts in RDRAM once initialized (above the mods loaded at
++// start): what a game's own allocator may treat as the mods' data end.
++uint32_t recomp::heap_rdram_address() {
++    return 0x80000000u + heap_offset;
++}
++
+ void recomp::register_heap_exports() {
+     recomp::overlays::register_base_export("recomp_alloc", recomp_alloc);
+     recomp::overlays::register_base_export("recomp_free", recomp_free);
+diff --git a/librecomp/src/mod_manifest.cpp b/librecomp/src/mod_manifest.cpp
+index 1f3afc5..77a9517 100644
+--- a/librecomp/src/mod_manifest.cpp
++++ b/librecomp/src/mod_manifest.cpp
+@@ -103,6 +103,48 @@ recomp::mods::LooseModFileHandle::LooseModFileHandle(const std::filesystem::path
+     error = ModOpenError::Good;
+ }
+ 
++bool recomp::mods::ModFileHandle::read_file_to(const std::string& filepath, Sink sink, void* opaque, bool& exists, uint64_t& size) const {
++    std::vector<char> data = read_file(filepath, exists);
++    size = data.size();
++    if (!exists) return false;
++    sink(opaque, 0, data.data(), data.size());
++    return true;
++}
++
++namespace {
++    struct ZipSinkState {
++        recomp::mods::ModFileHandle::Sink sink;
++        void* opaque;
++        bool stopped;
++    };
++    // miniz's write callback: fewer bytes than offered stop the extraction,
++    // which miniz then reports as a failure; `stopped` tells the two apart.
++    size_t zip_sink(void* opaque, mz_uint64 file_ofs, const void* buf, size_t n) {
++        ZipSinkState* st = static_cast<ZipSinkState*>(opaque);
++        if (st->stopped) return 0;
++        if (!st->sink(st->opaque, file_ofs, buf, n)) { st->stopped = true; return 0; }
++        return n;
++    }
++}
++
++bool recomp::mods::ZipModFileHandle::read_file_to(const std::string& filepath, Sink sink, void* opaque, bool& exists, uint64_t& size) const {
++    mz_uint32 file_index;
++    if (!mz_zip_reader_locate_file_v2(archive.get(), filepath.c_str(), nullptr, MZ_ZIP_FLAG_CASE_SENSITIVE, &file_index)) {
++        exists = false;
++        return false;
++    }
++    mz_zip_archive_file_stat stat;
++    if (!mz_zip_reader_file_stat(archive.get(), file_index, &stat)) {
++        exists = false;
++        return false;
++    }
++    exists = true;
++    size = stat.m_uncomp_size;
++    ZipSinkState st{ sink, opaque, false };
++    const bool ok = mz_zip_reader_extract_to_callback(archive.get(), file_index, zip_sink, &st, 0) != 0;
++    return ok || st.stopped;
++}
++
+ std::vector<char> recomp::mods::LooseModFileHandle::read_file(const std::string& filepath, bool& exists) const {
+     std::vector<char> ret{};
+     std::filesystem::path full_path = root_path / filepath;
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
+index 175fb9d..5014a1d 100644
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -2398,7 +2398,16 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::init_mod_code(uint8_t*
+     
+     // Load the binary data from the file provided in the manifest.
+     bool binary_exists = false;
++#ifdef RECOMP_STATIC_MODS
++    // The binary is not held in memory (Dinosaur Planet's mod is 42 MB, more
++    // than a console has to spare beside its RDRAM): the symbol parser gets
++    // no bytes (the code is baked into the executable) and the sections are
++    // streamed into RDRAM below.
++    std::vector<char> binary_data;
++    binary_exists = mod.manifest.file_handle->file_exists(std::string{ modpaths::binary_path });
++#else
+     std::vector<char> binary_data = mod.manifest.file_handle->read_file(std::string{ modpaths::binary_path }, binary_exists);
++#endif
+ 
+     if (binary_syms_exists && !binary_exists) {
+         return CodeModLoadError::HasSymsButNoBinary;
+@@ -2461,9 +2470,11 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::init_mod_code(uint8_t*
+             mod.section_load_addresses[section_index] = section.ram_addr;
+         }
+         else {
++#ifndef RECOMP_STATIC_MODS
+             for (size_t i = 0; i < section.size; i++) {
+                 MEM_B(i, (gpr)cur_section_addr) = binary_data[section.rom_addr + i];
+             }
++#endif
+             mod.section_load_addresses[section_index] = cur_section_addr;
+             // Calculate the bss section's address based on the size of this section.
+             cur_section_addr += section.size;
+@@ -2480,6 +2491,49 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::init_mod_code(uint8_t*
+         }
+     }
+ 
++#ifdef RECOMP_STATIC_MODS
++    // The sections' bytes, streamed out of the mod's file straight into RDRAM
++    // at the addresses just laid out.
++    {
++        struct StreamState {
++            uint8_t* rdram;
++            const std::vector<N64Recomp::Section>* sections;
++            const std::vector<uint32_t>* load_addresses;
++            uint64_t hash;
++            uint64_t next_offset;
++            bool in_order;
++        } st{ rdram, &mod_sections, &mod.section_load_addresses, 0xCBF29CE484222325ull, 0, true };
++        auto section_sink = [](void* opaque, uint64_t file_offset, const void* bytes, size_t count) -> bool {
++            StreamState* s = static_cast<StreamState*>(opaque);
++            uint8_t* rdram = s->rdram;
++            const uint8_t* src = static_cast<const uint8_t*>(bytes);
++            // The whole file's hash (recomp_static_mod_hash), the bytes in order.
++            if (file_offset != s->next_offset) s->in_order = false;
++            s->next_offset = file_offset + count;
++            for (size_t i = 0; i < count; i++) { s->hash ^= src[i]; s->hash *= 0x100000001B3ull; }
++            for (size_t k = 0; k < s->sections->size(); k++) {
++                const N64Recomp::Section& section = (*s->sections)[k];
++                if (section.fixed_address) continue;
++                const uint64_t lo = section.rom_addr, hi = (uint64_t)section.rom_addr + section.size;
++                const uint64_t a = file_offset > lo ? file_offset : lo;
++                const uint64_t b = (file_offset + count) < hi ? (file_offset + count) : hi;
++                for (uint64_t off = a; off < b; off++) {
++                    MEM_B(off - lo, (gpr)(*s->load_addresses)[k]) = src[off - file_offset];
++                }
++            }
++            return true;
++        };
++        bool exists = false;
++        uint64_t size = 0;
++        if (!mod.manifest.file_handle->read_file_to(std::string{ modpaths::binary_path }, section_sink, &st, exists, size) || !exists) {
++            return CodeModLoadError::FailedToParseSyms;
++        }
++        for (const N64Recomp::Section& section : mod_sections) {
++            if (!section.fixed_address && (uint64_t)section.rom_addr + section.size > size) return CodeModLoadError::FailedToParseSyms;
++        }
++        mod.streamed_binary_hash = st.in_order ? st.hash : 0;
++    }
++#endif
+     // Iterate over each section again after loading them to perform R_MIPS_32 relocations.
+     for (size_t section_index = 0; section_index < mod_sections.size(); section_index++) {
+         const auto& section = mod_sections[section_index];
+@@ -2590,8 +2644,8 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t*
+             error_param = mod.manifest.mod_id;
+             return CodeModLoadError::NotBuiltIn;
+         }
+-        const std::vector<uint8_t>& binary = mod.recompiler_context->rom;
+-        if (recomp_static_mod_hash(binary.data(), binary.size()) != find_it->second->binary_hash) {
++        // The binary was streamed into RDRAM (never in memory): its hash was taken as it went by.
++        if (mod.streamed_binary_hash != find_it->second->binary_hash) {
+             error_param = mod.manifest.mod_id;
+             return CodeModLoadError::BuiltInVersionMismatch;
+         }
+-- 
+2.55.0
+

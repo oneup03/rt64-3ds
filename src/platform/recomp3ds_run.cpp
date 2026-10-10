@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 
 #include "librecomp/addresses.hpp"
+namespace recomp { uint32_t heap_rdram_address() __attribute__((weak)); }
 #include "librecomp/game.hpp"
 #include "librecomp/rsp.hpp"
 #include "ultramodern/ultramodern.hpp"
@@ -516,12 +517,18 @@ void update_gfx_inner() {
         // sizing RECOMP_MEM_SIZE_MB (Dinosaur Planet's ReAsset).
         char rheap[64] = "";
 #ifdef RECOMP_NO_MODS
-        if (g_rdram != nullptr) {
-            const O1HeapDiagnostics d = o1heapGetDiagnostics((const O1HeapInstance*)(g_rdram + ((uint32_t)recomp::heap_rdram_start - 0x80000000u)));
+        const uint32_t rheap_addr = (uint32_t)recomp::heap_rdram_start;
+#else
+        // With mods the heap sits above them: where the runtime put it
+        // (librecomp heap_rdram_address, a runtime with that patch).
+        const uint32_t rheap_addr = recomp::heap_rdram_address != nullptr ? recomp::heap_rdram_address() : 0;
+#endif
+        if (g_rdram != nullptr && rheap_addr != 0) {
+            const O1HeapDiagnostics d = o1heapGetDiagnostics((const O1HeapInstance*)(g_rdram + (rheap_addr - 0x80000000u)));
             snprintf(rheap, sizeof(rheap), " rheap %lu/%lu KB (peak %lu, oom %lu)", (unsigned long)(d.allocated / 1024), (unsigned long)(d.capacity / 1024),
                      (unsigned long)(d.peak_allocated / 1024), (unsigned long)d.oom_count);
         }
-#endif
+
         if (log_stats) fprintf(stderr, "stats: %d dl/s%s (late %d, max gap %.0f ms) core0 %d%% core1 %d%%%s%s ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu low water %lu heap %lu KB%s%s%s%s%s%s%s\n",
                 st.dl_per_sec, want_fps, st.late_frames, st.max_gap_ms, busy0, busy1, core2, core3, ucode_ms, ucode_tasks, recomp3ds::audio_frames_queued(),
                 (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped, (unsigned long)(ac.low_water == 0xFFFFFFFFu ? 0u : ac.low_water),

@@ -19,10 +19,14 @@ enum class Gbi : uint8_t { F3DEX2, F3DEX };
 #define RECOMP_MEM_SIZE_MB 16
 #endif
 constexpr uint32_t kRdramBytes = (uint32_t)RECOMP_MEM_SIZE_MB << 20;
-// A mask, so the model must be a power of two: 24 MB would clear bit 23 and
-// alias everything above 8 MB onto the first 8 MB.
-static_assert((kRdramBytes & (kRdramBytes - 1)) == 0, "RECOMP_MEM_SIZE_MB must be a power of two (16, 32, 64)");
-constexpr uint32_t kRdramMask = kRdramBytes - 1;
+// The mask that turns an N64 address into an offset: the power of two at or
+// above the model (24 MB masked by 24 MB - 1 would clear bit 23 and alias
+// everything above 8 MB onto the first 8 MB). A model that is not a power
+// of two (80 MB: Dinosaur Planet with its mod) is bounded by kRdramBytes
+// where a size is checked, and an address between the model and the mask's
+// reach reads past the buffer, which no valid address does.
+constexpr uint32_t rdram_pot(uint32_t v) { uint32_t p = 1u << 20; while (p < v) p <<= 1; return p; }
+constexpr uint32_t kRdramMask = rdram_pot(kRdramBytes) - 1;
 
 // Where the game's frame sits on the 400x240 top screen, as RT64 lays it out
 // for any window: scaled uniformly to the screen's height, centred, and the

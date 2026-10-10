@@ -1,0 +1,32 @@
+From db9e6a24e31aa8bf14cedcea1653b9602ce1de26 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 10 Oct 2026 05:48:59 -0500
+Subject: [PATCH] Mod symbols: no code words without a binary
+
+A static build (the mod's code baked into the executable) hands the parser
+no binary: the words stay unfilled, nothing recompiles them.
+---
+ src/mod_symbols.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/mod_symbols.cpp b/src/mod_symbols.cpp
+index 7318a07..de1c2c3 100644
+--- a/src/mod_symbols.cpp
++++ b/src/mod_symbols.cpp
+@@ -508,8 +508,12 @@ N64Recomp::ModSymbolsError N64Recomp::parse_mod_symbols(std::span<const char> da
+         return ModSymbolsError::CorruptSymbolFile;
+     }
+ 
+-    // Fill in the words for each function.
++    // Fill in the words for each function. With no binary given (a static
++    // build: the code is baked into the executable and the binary's bytes
++    // are streamed into RDRAM by the loader, never held in memory) the
++    // words stay unfilled; nothing recompiles them.
+     for (auto& cur_func : mod_context_out.functions) {
++        if (binary.empty()) break;
+         if (cur_func.rom + cur_func.words.size() * sizeof(cur_func.words[0]) > binary.size()) {
+             mod_context_out = {};
+             return ModSymbolsError::FunctionOutOfBounds;
+-- 
+2.55.0
+
