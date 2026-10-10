@@ -97,6 +97,12 @@ struct RenderDesc {
     // since an image drawn once and sampled for many frames (Banjo's jiggy
     // transition) must not be redrawn by an in-between.
     bool inbetween_offscreen = false;
+    // Frame interpolation: a world camera that jumps between two lists is a
+    // scene cut (no in-between): a move of more than this many units that
+    // is also ten times the move before it. The default suits the sibling
+    // games' cameras; a fast-flying one (Dinosaur Planet's Cloudrunner
+    // starting from rest) needs a higher floor, or its first move is a cut.
+    float cut_min_jump = 5.0f;
     // The game copies parts of the frame it is still drawing into small
     // images of its own (texture rectangles out of the colour image, after
     // drawing into it) and draws with those copies in the same frame

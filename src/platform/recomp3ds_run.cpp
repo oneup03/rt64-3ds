@@ -802,7 +802,7 @@ int recomp3ds::run(const GameDesc& desc) {
         const uint64_t kRoomForTheRest = (uint64_t)(desc.rom_room_mb > 0 ? desc.rom_room_mb : 24) << 20;
         const bool heap_short = envGetHeapSize() < rom_bytes + recomp::mem_size + kRoomForTheRest;
         const bool stream = mode == 2 || (mode == 0 && (!is_new_3ds || heap_short));
-        if (stream) recomp3ds::rom_stream_install(2u << 20);
+        if (stream) recomp3ds::rom_stream_install((size_t)desc.rom_cache_mb << 20, (size_t)desc.rom_block_kb << 10);
         fprintf(stderr, "recomp3ds: ROM %s (rom_stream %d%s)\n", stream ? "read from the SD card as needed" : "held in memory", mode,
                 mode != 0 ? "" : !is_new_3ds ? ", auto: an Old 3DS" : heap_short ? ", auto: the heap is short" : ", auto");
     }
@@ -1012,7 +1012,7 @@ int recomp3ds::run(const GameDesc& desc) {
     recomp3ds::game_mode_begin(desc, game_mode);
     if (!game_mode.empty() && recomp::get_rom_stream() == nullptr) {
         // The mode's ROM is streamed from the card; the game's needs no room either.
-        recomp3ds::rom_stream_install(2u << 20);
+        recomp3ds::rom_stream_install((size_t)desc.rom_cache_mb << 20, (size_t)desc.rom_block_kb << 10);
     }
     recomp::start_game(desc.game_id, game_mode);
     recomp3ds::loadmon_start(g_watch_cores);

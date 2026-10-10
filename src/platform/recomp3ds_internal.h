@@ -61,7 +61,7 @@ namespace recomp3ds {
     // The ROM read from the SD card as the game needs it (rom_stream.cpp):
     // installs the runtime's RomStream with a block cache of about
     // cache_bytes, before start.
-    void rom_stream_install(size_t cache_bytes);
+    void rom_stream_install(size_t cache_bytes, size_t block_bytes = 32 * 1024);
     // Game modes (game_modes.cpp; nothing without RT64_3DS_STATIC_MODS): the
     // ROM patch handler, and the picker before the game starts (returns the
     // chosen mode's id, empty for the game itself).

@@ -643,6 +643,8 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     st.gpu_depth16 = desc.render.eye_depth16 ? 1 : 0;
     st.gpu_textures16 = desc.render.intensity_textures16 ? 1 : 0;
     st.gpu_fill_clear = desc.render.fill_clear ? 1 : 0;
+    g_required_mods.assign(desc.required_mods, desc.required_mods + desc.required_mod_count);
+    g_required_mods_hint = desc.required_mods_hint != nullptr ? desc.required_mods_hint : "";
     // The in-betweens' own eye targets serve "60 interp." alone, which an Old
     // 3DS does not run by default (GameDesc::old3ds_frame_cap): there they
     // would hold 1125 KB of VRAM (room for textures) and a 512 KB command

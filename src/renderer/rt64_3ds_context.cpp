@@ -1342,6 +1342,7 @@ private:
             }
             if (n == 0) ranges[n++] = { desc.frame_head_proj_id, desc.frame_head_proj_id };
             interp_.set_world_proj_ranges(ranges, n);
+            set_cut_min_jump(desc.cut_min_jump);   // RenderDesc::cut_min_jump
             {
                 FILE* f = rt64_3ds::data_fopen("AIM_TEX_LOG.TXT", "r");
                 aim_log_ = f ? 1 : 0;

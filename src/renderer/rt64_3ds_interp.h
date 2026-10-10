@@ -162,4 +162,8 @@ void reweight(const FrameLog& prev, FrameLog& cur, float weight, MatchResult* re
 }   // namespace interp
 }   // namespace rt64_3ds
 
+// RenderDesc::cut_min_jump: the camera move a scene cut needs at least.
+extern float g_cut_min_jump;
+inline void set_cut_min_jump(float units) { g_cut_min_jump = units; }
+
 #endif

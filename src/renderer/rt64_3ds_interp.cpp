@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstring>
 
+float g_cut_min_jump = 5.0f;   // RenderDesc::cut_min_jump (set_cut_min_jump)
+
 namespace rt64_3ds {
 namespace interp {
 
@@ -610,7 +612,7 @@ MatchResult match(const FrameLog& prev, FrameLog& cur, float w, bool (*world)(ui
                 float v[3];
                 for (int k = 0; k < 3; k++) { v[k] = e1[k] - e0[k]; e.cam_vel[k] = v[k]; }
                 const float mag = len3(v), prev_mag = len3(pp.cam_vel);
-                const bool jump = mag > 5.0f && mag > 10.0f * prev_mag;
+                const bool jump = mag > g_cut_min_jump && mag > 10.0f * prev_mag;
                 const bool turn = dot3(f0, f1) < 0.7071f;
                 if (jump || turn) res.camera_cut = true;
             }

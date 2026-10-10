@@ -79,6 +79,12 @@ struct GameDesc {
     const char* const* required_mods = nullptr;
     size_t required_mod_count = 0;
     const char* required_mods_hint = nullptr;   // appended to the missing-file message (where to get it)
+    // The ROM stream's cache (rom_stream_install): its size and its block, the
+    // unit of one card read. A game that loads long runs (Dinosaur Planet's
+    // maps) spends 10 ms per read on the card whatever the size, so bigger
+    // blocks load faster; small random reads cost a block each.
+    uint32_t rom_cache_mb = 2;
+    uint32_t rom_block_kb = 32;
     // Built-in mods (RT64_3DS_STATIC_MODS) left out when a game mode is
     // played, whatever is enabled: ones that replace a function the game
     // modes replace too (the mode would not load), or that assume the
