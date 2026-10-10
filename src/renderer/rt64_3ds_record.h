@@ -78,6 +78,7 @@ struct TexDesc {
     uint16_t tlut_mode = 0; // G_TT_* (0 none, 2 RGBA16, 3 IA16)
     bool bilerp = false;
     bool snapshot = false;  // samples the stored copy of a previous frame instead of RDRAM
+    uint8_t snap_slot = 0;  // ... which of the kMaxSnapshots copies (the storage buffer it reads)
     int8_t rtt = -1;        // samples the off-screen image FrameRecord::rtts[rtt] rendered on the GPU
     // Samples the frame drawn so far (RenderDesc::sample_drawn_frame): the
     // texel coordinates are the snapshot's (rotated 256x512 layout).
@@ -152,6 +153,10 @@ struct DrawRecord {
     // A rectangle sampling a texture of a whole image (RenderDesc::
     // merge_image_tiles): its neighbours alike merge into its record.
     bool image_rect = false;
+    // RenderDesc::aim_texture_hashes: the hash of a candidate reticle
+    // rectangle's texels (8..64 px, roughly square), computed in the read
+    // while RDRAM still holds them; 0 when not a candidate.
+    uint64_t tex_hash = 0;
     uint32_t dbg_vtx = 0;               // RDRAM address of the last vertex load (debug)
     float dbg_vp[4] = {};               // viewport scale x/y, translate x/y (debug logging)
     float dbg_proj[4] = {};             // projection m[1][1], m[3][1], m[2][3], m[3][3]
@@ -167,6 +172,9 @@ struct RttImage {
     uint16_t pot_w = 0, pot_h = 0;
 };
 constexpr int kMaxRtt = 4;
+// Storage buffers the game copies presented frames into, each with a GPU copy
+// of its own (Dinosaur Planet's effects keep two and the pause a third).
+constexpr int kMaxSnapshots = 4;
 
 struct FrameRecord {
     VtxArray verts;
@@ -175,7 +183,9 @@ struct FrameRecord {
     std::vector<TexDesc> mips;          // mipmap levels past the base (TexDesc::mip_index)
     bool has_fullsync = false;
     bool snapshot_request = false;      // copy the last presented frame before drawing this one
+    uint8_t snapshot_store = 0;         // ... into which snapshot slots (bits; TexDesc::snap_slot)
     uint32_t color_image = 0, color_width = 0, depth_image = 0;
+    uint16_t frame_w = 0, frame_h = 0;  // the frame size the list was read at (RenderDesc::frame_sizes); 0 = the fixed one
     bool has_cam = false;               // a perspective projection was loaded this frame
     bool cam_is_world = false;          // ... under the world projection group (stereo depth terms)
     float cam[16] = {};
@@ -203,8 +213,11 @@ struct FrameRecord {
         mips.swap(o.mips);
         std::swap(has_fullsync, o.has_fullsync);
         std::swap(snapshot_request, o.snapshot_request);
+        std::swap(snapshot_store, o.snapshot_store);
         std::swap(color_image, o.color_image);
         std::swap(color_width, o.color_width);
+        std::swap(frame_w, o.frame_w);
+        std::swap(frame_h, o.frame_h);
         std::swap(depth_image, o.depth_image);
         std::swap(has_cam, o.has_cam);
         std::swap(cam_is_world, o.cam_is_world);
@@ -223,6 +236,7 @@ struct FrameRecord {
         mips.clear();
         has_fullsync = false;
         snapshot_request = false;
+        snapshot_store = 0;
         has_cam = false;
         cam_is_world = false;
         has_hud_cam = false;

@@ -32,6 +32,7 @@ namespace {
 // ndsp channel 0 carries the AI stream (audio_ndsp.cpp); the voices take the rest.
 constexpr int kFirstChannel = 1;
 constexpr int kSlots = 23;
+int g_slots = kSlots;                   // kSlots less SynthDesc::reserve_channels
 constexpr int kBufs = 3;
 constexpr uint32_t kBufFrames = 1024;               // samples a buffer, at the sample's own rate
 constexpr double kDspRate = 268111856.0 / 8192.0;   // ndsp's output rate (32728.5 Hz)
@@ -384,10 +385,11 @@ Voice* find_voice(uint32_t key, bool create) {
     for (Voice& v : g_voices) if (v.key == key) return &v;
     if (!create) return nullptr;
     Voice* pick = nullptr;
-    for (Voice& v : g_voices) if (v.key == 0) { pick = &v; break; }
+    for (Voice& v : g_voices) if (v.ch >= 0 && v.key == 0) { pick = &v; break; }
     // More voices than channels: the least recently used, a silent one first.
     for (int pass = 0; pass < 2 && pick == nullptr; pass++) {
         for (Voice& v : g_voices) {
+            if (v.ch < 0) continue;             // a channel reserved for the game
             if (pass == 0 && v.playing) continue;
             if (pick == nullptr || v.last_used < pick->last_used) pick = &v;
         }
@@ -872,7 +874,9 @@ bool recomp3ds::dsp_synth_init(const SynthDesc& desc) {
     LightLock_Init(&g_lock);
     LightEvent_Init(&g_frame_event, RESET_ONESHOT);
     for (int i = 0; i < 128; i++) g_eqpower[i] = (int16_t)lrint(32767.0 * cos(i * M_PI / 2.0 / 127.0));
-    for (int s = 0; s < kSlots; s++) {
+    g_slots = kSlots - (int)desc.reserve_channels;
+    if (g_slots < 1) g_slots = 1;
+    for (int s = 0; s < g_slots; s++) {
         Voice& v = g_voices[s];
         v.ch = kFirstChannel + s;
         for (int i = 0; i < kBufs; i++) {
@@ -892,7 +896,7 @@ bool recomp3ds::dsp_synth_init(const SynthDesc& desc) {
     if (g_thread == nullptr && core != 0) { core = 0; g_thread = threadCreate(synth_thread, nullptr, 32 * 1024, 0x20, core, false); }
     if (g_thread == nullptr) { fprintf(stderr, "dsp-synth: no thread\n"); return false; }
     g_ready = true;
-    fprintf(stderr, "dsp-synth: ready (%d channels, decoding on core %d)\n", kSlots, core);
+    fprintf(stderr, "dsp-synth: ready (%d channels, decoding on core %d)\n", g_slots, core);
     return true;
 }
 

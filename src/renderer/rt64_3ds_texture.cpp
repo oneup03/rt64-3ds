@@ -2,6 +2,7 @@
 // parameters the interpreter recorded (no TMEM copy), decoded to a PICA
 // format, tiled (8x8 Morton, rows flipped so v = 0 is the top texel row) and
 // kept in linear memory keyed by their source and content.
+#include "rt64_3ds_types.h"
 #include "rt64_3ds_texture.h"
 #include "rt64_3ds_texdecode.h"
 #include "rt64_3ds.h"
@@ -35,7 +36,7 @@ namespace {
 // TextureCache::set_vram: how many copies go a frame.
 constexpr size_t kMaxUploadsPerFrame = 8;
 
-inline uint8_t rb(const uint8_t* rdram, uint32_t a) { return rdram[(a & 0xFFFFFF) ^ 3]; }
+inline uint8_t rb(const uint8_t* rdram, uint32_t a) { return rdram[(a & rt64_3ds::kRdramMask) ^ 3]; }
 inline uint16_t rh(const uint8_t* rdram, uint32_t a) { return *(const uint16_t*)(rdram + ((a & 0xFFFFFE) ^ 2)); }
 inline uint32_t rw(const uint8_t* rdram, uint32_t a) { return *(const uint32_t*)(rdram + (a & 0xFFFFFC)); }
 
@@ -246,7 +247,7 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut, const TexDesc
         const uint32_t at = (uint32_t)impl_->copies.size();
         impl_->copies.resize(at + (hi - lo));
         memcpy(impl_->copies.data() + at, rdram_ + lo, hi - lo);
-        ld.addr = at + ((ld.addr & 0xFFFFFF) - lo);
+        ld.addr = at + ((ld.addr & rt64_3ds::kRdramMask) - lo);
     };
     w.key = key;
     w.content = h;

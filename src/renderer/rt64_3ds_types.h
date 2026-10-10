@@ -11,6 +11,16 @@ namespace rt64_3ds {
 // family (Banjo-Kazooie). The RDP commands are the same in both.
 enum class Gbi : uint8_t { F3DEX2, F3DEX };
 
+// The RDRAM model's size (librecomp/addresses.hpp, RECOMP_MEM_SIZE_MB: 16 MB
+// by default on the 3DS; a game with mods baked in above the 16 MB mark sets
+// more, Dinosaur Planet 64): every RDRAM address the renderer takes from a
+// display list or a tile load is masked to it. The host tools keep 16.
+#ifndef RECOMP_MEM_SIZE_MB
+#define RECOMP_MEM_SIZE_MB 16
+#endif
+constexpr uint32_t kRdramBytes = (uint32_t)RECOMP_MEM_SIZE_MB << 20;
+constexpr uint32_t kRdramMask = kRdramBytes - 1;
+
 // Where the game's frame sits on the 400x240 top screen, as RT64 lays it out
 // for any window: scaled uniformly to the screen's height, centred, and the
 // widescreen margins beside it in the same N64 units (the game's patches

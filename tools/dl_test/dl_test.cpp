@@ -48,6 +48,22 @@ int main(int argc, char** argv) {
         static const uint32_t ids[] = { 0x1000, 0 };
         interp.set_world_proj_ids(ids, 2);
         interp.set_unify_world_depth(true);
+    } else {
+        // DL_WORLD_IDS=lo[-hi],...: the World rules' projection ids, as the
+        // console's RenderDesc gives them (default DK64's camera, 5).
+        rt64_3ds::Interpreter::ProjIdRange ranges[8];
+        int n = 0;
+        const char* spec = getenv("DL_WORLD_IDS");
+        if (spec == nullptr) spec = "5";
+        for (const char* p = spec; *p && n < 8;) {
+            char* end = nullptr;
+            unsigned long lo = strtoul(p, &end, 0), hi = lo;
+            if (end == p) break;
+            if (*end == '-') { hi = strtoul(end + 1, &end, 0); }
+            ranges[n++] = { (uint32_t)lo, (uint32_t)hi };
+            p = *end == ',' ? end + 1 : end;
+        }
+        interp.set_world_proj_ranges(ranges, n);
     }
     // RenderDesc::fix_rect_lr and merge_rect_slices (Goemon's settings).
     if (getenv("DL_RECT_PARITY")) { interp.set_fix_rect_lr(true); interp.set_merge_rect_slices(true); }

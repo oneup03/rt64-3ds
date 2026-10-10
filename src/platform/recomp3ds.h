@@ -160,6 +160,18 @@ struct GameDesc {
     uint16_t cstick_camera_lead_ms = 70;
     uint16_t cstick_camera_press_ms = 100;
     uint16_t cstick_camera_period_ms = 267;
+    // Optional: called once the audio is up (ndsp, and the DSP synthesizer
+    // when the game has one) with the first ndsp channel the platform leaves
+    // free (23 - SynthDesc::reserve_channels + 1; 24 when none is), for a
+    // game that plays something of its own on a channel (Dinosaur Planet's
+    // MP3 voice acting).
+    void (*on_audio_ready)(int first_free_channel) = nullptr;
+    // The room the ROM-in-memory decision wants beside the ROM and RDRAM in
+    // the application heap (recomp3ds_run.cpp; 24 MB by default). A game
+    // whose ROM only fits with less (Dinosaur Planet's 64 MB ROM with a 16 MB
+    // linear heap: ~20 MB left) lowers it; the log's "heap in use" says what
+    // the game really takes.
+    int rom_room_mb = 24;
 };
 
 // Brings up the console, registers the game and runs the runtime. Returns the

@@ -64,7 +64,15 @@ public:
     // projection is recorded in FrameRecord::cam), and whether orthographic
     // draws with an untagged modelview start a new record at every modelview
     // load, so a reticle made of quads stays one quad per record.
-    void set_world_proj_ids(const uint32_t* ids, int count);   // up to 4
+    // The projection group ids whose draws are the world (RenderDesc's World
+    // rules): the depth camera, the cut test, unify_world_depth. Up to 8
+    // ranges; set_world_proj_ids gives single ids (dl_test). None until set.
+    struct ProjIdRange { uint32_t lo, hi; };
+    void set_world_proj_ranges(const ProjIdRange* ranges, int count);
+    void set_world_proj_ids(const uint32_t* ids, int count);
+    // RenderDesc::aim_texture_hashes (or AIM_TEX_LOG.TXT): hash the texels of
+    // every candidate reticle rectangle into DrawRecord::tex_hash.
+    void set_aim_hash(bool on);
     void set_split_untagged_ortho(bool on);
     // Always take G_BRANCH_Z (the near model), as the recomp frontends do.
     void set_force_branch_z(bool on);

@@ -3,6 +3,7 @@
 // RDRAM is the recompiled runtime's byte-swapped image: byte a lives at
 // [a ^ 3], halfword a at [a ^ 2], aligned words in host order.
 #include "rt64_3ds_dl.h"
+#include "rt64_3ds_texdecode.h"
 
 #include <algorithm>
 #include <cmath>
@@ -731,11 +732,36 @@ struct Interpreter::Impl {
     int tile_rec_tile = -1, tile_rec_xf = -2;
     float tile_du[2] = {}, tile_dv[2] = {};    // the in-between's tile origin offsets (texels)
     uint32_t mv_seq = 0;
-    uint32_t world_proj_ids[4] = { 5, 5, 5, 5 };
+    // The world cameras (Interpreter::set_world_proj_ranges): none until the
+    // context sets them from the game's World rules (a game that tags its
+    // camera 0x10 + selector gives a range); dl_test sets DL_WORLD_IDS.
+    static constexpr int kWorldRanges = 8;
+    Interpreter::ProjIdRange world_ranges[kWorldRanges] = {};
+    int world_range_count = 0;
     bool is_world_proj(uint32_t id) const {
-        return id == world_proj_ids[0] || id == world_proj_ids[1] || id == world_proj_ids[2] || id == world_proj_ids[3];
+        for (int i = 0; i < world_range_count; i++) {
+            if (id >= world_ranges[i].lo && id <= world_ranges[i].hi) return true;
+        }
+        return false;
     }
     bool split_untagged_ortho = false;
+    bool aim_hash = false;             // Interpreter::set_aim_hash
+    // FNV-1a over the bytes the tile load reads (texel_span) and, with the
+    // TLUT on, the palette entries it indexes: RenderDesc::aim_texture_hashes.
+    uint64_t hash_texture(const TexDesc& d) const {
+        uint32_t lo, hi;
+        texel_span(d, lo, hi);
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t a = lo; a < hi; a++) h = (h ^ rdram[a]) * 1099511628211ull;
+        if (d.tlut_mode != 0) {
+            const int first = d.siz == 0 ? (int)d.palette * 16 : 0, n = d.siz == 0 ? 16 : 256;
+            for (int i = 0; i < n && first + i < 256; i++) {
+                h = (h ^ (tlut[first + i] & 0xFF)) * 1099511628211ull;
+                h = (h ^ (tlut[first + i] >> 8)) * 1099511628211ull;
+            }
+        }
+        return h == 0 ? 1 : h;
+    }
     bool force_branch_z = true;        // RenderDesc::force_lod_branch, or gEXForceBranch
     bool fix_rect_lr = false;          // RenderDesc::fix_rect_lr
     int scissor_slack = 0;             // RenderDesc::scissor_edge_slack
@@ -913,7 +939,7 @@ struct Interpreter::Impl {
         const bool wide = d.fmt == 3 || d.fmt == 4 || (d.fmt == 2 && d.tlut_mode == 3);   // decoded to RGBA8
         if ((uint32_t)pot16(w) * pot16(rows) * (wide ? 4u : 2u) > kImageBytes) return false;
         const uint32_t addr = L.img_addr + (uint32_t)im->lo * L.pitch;
-        if ((addr & 0xFFFFFF) + rows * L.pitch > 0x1000000u) return false;
+        if ((addr & kRdramMask) + rows * L.pitch > kRdramBytes) return false;
         out = d;
         TexDesc& m = out;
         m.addr = addr;
@@ -953,8 +979,30 @@ struct Interpreter::Impl {
     // the last presented frame, and loads from the storage sample it.
     uint32_t vi_fbs[4] = {};
     int vi_fb_next = 0;
-    uint32_t snapshot_base = 0;         // storage buffer that holds the snapshot
-    bool snapshot_valid = false;
+    // The storage buffers, one GPU copy each (kMaxSnapshots slots keyed by
+    // base address; the least recently stored into makes way): Dinosaur
+    // Planet's effects keep two snapshots and its pause a third, DK64 one.
+    struct SnapSlot { uint32_t base = 0; bool valid = false; uint32_t list = 0; };
+    SnapSlot snaps[kMaxSnapshots];
+    int snap_slot_for(uint32_t base) {
+        int pick = -1;
+        for (int i = 0; i < kMaxSnapshots; i++) {
+            if (snaps[i].valid && snaps[i].base == base) return i;
+            if (!snaps[i].valid && pick < 0) pick = i;
+        }
+        if (pick < 0) {
+            pick = 0;
+            for (int i = 1; i < kMaxSnapshots; i++) if (snaps[i].list < snaps[pick].list) pick = i;
+        }
+        snaps[pick] = SnapSlot{ base, false, 0 };
+        return pick;
+    }
+    int snap_of_load(uint32_t addr) const {
+        for (int i = 0; i < kMaxSnapshots; i++) {
+            if (snaps[i].valid && addr >= snaps[i].base && addr < snaps[i].base + (uint32_t)(screen_w * screen_h * 2)) return i;
+        }
+        return -1;
+    }
 
     // Render to texture (RenderDesc::render_to_texture): a colour image that
     // is neither a presented framebuffer nor the depth buffer is drawn into
@@ -1119,14 +1167,17 @@ struct Interpreter::Impl {
     }
 
     // ---- memory
-    uint8_t r8(uint32_t a) const { return rdram[(a & 0xFFFFFF) ^ 3]; }
+    uint8_t r8(uint32_t a) const { return rdram[(a & kRdramMask) ^ 3]; }
     int16_t r16(uint32_t a) const { return *(const int16_t*)(rdram + ((a & 0xFFFFFE) ^ 2)); }
     uint16_t ru16(uint32_t a) const { return *(const uint16_t*)(rdram + ((a & 0xFFFFFE) ^ 2)); }
     uint32_t r32(uint32_t a) const { return *(const uint32_t*)(rdram + (a & 0xFFFFFC)); }
 
     uint32_t seg(uint32_t a) const {
-        if (extended_rdram && (a & 0x80000000)) return a & 0xFFFFFF;
-        return (segments[(a >> 24) & 0xF] + (a & 0xFFFFFF)) & 0xFFFFFF;
+        // Extended RDRAM (gEXSetRDRAMExtended): a KSEG0 address as it is, so
+        // mod data above the N64's 8 MB is reachable; segment offsets stay
+        // the RSP's 24 bits. Both masked to the RDRAM model.
+        if (extended_rdram && (a & 0x80000000)) return a & kRdramMask;
+        return (segments[(a >> 24) & 0xF] + (a & 0xFFFFFF)) & kRdramMask;
     }
 
     // ---- matrices
@@ -1528,8 +1579,9 @@ struct Interpreter::Impl {
         // Reads of the stored frame are 16-bit tile loads out of a
         // screen-wide image; anything else at that address is ordinary
         // texture data (the storage may be heap memory the game reuses later).
-        d.snapshot = !d.frame && snapshot_valid && d.addr >= snapshot_base && d.addr < snapshot_base + (uint32_t)(screen_w * screen_h * 2) &&
-                     !best->block && best->pitch == (uint32_t)screen_w * 2 && tl.siz == 2;
+        const int snap = d.frame ? -1 : snap_of_load(d.addr);
+        d.snapshot = snap >= 0 && !best->block && best->pitch == (uint32_t)screen_w * 2 && tl.siz == 2;
+        d.snap_slot = d.snapshot ? (uint8_t)snap : 0;
         d.rtt = -1;
         // With sample_drawn_frame a block load of whole rows of an image
         // reads it too (the rims load their strips with LOADBLOCK), but only
@@ -1854,7 +1906,7 @@ struct Interpreter::Impl {
     // at the LAST row (normal textures are stored flipped for that), so t
     // counts back from 512.
     void snapshot_uv(const TexDesc& d, float u, float v, float& su, float& sv, bool stretch) const {
-        image_uv(snapshot_base, d, u, v, su, sv, stretch);
+        image_uv(snaps[d.snap_slot < kMaxSnapshots ? d.snap_slot : 0].base, d, u, v, su, sv, stretch);
     }
     // TexDesc::frame: the same layout, from the colour image being drawn
     // (the backend keeps each eye's frame in a 256x512 texture that way).
@@ -1978,8 +2030,10 @@ struct Interpreter::Impl {
                 if (src.valid && !src.frame && is_vi_framebuffer(src.addr)) {
                     if (!out->snapshot_request) stats->snapshots++;
                     out->snapshot_request = true;
-                    snapshot_base = cimg;
-                    snapshot_valid = true;
+                    const int slot = snap_slot_for(cimg);
+                    snaps[slot].valid = true;
+                    snaps[slot].list = list_seq;
+                    out->snapshot_store |= (uint8_t)(1u << slot);
                     tex_seq++;
                     return;
                 }
@@ -2008,6 +2062,14 @@ struct Interpreter::Impl {
         // Fill and copy modes cover the lower-right pixel too.
         if (cyc == 2 || cyc == 3) { lrx += 1.0f; lry += 1.0f; }
         float w = lrx - ulx, h = lry - uly;
+        // RenderDesc::aim_texture_hashes: a candidate reticle's texels are
+        // hashed here, while RDRAM still holds them (nothing reads RDRAM
+        // after "parsed"): a textured rectangle of 8..64 px, roughly square,
+        // sampling ordinary texture memory.
+        if (aim_hash && textured && r.tex[0].valid && !r.tex[0].snapshot && !r.tex[0].frame && r.tex[0].rtt < 0 &&
+            w >= 8.0f && h >= 8.0f && w <= 64.0f && h <= 64.0f && w <= h * 1.6f && h <= w * 1.6f) {
+            r.tex_hash = hash_texture(r.tex[0]);
+        }
         const Tile& tl = tiles[tile & 7];
         float uls = (float)(tl.uls >> 2), ult = (float)(tl.ult >> 2);
         float u0 = s - uls, v0 = t - ult;
@@ -3044,6 +3106,8 @@ void Interpreter::note_presented_framebuffer(uint32_t addr) {
 
 
 bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
+    out.frame_w = (uint16_t)impl_->screen_w;
+    out.frame_h = (uint16_t)impl_->screen_h;
     Interp* ip = impl_->ip;
     if (ip != nullptr) {
         // Frame interpolation: keep the state the list starts from (the
@@ -3119,7 +3183,9 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
     o.mips = real.mips;
     o.has_fullsync = real.has_fullsync;
     o.snapshot_request = real.snapshot_request;
+    o.snapshot_store = real.snapshot_store;
     o.color_image = real.color_image; o.color_width = real.color_width; o.depth_image = real.depth_image;
+    o.frame_w = real.frame_w; o.frame_h = real.frame_h;
     o.has_cam = real.has_cam; o.cam_is_world = real.cam_is_world;
     memcpy(o.cam, real.cam, sizeof(o.cam));
     o.has_hud_cam = real.has_hud_cam;
@@ -3422,10 +3488,20 @@ bool Interpreter::pass_over(uint32_t data_ptr, FrameRecord& scratch) {
     return false;
 }
 
+void Interpreter::set_world_proj_ranges(const ProjIdRange* ranges, int count) {
+    if (count > Impl::kWorldRanges) count = Impl::kWorldRanges;
+    if (count < 0) count = 0;
+    for (int i = 0; i < count; i++) impl_->world_ranges[i] = ranges[i];
+    impl_->world_range_count = count;
+}
 void Interpreter::set_world_proj_ids(const uint32_t* ids, int count) {
-    for (int i = 0; i < 4; i++) impl_->world_proj_ids[i] = count > 0 ? ids[i < count ? i : count - 1] : 5;
+    ProjIdRange ranges[Impl::kWorldRanges];
+    if (count > Impl::kWorldRanges) count = Impl::kWorldRanges;
+    for (int i = 0; i < count; i++) ranges[i] = { ids[i], ids[i] };
+    set_world_proj_ranges(ranges, count);
 }
 void Interpreter::set_split_untagged_ortho(bool on) { impl_->split_untagged_ortho = on; }
+void Interpreter::set_aim_hash(bool on) { impl_->aim_hash = on; }
 void Interpreter::set_force_branch_z(bool on) { impl_->force_branch_z = on; }
 void Interpreter::set_gbi(Gbi gbi) {
     impl_->gbi = gbi;

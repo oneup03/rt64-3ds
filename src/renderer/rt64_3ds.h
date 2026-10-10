@@ -58,6 +58,16 @@ struct RenderDesc {
     // The game's frame, in N64 pixels (its framebuffer's size: DK64 320x240,
     // Banjo 292x216). It is placed as RT64 places it: see ScreenGeometry.
     uint32_t vi_width = 320, vi_height = 240;
+    // A game whose frame size changes while it runs (Dinosaur Planet: 320x240
+    // in play, 640x480 for its title and menus, 384x192 once): the sizes it
+    // uses. Each display list is then placed by the VI's width when it is
+    // read (VI_WIDTH_REG, matched to one of these), scaled to the screen's
+    // height as ever, and the depth grid's blocks grow with the frame
+    // (ceil(w / 50) px); a list that changes the size gets no in-between.
+    // None (the default): vi_width x vi_height throughout.
+    struct FrameSize { uint16_t w, h; };
+    const FrameSize* frame_sizes = nullptr;
+    size_t frame_size_count = 0;
     bool hud_on_bottom_supported = false;
     const uint32_t* snapshot_buffers = nullptr;   // RDRAM addresses the game copies frames into
     size_t snapshot_count = 0;
@@ -248,6 +258,20 @@ struct RenderDesc {
     // gEXMatrixGroup), then as itself one refresh later. For games whose
     // patches tag their transforms for RT64's interpolation (Goemon).
     bool frame_interpolation = false;
+
+    // ---- The aiming reticle, for the depth-aware crosshair.
+    //
+    // Textured rectangles whose texels hash to one of these (FNV-1a over the
+    // bytes the tile load reads, and the palette entries of a CI texture:
+    // rt64_3ds_stereo.cpp hash_rect_texture) are the game's aiming reticle:
+    // placed at the depth under it (the aim sampler), as the desktop fork
+    // finds its reticle by texture hash (Dinosaur Planet's moving 32x32
+    // crosshair). AIM_TEX_LOG.TXT beside the executable logs the hash, size
+    // and format of every candidate (8..64 px, roughly square) to collect
+    // them. None (the default): only DK64's quad heuristic under
+    // first_person_scene().
+    const uint64_t* aim_texture_hashes = nullptr;
+    size_t aim_texture_count = 0;
 };
 
 void set_render_desc(const RenderDesc& desc);

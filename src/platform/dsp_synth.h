@@ -55,6 +55,9 @@ struct SynthDesc {
     SynthFx fx = SynthFx::Embedded;
     bool fx_lowpass = true;         // false: the game's microcode leaves its effect unfiltered (DK64)
     uint32_t sound_modes = 0;       // DK64: its surround, mono and headphone bytes (they move pan)
+    // ndsp channels left free above the synthesizer's (which take 1..23 - n)
+    // for the game's own use (GameDesc::on_audio_ready says which).
+    uint8_t reserve_channels = 0;
     SynthDesc() = default;
     SynthDesc(SynthFlavor f) : flavor(f) {
         if (f == SynthFlavor::NAudio) {

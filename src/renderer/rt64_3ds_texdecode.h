@@ -6,11 +6,12 @@
 
 #include <cstdint>
 
+#include "rt64_3ds_types.h"
 #include "rt64_3ds_record.h"
 
 namespace rt64_3ds {
 
-inline uint8_t tex_rb(const uint8_t* rdram, uint32_t a) { return rdram[(a & 0xFFFFFF) ^ 3]; }
+inline uint8_t tex_rb(const uint8_t* rdram, uint32_t a) { return rdram[(a & kRdramMask) ^ 3]; }
 inline uint16_t tex_rh(const uint8_t* rdram, uint32_t a) { return *(const uint16_t*)(rdram + ((a & 0xFFFFFE) ^ 2)); }
 inline uint32_t tex_rw(const uint8_t* rdram, uint32_t a) { return *(const uint32_t*)(rdram + (a & 0xFFFFFC)); }
 
@@ -104,12 +105,12 @@ inline uint32_t rgba5551_to_rgba8(uint16_t p) {   // 0xRRGGBBAA
 // to its texels' bytes (and a 4-bit texture's first nibble) plus the odd-row
 // swap.
 inline void texel_span(const TexDesc& d, uint32_t& lo, uint32_t& hi) {
-    const uint32_t addr = d.addr & 0xFFFFFF;
+    const uint32_t addr = d.addr & kRdramMask;
     const uint32_t rows = (d.wrap_rows != 0 && d.wrap_rows < d.height) ? d.wrap_rows : d.height;
     const uint32_t bytes = ((((uint32_t)d.width + d.nibble) << d.siz) + 1) / 2;
     lo = addr & ~3u;
     hi = (addr + (rows > 0 ? rows - 1 : 0) * d.pitch + bytes + 8 + 3) & ~3u;
-    if (hi > 0x1000000) hi = 0x1000000;
+    if (hi > kRdramBytes) hi = kRdramBytes;
 }
 
 // Whole tile to 0xRRGGBBAA texels (width * height).

@@ -33,7 +33,8 @@ struct StereoFrame {
     float rect_ndc = 0;      // texture/fill rectangles (eye-independent, NDC)
     float aim_ndc = 0;       // the reticle at the aimed depth (eye-independent, NDC)
     float px_scale = 0;      // screen pixels per N64 unit when HUD shifts snap to pixels (RenderDesc::snap_hud_shift), else 0
-    bool reticle = false;    // look for the first-person reticle this frame
+    bool reticle = false;    // look for DK64's first-person reticle quad this frame
+    bool aim = false;        // sample the depth under the reticle this frame (reticle, or a hashed one was drawn)
     // The world wrote no depth last frame (menus drawn from rectangles,
     // such as DK64's file select): its stray world draws, like a shadow
     // under the camera, would otherwise float out of the screen.
@@ -49,6 +50,10 @@ bool is_reticle_quad(const DrawRecord& d, const Vtx3ds* verts, float* minx, floa
 
 // A full-screen rectangle (tints, glare) stays on the screen plane.
 bool rect_covers_scissor(const DrawRecord& d, const Vtx3ds* verts);
+
+// A shift (N64 units) rounded to whole screen pixels (RenderDesc::
+// snap_hud_shift), the identity with px_scale 0.
+float snap_to_pixels(float v, float px_scale);
 
 // A frame's eye-independent HUD terms (StereoFrame::hud_offset, rect_ndc)
 // for a HUD depth other than 50, the 3D slider's position and the panel gain.

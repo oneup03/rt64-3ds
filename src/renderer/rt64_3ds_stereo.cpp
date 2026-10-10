@@ -134,7 +134,10 @@ void set_hud_terms(StereoFrame& sf, int hud_depth, float slider, float slider_ga
     // slider (unless RenderDesc::rect_hud_follows_separation).
     const float centered = ((float)hud_depth - 50.0f) / 50.0f;
     sf.hud_offset = -centered * kHudMaxOffset * (sf.sep / kHudReferenceSeparation);
-    sf.rect_ndc = -centered * kHudMaxOffset * 2.75f * slider * slider_gain;
+    // The orthographic HUD's factor (RenderDesc::hud_k_ortho, 2.75 by default)
+    // for the rectangles' fixed offset too, so a game that changes it keeps
+    // its rectangles and its orthographic HUD at one depth.
+    sf.rect_ndc = -centered * kHudMaxOffset * render_desc().hud_k_ortho * slider * slider_gain;
 }
 
 float cover_zoom_factor(float sep, const ScreenGeometry& geo) {
@@ -382,3 +385,5 @@ float near_depth_statistic(const float* grid, int cols, int rows, float region_b
 }
 
 }   // namespace rt64_3ds
+
+float rt64_3ds::snap_to_pixels(float v, float px_scale) { return snap_shift(v, px_scale); }

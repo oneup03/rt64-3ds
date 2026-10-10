@@ -622,7 +622,14 @@ extern "C" void __system_allocateHeaps(void) {
     svcGetResourceLimitCurrentValues(&current_commit, reslimit, &type, 1);
     svcCloseHandle(reslimit);
     const u32 remaining = (u32)(max_commit - current_commit) & ~0xFFFu;
+#ifdef RT64_3DS_LINEAR_HEAP_MB
+    // The game's own choice (CMake RT64_3DS_LINEAR_HEAP_MB): Dinosaur Planet
+    // takes 16 MB so its 64 MB ROM fits the application heap beside RDRAM.
+    __ctru_linear_heap_size = (u32)RT64_3DS_LINEAR_HEAP_MB << 20;
+    if (__ctru_linear_heap_size > remaining / 2) __ctru_linear_heap_size = remaining / 2;
+#else
     __ctru_linear_heap_size = remaining >= (96u << 20) ? (32u << 20) : (16u << 20);
+#endif
     __ctru_heap_size = remaining - __ctru_linear_heap_size;
     if (R_FAILED(svcControlMemory(&__ctru_heap, OS_HEAP_AREA_BEGIN, 0x0, __ctru_heap_size, MEMOP_ALLOC, (MemPerm)(MEMPERM_READ | MEMPERM_WRITE)))) svcBreak(USERBREAK_PANIC);
     if (R_FAILED(svcControlMemory(&__ctru_linear_heap, 0x0, 0x0, __ctru_linear_heap_size, MEMOP_ALLOC_LINEAR, (MemPerm)(MEMPERM_READ | MEMPERM_WRITE)))) svcBreak(USERBREAK_PANIC);
@@ -772,7 +779,7 @@ int recomp3ds::run(const GameDesc& desc) {
         snprintf(rom_path, sizeof(rom_path), "%s/%s.z64", g_base_path, (const char*)desc.game_id.c_str());
         struct stat rom_st;
         const uint64_t rom_bytes = stat(rom_path, &rom_st) == 0 ? (uint64_t)rom_st.st_size : (32u << 20);
-        constexpr uint64_t kRoomForTheRest = 24u << 20;
+        const uint64_t kRoomForTheRest = (uint64_t)(desc.rom_room_mb > 0 ? desc.rom_room_mb : 24) << 20;
         const bool heap_short = envGetHeapSize() < rom_bytes + recomp::mem_size + kRoomForTheRest;
         const bool stream = mode == 2 || (mode == 0 && (!is_new_3ds || heap_short));
         if (stream) recomp3ds::rom_stream_install(2u << 20);
@@ -964,6 +971,12 @@ int recomp3ds::run(const GameDesc& desc) {
     }
     // The DSP synthesizer's decoding thread wants core 1, granted just above.
     if (desc.synth.flavor != recomp3ds::SynthFlavor::None) recomp3ds::dsp_synth_init(desc.synth);
+    // The game's own audio (GameDesc::on_audio_ready): the first ndsp channel
+    // the platform leaves free, above the AI stream's (0) and the synth's.
+    if (desc.on_audio_ready != nullptr) {
+        const int first_free = desc.synth.flavor != recomp3ds::SynthFlavor::None ? 24 - desc.synth.reserve_channels : 1;
+        desc.on_audio_ready(first_free);
+    }
     {
         // Debug: the FPU control state threads start with (rounding mode in
         // bits 22-23, flush-to-zero in bit 24, default NaN in bit 25).

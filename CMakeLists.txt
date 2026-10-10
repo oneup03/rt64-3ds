@@ -124,6 +124,13 @@ add_library(recomp_3ds STATIC
     src/platform/autotest.cpp
 )
 target_include_directories(recomp_3ds PUBLIC src/platform)
+# The linear heap's size at start (recomp3ds_run.cpp __system_allocateHeaps):
+# 32 MB with plenty of memory and 16 otherwise by default; a game sets
+# RT64_3DS_LINEAR_HEAP_MB to choose (Dinosaur Planet: 16, for its 64 MB ROM
+# in the application heap).
+if(DEFINED RT64_3DS_LINEAR_HEAP_MB)
+    target_compile_definitions(recomp_3ds PRIVATE RT64_3DS_LINEAR_HEAP_MB=${RT64_3DS_LINEAR_HEAP_MB})
+endif()
 target_include_directories(recomp_3ds PRIVATE third_party/GamepadMotionHelpers)
 target_link_libraries(recomp_3ds PUBLIC rt64_3ds ultramodern librecomp ctru m)
 target_compile_features(recomp_3ds PUBLIC cxx_std_20)

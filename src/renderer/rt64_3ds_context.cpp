@@ -734,7 +734,8 @@ public:
                 add("late", inb_late_); add("budget", inb_budget_); add("snapshot", inb_snapshot_); add("rtt", inb_rtt_);
                 add("offscreen", inb_offscreen_); add("blanked", inb_blank_); add("depth", inb_depth_); add("after60", inb_after60_);
                 add("after-unsafe", inb_after_unsafe_); add("cut", inb_cut_); add("untagged", inb_nothing_); add("diverged", inb_diverged_);
-                inb_snapshot_ = inb_rtt_ = inb_offscreen_ = inb_blank_ = inb_depth_ = inb_after60_ = inb_after_unsafe_ = 0;
+                add("resize", inb_resize_);
+                inb_snapshot_ = inb_rtt_ = inb_offscreen_ = inb_blank_ = inb_depth_ = inb_after60_ = inb_after_unsafe_ = inb_resize_ = 0;
             }
             {
                 const float ms = 1000.0f / (float)SYSCLOCK_ARM11;
@@ -993,6 +994,7 @@ public:
         maybe_capture(task);
         // In first person the reticle's quads must stay one per record.
         interp_.set_split_untagged_ortho(rt64_3ds::first_person_scene());
+        maybe_switch_frame_size();
         const bool present = interp_.run(task->t.data_ptr, frame_);
         pass_next_ = present && interp_.last_list_plain();
         // Everything the replay reads from RDRAM is read by now once the
@@ -1288,12 +1290,9 @@ private:
         // a 256x512 RGBA8 texture (same tiling, rows padded), for the game's
         // framebuffer effects.
         // (In the eyes' format: the copy is byte for byte.)
-        const GPU_TEXCOLOR snap_fmt = color16_ ? GPU_RGB565 : GPU_RGBA8;
-        if (!C3D_TexInitVRAM(&snapshot_, 256, 512, snap_fmt)) {
-            if (!C3D_TexInit(&snapshot_, 256, 512, snap_fmt)) fprintf(stderr, "rt64-3ds: snapshot texture allocation failed\n");
-        }
-        C3D_TexSetFilter(&snapshot_, GPU_LINEAR, GPU_LINEAR);
-        C3D_TexSetWrap(&snapshot_, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+        // The first slot now (as ever); a game storing into more buffers
+        // gets the others when it first does (copy_snapshot).
+        init_snapshot_tex(0);
         if (rt64_3ds::render_desc().sample_drawn_frame) {
             // RenderDesc::sample_drawn_frame: the copy of an eye's frame drawn
             // so far, as a render target with its own depth buffer. It holds
@@ -1314,25 +1313,32 @@ private:
         {
             // The game's frame on the screen, as RT64 would place it (see
             // rt64_3ds::ScreenGeometry).
-            geo_ = rt64_3ds::screen_geometry();
-            grid_cols_ = std::min((geo_.w + 7) / 8, kGridColsMax);
-            grid_rows_ = std::min((geo_.h + 7) / 8, kGridRowsMax);
+            apply_geometry(rt64_3ds::screen_geometry());
+            read_geo_ = geo_;
             interp_.set_screen(geo_);
-            fprintf(stderr, "rt64-3ds: game frame %dx%d, x%.3f, %.1f-unit margins\n", geo_.w, geo_.h, geo_.scale, geo_.x0);
         }
         {
             // The perspective groups the game's rules place as world: their
             // projection turns the depth buffer into distances.
+            // Every World rule, ranges included (a camera tagged 0x10 +
+            // selector: Dinosaur Planet); frame_head_proj_id without any.
             const rt64_3ds::RenderDesc& desc = rt64_3ds::render_desc();
-            uint32_t ids[4];
+            rt64_3ds::Interpreter::ProjIdRange ranges[8];
             int n = 0;
-            for (size_t i = 0; i < desc.rule_count && n < 4; i++) {
+            for (size_t i = 0; i < desc.rule_count && n < 8; i++) {
                 const rt64_3ds::StereoRule& r = desc.rules[i];
-                if (r.cls == rt64_3ds::StereoClass::World && (r.kind == rt64_3ds::ProjKind::Any || r.kind == rt64_3ds::ProjKind::Perspective) &&
-                    r.id_lo == r.id_hi) ids[n++] = r.id_lo;
+                if (r.cls == rt64_3ds::StereoClass::World && (r.kind == rt64_3ds::ProjKind::Any || r.kind == rt64_3ds::ProjKind::Perspective)) {
+                    ranges[n++] = { r.id_lo, r.id_hi };
+                }
             }
-            if (n == 0) ids[n++] = desc.frame_head_proj_id;
-            interp_.set_world_proj_ids(ids, n);
+            if (n == 0) ranges[n++] = { desc.frame_head_proj_id, desc.frame_head_proj_id };
+            interp_.set_world_proj_ranges(ranges, n);
+            {
+                FILE* f = rt64_3ds::data_fopen("AIM_TEX_LOG.TXT", "r");
+                aim_log_ = f ? 1 : 0;
+                if (f) fclose(f);
+            }
+            interp_.set_aim_hash(desc.aim_texture_count > 0 || aim_log_ == 1);
             interp_.set_force_branch_z(desc.force_lod_branch);
             interp_.set_gbi(desc.gbi);
             interp_.set_render_to_texture(desc.render_to_texture);
@@ -1394,6 +1400,8 @@ private:
     // list is done a refresh sooner. A game frame that can't be recorded
     // on its own has it transferred here first (flush_pending_inbetween).
     bool replay_and_present(Present kind = Present::Normal, bool handoff = false, bool hold = false) {
+        // RenderDesc::frame_sizes: the geometry this list was read at.
+        apply_frame_geometry();
         const bool inbetween = kind == Present::Inbetween;
         await_presenter();
         // GFX_CAPTURE.TXT "seq": every frame put on the screen.
@@ -1440,7 +1448,7 @@ private:
         if (pair_ && !inbetween) pair_frames_++;
         if (defer) begin_deferred();
         else {
-            if (frame_.snapshot_request && snapshot_.data != nullptr) copy_snapshot();
+            if (frame_.snapshot_request) copy_snapshot();
             const bool readback = start_readback();
             update_vi_blank();
             u64 tb0 = svcGetSystemTick();
@@ -1611,7 +1619,7 @@ private:
                 // both eyes (every class's shift is odd in the eye).
                 float sa = 0.0f, sb = 0.0f;
                 if (sfd.on && d.rtt < 0) {
-                    if (classes_[i] == kReticle) sa = -sfd.aim_ndc * 200.0f;
+                    if (classes_[i] == kReticle) sa = rt64_3ds::snap_to_pixels(-sfd.aim_ndc * 200.0f, sfd.px_scale);
                     else rt64_3ds::stereo_shift(sfd, (rt64_3ds::StereoClass)classes_[i], d, 1, &sa, &sb);
                 }
                 if (sa != last_sa_ || sb != last_sb_) {
@@ -2373,6 +2381,7 @@ private:
         const rt64_3ds::RenderDesc& desc = rt64_3ds::render_desc();
         uint32_t* unsafe = nullptr;
         if (frame_.snapshot_request) unsafe = &inb_snapshot_;
+        else if (frame_resized_) unsafe = &inb_resize_;
         else if (desc.depth_to_rdram && !double_eyes_) unsafe = &inb_depth_;
         else if (vi_blanked_) unsafe = &inb_blank_;
         if (unsafe == nullptr && desc.render_to_texture) for (const rt64_3ds::DrawRecord& d : frame_.draws) if (d.rtt >= 0) { unsafe = &inb_rtt_; break; }
@@ -2484,7 +2493,35 @@ private:
         LightLock_Unlock(&g_readback_lock);
     }
 
+    bool init_snapshot_tex(int slot) {
+        if (snapshot_[slot].data != nullptr) return true;
+        const GPU_TEXCOLOR snap_fmt = color16_ ? GPU_RGB565 : GPU_RGBA8;
+        if (!C3D_TexInitVRAM(&snapshot_[slot], 256, 512, snap_fmt)) {
+            if (!C3D_TexInit(&snapshot_[slot], 256, 512, snap_fmt)) {
+                fprintf(stderr, "rt64-3ds: snapshot texture %d allocation failed\n", slot);
+                return false;
+            }
+        }
+        C3D_TexSetFilter(&snapshot_[slot], GPU_LINEAR, GPU_LINEAR);
+        C3D_TexSetWrap(&snapshot_[slot], GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+        if (slot != 0) fprintf(stderr, "rt64-3ds: snapshot texture %d made (%s)\n", slot, snapshot_[slot].data != nullptr ? "ok" : "none");
+        return true;
+    }
+
+    // Every storage buffer this frame stores into gets the last presented
+    // frame (FrameRecord::snapshot_store; the first slot when the record
+    // predates the slots).
     void copy_snapshot() {
+        const uint8_t store = frame_.snapshot_store != 0 ? frame_.snapshot_store : 1;
+        for (int slot = 0; slot < rt64_3ds::kMaxSnapshots; slot++) {
+            if ((store & (1u << slot)) == 0) continue;
+            if (!init_snapshot_tex(slot)) continue;
+            copy_snapshot_to(slot);
+        }
+    }
+
+    void copy_snapshot_to(int slot) {
+        last_snap_slot_ = slot;
         {
             // Outside a frame (C3D_SyncTextureCopy then waits for the last
             // frame's GPU work and starts the copy, and the next
@@ -2508,7 +2545,7 @@ private:
             }
             if (cpu_copy == 1) {
                 const u8* src = (const u8*)last_eye_[0]->frameBuf.colorBuf;
-                u8* dst = (u8*)snapshot_.data;
+                u8* dst = (u8*)snapshot_[slot].data;
                 for (u32 tr = 0; tr < 400 / 8; tr++) memcpy(dst + tr * (row + gap), src + tr * row, row);
             }
             else {
@@ -2518,7 +2555,7 @@ private:
                 // RGB8 screen output): the scrambled snapshot.
                 constexpr u32 kTextureCopyMode = BIT(3);
                 C3D_SyncTextureCopy((u32*)last_eye_[0]->frameBuf.colorBuf, GX_BUFFER_DIM(row / 16, 0),
-                                    (u32*)snapshot_.data, GX_BUFFER_DIM(row / 16, gap / 16), 240 * 400 * bpp,
+                                    (u32*)snapshot_[slot].data, GX_BUFFER_DIM(row / 16, gap / 16), 240 * 400 * bpp,
                                     kTextureCopyMode);
             }
             snapshots_++;
@@ -2535,7 +2572,7 @@ private:
         const u32 bpp = color16_ ? 2 : 4;
         const u32 row = 240 * 8 * bpp, gap = (256 - 240) * 8 * bpp;
         const u32* src = (const u32*)last_eye_[0]->frameBuf.colorBuf;
-        const u32* dst = (const u32*)snapshot_.data;
+        const u32* dst = (const u32*)snapshot_[last_snap_slot_].data;
         u32 bad = 0, seed = 0x1234567u;
         for (int i = 0; i < 512; i++) {
             seed = seed * 1103515245u + 12345u;
@@ -2661,10 +2698,11 @@ private:
         float us = 1.0f, vs = 1.0f, us1 = 1.0f, vs1 = 1.0f;
         for (int t = 0; t < 2; t++) {
             bool bound = false;
-            if (d.tex[t].valid && d.tex[t].snapshot && snapshot_.data != nullptr) {
-                if (last_tex_[t] != &snapshot_) {
-                    C3D_TexBind(t, &snapshot_);
-                    last_tex_[t] = &snapshot_; last_tex_param_[t] = 0xFFFFFFFFu;
+            C3D_Tex* snap = d.tex[t].snapshot ? &snapshot_[d.tex[t].snap_slot < rt64_3ds::kMaxSnapshots ? d.tex[t].snap_slot : 0] : nullptr;
+            if (d.tex[t].valid && snap != nullptr && snap->data != nullptr) {
+                if (last_tex_[t] != snap) {
+                    C3D_TexBind(t, snap);
+                    last_tex_[t] = snap; last_tex_param_[t] = 0xFFFFFFFFu;
                 }
                 if (t == 0) { us = 1.0f / 256.0f; vs = 1.0f / 512.0f; }
                 else { us1 = 1.0f / 256.0f; vs1 = 1.0f / 512.0f; }
@@ -3226,15 +3264,15 @@ public:
     void read_depth_grid() {
         for (int gy = 0; gy < grid_rows_; gy++) {
             for (int gx = 0; gx < grid_cols_; gx++) {
-                const float nx = (float)(gx * 8 + 4), ny = (float)(gy * 8 + 4);
+                const float nx = (float)(gx * grid_bx_ + grid_bx_ / 2), ny = (float)(gy * grid_by_ + grid_by_ / 2);
                 depth_grid_[gy * grid_cols_ + gx] = read_depth_zp((int)geo_.screen_x(nx), (int)geo_.screen_y(ny));
             }
         }
     }
     void depth_to_rdram(uint32_t zimg) {
         const uint32_t pitch = (uint32_t)geo_.w * 2;
-        if ((zimg & 0xFFFFFF) + pitch * (uint32_t)geo_.h > 16u * 1024 * 1024) return;
-        uint8_t* z = rdram_ + (zimg & 0xFFFFFF);
+        if ((zimg & rt64_3ds::kRdramMask) + pitch * (uint32_t)geo_.h > rt64_3ds::kRdramBytes) return;
+        uint8_t* z = rdram_ + (zimg & rt64_3ds::kRdramMask);
         // A block is one value, so a word holds a pixel pair whichever half
         // each pixel is in (RDRAM's halves are swapped, ^2): word stores, a
         // quarter of the stores pixel by pixel took (needs an aligned buffer
@@ -3249,8 +3287,8 @@ public:
                 const float zp = depth_grid_[gy * grid_cols_ + gx];
                 const uint16_t v = zp >= 1.0f ? 0xFFFC : n64_depth(zp);
                 const uint32_t vv = (uint32_t)v | ((uint32_t)v << 16);
-                const int x0 = gx * 8, x1 = std::min(x0 + 8, geo_.w);
-                for (int y = gy * 8; y < gy * 8 + 8 && y < geo_.h; y++) {
+                const int x0 = gx * grid_bx_, x1 = std::min(x0 + grid_bx_, geo_.w);
+                for (int y = gy * grid_by_; y < gy * grid_by_ + grid_by_ && y < geo_.h; y++) {
                     uint8_t* row = z + (uint32_t)y * pitch;
                     int x = x0;
                     if (words) for (; x + 1 < x1; x += 2) *(uint32_t*)(row + x * 2) = vv;
@@ -3309,6 +3347,7 @@ public:
             if (sf.on && st.hud_depth != 50) rt64_3ds::set_hud_terms(sf, st.hud_depth, slider_, st.slider_gain);
             if (rt64_3ds::render_desc().snap_hud_shift) sf.px_scale = geo_.scale;
             sf.reticle = sf.on && held_sf_.reticle;
+            sf.aim = sf.on && held_sf_.aim;
             sf.aim_ndc = held_sf_.aim_ndc;
             return sf;
         }
@@ -3334,9 +3373,13 @@ public:
         if (sf.on && st.hud_depth != 50) rt64_3ds::set_hud_terms(sf, st.hud_depth, slider_, st.slider_gain);
         if (rt64_3ds::render_desc().snap_hud_shift) sf.px_scale = geo_.scale;
         sf.reticle = sf.on && rt64_3ds::first_person_scene();
+        // The depth under the reticle: DK64's quad while first person is on,
+        // or a rectangle matching RenderDesc::aim_texture_hashes drawn last
+        // frame (classify_frame), its centre the aim point.
+        sf.aim = sf.on && (sf.reticle || aim_seen_);
         aim_z_ = -1.0f;
-        if (!sf.reticle) aim_have_prev_ = false;
-        if (sf.reticle) {
+        if (!sf.aim) aim_have_prev_ = false;
+        if (sf.aim) {
             aim_z_ = sample_aim_depth(sf);
             // Zero at the convergence distance, the full separation at
             // infinity (also when nothing was sampled: open sky), negative
@@ -3481,7 +3524,7 @@ public:
         // once and replayed for both eyes, so the zoom (eye-independent) is
         // applied to them here, before they are flushed to the GPU.
         const float cover = rt64_3ds::cover_zoom_factor(sf.sep, geo_);
-        bool any = false;
+        bool any = false, aim_hit = false;
         float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
         for (size_t i = 0; i < frame_.draws.size(); i++) {
             const rt64_3ds::DrawRecord& d = frame_.draws[i];
@@ -3505,7 +3548,25 @@ public:
             if (cls == rt64_3ds::StereoClass::World && sf.world_empty) cls = rt64_3ds::StereoClass::Hud;
             uint8_t c = (uint8_t)cls;
             float a, b, e, f;
-            if (sf.reticle && !d.perspective && cls != rt64_3ds::StereoClass::Infinity &&
+            if (d.tex_hash != 0 && d.kind == rt64_3ds::DrawRecord::TexRect && d.rtt < 0) {
+                // RenderDesc::aim_texture_hashes: the game's reticle by its
+                // texture (the desktop fork's way; it moves across the
+                // screen), placed at the depth under it.
+                if (aim_log_ == 1) log_aim_texture(d);
+                bool hit = false;
+                for (size_t k = 0; k < desc.aim_texture_count && !hit; k++) hit = desc.aim_texture_hashes[k] == d.tex_hash;
+                if (hit) {
+                    a = 1e9f; b = -1e9f; e = 1e9f; f = -1e9f;
+                    for (uint32_t v = d.first; v < d.first + d.count; v++) {
+                        a = std::min(a, verts[v].x); b = std::max(b, verts[v].x);
+                        e = std::min(e, verts[v].y); f = std::max(f, verts[v].y);
+                    }
+                    c = kReticle;
+                    any = true; aim_hit = true;
+                    x0 = std::min(x0, a); x1 = std::max(x1, b); y0 = std::min(y0, e); y1 = std::max(y1, f);
+                }
+            }
+            if (c != kReticle && sf.reticle && !d.perspective && cls != rt64_3ds::StereoClass::Infinity &&
                 rt64_3ds::is_reticle_quad(d, verts, &a, &b, &e, &f)) {
                 c = kReticle;
                 any = true;
@@ -3516,6 +3577,18 @@ public:
         }
         if (any) { reticle_cx_ = (x0 + x1) * 0.5f; reticle_cy_ = (y0 + y1) * 0.5f; }
         else { reticle_cx_ = (float)geo_.w * 0.5f; reticle_cy_ = (float)geo_.h * 0.5f; }
+        aim_seen_ = aim_hit;
+    }
+
+    // AIM_TEX_LOG.TXT: each candidate reticle texture once, to collect a
+    // game's RenderDesc::aim_texture_hashes.
+    void log_aim_texture(const rt64_3ds::DrawRecord& d) {
+        for (uint64_t h : aim_logged_) if (h == d.tex_hash) return;
+        if (aim_logged_.size() >= 256) return;
+        aim_logged_.push_back(d.tex_hash);
+        const rt64_3ds::TexDesc& t = d.tex[0];
+        fprintf(stderr, "rt64-3ds: aim-tex: %016llx %ux%u fmt %u siz %u tlut %u (frame %u)\n", (unsigned long long)d.tex_hash,
+                t.width, t.height, t.fmt, t.siz, t.tlut_mode, frames_);
     }
 
     static constexpr uint8_t kReticle = 0xFF;
@@ -3524,6 +3597,54 @@ public:
     static constexpr int kGridColsMax = 50, kGridRowsMax = 30;
     rt64_3ds::ScreenGeometry geo_ = rt64_3ds::ScreenGeometry::make(320, 240);
     int grid_cols_ = 40, grid_rows_ = 30;
+    int grid_bx_ = 8, grid_by_ = 8;         // a grid block's size in N64 pixels (8, or more for a larger frame)
+    // RenderDesc::frame_sizes: the geometry the lists are read at (the
+    // reader's, set before each read) and the one the replay draws with
+    // (geo_, set from the record when it differs). A list read at another
+    // size than the one before gets no in-between.
+    rt64_3ds::ScreenGeometry read_geo_ = rt64_3ds::ScreenGeometry::make(320, 240);
+    bool frame_resized_ = false;
+    uint32_t inb_resize_ = 0;
+
+    // The frame's placement on the screen, at start and at a change of frame
+    // size: the projection, and the depth grid in blocks of at least 8 px
+    // (so a 320x240 frame keeps its 40x30 grid), at most 50x30 of them.
+    void apply_geometry(const rt64_3ds::ScreenGeometry& geo) {
+        geo_ = geo;
+        grid_bx_ = std::max(8, (geo_.w + kGridColsMax - 1) / kGridColsMax);
+        grid_by_ = std::max(8, (geo_.h + kGridRowsMax - 1) / kGridRowsMax);
+        grid_cols_ = std::min((geo_.w + grid_bx_ - 1) / grid_bx_, kGridColsMax);
+        grid_rows_ = std::min((geo_.h + grid_by_ - 1) / grid_by_, kGridRowsMax);
+        for (float& z : depth_grid_) z = 1.0f;
+        Mtx_OrthoTilt(&proj_, -geo_.x0, (float)geo_.w + geo_.x0, (float)geo_.h, 0.0f, 0.0f, 1.0f, true);
+        fprintf(stderr, "rt64-3ds: game frame %dx%d, x%.3f, %.1f-unit margins, depth grid %dx%d of %dx%d px\n",
+                geo_.w, geo_.h, geo_.scale, geo_.x0, grid_cols_, grid_rows_, grid_bx_, grid_by_);
+    }
+    // Before a list is read (RenderDesc::frame_sizes): the VI's width names
+    // the frame size it is drawn at; the interpreter reads the list in it.
+    void maybe_switch_frame_size() {
+        const rt64_3ds::RenderDesc& desc = rt64_3ds::render_desc();
+        if (desc.frame_size_count == 0) return;
+        const ultramodern::renderer::ViRegs* vi = ultramodern::renderer::get_vi_regs();
+        if (vi == nullptr) return;
+        const uint32_t width = vi->VI_WIDTH_REG & 0xFFF;
+        for (size_t i = 0; i < desc.frame_size_count; i++) {
+            const rt64_3ds::RenderDesc::FrameSize& fs = desc.frame_sizes[i];
+            if (fs.w != width) continue;
+            if (fs.w == read_geo_.w && fs.h == read_geo_.h) return;
+            read_geo_ = rt64_3ds::ScreenGeometry::make(fs.w, fs.h);
+            interp_.set_screen(read_geo_);
+            return;
+        }
+    }
+    // On the gfx thread, before anything of this list is placed: the
+    // geometry it was read at.
+    void apply_frame_geometry() {
+        frame_resized_ = false;
+        if (frame_.frame_w == 0 || (frame_.frame_w == geo_.w && frame_.frame_h == geo_.h)) return;
+        apply_geometry(rt64_3ds::ScreenGeometry::make(frame_.frame_w, frame_.frame_h));
+        frame_resized_ = true;
+    }
     int draw_lo_ = 0, draw_hi_ = 1 << 30;       // DRAW_RANGE.TXT
 
     // Decode (or find in the cache) every RDRAM texture the frame's draws
@@ -3899,6 +4020,9 @@ public:
     bool prev_cam_world_ = false;
     float prev_m22_ = 0.0f, prev_m32_ = 0.0f;
     float reticle_cx_ = 160.0f, reticle_cy_ = 120.0f;
+    bool aim_seen_ = false;                 // a hashed reticle rectangle was drawn last frame
+    int aim_log_ = -1;                      // AIM_TEX_LOG.TXT
+    std::vector<uint64_t> aim_logged_;
     float applied_conv_ = 0.0f, near_z_ = -1.0f, aim_z_ = -1.0f;
     float prev_sep_ = 0.0f, prev_conv_ = 0.0f;
     float aim_ema_ = -1.0f;
@@ -3915,7 +4039,8 @@ public:
     uint8_t* capture_copy_ = nullptr;
     OSTask capture_task_{};
     C3D_Tex white_{};
-    C3D_Tex snapshot_{};
+    C3D_Tex snapshot_[rt64_3ds::kMaxSnapshots]{};
+    int last_snap_slot_ = 0;                // the slot copy_snapshot_to last filled (verify_snapshot)
     uint32_t snapshots_ = 0;
     bool check_snapshot_ = false;
     bool gpu_debug_ = false, debug_sync_ = true;
