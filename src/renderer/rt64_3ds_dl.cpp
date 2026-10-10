@@ -2041,8 +2041,19 @@ struct Interpreter::Impl {
     // rectangles RT64 stretches for covering the width).
     void emit_rect_aligned(float ulx, float uly, float lrx, float lry, bool textured, int tile, float s, float t, float dsdx, float dtdy, bool flip,
                            float lshift, float rshift, const float* align, bool plain_origins) {
+        const float ulx_game = ulx, lrx_game = lrx;
         ulx += align[0]; uly += align[1];
         lrx += align[2]; lry += align[3];
+        // Align offsets that widen a rectangle already spanning the frame
+        // (Dinosaur Planet's menu backgrounds: CENTER origins and -/+ half
+        // the width) mean "cover the wide screen": it is spread over the
+        // screen with its texture, as a full-width rectangle is (stretch),
+        // not drawn 1:1 with the texels past the loaded ones clamped.
+        bool cover = false;
+        if ((align[0] != 0.0f || align[2] != 0.0f) && ulx_game <= 0.0f && lrx_game >= (float)screen_w && lrx - ulx > lrx_game - ulx_game) {
+            ulx = ulx_game; lrx = lrx_game;
+            cover = true;
+        }
         uint32_t cyc = (othermode_h >> 20) & 3;
         if (fix_rect_lr) {
             // RT64's rect.fixRectLR (rt64_rdp.cpp, drawRect): an edge within
@@ -2145,7 +2156,7 @@ struct Interpreter::Impl {
         // frame copy, spans the full width with plain origins (full-screen
         // fills and tints), or is tagged STRETCH, unless it is tagged ADJUST.
         const bool stretch = ((textured && (r.tex[0].snapshot || r.tex[0].frame)) || (plain_origins && ulx <= 0.0f && lrx >= (float)screen_w) ||
-                              rect_aspect == kAspectStretch) && rect_aspect != kAspectAdjust && cur_rtt < 0;
+                              rect_aspect == kAspectStretch || cover) && rect_aspect != kAspectAdjust && cur_rtt < 0;
         const float ulx_n64 = ulx, lrx_n64 = lrx;     // before any stretch (merge_rect_slices)
         if (stretch) {
             ulx = stretch_x(ulx);
