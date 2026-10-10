@@ -18,6 +18,8 @@
 #include <cstring>
 #include <string>
 
+extern "C" const char* recomp3ds_game_stall_info() __attribute__((weak));
+
 #include "recomp3ds.h"
 #include "recomp3ds_internal.h"
 #include "ultramodern/ultramodern.hpp"
@@ -91,6 +93,12 @@ void report(u64 stalled, const ultramodern::ThreadLoad* before, size_t before_n)
                 others += item;
             }
         }
+    }
+    // A game may name what its threads were running (a diagnostic build's
+    // function trace): recomp3ds_game_stall_info, weak.
+    if (recomp3ds_game_stall_info != nullptr) {
+        const char* info = recomp3ds_game_stall_info();
+        if (info != nullptr) fprintf(stderr, "recomp3ds: STALL: the game's last functions: %s\n", info);
     }
     fprintf(stderr, "recomp3ds: STALL: the main thread has not run for %.1f s; game thread running: %s; wake-ups since of the others: %s\n",
             (float)stalled * ms / 1000.0f, running.empty() ? "none" : running.c_str(), others.c_str());
