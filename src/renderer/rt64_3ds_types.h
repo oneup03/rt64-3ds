@@ -19,6 +19,9 @@ enum class Gbi : uint8_t { F3DEX2, F3DEX };
 #define RECOMP_MEM_SIZE_MB 16
 #endif
 constexpr uint32_t kRdramBytes = (uint32_t)RECOMP_MEM_SIZE_MB << 20;
+// A mask, so the model must be a power of two: 24 MB would clear bit 23 and
+// alias everything above 8 MB onto the first 8 MB.
+static_assert((kRdramBytes & (kRdramBytes - 1)) == 0, "RECOMP_MEM_SIZE_MB must be a power of two (16, 32, 64)");
 constexpr uint32_t kRdramMask = kRdramBytes - 1;
 
 // Where the game's frame sits on the 400x240 top screen, as RT64 lays it out

@@ -60,6 +60,12 @@ public:
     // The colour image a presented frame was drawn to: reads from it by a
     // later list are the game copying the screen (framebuffer effects).
     void note_presented_framebuffer(uint32_t addr);
+    // The VI's origin register: the buffer the console shows, wherever it
+    // lives (Dinosaur Planet keeps its 640x480 front-end buffers in patch
+    // RAM, above the 8 MB mark that note_presented_framebuffer treats as
+    // off-screen with render to texture on). It carries the mode's field
+    // offset: a colour image up to 4 KB below a noted origin is presented.
+    void note_vi_origin(uint32_t origin);
     // Stereo support: the projection group id of the world camera (its
     // projection is recorded in FrameRecord::cam), and whether orthographic
     // draws with an untagged modelview start a new record at every modelview

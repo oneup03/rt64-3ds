@@ -35,6 +35,14 @@ int main(int argc, char** argv) {
     rt64_3ds::ScreenGeometry geo = rt64_3ds::ScreenGeometry::make(320, 240);
     if (const char* e = getenv("DL_SCREEN")) { int w = 0, h = 0; if (sscanf(e, "%dx%d", &w, &h) == 2) geo = rt64_3ds::ScreenGeometry::make(w, h); }
     interp.set_screen(geo);
+    // DL_VI_ORIGINS=hex,hex,...: the VI origin register's values on the
+    // console (log "VI origin ... noted"): the presented framebuffers, for
+    // a game that keeps them above the 8 MB mark (Dinosaur Planet's 640x480
+    // front end), which the interpreter otherwise takes as off-screen.
+    if (const char* e = getenv("DL_VI_ORIGINS")) {
+        char buf[256]; strncpy(buf, e, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+        for (char* t = strtok(buf, ","); t != nullptr; t = strtok(nullptr, ",")) interp.note_vi_origin((uint32_t)strtoul(t, nullptr, 16));
+    }
     if (getenv("DL_RTT")) interp.set_render_to_texture(true);
     // RenderDesc::force_lod_branch = false (Banjo): G_BRANCH_Z tests the depth.
     if (getenv("DL_LOD_BRANCH")) interp.set_force_branch_z(false);

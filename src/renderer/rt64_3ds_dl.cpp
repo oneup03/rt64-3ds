@@ -979,6 +979,16 @@ struct Interpreter::Impl {
     // the last presented frame, and loads from the storage sample it.
     uint32_t vi_fbs[4] = {};
     int vi_fb_next = 0;
+    // The VI origin register's values (note_vi_origin): a framebuffer plus
+    // the mode's field offset (a line or two), so a colour image that short
+    // distance below one is that framebuffer.
+    uint32_t vi_origins[4] = {};
+    int vi_origin_next = 0;
+    static constexpr uint32_t kOriginSlack = 0x1000;
+    bool is_vi_origin_fb(uint32_t a) const {
+        for (uint32_t o : vi_origins) if (o != 0 && a <= o && o - a <= kOriginSlack) return true;
+        return false;
+    }
     // The storage buffers, one GPU copy each (kMaxSnapshots slots keyed by
     // base address; the least recently stored into makes way): Dinosaur
     // Planet's effects keep two snapshots and its pause a third, DK64 one.
@@ -1109,10 +1119,13 @@ struct Interpreter::Impl {
 
     bool is_presented_fb(uint32_t a) const {
         for (uint32_t fb : vi_fbs) if (fb != 0 && a == fb) return true;
-        return false;
+        return is_vi_origin_fb(a);
     }
     int rtt_for_cimg(uint32_t a, uint32_t width) {
         if (a == zimg) return -1;
+        // A framebuffer the VI presents is on screen wherever it lives
+        // (Dinosaur Planet keeps its 640x480 front-end buffers in patch RAM).
+        if (is_presented_fb(a)) return -1;
         if (!rtt_enabled) {
             if (!frame_copy || width == (uint32_t)screen_w || width == 0) return -1;
             // A copy target: one texture per address and width (Goemon draws
@@ -1131,7 +1144,7 @@ struct Interpreter::Impl {
         }
         // Known once two framebuffers have been presented (a double-buffered
         // game's second one is drawn before it is ever shown).
-        const bool known = vi_fbs[0] != 0 && vi_fbs[1] != 0;
+        const bool known = (vi_fbs[0] != 0 && vi_fbs[1] != 0) || (vi_origins[0] != 0 && vi_origins[1] != 0);
         if (!(a >= 0x800000 || (known && !is_presented_fb(a)))) return -1;
         for (int i = 0; i < rtt_count; i++) {
             if (rtt_images[i].addr == a) {
@@ -1163,6 +1176,7 @@ struct Interpreter::Impl {
 
     bool is_vi_framebuffer(uint32_t a) const {
         for (uint32_t fb : vi_fbs) if (fb != 0 && a >= fb && a < fb + (uint32_t)(screen_w * screen_h * 2)) return true;
+        for (uint32_t o : vi_origins) if (o != 0 && a + kOriginSlack >= o && a < o + (uint32_t)(screen_w * screen_h * 2)) return true;
         return false;
     }
 
@@ -1714,7 +1728,8 @@ struct Interpreter::Impl {
         // every off-screen image is, and so is colour drawn into the depth
         // buffer's memory (Banjo stores the paused frame there): its copy
         // of the front buffer becomes a snapshot.
-        return rtt_enabled ? (cur_rtt >= 0 || (zimg != 0 && cimg == zimg)) : (cimg >= 0x800000 || cur_rtt >= 0);
+        if (rtt_enabled) return cur_rtt >= 0 || (zimg != 0 && cimg == zimg);
+        return (cimg >= 0x800000 && !is_presented_fb(cimg)) || cur_rtt >= 0;
     }
 
     void emit_tri(int i0, int i1, int i2) {
@@ -2519,6 +2534,7 @@ struct Interpreter::Impl {
         }
     }
     bool profile = false;
+    uint32_t dbg_lists_ = 0, dbg_unknown_ = 0;   // the bring-up logs in run()
 
     bool run(uint32_t data_ptr) {
         tex_seq++;   // FrameRecord::tlut restarts: cached palette indices are stale
@@ -2526,6 +2542,13 @@ struct Interpreter::Impl {
         int depth = 0;
         uint32_t pc = seg(data_ptr);
         bool fullsync = false;
+        // The first lists, for a port's bring-up: where the list is and how
+        // it begins (a wrong pointer or byte order reads as unknown opcodes).
+        if (dbg_lists_ < 3) {
+            dbg_lists_++;
+            fprintf(stderr, "rt64-3ds: list %u at %08x (pc %06x): %08x %08x  %08x %08x  %08x %08x  %08x %08x\n", dbg_lists_, data_ptr, pc,
+                    r32(pc), r32(pc + 4), r32(pc + 8), r32(pc + 12), r32(pc + 16), r32(pc + 20), r32(pc + 24), r32(pc + 28));
+        }
         ProfScope prof;
         if (profile) { prof.prof = stats->prof; prof.t = prof_tick(); }
         for (uint32_t guard = 0; guard < 400000; guard++) {
@@ -2982,6 +3005,10 @@ struct Interpreter::Impl {
                 case F3DEX_G_CULLDL: stats->cull_dl++; break;
                 default:
                     stats->unknown++;
+                    if (dbg_unknown_ < 8) {
+                        dbg_unknown_++;
+                        fprintf(stderr, "rt64-3ds: unknown opcode %02x at %06x: %08x %08x (depth %d)\n", w0 >> 24, pc, w0, w1, depth);
+                    }
                     break;
             }
             pc = next;
@@ -3104,6 +3131,14 @@ void Interpreter::note_presented_framebuffer(uint32_t addr) {
     impl_->vi_fbs[impl_->vi_fb_next++ & 3] = addr;
 }
 
+
+void Interpreter::note_vi_origin(uint32_t origin) {
+    const uint32_t addr = origin & kRdramMask;
+    if (addr == 0) return;
+    for (uint32_t o : impl_->vi_origins) if (o == addr) return;
+    impl_->vi_origins[impl_->vi_origin_next++ & 3] = addr;
+    if (impl_->vi_origin_next <= 6) fprintf(stderr, "rt64-3ds: VI origin %08x noted (a presented framebuffer ends a line or two below it)\n", addr);
+}
 
 bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
     out.frame_w = (uint16_t)impl_->screen_w;

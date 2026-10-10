@@ -995,6 +995,11 @@ public:
         // In first person the reticle's quads must stay one per record.
         interp_.set_split_untagged_ortho(rt64_3ds::first_person_scene());
         maybe_switch_frame_size();
+        if (dbg_tasks_ < 3) {
+            dbg_tasks_++;
+            fprintf(stderr, "rt64-3ds: gfx task %u: data_ptr %08x size %u ucode %08x output %08x yield %08x\n", dbg_tasks_,
+                    (unsigned)task->t.data_ptr, (unsigned)task->t.data_size, (unsigned)task->t.ucode, (unsigned)task->t.output_buff, (unsigned)task->t.yield_data_ptr);
+        }
         const bool present = interp_.run(task->t.data_ptr, frame_);
         pass_next_ = present && interp_.last_list_plain();
         // Everything the replay reads from RDRAM is read by now once the
@@ -1509,8 +1514,16 @@ private:
         // (Banjo's jiggy transition renders the scene into its own image
         // and presents nothing): fill the texture, leave the screen with the
         // previous frame, as the VI would.
+        // A list that ends on a storage buffer it only copied the screen
+        // into (Dinosaur Planet's effects store every frame at the list's
+        // end) did draw the screen: the end image counts when a draw went
+        // into it.
         bool offscreen_frame = false;
-        for (const rt64_3ds::RttImage& img : frame_.rtts) if (img.addr != 0 && img.addr == frame_.color_image) offscreen_frame = true;
+        for (int r = 0; r < rt64_3ds::kMaxRtt; r++) {
+            const rt64_3ds::RttImage& img = frame_.rtts[r];
+            if (img.addr == 0 || img.addr != frame_.color_image) continue;
+            for (const rt64_3ds::DrawRecord& d : frame_.draws) if (d.rtt == r) { offscreen_frame = true; break; }
+        }
         // RenderDesc::fill_clear: the frame's leading full-screen fill
         // rectangle becomes the eyes' clear value, and is not drawn.
         u32 clear_value = eye_clear_;
@@ -3627,6 +3640,7 @@ public:
         if (desc.frame_size_count == 0) return;
         const ultramodern::renderer::ViRegs* vi = ultramodern::renderer::get_vi_regs();
         if (vi == nullptr) return;
+        interp_.note_vi_origin(vi->VI_ORIGIN_REG);
         const uint32_t width = vi->VI_WIDTH_REG & 0xFFF;
         for (size_t i = 0; i < desc.frame_size_count; i++) {
             const rt64_3ds::RenderDesc::FrameSize& fs = desc.frame_sizes[i];
@@ -3634,9 +3648,16 @@ public:
             if (fs.w == read_geo_.w && fs.h == read_geo_.h) return;
             read_geo_ = rt64_3ds::ScreenGeometry::make(fs.w, fs.h);
             interp_.set_screen(read_geo_);
+            fprintf(stderr, "rt64-3ds: VI width %u: lists read at %dx%d from here\n", width, read_geo_.w, read_geo_.h);
             return;
         }
+        if (width != vi_width_logged_) {
+            vi_width_logged_ = width;
+            fprintf(stderr, "rt64-3ds: VI width %u matches none of the game's frame sizes (lists read at %dx%d)\n", width, read_geo_.w, read_geo_.h);
+        }
     }
+    uint32_t vi_width_logged_ = 0;
+    uint32_t dbg_tasks_ = 0;
     // On the gfx thread, before anything of this list is placed: the
     // geometry it was read at.
     void apply_frame_geometry() {

@@ -16,6 +16,8 @@
 #include "ultramodern/error_handling.hpp"
 #include "ultramodern/events.hpp"
 #include "ultramodern/host_thread.hpp"
+#include "o1heap/o1heap.h"
+#include "librecomp/addresses.hpp"
 #include "recomp3ds.h"
 #include "recomp3ds_internal.h"
 #include "naudio_hle.h"
@@ -509,10 +511,21 @@ void update_gfx_inner() {
         char core2[16] = "", core3[16] = "";
         if (busy2 >= 0) snprintf(core2, sizeof(core2), " core2 %d%%", busy2);
         if (busy3 >= 0) snprintf(core3, sizeof(core3), " core3 %d%%", busy3);
-        if (log_stats) fprintf(stderr, "stats: %d dl/s%s (late %d, max gap %.0f ms) core0 %d%% core1 %d%%%s%s ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu low water %lu heap %lu KB%s%s%s%s%s%s\n",
+        // The recomp heap (recomp_alloc, o1heap inside RDRAM at the fixed
+        // heap_rdram_start without mods): what the game's patches take, for
+        // sizing RECOMP_MEM_SIZE_MB (Dinosaur Planet's ReAsset).
+        char rheap[64] = "";
+#ifdef RECOMP_NO_MODS
+        if (g_rdram != nullptr) {
+            const O1HeapDiagnostics d = o1heapGetDiagnostics((const O1HeapInstance*)(g_rdram + ((uint32_t)recomp::heap_rdram_start - 0x80000000u)));
+            snprintf(rheap, sizeof(rheap), " rheap %lu/%lu KB (peak %lu, oom %lu)", (unsigned long)(d.allocated / 1024), (unsigned long)(d.capacity / 1024),
+                     (unsigned long)(d.peak_allocated / 1024), (unsigned long)d.oom_count);
+        }
+#endif
+        if (log_stats) fprintf(stderr, "stats: %d dl/s%s (late %d, max gap %.0f ms) core0 %d%% core1 %d%%%s%s ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu low water %lu heap %lu KB%s%s%s%s%s%s%s\n",
                 st.dl_per_sec, want_fps, st.late_frames, st.max_gap_ms, busy0, busy1, core2, core3, ucode_ms, ucode_tasks, recomp3ds::audio_frames_queued(),
                 (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped, (unsigned long)(ac.low_water == 0xFFFFFFFFu ? 0u : ac.low_water),
-                (unsigned long)(mallinfo().arena / 1024), hle_stats, hle_ms.c_str(), "", rom_stats, game_stats, thread_stats.c_str());
+                (unsigned long)(mallinfo().arena / 1024), rheap, hle_stats, hle_ms.c_str(), "", rom_stats, game_stats, thread_stats.c_str());
         // On a line of its own: the log cuts lines at 512 characters.
         if (log_stats && dsp_stats[0] != '\0') fprintf(stderr, "%s\n", dsp_stats + 1);
         // One 40-column row: frames drawn and each core's load.
