@@ -972,7 +972,7 @@ struct Interpreter::Impl {
     uint32_t plain_cimg = 0;
     void note_target(bool fill) {
         if (cur_rtt >= 0) { plain = false; return; }
-        if (zimg != 0 && cimg == zimg) { if (!fill) plain = false; return; }
+        if (cimg_is_depth_memory()) { if (!fill) plain = false; return; }
         if (plain_cimg == 0) plain_cimg = cimg;
         else if (cimg != plain_cimg) plain = false;
     }
@@ -1128,6 +1128,13 @@ struct Interpreter::Impl {
     bool is_presented_fb(uint32_t a) const {
         for (uint32_t fb : vi_fbs) if (fb != 0 && a == fb) return true;
         return is_vi_origin_fb(a);
+    }
+    // Colour drawn into the depth buffer's memory (Banjo stores its paused
+    // frame there) is off screen, unless the game names a presented
+    // framebuffer as its depth image (Dinosaur Planet's 640x480 front end
+    // has no room for one and points at framebuffer 0): that is the screen.
+    bool cimg_is_depth_memory() const {
+        return zimg != 0 && cimg == zimg && !is_presented_fb(cimg);
     }
     int rtt_for_cimg(uint32_t a, uint32_t width) {
         if (a == zimg) return -1;
@@ -1744,7 +1751,7 @@ struct Interpreter::Impl {
         // every off-screen image is, and so is colour drawn into the depth
         // buffer's memory (Banjo stores the paused frame there): its copy
         // of the front buffer becomes a snapshot.
-        if (rtt_enabled) return cur_rtt >= 0 || (zimg != 0 && cimg == zimg);
+        if (rtt_enabled) return cur_rtt >= 0 || cimg_is_depth_memory();
         return (cimg >= 0x800000 && !is_presented_fb(cimg)) || cur_rtt >= 0;
     }
 
@@ -2071,7 +2078,7 @@ struct Interpreter::Impl {
             }
             if (cur_rtt < 0) return;
         }
-        if (!textured && zimg != 0 && cimg == zimg) return;   // depth clear: the target is cleared per frame
+        if (!textured && cimg_is_depth_memory()) return;   // depth clear: the target is cleared per frame
         state_seq++;
         out->draws.emplace_back();
         DrawRecord& r = out->draws.back();
@@ -3125,7 +3132,7 @@ struct Interpreter::Impl {
     bool list_plain = false;
     void end_list(bool fullsync) {
         list_plain = fullsync && plain && cur_rtt < 0 && (plain_cimg == 0 || plain_cimg == cimg) &&
-                     !(zimg != 0 && cimg == zimg) && cimg < 0x800000 && is_presented_fb(cimg);
+                     !cimg_is_depth_memory() && cimg < 0x800000 && is_presented_fb(cimg);
     }
 };
 
