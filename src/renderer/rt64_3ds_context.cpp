@@ -2996,9 +2996,34 @@ public:
         // this frame is drawn (the game thread keeps changing RDRAM).
         if (capture_copy_ == nullptr) capture_copy_ = (uint8_t*)malloc(16u * 1024 * 1024);
         if (capture_copy_ == nullptr) {
-            fprintf(stderr, "rt64-3ds: capture of frame %u refused: no memory for a 16 MB copy of RDRAM\n", frames_);
-            capture::set_message(4, "Capture refused: no memory");
+            // No memory for the copy (a game whose RDRAM model leaves the
+            // console little, Dinosaur Planet's 72 MB): written now, from
+            // RDRAM itself, on this thread. The game pauses meanwhile (it
+            // waits for this list's completion before its next frame), about
+            // 11 s on the console. The frame's image follows as ever.
+            char name[32];
+            if (direct_captures_ == 0) snprintf(name, sizeof(name), "gfx_task.bin");
+            else snprintf(name, sizeof(name), "gfx_task%d.bin", direct_captures_);
+            direct_captures_++;
+            fprintf(stderr, "rt64-3ds: capture of frame %u: no memory for a copy of RDRAM, writing %s now (the game pauses)\n", frames_, name);
+            capture::set_message(1, "Capture: no memory for a copy, writing %s now", name);
+            const u64 t0 = svcGetSystemTick();
+            const capture::Piece pieces[2] = { { task, (u32)sizeof(OSTask) }, { rdram_, 16u * 1024 * 1024 } };
+            capture::g_total_bytes = 16u * 1024 * 1024 + (u32)sizeof(OSTask);   // the progress lines' total
+            capture::g_done_bytes = 0;
+            const bool ok = capture::write_file(name, pieces, 2, true);
+            const float secs = (float)(svcGetSystemTick() - t0) / (float)SYSCLOCK_ARM11;
+            if (ok) {
+                fprintf(stderr, "rt64-3ds: capture written (%s, the first 16 MB of RDRAM) in %.1f s\n", name, secs);
+                capture::set_message(2, "Capture saved: %s (%.0f s)", name, secs);
+            }
+            else {
+                fprintf(stderr, "rt64-3ds: capture %s FAILED after %.1f s\n", name, secs);
+                capture::set_message(3, "Capture FAILED: %s, see log", name);
+            }
             capture_pair_next_ = false;
+            capture_task_ = *task;
+            fb_capture_pending_ = true;   // the next frame begin saves what this task rendered
             return;
         }
         memcpy(capture_copy_, rdram_, 16u * 1024 * 1024);
@@ -4076,6 +4101,7 @@ public:
     int capture_snapshot_frames_ = 0;
     int capture_want_ = -2, store_delay_ = -1;
     bool capture_pair_ = false, capture_pair_next_ = false;   // GFX_CAPTURE.TXT "pair <frame>"
+    int direct_captures_ = 0;                                   // written without a copy (no memory for one)
     bool rtt_capture_armed_ = false;            // GFX_CAPTURE.TXT "rtt"
     int seq_rtt_count_ = 0;                     // GFX_CAPTURE.TXT "seqrtt <count>"
     OSTask rtt_capture_task_{};
