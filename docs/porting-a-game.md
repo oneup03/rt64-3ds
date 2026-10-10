@@ -862,7 +862,12 @@ clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   computing for long held the scheduler and the audio thread back, and at
   the Old clock Goemon lost half its audio frames. nmr 0025 raises
   `ultramodern_preempt_pending`; Goemon's `TRACE_ENTRY` (include/trace.h,
-  run at every function's entry) tests it and calls `ultramodern_preempt`.
+  run at every function's entry) tests it and calls `ultramodern_preempt`,
+  as does Dinosaur Planet's `recomp_enter_function` (its recompiler fork's
+  entry hook, platform/3ds/dino_host_protos.h). A game whose recompiled
+  code has no such hook gets no preemption: a thread that polls between
+  messages then holds every other game thread back for good (Dinomod
+  Enhanced's title froze that way until the hook carried the check).
   A game without such a hook needs the recompiler to emit the check (Banjo
   and DK64 have none, so 0025 does nothing for them).
 - **Game code at -Os.** No gain (Banjo, Old clock): recompiled code is
