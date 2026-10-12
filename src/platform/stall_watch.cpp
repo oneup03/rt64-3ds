@@ -8,9 +8,11 @@
 // just ends. This thread, above them, notices the main thread's silence
 // and says which game thread has been running, and for how long.
 // It also puts a red line on the touch screen, for a photo when the log
-// can't say more, while one of these lasts 3 s: the main thread stopped, no
-// frame drawn, the log's card write not returning (a stuck card stops the
-// log, and a game reading its ROM from the card, without a word). When the
+// can't say more, while one of these lasts: the main thread stopped or no
+// frame drawn for 3 s, the log's card write not returning for 15 s (a stuck
+// card stops the log, and a game reading its ROM from the card, without a
+// word; a slow card takes over 3 s for some writes once the log has grown a
+// few MB, and the game runs on meanwhile). When the
 // screen and that line freeze too, the whole console stopped.
 #include <3ds.h>
 #include <atomic>
@@ -140,7 +142,7 @@ void alert(u64 main_stalled, u64 frames_stalled, uint32_t write_ms, int busy0, i
     int n = 0;
     if (main_stalled > 3ull * SYSCLOCK_ARM11) n += snprintf(line + n, sizeof(line) - n, "main %.0fs ", (float)main_stalled * s);
     if (frames_stalled > 3ull * SYSCLOCK_ARM11) n += snprintf(line + n, sizeof(line) - n, "frames %.0fs ", (float)frames_stalled * s);
-    if (write_ms > 3000) n += snprintf(line + n, sizeof(line) - n, "card write %us ", (unsigned)(write_ms / 1000));
+    if (write_ms > 15000) n += snprintf(line + n, sizeof(line) - n, "card write %us ", (unsigned)(write_ms / 1000));
     if (n > 0) {
         char text[64];
         snprintf(text, sizeof(text), "STOPPED: %s", line);

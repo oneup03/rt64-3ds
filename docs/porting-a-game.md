@@ -901,9 +901,10 @@ read from a photograph:
   running: <name> (for how long); wake-ups since of the others: ...` and
   `STALL over` when it runs again. `STALL_TEST.TXT` makes the main thread
   sleep 4 s once, about 40 s in, to check it.
-- The touch screen's bottom three rows turn red while the main thread, the
-  frames or the log's card write (`log_write_stuck_ms`) have stopped for
-  3 s (not while the HOME Menu or sleep has the screens, not before the
+- The touch screen's bottom three rows turn red while the main thread or
+  the frames have stopped for 3 s, or the log's card write
+  (`log_write_stuck_ms`) for 15 s (a slow card takes over 3 s for some
+  writes once the log is a few MB) (not while the HOME Menu or sleep has the screens, not before the
   first frame), drawn from the watcher's own thread with a try-lock and its
   own cache flush:
   - row 29: `STOPPED: main Ns / frames Ns / card write Ns`;
