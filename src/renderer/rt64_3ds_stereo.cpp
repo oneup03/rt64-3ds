@@ -8,7 +8,6 @@ namespace rt64_3ds {
 
 namespace {
 
-constexpr float kPxPerNdc = 200.0f;          // half the 400 px top screen
 constexpr float kHudMaxOffset = 0.04f;
 constexpr float kHudReferenceSeparation = 0.10f;   // the desktop's tuning anchor (slider 50)
 

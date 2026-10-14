@@ -19,6 +19,9 @@
 
 namespace rt64_3ds {
 
+// Desktop NDC offsets are fractions of the half screen width: 200 px here.
+constexpr float kPxPerNdc = 200.0f;
+
 // The first matching rule of the game's table, then the HUD id range, then
 // the game's defaults by projection type. Rectangles are their own class
 // unless a ProjKind::Rect rule names their projection group.

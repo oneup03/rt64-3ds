@@ -88,7 +88,7 @@ void recomp3ds::autotest_load(const char* base_path) {
         else if (strcasecmp(b, "HOME") == 0) { cmd->kind = HOME; }
         // "CAPTURE": this display list with RDRAM (gfx_task*.bin) and the
         // frame it draws (gfx_frame*.ppm), as a SELECT hold with
-        // debug_capture=1; "CAPTURE seq <count>": the next <count> frames
+        // dbg_capture=1; "CAPTURE seq <count>": the next <count> frames
         // shown, as images; "CAPTURE pair": this display list and the next,
         // with RDRAM, for the host tools.
         else if (strcasecmp(b, "CAPTURE") == 0) { cmd->kind = CAPTURE; if (n > 2) strncpy(cmd->text, c, sizeof(cmd->text) - 1); }

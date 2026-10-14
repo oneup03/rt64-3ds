@@ -321,39 +321,6 @@ BoundTex TextureCache::decode_into(uint64_t key, uint32_t h, const uint8_t* src,
         else memcpy(&impl_->stage16[y * potw], &impl_->stage16[(d.height - 1) * potw], potw * 2);
     }
 
-    // TEX_DUMP.TXT next to the executable: write the first decoded textures
-    // as PPM files with their descriptions, to check the decoder by eye.
-    // The file holds the frame number to start at (0 = from boot), and
-    // optionally an RDRAM address (hex) to dump only that texture's decodes.
-    static int dump_state = -1, dumped = 0, dump_from = 0;
-    static unsigned dump_addr = 0;
-    if (dump_state < 0) {
-        FILE* f = rt64_3ds::data_fopen("TEX_DUMP.TXT", "r");
-        dump_state = f ? 1 : 0;
-        if (f) { if (fscanf(f, "%d %x", &dump_from, &dump_addr) < 1) dump_from = 0; fclose(f); }
-    }
-    if (dump_state == 1 && dumped < 40 && (int)impl_->frame >= dump_from && (dump_addr == 0 || (rdram_addr & 0xFFFFFF) == (dump_addr & 0xFFFFFF))) {
-        char path[96];
-        char name[24];
-        snprintf(name, sizeof(name), "tex_%02d.ppm", dumped);
-        rt64_3ds::data_path(path, sizeof(path), name);
-        FILE* f = fopen(path, "wb");
-        if (f) {
-            fprintf(f, "P6\n%u %u\n255\n", (unsigned)d.width, (unsigned)d.height);
-            for (uint32_t y = 0; y < d.height; y++) for (uint32_t x = 0; x < d.width; x++) {
-                uint8_t px[3];
-                if (wide) { uint32_t v = impl_->stage32[y * potw + x]; px[0] = v >> 24; px[1] = v >> 16; px[2] = v >> 8; }
-                else if (la8) { uint16_t v = impl_->stage16[y * potw + x]; px[0] = px[1] = px[2] = (uint8_t)(v >> 8); }
-                else { uint16_t v = impl_->stage16[y * potw + x]; px[0] = ((v >> 11) & 31) * 8; px[1] = ((v >> 6) & 31) * 8; px[2] = ((v >> 1) & 31) * 8; }
-                fwrite(px, 1, 3, f);
-            }
-            fclose(f);
-        }
-        fprintf(stderr, "texdump %02d: addr %06x pitch %u fmt %u siz %u %ux%u masks %u/%u cm %u/%u pal %u tlut %u\n", dumped,
-                rdram_addr, d.pitch, d.fmt, d.siz, d.width, d.height, d.masks, d.maskt, d.cms, d.cmt, d.palette, d.tlut_mode);
-        dumped++;
-    }
-
     Entry e;
     if (!C3D_TexInitWithParams(&e.tex, nullptr, C3D_TexInitParams{ (u16)potw, (u16)poth, (u8)(levels - 1), fmt, GPU_TEX_2D, false })) {
         fprintf(stderr, "rt64-3ds: C3D_TexInit %ux%u (%u levels) failed\n", (unsigned)potw, (unsigned)poth, (unsigned)levels);

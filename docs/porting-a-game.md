@@ -117,8 +117,9 @@ renderer can't find out from the display lists:
 | `render_to_texture` | On for games that draw the world into an off-screen colour image and then sample it (Banjo's jiggy transition and picture puzzles). A frame that ends on an off-screen image isn't presented, as on the VI. |
 | (snapshots) | Storage buffers the game copies the presented frame into with rectangles are found by themselves (patch RAM, or any off-screen image with `render_to_texture`); up to `kMaxSnapshots` (4) of them at a time, each with a GPU copy of the frame presented when it was stored into (Dinosaur Planet's dissolve blends two, its pause a third; the least recently stored into makes way). `snapshot_buffers` | The RDRAM addresses the game copies the presented frame into with rectangles (DK64's pause background). They're sampled from a copy of the screen. |
 | `sample_drawn_frame` | For games that copy strips of the frame just drawn into images with texture rectangles and draw with them (Goemon's menu rims): a copy of each eye's frame is kept for the frames that do it. |
-| `force_lod_branch` | `true` (the desktop frontends' setting) always draws the near model of a `gSPBranchLessZ` pair. Set it `false` to keep the game's own level of detail, which is cheaper (Banjo). |
-| `depth_to_rdram` | Only for games that read the depth buffer on the CPU (DK64's camera). It costs a read-back every frame. With `frame_interpolation` it needs `double_eyes`: with one set of eye targets the depth read back would be the in-between's, so every list goes without one. |
+| `force_lod_branch` | `true` (the desktop frontends' setting) always draws the near model of a `gSPBranchLessZ` pair. Set it `false` to keep the game's own level of detail, which is cheaper (Banjo and, since 2026-10-14, DK64 on both consoles). |
+| `cull_dl` | `true`: `gSPCullDisplayList` ends a list whose tested vertices all lie off one side of the visible area, as the RSP does (the AND of the vertices' clip codes), with a quarter of the frame's width and height of slack each way for the eyes' shifts and the in-betweens; the object's draws, vertex transforms and texture loads are skipped. The desktop renderer ignores the command, so this was off until 2026-10-14. DK64 tests up to 40 objects a frame: its three captures lost 12-31 % of their draws and 9-29 % of their interpreted commands with the renders pixel-identical (the culled objects were being clipped away triangle by triangle); Banjo never uses it, since its 3DS build keeps the game's own CPU culling on (`culling_patches.c`, the frustum widened 1.25x), while DK64's recomp patches disable the game's for widescreen. The frame line's `culldl N/M` is lists ended / tests. |
+| `depth_to_rdram` | Only for games that read the depth buffer on the CPU (DK64's camera). It costs a read-back every frame: the renderer's 8x8 grid is read from the GPU's depth copy (the auto-convergence and the aim depth use it too), then the whole 320x240 RDRAM buffer is filled from it, which is the expensive half (about 2 ms a frame on a New 3DS, three times that at the Old clock, on the renderer's core). `depth_to_rdram_every` fills it every Nth game frame instead (`depth_to_rdram_every_old3ds` is the Old 3DS's value); the grid is still read every frame, so nothing else changes. DK64 sets 2 on an Old 3DS. With `frame_interpolation` it needs `double_eyes`: with one set of eye targets the depth read back would be the in-between's, so every list goes without one. |
 | `rules` as depth cameras | Every `World` rule of kind `Any` or `Perspective`, ranges included, names the depth cameras (the depth statistics, auto-convergence, the aim depth, the cut test; up to 8 rules): a game that tags its camera `0x10 + selector` gives `{0x10, 0x1F}`. None: `frame_head_proj_id`. |
 | `autoconv` | Tuning for depth-driven auto-convergence: the screen region measured, history length and approach/retreat rates. The defaults are DK64's; Banjo's cutscenes (close-ups low in the frame, cuts at 20 fps) wanted 0.9 / 5 / 0.4 / 1.8. |
 | `autoconv.near_clamp` | How near convergence may come, in world units (DK64 4, Goemon 2). |
@@ -134,9 +135,9 @@ renderer can't find out from the display lists:
 | (presented framebuffers) | The buffers the VI shows are read from its origin register before each list (`note_vi_origin`; the register carries the mode's field offset, so a colour image up to 4 KB below one matches): a list drawing into one is on screen wherever the buffer lives, even above the 8 MB mark that `render_to_texture` otherwise takes as off-screen (Dinosaur Planet keeps its 640x480 front-end buffers in patch RAM), and even when the game names that buffer as its depth image (its 480p mode has no room for one). A list that ends on a storage buffer it only copied the screen into is still on screen. `gEXSetRectAlign` offsets are in the rectangle's own quarter pixels, as RT64 adds them. |
 | `inbetween_offscreen` | With `render_to_texture`: the game draws its off-screen images anew every frame (Dinosaur Planet's shadow textures), so a list drawing off screen keeps its in-betweens, which draw their own versions of those images. Off: such a list gets none (`rtt` in the reasons), as an image drawn once and sampled for many frames must not be redrawn. |
 | `cut_min_jump` | Frame interpolation: a world camera that moves more than this many units between two lists, and ten times its move before, is a scene cut (no in-between). 5 by default; a fast camera that starts from rest (Dinosaur Planet's Cloudrunner at 20 units a frame) needs a higher floor, 40, or its first move drops an in-between. |
-| `aim_texture_hashes` | The aiming reticle by its texture, as the desktop fork finds Dinosaur Planet's (a 32x32 texture rectangle that moves across the screen, so no position test can name it): textured rectangles of 8..64 px, roughly square, have their texels hashed in the read (FNV-1a over the bytes the tile load reads and the palette entries it indexes; `DrawRecord::tex_hash`), and a match is the reticle, placed at the depth under it by the aim sampler (`sample_aim_depth`; its centre is the aim point), with the shift on whole pixels under `snap_hud_shift`. `AIM_TEX_LOG.TXT` beside the executable logs every candidate once (`aim-tex: <hash> WxH fmt siz tlut`) to collect them in Azahar while aiming. DK64's first-person quad heuristic (`set_first_person`) is unchanged. |
+| `aim_texture_hashes` | The aiming reticle by its texture, as the desktop fork finds Dinosaur Planet's (a 32x32 texture rectangle that moves across the screen, so no position test can name it): textured rectangles of 8..64 px, roughly square, have their texels hashed in the read (FNV-1a over the bytes the tile load reads and the palette entries it indexes; `DrawRecord::tex_hash`), and a match is the reticle, placed at the depth under it by the aim sampler (`sample_aim_depth`; its centre is the aim point), with the shift on whole pixels under `snap_hud_shift`. `dbg_aim_tex_log=1` in `settings.ini` logs every candidate once (`aim-tex: <hash> WxH fmt siz tlut`) to collect them in Azahar while aiming. DK64's first-person quad heuristic (`set_first_person`) is unchanged. |
 | `frame_interpolation` | Offers "60 interp." on the Frame rate row (`frame_cap=2`): for games whose patches tag their transforms for RT64's high frame rate (`gEXMatrixGroup*`). Goemon, DK64 and Banjo. A game's default of `frame_cap=2` (`GameDesc::menu_defaults`) becomes `GameDesc::old3ds_frame_cap` on an Old 3DS, which can't afford the in-betweens: 1, the 30 fps cap, by default (Goemon), or 0, the game's own rate (DK64, Banjo); `settings.ini` still decides. See "Frame rate". |
-| `eye_color16`, `eye_depth16`, `intensity_textures16`, `fill_clear` | The GPU's share of a frame: RGB565 eye colour buffers (snapshots then have no alpha; no dithering, so some banding), 16-bit eye depth, I/IA textures as LA8 (identical texels, half the size), and a frame's leading full-screen fill rectangle (the game's own clear) turned into the eyes' clear colour instead of a screen of fragments. Off by default. All three games set the last three (the console showed Banjo's and DK64's busiest scenes GPU-bound with 3D on; the pictures are the same); none sets `eye_color16`. Each is also a `settings.ini` key read at start (`gpu_color16`, `gpu_depth16`, `gpu_textures16`, `gpu_fill_clear`) for A/B tests on the console. With `depth_to_rdram`, check that 16-bit depth keeps the game's depth reads working: the write-back converts it. |
+| `eye_color16`, `eye_depth16`, `intensity_textures16`, `fill_clear` | The GPU's share of a frame: RGB565 eye colour buffers (snapshots then have no alpha; no dithering, so some banding), 16-bit eye depth, I/IA textures as LA8 (identical texels, half the size), and a frame's leading full-screen fill rectangle (the game's own clear) turned into the eyes' clear colour instead of a screen of fragments. Off by default. All three games set the last three (the console showed Banjo's and DK64's busiest scenes GPU-bound with 3D on; the pictures are the same); none sets `eye_color16`. With `depth_to_rdram`, check that 16-bit depth keeps the game's depth reads working: the write-back converts it. |
 | `double_eyes` | With `frame_interpolation`: the in-betweens draw into eye targets of their own (two more 240x400 colour + depth buffers: 1125 KB of VRAM at RGBA8/D16, 1500 KB at D24S8, taken after everything else and skipped when there isn't room), and the game's frame of each pair is recorded into a command buffer of its own while the GPU still draws the in-between; the presenter thread queues it. All three games set it. On an Old 3DS the library leaves it off whatever the game set, since "60 interp." is not its default there (`old3ds_frame_cap`) and the targets would hold the VRAM and a 512 KB command buffer for nothing; `gpu_double_eyes=1` in `settings.ini` turns it on there. See "Double eyes and the presenter". |
 | `early_drawn` | The game hears a display list drawn (the RDP's completion) once the renderer has read it, at "parsed", not when the renderer is done with it (nmr patch 0028, `ultramodern::renderer::report_list_drawn`). For a game that waits for the RDP before its next frame (Banjo's frame limiter does, every frame): with frame interpolation the renderer's waits for the screen otherwise come out of the game's frame time, and it misses retraces (Banjo's cutscenes fell behind their music). A list may then wait for the one before; `list_wait_us` says how long. With `depth_to_rdram` the game hears it a little later: once the last game frame's depth is in RDRAM, after the read and once the presenter is done with that frame, since the game must not run while its depth buffer is written. Banjo and DK64 set it. |
 
@@ -275,8 +276,7 @@ to the presenter. The GPU still runs the in-betweens first, since it
 follows the order they are queued in. That is safe because every frame sets
 all of its state at its start: combiner stages, depth, blend, alpha test,
 scissor, textures, uniforms, framebuffer. Frames with a capture or
-screenshot pending keep the old order. `BUILDER_OFF.TXT` keeps the builds on
-the gfx thread. The `frame interpolation timing:` line gives the builds and
+screenshot pending keep the old order. The `frame interpolation timing:` line gives the builds and
 what of them the gfx thread waited for.
 
 Moving the list's read to core 1 instead was weighed and not done:
@@ -302,7 +302,7 @@ has been granted to a `.3dsx` from the Homebrew Launcher; when it is
 refused, one thread builds as before (the boot log says which:
 `a thread on core 3:`). The timing line's `halves built on core 3` gives the
 helper's builds, their time, and how long the building thread waited for
-them. `BUILD_SPLIT_OFF.TXT` turns the helper off, for A/B tests. The touch
+them. The touch
 screen's status row shows core 3's load as `c3` when the system lets the
 application use the core.
 
@@ -395,7 +395,7 @@ is three lines; a new figure goes on a line of its own.
    frame): each flat draw's box must lie between its two game frames'
    boxes. Match draws by kind, count, tag and texture, never by index or
    vertex address (sprites come and go, buffers are per frame).
-   `INTERP_CHECK.TXT` runs that check on the console; it costs the gfx
+   `dbg_interp_check=1` runs that check on the console; it costs the gfx
    thread every frame, so leave it off otherwise.
 
 ### Testing in Azahar
@@ -435,8 +435,7 @@ the right eye's target and sign (`close_segment`, `queue_again`). That
 leaves the GPU where citro3d thinks it is, apart from what the ghost
 pass sets anyway. Frames that draw into other targets between the
 eyes' draws (off-screen images, `sample_drawn_frame`'s frame copy) and
-the GPU debug mode record both eyes as before, and so does
-`EYE_REPLAY_OFF.TXT`.
+the GPU debug mode record both eyes as before.
 
 ### Depth from a GPU copy
 
@@ -445,8 +444,7 @@ The game frame's depth (the stereo statistics, the aim sampler,
 frame for the grid. The GPU now copies the left eye's depth buffer to
 linear memory once that eye's draws are queued (`queue_depth_copy`), and
 the reads use the copy. The first eight copies, one every 300th frame,
-are checked against VRAM in the log (`depth copy check`). With
-`DEPTH_COPY_OFF.TXT` the reads use VRAM. `depth_to_rdram` writes the
+are checked against VRAM in the log (`depth copy check`). `depth_to_rdram` writes the
 game's depth buffer a word (two pixels) at a time.
 
 ### The list's record
@@ -470,10 +468,40 @@ So the renderer stays non-indexed. The host and Azahar were even on it too:
 x86 copies and float maths are cheap, so only the console settles such a
 change.
 
+### Culling
+
+Two culls keep off-screen geometry out of the renderer's work, both with
+their renders checked pixel-identical on the games' captures (`dl_test`):
+
+- `gSPCullDisplayList` (`RenderDesc::cull_dl`, the table above): the
+  game's own bounding-box test, honoured as the RSP does; it skips the
+  object's whole list, so the read's commands, matrices, texture lookups
+  and vertex transforms. Only a game that issues it benefits (DK64; Banjo
+  culls models on the CPU before it builds a list, and its 3DS build keeps
+  that culling on with the frustum widened to the screen).
+- The screen cull (`Interpreter::set_screen_cull`): a triangle whose three
+  vertices lie beyond the same edge of the visible area, by more than a
+  slack, can't cover a pixel, so it is dropped before the vertex buffer
+  and left out of the in-betweens instead of going to the GPU, which runs
+  its vertex shader and rejects it in setup. It needs nothing from the
+  game, but it comes after the read's transforms, so it saves vertex-buffer
+  writes, GPU vertex work and the in-between builder's share, not the
+  read. On the DK64 captures it dropped 23-47 % of the vertices sent to the
+  GPU (5-20 % on Banjo's). The visible area is the frame plus the wide
+  screen's margins (`ScreenGeometry::x0`): a test against the frame alone
+  ate the margins. The slack is a tenth of the frame on an Old 3DS (no
+  in-betweens there, and every vertex counts) and a quarter on a New 3DS
+  (an in-between may move what the game frame has just off the edge back
+  in), never less than twice the eyes' shift at infinity (`sep * 200 px`:
+  the world's shift is `sep * 200 * (conv / w - 1)`, so twice it covers
+  anything nearer than half the convergence distance); `dbg_screen_cull_pct`
+  holds another slack in percent for an A/B on the console,
+  `dbg_screen_cull_off` turns it off. The boot log says which.
+
 ### Textures in VRAM
 
 Textures go to VRAM, where the GPU reads them faster than from the linear
-heap (`TextureCache::set_vram`; `TEX_VRAM_OFF.TXT` keeps them linear). They
+heap (`TextureCache::set_vram`). They
 are decoded into the linear heap as ever. Before a frame begins, the gfx
 thread copies up to 8 a frame into VRAM with `C3D_SyncTextureCopy`, each on
 a queue of its own. Inside a frame the copies overflowed citro3d's 32-entry
@@ -510,7 +538,7 @@ samples it with the mip filter (linear between levels when the tile is
 bilinear). The combiner reads TEXEL1 as TEXEL0, so the lerp falls away and
 no second texture is sampled. Before this, such draws read both tiles at
 every pixel and kept only the first (LOD_FRACTION was a constant 0).
-`MIPMAP_OFF.TXT` draws the base level alone; TEXEL1 is still left out.
+TEXEL1 is still left out.
 Banjo's level geometry is drawn this way: 32x32 RGBA16 with 16x16 and 8x8
 levels (and a 4x4 the PICA can't use); 19 of 104 draws in a Spiral Mountain
 capture, on 10 textures (the other G_TL_LOD draws have level 0 and never
@@ -559,7 +587,7 @@ per pair, and with `double_eyes` what the presenter waited instead; compare
 
 Check a frame on the host before blaming the console: set
 `GFX_CAPTURE.TXT` to a frame number to write that frame's RDRAM and task to
-`gfx_task.bin` (or hold SELECT for a second with `debug_capture=1` in
+`gfx_task.bin` (or hold SELECT for a second with `dbg_capture=1` in
 `settings.ini`, or `CAPTURE` in a test script). One writer thread writes
 captures (about 11 s for the 16 MB on the console) while the game plays on;
 one asked for meanwhile is refused, and the touch screen says so. Then
@@ -630,19 +658,10 @@ line otherwise, which is the first sign that a game's build differs.
 
 Verifying a new game's command stream:
 
-- `AUDIO_DIFF.TXT` next to the executable: every command also runs through
-  the recompiled microcode and mismatches are logged (`naudio-hle:` or
-  `aspmain-hle:` lines). The scalar vector unit used to multiply two
-  unsigned lanes in `int` (VMUDL, VMADL), which overflows; GCC for the
-  ARM11 exploits that, so the console's reference computed Goemon's
-  envelope ramps a few LSBs off the desktop's, about ten commands a task
-  (DK64's rare one-LSB envelope-init reports are likely the same).
-  `nmr-patches/nmr/0021` fixes it: re-run `nmr-patches/apply.sh` on the
-  game's runtime before trusting a console diff.
 - `AUDIO_CAPTURE.TXT`: tasks N to N+7 (N from the file, 200 when it names
   none) are written to `audio_task_N.bin` (RDRAM + OSTask, 16 MB each),
   whether the interpreter or the recompiled microcode runs them
-  (`AUDIO_RSP.TXT` selects the latter). `tools/naudio_test/build.sh <game
+  (`dbg_audio_rsp=1` selects the latter). `tools/naudio_test/build.sh <game
   repo>` (`HLE=aspmain` for that family, `SISD=1` for the scalar vector path
   the console runs) builds a host harness that replays them against the x86
   microcode: whole task (all of RDRAM, and DMEM for aspMain), `--lockstep N`
@@ -785,8 +804,6 @@ Checking a game's synth:
   - `remaps` (the AI clock jumped), 0;
   - `callbacks` (about 204.5 a second);
   - `lists skipped`, which equals the game's audio frames per second.
-- `DSP_SYNTH_TRACE.TXT` beside the executable (the number of seconds inside)
-  logs every event with its time and arguments.
 - Compare loudness and timing with the RSP engine by recording Azahar's own
   audio stream: `pw-dump` gives the stream's `object.serial`, and
   `pw-record --target <serial>` records it.
@@ -796,8 +813,7 @@ Not done:
   never moves the aux bus's samples between the DSP and the CPU. An enabled
   bus mixes its raw sends back into the output. `dsp_reverb.cpp` keeps a
   working effect engine (libaudio and n_audio's sections, with DK64's
-  layout) behind `kAuxReturn = false`, and `REVERB_OFF.TXT` is its A/B
-  switch.
+  layout) behind `kAuxReturn = false`.
 - **Sample-accurate starts.** Events land on DSP frames (4.9 ms).
 - **More channels.** There are 23 voice channels; Banjo's 24 and DK64's 30
   physical voices share them, the least recently used going first.
@@ -810,8 +826,8 @@ in Banjo.
 
 ## CPU budget (Old 3DS)
 
-The **CPU speed** row runs a New 3DS at 268 MHz without L2 (the Old 3DS
-clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
+`dbg_old_clock=1` in `settings.ini` runs a New 3DS at 268 MHz without L2 (the
+Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
 
 - **Where the time goes.** The stats line reports:
   - `core0` / `core2` loads (`core1` instead of `core2` with two cores);
@@ -822,10 +838,10 @@ clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
     CPU, and so is any game thread whose loop is a branch to self: Banjo's
     INIT thread's large share is the game waiting, not working.
 
-  `PROFILE.TXT` adds the renderer's split by command kind. The touch
-  screen shows frames and each core's load. settings.ini's `debug_rows=1`
+  `dbg_profile=1` adds the renderer's split by command kind. The touch
+  screen shows frames and each core's load. settings.ini's `dbg_rows=1`
   adds the thread shares and the audio rows. loadmon's calibrations follow
-  the CPU speed row's clock: 268 and 804 MHz, exactly 1:3.
+  the clock chosen: 268 and 804 MHz, exactly 1:3.
 - **Logging.** settings.ini's `log_level` (log.cpp) has three levels:
   - 2: everything (for tests).
   - 1, the New 3DS default: no renderer reports or late-frame lines, and
@@ -838,7 +854,7 @@ clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   console (later entries win).
 
   Each line costs a debug-string syscall, a copy and its share of the card
-  writes on core 0; `PROFILE.TXT` costs far more (about 18 % in Goemon; it
+  writes on core 0; `dbg_profile` costs far more (about 18 % in Goemon; it
   reads the clock once per command, about 1.5 us at the Old clock, 16 %
   fewer frames in Banjo, most of it on the triangles, the most numerous
   commands). Azahar buffers its own log and loses the tail
@@ -899,10 +915,11 @@ read from a photograph:
   beat for 3 s it logs
   `recomp3ds: STALL: the main thread has not run for N s; game thread
   running: <name> (for how long); wake-ups since of the others: ...` and
-  `STALL over` when it runs again. `STALL_TEST.TXT` makes the main thread
-  sleep 4 s once, about 40 s in, to check it.
+  `STALL over` when it runs again.
 - The touch screen's bottom three rows turn red while the main thread or
-  the frames have stopped for 3 s, or the log's card write
+  the frames have stopped for 3 s (15 s while the game has the video
+  blanked: DK64 draws nothing through its loads, 4-7 s on an Old 3DS,
+  which lit the row at every load), or the log's card write
   (`log_write_stuck_ms`) for 15 s (a slow card takes over 3 s for some
   writes once the log is a few MB) (not while the HOME Menu or sleep has the screens, not before the
   first frame), drawn from the watcher's own thread with a try-lock and its
@@ -992,7 +1009,7 @@ What has frozen a console so far:
   to about 0.2 %. For gains of a few percent, A/B inside one boot: a switch
   file read at a known point (the demo loop's second pass) flips the
   change, and demos 0-7 are compared with 8-15 in one log.
-- The console A/B switches are files beside the executable (the table
+- The console A/B switches are `dbg_*` keys in `settings.ini` (the table
   below); a build of the previous renderer in its own build directory
   bisects what a switch doesn't cover.
 
@@ -1030,8 +1047,7 @@ What has frozen a console so far:
   core 0 is idle during the read anyway (the read took 26 ms on core 1
   against about 21 on core 0). A game that does not wait on "parsed"
   should leave it off: there the read on core 1 runs beside the game. The
-  reader flushes the vertices it wrote from its own core. `READER_OFF.TXT`
-  keeps the read on the gfx thread.
+  reader flushes the vertices it wrote from its own core.
   With the reader on core 0 (2026-10-07), Banjo got 16.8 and 19.2 lists a
   second (from 16.3 and 18.7), core 0 at 95 % and core 1 at 35 %. At first
   the reader ran above the game's threads. Banjo's audio thread then
@@ -1052,8 +1068,7 @@ What has frozen a console so far:
   output in the read as before. It is off with `merge_image_tiles`, whose
   compaction renumbers the records. On the host, Banjo's read got about
   20 % shorter. `DL_DEFER=1` makes `dl_test` defer: the dumps and
-  in-betweens match without it. `TRIS_ON_READER.TXT` keeps the output in
-  the read.
+  in-betweens match without it.
 - The vertex loads are deferred too. The read copies each vertex's 16 RDRAM
   bytes and records its load's context: the matrix, texture scales and fog
   terms, plus for a lit load its lighting (light directions and colours,
@@ -1066,7 +1081,7 @@ What has frozen a console so far:
   bit-identical (`dl_test DL_DEFER=1` against `DL_DEFER=tris` and no
   deferral); it must stay inline, or the normal path is 6 % slower. It
   stays off while frame interpolation records the list, which needs the
-  lit colours then. `VERTS_ON_READER.TXT` keeps the transforms in the read.
+  lit colours then.
 - The gfx thread does the deferred output while the read is still going
   (`Interpreter::drain_triangles`). It would otherwise sit idle, and each
   list goes through it in order: read wait, output, drawing. When that
@@ -1093,7 +1108,7 @@ What has frozen a console so far:
   from such a copy and from RDRAM and compares: identical on 18 Banjo and
   DK64 captures. Within a list a texture asked for again gets the first
   answer (`TextureCache::begin_list`): Banjo repeats 40-60 % of them.
-  `DECODE_ON_READER.TXT` keeps the decoding in the read. Matrices stay in
+  Matrices stay in
   the read: about 120 multiplies and 285 combined-matrix updates a list in
   Banjo (~0.5 ms), not worth moving.
 - Banjo at the Old clock, timed over the attract demos (see "Measuring"):
@@ -1104,7 +1119,7 @@ What has frozen a console so far:
   a list), then the read (about 14). Running the game a list ahead (the
   read on core 1, beside the game) would put about 42 ms a list on core 1,
   about 19 lists a second: no gain.
-- The Game page's **Cores** row (Auto / "2, game on 1" / "2, game on 0", key `cores`,
+- `settings.ini`'s `dbg_cores` (0 auto, 1 "2, game on 1", 2 "2, game on 0",
   read at start) gives a New 3DS the Old 3DS's layout, to test it on one;
   Auto on an Old 3DS uses the game's choice. The renderer's in-between
   builder (core 1) is off without core 2 (`Settings::no_core2`), and the
@@ -1119,46 +1134,45 @@ What has frozen a console so far:
   during play. The in-between helper runs there (above); a boot-log line
   records whether the application was allowed.
 
-## Switch files and settings keys
+## Files, switches and settings keys
 
-Files beside the executable (`sdmc:/3ds/<sd_dir>/`), read at start unless
-said otherwise. They are for A/B tests on the console and for the host
-checks; a player never needs one. Each is also named where its feature is
-described.
+Four files beside the executable (`sdmc:/3ds/<sd_dir>/`) are one-shot
+inputs a job needs. They stay files because each would run again at every
+start if it were a setting.
 
 | File | Effect |
 |---|---|
 | `AUTOTEST.TXT` | An input script for unattended runs (`WHEN <log text>` phases, key presses by frame, `SHOT`, `TOUCH`, `CAPTURE pair`/`seq N`, `HOME`, `EXIT`; the format is in `autotest.cpp`); `tools/azahar-run.sh --script` copies one in. |
-| `GFX_CAPTURE.TXT` | A frame number, `pair <frame>` or `seq`: writes that frame's RDRAM and task to `gfx_task.bin` for `dl_test` (`seq`: every frame put on the screen). |
-| `CAPTURE_THROTTLE.TXT` | Milliseconds of sleep per capture request, to emulate a slow card. |
-| `STORE_DEBUG.TXT` | Logs every draw of the frame three frames after each store of the screen. |
-| `FRAME_TRACE.TXT` | `<first> <count>`: a log line per replayed frame from `first` with the replay's decisions (draws recorded and issued, colour image, snapshot store, off-screen, fill skip, eyes, geometry, eye set), to find frames that come out black. |
-| `DRAW_RANGE.TXT` | `<first> <last>`: replays only those draws of every frame (to find the one that breaks a picture). |
-| `NO_SCISSOR.TXT` | No scissor, to see draws a wrong clip would hide. |
-| `GPU_DEBUG.TXT` | `<start frame> <frame count> <sync 0/1> <every N frames>`: the GPU debug mode (a sync per draw, to find the draw that hangs the GPU). |
-| `SNAPSHOT_CPU.TXT` | Copies the screen snapshot with the CPU to check the GPU copy, in the emulator only: the CPU can't write VRAM on the console. |
-| `TEX_DUMP.TXT` | Writes the first decoded textures to files. |
-| `PROFILE.TXT` | The `read profile per list:` line (costly: it reads the clock once per command). |
-| `EARLY_DRAWN_OFF.TXT` | Ignores `RenderDesc::early_drawn`. |
-| `BUILDER_OFF.TXT` | In-betweens built on the gfx thread, not core 1. |
-| `BUILD_SPLIT_OFF.TXT` | No core-3 helper: one thread builds each in-between. |
-| `INTERP_CHECK.TXT` | Checks each in-between's flat draws against their game frames and logs the ones that land outside. |
-| `EYE_REPLAY_OFF.TXT` | Both eyes recorded, instead of the right from the left's commands. |
-| `DEPTH_COPY_OFF.TXT` | Depth read by the CPU from VRAM, not from the GPU copy. |
-| `TEX_VRAM_OFF.TXT` | Textures stay in the linear heap. |
-| `MIPMAP_OFF.TXT` | Base level only for the game's mipmapped draws. |
-| `READER_OFF.TXT` | The list read on the gfx thread (two cores). |
-| `TRIS_ON_READER.TXT`, `VERTS_ON_READER.TXT`, `DECODE_ON_READER.TXT` | The triangles' output, the vertex transforms, the texture decoding done in the read rather than on the gfx thread. |
-| `SLOW.TXT` | `<gfx ms> <audio ms>`: pads every display list and audio task by that much, to mimic a slower console in the emulator. |
-| `AUDIO_CORE.TXT` | `1` or `2`: forces the audio task's core. |
-| `AIM_TEX_LOG.TXT` | Logs every candidate reticle texture's hash once (`RenderDesc::aim_texture_hashes`). |
-| `AUDIO_DIFF.TXT` | Runs the recompiled audio microcode alongside the interpreter and logs mismatches. |
+| `GFX_CAPTURE.TXT` | A frame number, `pair <frame>`, `seq`, `snap`, `rtt`, `seqrtt <count>` or `cam`: writes that frame's RDRAM and task to `gfx_task.bin` for `dl_test` (`seq`: every frame put on the screen). |
 | `AUDIO_CAPTURE.TXT` | Writes eight audio tasks from the number inside (default 200) to `audio_task_N.bin` (16 MB each, on the task thread: audio stalls while it writes). |
-| `AUDIO_RSP.TXT` | Runs the recompiled audio microcode instead of the interpreter. |
 | `AUDIO_WAV.TXT` | `<start> <length>` in seconds: records the output to `audio.wav` (loudness comparisons; the source for a banner sound, which is then the game's own audio and must not be shipped). |
-| `DSP_SYNTH_TRACE.TXT` | Logs every DSP synth event for the number of seconds inside. |
-| `REVERB_OFF.TXT` | The reverb engine's A/B switch (inactive while `kAuxReturn` is false). |
-| `STALL_TEST.TXT`, `STALL_DUMP_TEST.TXT` | The main thread sleeps 4 s once about 40 s in; the stall dump runs once after 30 s. Both check the watch. |
+
+Every other switch is a `dbg_*` key in `settings.ini`: hidden rows, so the
+file carries them all at 0 after the first run; 0 is off, the normal
+behaviour; read at start. They are A/B switches and diagnostics for the
+console and the host checks, nothing a player needs. Each is also named
+where its feature is described. (Until 2026-10-14 these were `*.TXT` files
+beside the executable; the settled experiments' switches went: the reader's
+layout, textures in VRAM, mipmaps, the core-1 builder, the capture throttle,
+the store and snapshot checks, the audio differential mode, the reverb A/B,
+the stall dump test and self-test, the audio core choice, the synth trace, and
+the early-drawn, eye-replay, depth-copy, build-split and CULLDL A/Bs, and the
+`gpu_*` overrides of the eye formats, fill clears, depth interval and LOD.)
+
+| key | effect |
+|---|---|
+| `dbg_profile` | The `read profile per list:` line (costly: it reads the clock once per command). |
+| `dbg_screen_cull_off`, `dbg_screen_cull_pct` | The screen cull off, or its base slack in percent of the frame (`10`, `25`) in place of the console's default; see "Culling". |
+| `dbg_interp_check` | Checks each in-between's flat draws against their game frames and logs the ones that land outside (costs the gfx thread every frame). |
+| `dbg_no_scissor` | No scissor, to see draws a wrong clip would hide. |
+| `dbg_frame_trace_from`, `dbg_frame_trace_count` | A log line per replayed frame from `from` for `count` frames with the replay's decisions (draws recorded and issued, colour image, snapshot store, off-screen, fill skip, eyes, geometry, eye set), to find frames that come out black. |
+| `dbg_draw_first`, `dbg_draw_last` | With `last` above 0: replays only those draws of every frame (to find the one that breaks a picture). |
+| `dbg_gpu_debug_from`, `dbg_gpu_debug_count`, `dbg_gpu_debug_sync` | With `count` above 0: the GPU debug mode (a sync per draw with `sync` 1, to find the draw that hangs the GPU) for `count` frames from `from`. |
+| `dbg_aim_tex_log` | Logs every candidate reticle texture's hash once (`RenderDesc::aim_texture_hashes`). |
+| `dbg_old_clock` | A New 3DS at the Old 3DS clock (268 MHz, no L2), applied at start. |
+| `dbg_cores` | The two-core layouts an Old 3DS has, on a New 3DS: 1 the game on core 1, 2 on core 0 (read at start). |
+| `dbg_slow_gfx_ms`, `dbg_slow_audio_ms` | Pads every display list and audio task by that much, to mimic a slower console in the emulator. |
+| `dbg_audio_rsp` | Runs the recompiled audio microcode instead of the interpreter. |
 
 The menu writes every row it knows to `settings.ini`, the hidden ones
 included, so after a game's first run the file pins every default: a changed
@@ -1175,12 +1189,13 @@ library's keys:
 | `stick_deadzone`, `cstick_deadzone`, `cstick_up`, `cstick_camera` | 5, 20, 1, 1 (`cstick_camera` only with `GameDesc::cstick_camera_hold`) | Controls | `input_set_*` |
 | `audio` | 1 | Game | `audio_set_enabled` |
 | `frame_cap` | 0; the games 2, which an Old 3DS turns into `old3ds_frame_cap` | Game | the gfx thread |
-| `cpu_speed` | 1 | Game, New 3DS only | `set_cpu_speed` |
-| `cores` | 0 (Auto) | Game, read at start | the core layout |
+| `dbg_old_clock` | 0 | none, New 3DS only | `set_cpu_speed` (1 runs at the Old 3DS clock) |
+| `dbg_cores` | 0 (Auto) | none, read at start | the core layout (1 two cores with the game on core 1, 2 on core 0) |
 | `rom_stream` | 0 (auto) | none, read at start | the ROM stream |
 | `log_level` | 1 on a New 3DS, 0 on an Old | none | `log_set_level` |
-| `debug_rows`, `debug_capture` | 0, 0 | none | the touch screen's stats rows; SELECT held for a capture |
-| `gpu_color16`, `gpu_depth16`, `gpu_textures16`, `gpu_fill_clear`, `gpu_double_eyes` | the `RenderDesc` values; `gpu_double_eyes` off on an Old 3DS | none, read at start | the renderer's init |
+| `dbg_rows`, `dbg_capture` | 0, 0 | none | the touch screen's stats rows; SELECT held for a capture |
+| `dbg_*` | 0 | none, read at start | the table above |
+| `gpu_double_eyes` | the `RenderDesc` value; off on an Old 3DS | none, read at start | the renderer's init |
 | `audio_engine` | 1 (the DSP synth) for a game with `GameDesc::synth` | none | `dsp_synth_set_enabled` |
 | `mod.<id>`, `mod.<id>.<option>` | absent = off, the manifest's defaults | Mods | the baked mods, before they load |
 | `game_mode` | none | the picker at start | the game-mode picker |
@@ -1228,7 +1243,12 @@ fed from tables compiled into the executable.
   wants bigger blocks (128 KB), one that reads small pieces at random
   wants small ones. A miss also queues the next block for a read-ahead
   thread (core 3 on a New 3DS), so a run of reads finds its next block in
-  the cache while the game uses the one before.
+  the cache while the game uses the one before. The stats line's
+  `rom N reads (M KB) waited T ms in W (max X)` counts the card reads and
+  the game's waits in the stream (calls over 50 us), so a slow load can be
+  told from a slow card: a 15-minute DK64 session on an Old 3DS made 148
+  reads (4.7 MB) in all, about 10 per load, so its 4-7 s loads are not
+  waiting on a 2 MB cache; the waits figure says what they wait for.
 - **`GameDesc.required_mods`**: mods that are part of the game (Dinosaur
   Planet's Dinomod Enhanced): on whatever `settings.ini` says, no on/off
   row on the Mods page (their options still show), and a message plus exit

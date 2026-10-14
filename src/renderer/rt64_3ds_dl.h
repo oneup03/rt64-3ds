@@ -22,6 +22,7 @@ struct InterpreterStats {
     uint32_t mtx_loads = 0, vtx_loaded = 0, draws_merged = 0, probes = 0, clipped = 0;
     uint32_t rects_merged = 0;     // rectangles stretched as slices of a full-width row (merge_rect_slices)
     uint32_t branch_z_taken = 0, branch_z_not = 0, cull_dl = 0;   // level-of-detail branches, cull tests
+    uint32_t cull_dl_culled = 0;   // ... of cull_dl, tests that ended their list (set_cull_dl)
     uint32_t refresh_rate = 0;     // the game's intended frame rate (gEXSetRefreshRate), 0 = not given
     uint32_t image_tris = 0;       // triangles sampled from a whole image (merge_image_tiles)
     uint32_t image_fallbacks = 0;  // ... and those of such tiles that kept their tile (coordinates outside it)
@@ -76,12 +77,20 @@ public:
     struct ProjIdRange { uint32_t lo, hi; };
     void set_world_proj_ranges(const ProjIdRange* ranges, int count);
     void set_world_proj_ids(const uint32_t* ids, int count);
-    // RenderDesc::aim_texture_hashes (or AIM_TEX_LOG.TXT): hash the texels of
+    // RenderDesc::aim_texture_hashes (or dbg_aim_tex_log): hash the texels of
     // every candidate reticle rectangle into DrawRecord::tex_hash.
     void set_aim_hash(bool on);
     void set_split_untagged_ortho(bool on);
     // Always take G_BRANCH_Z (the near model), as the recomp frontends do.
     void set_force_branch_z(bool on);
+    // gSPCullDisplayList honoured (RenderDesc::cull_dl): a list whose tested
+    // vertices all lie off one side of the visible area ends there.
+    void set_cull_dl(bool on);
+    // The screen cull: triangles wholly beyond one edge of the visible area
+    // (the frame and the wide screen's margins), by more than slack * the
+    // frame's size, are dropped before the vertex buffer and left out of
+    // the in-betweens (below zero: off, the default).
+    void set_screen_cull(float slack);
     // The display-list encoding the game's lists use (F3DEX2 by default).
     void set_gbi(Gbi gbi);
     // Draw off-screen colour images into textures of their own instead of

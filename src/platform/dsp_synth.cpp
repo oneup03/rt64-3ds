@@ -653,45 +653,7 @@ uint32_t heard_at(int32_t samples) {
     return ahead < 0 ? now : (ahead > most ? now + (uint32_t)most : t);
 }
 
-// DSP_SYNTH_TRACE.TXT beside the executable: every event for its first
-// seconds (the number in the file, 5 by default) goes to the log.
-int g_trace_left = -1;          // events still to log; -1: not yet looked
-uint32_t g_trace_until = 0;     // the AI stream's sample
-
-void trace(const Event& e) {
-    if (g_trace_left < 0) {
-        g_trace_left = 0;
-        char path[192];
-        snprintf(path, sizeof(path), "%s/DSP_SYNTH_TRACE.TXT", recomp3ds::base_path());
-        if (FILE* f = fopen(path, "r")) {
-            int secs = 5;
-            if (fscanf(f, "%d", &secs) != 1 || secs <= 0) secs = 5;
-            fclose(f);
-            g_trace_left = 4000;
-            g_trace_until = recomp3ds::audio_frames_played() + (uint32_t)secs * recomp3ds::audio_rate();
-            fprintf(stderr, "dsp-synth: tracing events for %d s\n", secs);
-        }
-    }
-    const uint32_t now = recomp3ds::audio_frames_played();
-    if (g_trace_left <= 0 || (int32_t)(now - g_trace_until) > 0) return;
-    g_trace_left--;
-    static const char* const kNames[] = { "start", "stop", "vol", "pitch", "pan", "fx" };
-    const double rate = (double)recomp3ds::audio_rate();
-    fprintf(stderr, "dsp-synth: %.3f +%.3f %08lx %s", now / rate, (int32_t)(e.due - now) / rate, (unsigned long)e.key, kNames[e.kind]);
-    switch (e.kind) {
-        case EvStart: fprintf(stderr, " base %06lx len %lu type %u loop %lu-%lu x%ld", (unsigned long)g_waves[e.wave].base, (unsigned long)g_waves[e.wave].len,
-                              g_waves[e.wave].type, (unsigned long)g_waves[e.wave].loop_start, (unsigned long)g_waves[e.wave].loop_end, (long)g_waves[e.wave].loop_count); break;
-        case EvVol: fprintf(stderr, " %d ramp %lu us%s", (int)e.vol, (unsigned long)e.ramp_us, e.from_silence ? " from 0" : ""); break;
-        case EvPitch: fprintf(stderr, " %.4f", e.pitch); break;
-        case EvPan: fprintf(stderr, " %d", (int)e.pan); break;
-        case EvFx: fprintf(stderr, " %d", (int)e.fx); break;
-        default: break;
-    }
-    fprintf(stderr, "\n");
-}
-
 void queue(Event&& e) {
-    trace(e);
     LightLock_Lock(&g_lock);
     g_events.push_back(std::move(e));
     LightLock_Unlock(&g_lock);

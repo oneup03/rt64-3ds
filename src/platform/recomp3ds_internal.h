@@ -72,7 +72,9 @@ namespace recomp3ds {
     void game_mode_begin(const GameDesc& desc, const std::string& game_mode);
     bool mod_left_out(const std::string& mod_id);
     bool rom_stream_active();
-    void rom_stream_take_stats(uint32_t* misses, uint32_t* bytes);   // since the last call
+    // Since the last call: the card reads and their bytes, and the game's
+    // waits in the stream (calls over 50 us), their time and the longest.
+    void rom_stream_take_stats(uint32_t* misses, uint32_t* bytes, uint32_t* waits, uint32_t* wait_ms, uint32_t* wait_max_ms);
 
     // The bottom screen's text console is the platform's own (status panel,
     // settings menu, picker, messages): screen_init takes libctru's console
@@ -120,8 +122,15 @@ namespace recomp3ds {
     void settings_menu_update();        // ~60 times a second, main thread
     void settings_menu_toggle();
     int settings_rom_stream();          // settings.ini's rom_stream: 0 auto, 1 in memory, 2 from the SD card
-    bool settings_debug_rows();         // settings.ini's debug_rows: the touch screen's thread and audio rows
-    int settings_cores();               // the Cores row, read at start: 0 auto, 1 two cores with the game on core 1, 2 ... on core 0
+    bool settings_debug_rows();         // settings.ini's dbg_rows: the touch screen's thread and audio rows
+    int settings_cores();               // settings.ini's dbg_cores, read at start: 0 auto, 1 two cores with the game on core 1, 2 ... on core 0
+    // settings.ini's dbg_* keys that the platform reads (hidden rows, 0 off;
+    // the renderer's are in rt64_3ds::Settings).
+    struct DebugSettings {
+        int slow_gfx_ms = 0, slow_audio_ms = 0;   // pad every display list / audio task by that much (the emulator mimicking a slower console)
+        int audio_rsp = 0;                        // the recompiled audio microcode instead of the interpreter
+    };
+    const DebugSettings& debug_settings();
     // The core the DSP synthesizer's thread runs on (core 1 when the system
     // grants time there, core 0 when the game has core 1).
     int helper_core();
@@ -135,7 +144,7 @@ namespace recomp3ds {
     uint16_t touch_pad_held();
     std::string settings_game_mode();
     void settings_set_game_mode(const std::string& mod_id);
-    bool settings_debug_capture();      // settings.ini's debug_capture: a SELECT hold saves a frame capture
+    bool settings_debug_capture();      // settings.ini's dbg_capture: a SELECT hold saves a frame capture
     void settings_menu_redraw();        // after something else wrote over the console
     void settings_flush();              // write settings.ini now if a change is pending (at exit)
     u32  settings_menu_keys();          // 3DS keys the open menu keeps from the game

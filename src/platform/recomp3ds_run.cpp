@@ -44,9 +44,9 @@ bool g_audio_hle = false;
 recomp3ds::AudioHle g_audio_hle_family = recomp3ds::AudioHle::Naudio;
 
 uint8_t* g_rdram = nullptr;
-// SLOW.TXT "<gfx ms> <audio ms>": pad every display list and audio task by
-// that much, to reproduce console timing in the emulator.
-int g_slow_audio_ms = -1;
+// dbg_slow_gfx_ms / dbg_slow_audio_ms (settings.ini): pad every display list
+// and audio task by that much, to reproduce console timing in the emulator.
+int g_slow_audio_ms = 0;
 
 RspExitReason timed_ucode(uint8_t* rdram, uint32_t ucode_addr) {
     g_rdram = rdram;
@@ -92,27 +92,16 @@ RspUcodeFunc* timed_get_ucode(const OSTask* task) {
             recomp3ds::audio_hle_capture_dir(g_base_path, first);
         }
         if (g_audio_hle) {
-            // The CPU interpreter replaces the game's (recompiled) microcode. In
-            // differential mode it still runs the original to check itself.
+            // The CPU interpreter replaces the game's (recompiled) microcode;
+            // dbg_audio_rsp runs the recompiled microcode instead, for comparison.
             const bool aspmain = g_audio_hle_family == recomp3ds::AudioHle::Aspmain;
-            snprintf(path, sizeof(path), "%s/AUDIO_RSP.TXT", g_base_path);
-            if (FILE* r = fopen(path, "r")) {
-                fclose(r);
-                g_audio_hle = false;   // the recompiled microcode itself, for comparison
-                fprintf(stderr, "recomp3ds: audio runs the recompiled RSP microcode (AUDIO_RSP.TXT present)\n");
+            if (recomp3ds::debug_settings().audio_rsp != 0) {
+                g_audio_hle = false;
+                fprintf(stderr, "recomp3ds: audio runs the recompiled RSP microcode (dbg_audio_rsp)\n");
             }
-            snprintf(path, sizeof(path), "%s/AUDIO_DIFF.TXT", g_base_path);
             if (g_audio_hle) {
-                if (FILE* d = fopen(path, "r")) {
-                    fclose(d);
-                    if (aspmain) recomp3ds::aspmain_hle_set_reference(f);
-                    else recomp3ds::naudio_hle_set_reference(f);
-                    fprintf(stderr, "recomp3ds: audio HLE (%s) in differential mode (AUDIO_DIFF.TXT present)\n", aspmain ? "aspMain" : "naudio");
-                }
-                else {
-                    fprintf(stderr, "recomp3ds: audio task interpreted on the CPU (%s; AUDIO_RSP.TXT selects the recompiled microcode)\n",
-                            aspmain ? "aspMain" : "naudio");
-                }
+                fprintf(stderr, "recomp3ds: audio task interpreted on the CPU (%s; dbg_audio_rsp selects the recompiled microcode)\n",
+                        aspmain ? "aspMain" : "naudio");
             }
         }
     }
@@ -306,7 +295,7 @@ void update_gfx_inner() {
     {
         // SELECT (the game has no use for it): a tap opens or closes the
         // settings menu; held for a second it saves a screenshot (with
-        // debug_capture=1 in settings.ini, a frame capture for the host
+        // dbg_capture=1 in settings.ini, a frame capture for the host
         // tools instead), and says so on the touch screen.
         static u64 select_since = 0;
         static bool fired = false;
@@ -373,18 +362,6 @@ void update_gfx_inner() {
         {
             static bool seen = false, reported = false;
             static int idle = 0;
-            static int test_countdown = -2;   // STALL_DUMP_TEST.TXT: run the dump once after 30 s (checks the dumper)
-            if (test_countdown == -2) {
-                char path[192];
-                snprintf(path, sizeof(path), "%s/STALL_DUMP_TEST.TXT", g_base_path);
-                FILE* f = fopen(path, "r");
-                test_countdown = f ? 30 : -1;
-                if (f) fclose(f);
-            }
-            if (test_countdown > 0 && --test_countdown == 0 && g_desc != nullptr && g_desc->on_audio_stall != nullptr && g_rdram != nullptr) {
-                fprintf(stderr, "recomp3ds: stall dump test\n");
-                g_desc->on_audio_stall(g_rdram);
-            }
             if (ucode_tasks > 0) { seen = true; idle = 0; }
             else if (seen && !reported && ++idle >= 2) {
                 reported = true;
@@ -398,14 +375,16 @@ void update_gfx_inner() {
         if (g_desc != nullptr && g_desc->append_stats != nullptr && g_rdram != nullptr) {
             g_desc->append_stats(g_rdram, game_stats, sizeof(game_stats));
         }
-        char rom_stats[64] = "";
+        char rom_stats[96] = "";
         if (recomp3ds::rom_stream_active()) {
-            uint32_t misses = 0, bytes = 0;
-            recomp3ds::rom_stream_take_stats(&misses, &bytes);
-            snprintf(rom_stats, sizeof(rom_stats), " rom %lu reads (%lu KB)", (unsigned long)misses, (unsigned long)(bytes / 1024));
+            uint32_t misses = 0, bytes = 0, waits = 0, wait_ms = 0, wait_max = 0;
+            recomp3ds::rom_stream_take_stats(&misses, &bytes, &waits, &wait_ms, &wait_max);
+            snprintf(rom_stats, sizeof(rom_stats), " rom %lu reads (%lu KB) waited %lu ms in %lu (max %lu)", (unsigned long)misses, (unsigned long)(bytes / 1024),
+                     (unsigned long)wait_ms, (unsigned long)waits, (unsigned long)wait_max);
         }
-        // The audio interpreter's unknown commands and, with AUDIO_DIFF.TXT,
-        // its mismatches against the recompiled microcode: shown when non-zero.
+        // The audio interpreter's unknown commands (and the differential
+        // mode's mismatches, which only the host tool runs now): shown when
+        // non-zero.
         char hle_stats[96] = "";
         {
             const recomp3ds::AudioHleStats& hs = g_audio_hle_family == recomp3ds::AudioHle::Aspmain ? recomp3ds::aspmain_hle_stats()
@@ -547,7 +526,7 @@ void update_gfx_inner() {
         else if (busy2 >= 0) snprintf(line, sizeof(line), "%3d fps cpu0 %3d%% cpu1 %3d%% cpu2 %3d%%", shown_fps, busy0, busy1, busy2);
         else snprintf(line, sizeof(line), "%3d fps cpu0 %3d%% cpu1 %3d%%", shown_fps, busy0, busy1);   // two cores
         recomp3ds::screen_printf("\x1b[2;0H%-39.39s\n", line);
-        // settings.ini's debug_rows=1: the game threads' shares (wake-ups a
+        // settings.ini's dbg_rows=1: the game threads' shares (wake-ups a
         // second last) and the audio rows below.
         const bool debug_rows = recomp3ds::settings_debug_rows();
         if (debug_rows) recomp3ds::screen_printf("\x1b[3;0H%-39.39s", thread_row);
@@ -766,20 +745,6 @@ int recomp3ds::run(const GameDesc& desc) {
     mkdir(g_base_path, 0777);
     recomp3ds::log_init(g_base_path);          // stderr: debug log + <base>/log.txt
     recomp3ds::autotest_load(g_base_path);
-    {
-        char path[192];
-        snprintf(path, sizeof(path), "%s/SLOW.TXT", g_base_path);
-        if (FILE* f = fopen(path, "r")) {
-            int gfx_ms = 0, audio_ms = 0;
-            if (fscanf(f, "%d %d", &gfx_ms, &audio_ms) >= 1) {
-                g_slow_audio_ms = audio_ms;
-                rt64_3ds::set_debug_gfx_delay_ms(gfx_ms);
-                fprintf(stderr, "recomp3ds: SLOW.TXT: +%d ms per display list, +%d ms per audio task\n", gfx_ms, audio_ms);
-            }
-            fclose(f);
-        }
-    }
-
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
     fprintf(stderr, "recomp3ds: %s starting on %s 3DS\n", desc.render.game_name, is_new_3ds ? "a New" : "an Old");
@@ -789,6 +754,16 @@ int recomp3ds::run(const GameDesc& desc) {
     recomp3ds::input_set_map(desc.button_map, desc.button_map_count);
     recomp3ds::input_set_controller_pak(desc.controller_pak);
     recomp3ds::settings_menu_init(g_base_path, desc);
+    {
+        // dbg_slow_gfx_ms / dbg_slow_audio_ms: pad every display list and
+        // audio task, to mimic a slower console in the emulator.
+        const recomp3ds::DebugSettings& dbg = recomp3ds::debug_settings();
+        if (dbg.slow_gfx_ms > 0 || dbg.slow_audio_ms > 0) {
+            g_slow_audio_ms = dbg.slow_audio_ms;
+            rt64_3ds::set_debug_gfx_delay_ms(dbg.slow_gfx_ms);
+            fprintf(stderr, "recomp3ds: dbg_slow: +%d ms per display list, +%d ms per audio task\n", dbg.slow_gfx_ms, dbg.slow_audio_ms);
+        }
+    }
     {
         // The ROM in memory, or read from the SD card as the game needs it
         // (settings.ini rom_stream: 0 auto, 1 in memory, 2 from the SD
@@ -914,7 +889,6 @@ int recomp3ds::run(const GameDesc& desc) {
     // The audio microcode interpreter shares core 2 with the renderer and
     // outranks it there, so every audio task stalls a frame. Core 1 (the
     // system core, time-limited for applications) takes it when available.
-    // AUDIO_CORE.TXT holds 1 or 2 to force a core.
     // The game's N64 threads go to core 1 and the renderer, the audio task
     // and the DSP synthesizer to core 0 on an Old 3DS, which has no core 2:
     // the renderer is the larger load, and core 0 is the core the system
@@ -925,10 +899,6 @@ int recomp3ds::run(const GameDesc& desc) {
     // that layout on a New 3DS too, to test an Old 3DS on one.
     {
         (void)cpu_mhz;
-        int want = 1;
-        char path[192];
-        snprintf(path, sizeof(path), "%s/AUDIO_CORE.TXT", g_base_path);
-        if (FILE* f = fopen(path, "r")) { if (fscanf(f, "%d", &want) != 1) want = 1; fclose(f); }
         const int cores_row = recomp3ds::settings_cores();
         const bool two_cores = !is_new_3ds || cores_row != 0;
         const bool core2 = !two_cores;
@@ -937,7 +907,7 @@ int recomp3ds::run(const GameDesc& desc) {
         g_sp_core = core2 ? 2 : 0;
         g_gfx_core = core2 ? 2 : 0;
         g_watch_cores = core2 ? 0x5 : 0x1;
-        if (want == 1 || two_cores) {
+        {
             // PM refuses a limit above the exheader's MaxCpu (low 7 bits):
             // take the highest it accepts. More than 80 is accepted and
             // ignored (a New 3DS, as a CIA and as a .3dsx).
@@ -964,10 +934,6 @@ int recomp3ds::run(const GameDesc& desc) {
             fprintf(stderr, "recomp3ds: core 1 time limit %lu%% (rc %08lx); %s: game on core %d, audio task on core %d, renderer on core %d, synth on core %d\n",
                     (unsigned long)limit, (unsigned long)rc, core2 ? "three cores" : "two cores",
                     g_game_core, g_sp_core, g_gfx_core, g_helper_core);
-        }
-        else {
-            g_helper_core = 0;
-            fprintf(stderr, "recomp3ds: audio task on core 2\n");
         }
         if (is_new_3ds) {
             // Core 3 is the system's (head tracking and other services): an

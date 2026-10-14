@@ -181,7 +181,7 @@ void aux_callback(void*, int nsamples, void* bufs[4]) {
     g_out_r = r;
 }
 
-bool g_off = false;     // REVERB_OFF.TXT beside the executable: no reverb (an A/B switch)
+bool g_off = false;     // no reverb (an A/B switch; nothing sets it while kAuxReturn is false)
 
 }   // namespace
 
@@ -197,13 +197,6 @@ bool recomp3ds::ReverbConfig::same(const ReverbConfig& o) const {
 }
 
 void recomp3ds::dsp_reverb_init() {
-    char path[192];
-    snprintf(path, sizeof(path), "%s/REVERB_OFF.TXT", recomp3ds::base_path());
-    if (FILE* f = fopen(path, "r")) {
-        fclose(f);
-        g_off = true;
-        fprintf(stderr, "dsp-reverb: off (REVERB_OFF.TXT)\n");
-    }
     LightLock_Init(&g_lock);
     ndspAuxSetEnable(0, false);
     ndspAuxSetCallback(0, aux_callback, nullptr);

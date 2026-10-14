@@ -31,6 +31,11 @@ LightLock g_lock;                       // the blocks' bookkeeping
 LightLock g_file_lock;                  // one card read at a time
 LightEvent g_loaded;                    // a block's read completed
 volatile uint32_t g_misses = 0, g_miss_bytes = 0;
+// The game's waits in stream_read (a miss's card read, or a block the
+// read-ahead thread is still reading): the calls over 50 us, their time and
+// the longest, for the stats line; under g_lock.
+volatile uint32_t g_waits = 0;
+volatile uint64_t g_wait_ticks = 0, g_wait_max = 0;
 
 // Read-ahead: a miss at block k also queues block k + 1 for a thread of its
 // own, so a game that reads long runs (a map load, streamed music) finds the
@@ -162,6 +167,7 @@ bool stream_open(const std::filesystem::path& path, uint64_t* size) {
 }
 
 void stream_read(uint64_t offset, uint8_t* dst, size_t size) {
+    const u64 t0 = svcGetSystemTick();
     LightLock_Lock(&g_lock);
     while (size > 0) {
         if (offset >= g_size) { memset(dst, 0, size); break; }
@@ -172,6 +178,12 @@ void stream_read(uint64_t offset, uint8_t* dst, size_t size) {
         dst += n;
         offset += n;
         size -= n;
+    }
+    const u64 dt = svcGetSystemTick() - t0;
+    if (dt > SYSCLOCK_ARM11 / 20000) {     // over 50 us: a card read waited for, not a cache hit
+        g_waits = g_waits + 1;
+        g_wait_ticks = g_wait_ticks + dt;
+        if (dt > g_wait_max) g_wait_max = dt;
     }
     LightLock_Unlock(&g_lock);
 }
@@ -207,9 +219,17 @@ bool recomp3ds::rom_stream_active() {
     return g_file != nullptr;
 }
 
-void recomp3ds::rom_stream_take_stats(uint32_t* misses, uint32_t* bytes) {
+void recomp3ds::rom_stream_take_stats(uint32_t* misses, uint32_t* bytes, uint32_t* waits, uint32_t* wait_ms, uint32_t* wait_max_ms) {
     *misses = g_misses;
     *bytes = g_miss_bytes;
     g_misses = 0;
     g_miss_bytes = 0;
+    LightLock_Lock(&g_lock);
+    *waits = g_waits;
+    *wait_ms = (uint32_t)(g_wait_ticks * 1000ull / SYSCLOCK_ARM11);
+    *wait_max_ms = (uint32_t)(g_wait_max * 1000ull / SYSCLOCK_ARM11);
+    g_waits = 0;
+    g_wait_ticks = 0;
+    g_wait_max = 0;
+    LightLock_Unlock(&g_lock);
 }

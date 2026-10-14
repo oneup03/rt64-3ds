@@ -104,9 +104,8 @@ void apply_conv(int v) { rt64_3ds::settings().convergence_hundredths = v * 10; }
 void apply_auto(int v) { rt64_3ds::settings().auto_convergence = v != 0; }
 
 // The New 3DS CPU speed, to see how an Old 3DS would fare.
-int g_cpu_new = 1;
-const char* const kCpuNames[] = { "Old 3DS", "New 3DS" };
-void apply_cpu(int v) { recomp3ds::set_cpu_speed(v != 0); }
+int g_dbg_old_clock = 0;    // dbg_old_clock: a New 3DS at the Old 3DS clock (268 MHz, no L2)
+void apply_old_clock(int v) { recomp3ds::set_cpu_speed(v == 0); }
 
 // An Old 3DS's layout on a New 3DS (read at start; recomp3ds_run.cpp):
 // core 2 left unused, the game on core 1 and the rest on core 0, or the
@@ -151,6 +150,7 @@ int g_rom_stream = 0;
 // Debugging, settings.ini only: 1 makes a SELECT hold save a frame capture
 // for the host tools (gfx_task.bin, gfx_frame.ppm) instead of a screenshot.
 int g_debug_capture = 0;
+recomp3ds::DebugSettings g_dbg;         // the platform's dbg_* keys (recomp3ds::debug_settings)
 
 // Stick deadzones in percent of the travel.
 int g_stick_dz = 5, g_cstick_dz = 20;
@@ -633,16 +633,11 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "audio", "Audio", 0, 1, &g_audio_on, kAudioNames, false, nullptr, apply_audio, PageGame, 1, nullptr });
     add_row({ "frame_cap", "Frame rate", 0, desc.render.frame_interpolation ? 2 : 1, &st.frame_cap, kFrameCapNames, false, nullptr, nullptr, PageGame, 1, nullptr });
     add_row({ "rom_stream", "ROM stream", 0, 2, &g_rom_stream, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
-    add_row({ "debug_capture", "Debug capture", 0, 1, &g_debug_capture, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_capture", "Debug capture", 0, 1, &g_debug_capture, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
-    // The renderer's GPU-cost choices (RenderDesc::eye_color16 and so on),
-    // settings.ini only and read at start: the game's choice unless the file
-    // says otherwise, for A/B tests on the console.
-    st.gpu_color16 = desc.render.eye_color16 ? 1 : 0;
-    st.gpu_depth16 = desc.render.eye_depth16 ? 1 : 0;
-    st.gpu_textures16 = desc.render.intensity_textures16 ? 1 : 0;
-    st.gpu_fill_clear = desc.render.fill_clear ? 1 : 0;
+    // RenderDesc::double_eyes, settings.ini only and read at start: the
+    // game's choice unless the file says otherwise.
     g_required_mods.assign(desc.required_mods, desc.required_mods + desc.required_mod_count);
     g_required_mods_hint = desc.required_mods_hint != nullptr ? desc.required_mods_hint : "";
     // The in-betweens' own eye targets serve "60 interp." alone, which an Old
@@ -650,14 +645,32 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     // would hold 1125 KB of VRAM (room for textures) and a 512 KB command
     // buffer of linear memory for nothing.
     st.gpu_double_eyes = desc.render.double_eyes && is_new_3ds ? 1 : 0;
-    add_row({ "gpu_color16", "GPU 16-bit colour", 0, 1, &st.gpu_color16, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
-    add_row({ "gpu_depth16", "GPU 16-bit depth", 0, 1, &st.gpu_depth16, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
-    add_row({ "gpu_textures16", "GPU 16-bit I/IA textures", 0, 1, &st.gpu_textures16, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
-    add_row({ "gpu_fill_clear", "GPU fill clears", 0, 1, &st.gpu_fill_clear, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "gpu_double_eyes", "GPU double eye targets", 0, 1, &st.gpu_double_eyes, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
-    if (is_new_3ds) add_row({ "cpu_speed", "CPU speed", 0, 1, &g_cpu_new, kCpuNames, false, nullptr, apply_cpu, PageGame, 1, nullptr });
-    add_row({ "cores", "Cores (at restart)", 0, 2, &g_cores, kCoresNames, false, nullptr, nullptr, PageGame, 1, nullptr });
-    add_row({ "debug_rows", "Debug rows", 0, 1, &g_debug_rows, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    // Debug keys (dbg_*): A/B switches and diagnostics for the console, off by
+    // default, settings.ini only (hidden rows). The renderer's in
+    // rt64_3ds::Settings, the platform's in g_dbg (recomp3ds::debug_settings).
+    const int kBig = 1000000000;
+    add_row({ "dbg_profile", "Read profile per list", 0, 1, &st.dbg_profile, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_screen_cull_off", "Screen cull off", 0, 1, &st.dbg_screen_cull_off, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_screen_cull_pct", "Screen cull slack %", 0, 400, &st.dbg_screen_cull_pct, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_interp_check", "Interpolation check", 0, 1, &st.dbg_interp_check, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_no_scissor", "No scissor", 0, 1, &st.dbg_no_scissor, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_frame_trace_from", "Frame trace from", 0, kBig, &st.dbg_frame_trace_from, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_frame_trace_count", "Frame trace count", 0, kBig, &st.dbg_frame_trace_count, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_draw_first", "Replay draws from", 0, kBig, &st.dbg_draw_first, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_draw_last", "Replay draws to", 0, kBig, &st.dbg_draw_last, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_gpu_debug_from", "GPU debug from frame", 0, kBig, &st.dbg_gpu_debug_from, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_gpu_debug_count", "GPU debug frames", 0, kBig, &st.dbg_gpu_debug_count, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_gpu_debug_sync", "GPU debug sync per draw", 0, 1, &st.dbg_gpu_debug_sync, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_aim_tex_log", "Log reticle textures", 0, 1, &st.dbg_aim_tex_log, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_slow_gfx_ms", "Pad each list (ms)", 0, 5000, &g_dbg.slow_gfx_ms, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_slow_audio_ms", "Pad each audio task (ms)", 0, 5000, &g_dbg.slow_audio_ms, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_audio_rsp", "Recompiled audio ucode", 0, 1, &g_dbg.audio_rsp, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    // Testing an Old 3DS on a New 3DS (settings.ini only): the Old clock, and
+    // the two-core layouts an Old 3DS has (read at start).
+    if (is_new_3ds) add_row({ "dbg_old_clock", "Old 3DS clock", 0, 1, &g_dbg_old_clock, nullptr, false, nullptr, apply_old_clock, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_cores", "Cores (at restart)", 0, 2, &g_cores, kCoresNames, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_rows", "Debug rows", 0, 1, &g_debug_rows, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     g_log_level = is_new_3ds ? 1 : 0;
     add_row({ "log_level", "Log level", 0, 2, &g_log_level, nullptr, false, nullptr, apply_log_level, recomp3ds::PageCount, 1, nullptr });
     if (desc.synth.flavor != recomp3ds::SynthFlavor::None) {
@@ -690,6 +703,7 @@ int recomp3ds::settings_rom_stream() { return g_rom_stream; }
 int recomp3ds::settings_cores() { return g_cores; }
 bool recomp3ds::settings_debug_rows() { return g_debug_rows != 0; }
 bool recomp3ds::settings_debug_capture() { return g_debug_capture != 0; }
+const recomp3ds::DebugSettings& recomp3ds::debug_settings() { return g_dbg; }
 
 void recomp3ds::settings_menu_toggle() {
     g_open = !g_open;

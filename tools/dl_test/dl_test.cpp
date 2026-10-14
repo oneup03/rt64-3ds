@@ -46,6 +46,10 @@ int main(int argc, char** argv) {
     if (getenv("DL_RTT")) interp.set_render_to_texture(true);
     // RenderDesc::force_lod_branch = false (Banjo): G_BRANCH_Z tests the depth.
     if (getenv("DL_LOD_BRANCH")) interp.set_force_branch_z(false);
+    // DL_CULLDL=0: gSPCullDisplayList ignored (RenderDesc::cull_dl off), for A/B.
+    if (const char* e = getenv("DL_CULLDL")) interp.set_cull_dl(atoi(e) != 0);
+    // DL_SCREEN_CULL=<slack>: the screen cull (0.10 an Old 3DS's, 0.25 a New 3DS's; the console adds the eyes' shift).
+    if (const char* e = getenv("DL_SCREEN_CULL")) interp.set_screen_cull((float)atof(e));
     // RenderDesc::sample_drawn_frame (Goemon's menu box rims).
     if (getenv("DL_FRAME_COPY")) interp.set_sample_drawn_frame(true);
     // RenderDesc::primary_world_instance (the dump then lists each record's projection instance).
@@ -398,8 +402,9 @@ int main(int argc, char** argv) {
         }
     }
     const rt64_3ds::InterpreterStats& st = interp.stats();
-    printf("task data_ptr %08x: fullsync %d, %zu draws, %zu verts, %u commands, %u tris, %u rects, unknown %u ex %u, unresolved tex %u\n",
-           task.t.data_ptr, (int)present, frame.draws.size(), frame.verts.size(), st.commands, st.tris, st.rects, st.unknown, st.ex_unknown, st.tex_unresolved);
+    printf("task data_ptr %08x: fullsync %d, %zu draws, %zu verts, %u commands, %u tris, %u rects, unknown %u ex %u, unresolved tex %u, culldl %u/%u\n",
+           task.t.data_ptr, (int)present, frame.draws.size(), frame.verts.size(), st.commands, st.tris, st.rects, st.unknown, st.ex_unknown, st.tex_unresolved,
+           st.cull_dl_culled, st.cull_dl);
     size_t textured = 0;
     for (const auto& d : frame.draws) if (d.tex[0].valid) textured++;
     printf("%zu textured draws, %u merged, %u probes, %u triangles clipped, %u rectangles stretched as slices of a row\n", textured, st.draws_merged, st.probes, st.clipped, st.rects_merged);

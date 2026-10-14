@@ -1,6 +1,6 @@
 // What the audio microcode interpreters (naudio_hle.cpp, aspmain_hle.cpp)
 // share: their statistics, the differential runner that checks one against
-// the recompiled microcode command by command (AUDIO_DIFF.TXT), and task
+// the recompiled microcode command by command (the host tool's check), and task
 // capture for the host harness (AUDIO_CAPTURE.TXT, tools/naudio_test).
 #ifndef RECOMP3DS_AUDIO_HLE_DIFF_H
 #define RECOMP3DS_AUDIO_HLE_DIFF_H

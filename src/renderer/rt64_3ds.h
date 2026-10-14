@@ -84,6 +84,12 @@ struct RenderDesc {
     // level-of-detail pair: what the recomp frontends set (RT64's
     // enhancementConfig.f3dex.forceBranch).
     bool force_lod_branch = true;
+    // Honour gSPCullDisplayList, as the RSP does: a list whose tested
+    // vertices all lie off one side of the visible area (with a quarter of
+    // the frame's width and height of slack for the eyes' shifts and the
+    // in-betweens) ends there, and the object's draws and vertex transforms
+    // are skipped. DK64 tests up to 40 objects a frame; Banjo never uses it.
+    bool cull_dl = true;
     // Draw colour images the game renders off screen (neither a presented
     // framebuffer nor the depth buffer) into GPU textures, and sample those
     // where the game loads textures from them: Banjo's jiggy transition and
@@ -213,21 +219,32 @@ struct RenderDesc {
     // The GPU's share of a frame (the defaults are what DK64 and Banjo were
     // tuned with; each is also a settings.ini key, read at start, for A/B
     // tests on the console, where the frame line logs GPU ms per frame):
-    // eye_color16 (gpu_color16): the eyes' colour buffers RGB565 instead of
+    // eye_color16: the eyes' colour buffers RGB565 instead of
     // RGBA8 (the N64's own framebuffer is 16-bit): half the colour traffic
     // of every draw, blend, clear, ghost pass and display transfer.
     // Snapshots follow the eye's format and so lose their alpha (sampled as
     // 1): games that copy the frame and need it (DK64) keep RGBA8.
     bool eye_color16 = false;
-    // eye_depth16 (gpu_depth16): 16-bit depth buffers for the eyes instead
+    // depth_to_rdram_every: with depth_to_rdram, write the
+    // game's depth buffer every Nth game frame instead of every one. The
+    // write fills the whole 320x240 buffer from the renderer's 8x8 grid
+    // (about 2 ms a frame on a New 3DS, three times that at the Old clock,
+    // on the renderer's core); the game then reads a depth up to N - 1
+    // frames old, which DK64's camera and sun tests tolerate. The grid
+    // itself, which the auto-convergence and the aim depth use, is read
+    // every frame whatever this says. 1 by default; depth_to_rdram_every_old3ds
+    // is the Old 3DS's value when above 0 (DK64 sets 2).
+    int depth_to_rdram_every = 1;
+    int depth_to_rdram_every_old3ds = 0;
+    // eye_depth16: 16-bit depth buffers for the eyes instead
     // of 24-bit depth + stencil (nothing uses stencil): half the depth
     // traffic. 65536 steps of z/w, against the N64's own 18-bit z.
     bool eye_depth16 = false;
-    // intensity_textures16 (gpu_textures16): I and IA textures (and CI ones
+    // intensity_textures16: I and IA textures (and CI ones
     // with an IA16 palette) as the PICA's 16-bit LA8 instead of RGBA8: the
     // same texels (L replicated into RGB, 8-bit alpha), half the size.
     bool intensity_textures16 = false;
-    // fill_clear (gpu_fill_clear): a frame whose first draw into the eye is
+    // fill_clear: a frame whose first draw into the eye is
     // a fill-mode rectangle covering it (the game's own clear, Goemon's
     // every frame) clears the eyes to its colour instead of drawing it: one
     // full screen of fragments less per eye, the same pixels.
@@ -279,7 +296,7 @@ struct RenderDesc {
     // rt64_3ds_stereo.cpp hash_rect_texture) are the game's aiming reticle:
     // placed at the depth under it (the aim sampler), as the desktop fork
     // finds its reticle by texture hash (Dinosaur Planet's moving 32x32
-    // crosshair). AIM_TEX_LOG.TXT beside the executable logs the hash, size
+    // crosshair). settings.ini's dbg_aim_tex_log logs the hash, size
     // and format of every candidate (8..64 px, roughly square) to collect
     // them. None (the default): only DK64's quad heuristic under
     // first_person_scene().
@@ -292,7 +309,7 @@ const RenderDesc& render_desc();
 // ScreenGeometry::make of render_desc()'s vi_width x vi_height.
 ScreenGeometry screen_geometry();
 
-// The folder the renderer's debug switches (*.TXT) and captures live in:
+// The folder the renderer's one-shot input files (GFX_CAPTURE.TXT) and captures live in:
 // the game's folder on the SD card, which the platform sets at start.
 void set_data_dir(const char* dir);
 void data_path(char* out, size_t size, const char* name);    // dir/name
@@ -341,10 +358,22 @@ struct Settings {
     // 2 (RenderDesc::frame_interpolation only): 60 a second while the game
     // asks for 30, an interpolated frame between each two of the game's.
     int frame_cap = 0;
-    // RenderDesc::eye_color16 / eye_depth16 / intensity_textures16 /
-    // fill_clear / double_eyes, as the game sets them unless settings.ini
-    // says otherwise (read at start).
-    int gpu_color16 = 0, gpu_depth16 = 0, gpu_textures16 = 0, gpu_fill_clear = 0, gpu_double_eyes = 0;
+    // RenderDesc::double_eyes, as the game sets it unless settings.ini says
+    // otherwise (read at start; off on an Old 3DS by default).
+    int gpu_double_eyes = 0;
+    // Debug keys (settings.ini dbg_*, hidden rows, read at start; 0 is off,
+    // the normal behaviour): A/B switches and diagnostics for the console,
+    // nothing a player needs. The platform's own are recomp3ds::DebugSettings.
+    // docs/porting-a-game.md, "Files, switches and settings keys".
+    int dbg_profile = 0;              // the read profile per list (the clock read once per command: costly)
+    int dbg_screen_cull_off = 0;      // the screen cull off
+    int dbg_screen_cull_pct = 0;      // its base slack in percent of the frame (0: the console's default)
+    int dbg_interp_check = 0;         // each in-between's flat draws checked against their frames (costly)
+    int dbg_no_scissor = 0;           // no scissor, to see draws a wrong clip would hide
+    int dbg_frame_trace_from = 0, dbg_frame_trace_count = 0;   // a log line per replayed frame, count frames from `from`
+    int dbg_draw_first = 0, dbg_draw_last = 0;                 // with last > 0: only draws first..last of every frame replayed
+    int dbg_gpu_debug_from = 0, dbg_gpu_debug_count = 0, dbg_gpu_debug_sync = 1;   // the GPU debug mode (a sync per draw) for count frames from `from`
+    int dbg_aim_tex_log = 0;          // every candidate reticle texture's hash logged once (aim_texture_hashes)
 };
 Settings& settings();
 
@@ -368,6 +397,7 @@ struct Progress {
     volatile uint32_t frames = 0;
     volatile uint32_t draw_index = 0, draw_count = 0;
     volatile uint32_t phase = 0;      // 0 idle, 1 interpreting, 2 frame begin, 3 replaying, 4 frame end
+    volatile uint32_t blanked = 0;    // the game has the video blanked: it draws nothing by design (loads)
 };
 const Progress& progress();
 void dump_progress();

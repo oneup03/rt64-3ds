@@ -311,6 +311,28 @@ struct TriSink {
 // guard band around the screen and to the near plane (z' >= 0), in
 // homogeneous screen space, then drawn as a fan.
 constexpr float kGuard = 1024.0f;   // pixels beyond the screen centre, each axis
+// The screen cull (Interpreter::set_screen_cull, dl_test DL_SCREEN_CULL=
+// <slack>): a triangle whose three vertices lie beyond the same edge of the
+// visible area, by more than slack * the frame's size, can't cover a pixel:
+// dropped here instead of going to the vertex buffer and the GPU (which
+// rejects it in setup after running its vertex shader), and left out of the
+// in-betweens. Off below zero. The visible area is the frame plus the wide
+// screen's margins (ScreenGeometry::x0, kept by set_screen): the frame
+// alone would drop what the margins show. The slack covers the eyes' shifts
+// and what the in-betweens move; the context sets it per list.
+float g_screen_cull_slack = -1.0f;
+float g_screen_cull_x0 = 0.0f;
+inline bool off_screen(const Vtx3ds* t, int screen_w, int screen_h) {
+    if (g_screen_cull_slack < 0.0f) return false;
+    if (!(t[0].w > 0.0f) || !(t[1].w > 0.0f) || !(t[2].w > 0.0f)) return false;
+    const float sx = g_screen_cull_slack * (float)screen_w, sy = g_screen_cull_slack * (float)screen_h;
+    const float lo_x = -g_screen_cull_x0 - sx, hi_x = (float)screen_w + g_screen_cull_x0 + sx, lo_y = -sy, hi_y = (float)screen_h + sy;
+    if (t[0].x < lo_x * t[0].w && t[1].x < lo_x * t[1].w && t[2].x < lo_x * t[2].w) return true;
+    if (t[0].x > hi_x * t[0].w && t[1].x > hi_x * t[1].w && t[2].x > hi_x * t[2].w) return true;
+    if (t[0].y < lo_y * t[0].w && t[1].y < lo_y * t[1].w && t[2].y < lo_y * t[2].w) return true;
+    if (t[0].y > hi_y * t[0].w && t[1].y > hi_y * t[1].w && t[2].y > hi_y * t[2].w) return true;
+    return false;
+}
 inline bool in_guard_band(const Vtx3ds& v, int screen_w, int screen_h) {
     if (!(v.w > 0.0f) || v.z < 0.0f) return false;
     const float gx = kGuard * v.w;
@@ -421,6 +443,7 @@ inline void output_tri(const TriSink& s, const LoadedVertex& a, const LoadedVert
         t.r = v.r; t.g = v.g; t.b = v.b; t.a = v.a;
     }
     (*s.tris)++;
+    if (off_screen(tri, s.screen_w, s.screen_h)) return;
     if (!in_guard_band(tri[0], s.screen_w, s.screen_h) || !in_guard_band(tri[1], s.screen_w, s.screen_h) || !in_guard_band(tri[2], s.screen_w, s.screen_h)) {
         clip_tri(s, tri);
         return;
@@ -617,6 +640,19 @@ struct Interpreter::Defer {
         z = ob0 * m[0][2] + ob1 * m[1][2] + ob2 * m[2][2] + m[3][2];
         w = ob0 * m[0][3] + ob1 * m[1][3] + ob2 * m[2][3] + m[3][3];
     }
+    // The vertex's position alone, as resolve computes it (cull_dl_test).
+    void position(uint32_t e, float& x, float& y, float& z, float& w) const {
+        const Raw& r = raw[e];
+        const uint32_t c = __atomic_load_n(&r.ctx, __ATOMIC_ACQUIRE);
+        if (c & kDone) { x = verts[e].x; y = verts[e].y; z = verts[e].z; w = verts[e].w; return; }
+        const float (*m)[4] = ctxs[c].m;
+        float ob0, ob1, ob2;
+        unpack(r.b, ob0, ob1, ob2);
+        x = ob0 * m[0][0] + ob1 * m[1][0] + ob2 * m[2][0] + m[3][0];
+        y = ob0 * m[0][1] + ob1 * m[1][1] + ob2 * m[2][1] + m[3][1];
+        z = ob0 * m[0][2] + ob1 * m[1][2] + ob2 * m[2][2] + m[3][2];
+        w = ob0 * m[0][3] + ob1 * m[1][3] + ob2 * m[2][3] + m[3][3];
+    }
     // The published triangles' output into out, in order (each run's
     // vertices one stretch of it, and each record's runs consecutive).
     // On the thread that calls finish, while run goes on elsewhere or after.
@@ -770,6 +806,7 @@ struct Interpreter::Impl {
         return h == 0 ? 1 : h;
     }
     bool force_branch_z = true;        // RenderDesc::force_lod_branch, or gEXForceBranch
+    bool cull_dl = true;               // RenderDesc::cull_dl: gSPCullDisplayList ends a list (cull_dl_test)
     bool fix_rect_lr = false;          // RenderDesc::fix_rect_lr
     int scissor_slack = 0;             // RenderDesc::scissor_edge_slack
     bool merge_rect_slices = false;    // RenderDesc::merge_rect_slices
@@ -789,6 +826,41 @@ struct Interpreter::Impl {
     uint32_t defer_key_draw = ~0u, defer_key_state = 0;   // the state of dfr's last run
     uint32_t dslot[kMaxVerts] = {};
     LoadedVertex& slot(int i) { return defer_active ? dfr->resolve(dslot[i]) : vtx[i]; }
+    // gSPCullDisplayList(v0, vn): true when every vertex from v0 to vn lies
+    // off the same side of the visible area, or behind the eye, as the RSP's
+    // clip codes decide it (the AND of the vertices' codes); the list then
+    // ends as at G_ENDDL, so the object's draws and vertex transforms are
+    // skipped (DK64 tests up to 40 objects a frame). The RSP tests the
+    // frame's edges; here the visible area is the frame plus the wide
+    // screen's margins (geo.x0), and a quarter of the frame's width and
+    // height of slack each way keeps what the eyes' shifts and the
+    // in-betweens (an object leaving the frame between two lists) could
+    // bring in. Not during a pass_over, which
+    // loads no vertices (the list runs on, for its state), and not while
+    // the list draws into an off-screen image, whose extent is its own.
+    bool cull_dl_test(int v0, int vn) {
+        if (!cull_dl || skim || cur_rtt >= 0 || v0 < 0 || vn < v0 || vn >= kMaxVerts) return false;
+        const float sx = 0.25f * (float)screen_w, sy = 0.25f * (float)screen_h;
+        const float x_lo = -geo.x0 - sx, x_hi = (float)screen_w + geo.x0 + sx, y_lo = -sy, y_hi = (float)screen_h + sy;
+        enum : uint32_t { kNegX = 1, kPosX = 2, kNegY = 4, kPosY = 8, kNear = 16, kAll = 31 };
+        uint32_t all = kAll;
+        for (int i = v0; i <= vn && all != 0; i++) {
+            float x, y, z, w;
+            if (defer_active) dfr->position(dslot[i], x, y, z, w);
+            else { x = vtx[i].x; y = vtx[i].y; z = vtx[i].z; w = vtx[i].w; }
+            uint32_t f = 0;
+            if (!(w > 0.0f)) f = kAll;      // behind the eye: out on every side
+            else {
+                if (x < x_lo * w) f |= kNegX;
+                if (x > x_hi * w) f |= kPosX;
+                if (y < y_lo * w) f |= kNegY;
+                if (y > y_hi * w) f |= kPosY;
+                if (z < 0.0f) f |= kNear;   // z' = (z + w) / 2: before the near plane
+            }
+            all &= f;
+        }
+        return all != 0;
+    }
     // A fresh entry for slot i (edits of a vertex the triangles before it
     // keep, the list's starting buffer): written at once, before the next
     // one is made.
@@ -2682,7 +2754,16 @@ struct Interpreter::Impl {
                     }
                     break;
                 }
-                case G_CULLDL: stats->cull_dl++; break;
+                case G_CULLDL: {
+                    // gSPCullDisplayList(vstart, vend): w0 holds vstart * 2, w1 vend * 2.
+                    stats->cull_dl++;
+                    if (cull_dl_test((int)((w0 & 0xFFFF) >> 1), (int)((w1 & 0xFFFF) >> 1))) {
+                        stats->cull_dl_culled++;
+                        op = G_ENDDL;
+                        goto op_enddl;
+                    }
+                    break;
+                }
                 case G_BRANCH_Z: op_branch_z: {
                     // gSPBranchLessZ, the games' level of detail: jump to the
                     // list in RDPHALF_1 when the vertex's screen depth (the
@@ -3039,7 +3120,16 @@ struct Interpreter::Impl {
                     if (w1 != 0) break;
                     op = G_POPMTX; w1 = 64;
                     goto op_popmtx;
-                case F3DEX_G_CULLDL: stats->cull_dl++; break;
+                case F3DEX_G_CULLDL: {
+                    // gSPCullDisplayList(vstart, vend): w0 holds vstart * 40, w1 (vend + 1) * 40.
+                    stats->cull_dl++;
+                    if (cull_dl_test((int)((w0 & 0xFFFFFF) / 40), (int)(w1 / 40) - 1)) {
+                        stats->cull_dl_culled++;
+                        op = G_ENDDL;
+                        goto op_enddl;
+                    }
+                    break;
+                }
                 default:
                     stats->unknown++;
                     if (dbg_unknown_ < 8) {
@@ -3394,6 +3484,7 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
                             q.v = (lq.v * s.st - s.ult) - dv + v.v * s.st;
                         }
                     }
+                    if (off_screen(tri, r.screen_w, r.screen_h)) continue;
                     if (s.cull != 0) {
                         const Vtx3ds& a = tri[0]; const Vtx3ds& b = tri[1]; const Vtx3ds& c = tri[2];
                         const float ab = a.w * b.w, bc = b.w * c.w, ac = a.w * c.w;
@@ -3592,6 +3683,8 @@ void Interpreter::set_world_proj_ids(const uint32_t* ids, int count) {
 void Interpreter::set_split_untagged_ortho(bool on) { impl_->split_untagged_ortho = on; }
 void Interpreter::set_aim_hash(bool on) { impl_->aim_hash = on; }
 void Interpreter::set_force_branch_z(bool on) { impl_->force_branch_z = on; }
+void Interpreter::set_cull_dl(bool on) { impl_->cull_dl = on; }
+void Interpreter::set_screen_cull(float slack) { g_screen_cull_slack = slack; }
 void Interpreter::set_gbi(Gbi gbi) {
     impl_->gbi = gbi;
     impl_->op_table = gbi == Gbi::F3DEX ? kF3dexOp.v : kF3dex2Op.v;
@@ -3622,6 +3715,7 @@ void Interpreter::set_hud_camera_id(uint32_t id) { impl_->hud_camera_id = id; }
 void Interpreter::set_merge_image_tiles(bool on) { impl_->image_tiles = on; }
 void Interpreter::set_screen(const ScreenGeometry& geo) {
     impl_->geo = geo;
+    g_screen_cull_x0 = geo.x0;
     impl_->screen_w = geo.w;
     impl_->screen_h = geo.h;
     const int16_t full[4] = { 0, 0, (int16_t)geo.w, (int16_t)geo.h };

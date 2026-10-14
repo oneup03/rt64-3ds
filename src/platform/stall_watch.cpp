@@ -9,7 +9,9 @@
 // and says which game thread has been running, and for how long.
 // It also puts a red line on the touch screen, for a photo when the log
 // can't say more, while one of these lasts: the main thread stopped or no
-// frame drawn for 3 s, the log's card write not returning for 15 s (a stuck
+// frame drawn for 3 s (15 s while the game has the video blanked: DK64 draws
+// nothing through its loads, 4-7 s on an Old 3DS, which lit the row at every
+// load), the log's card write not returning for 15 s (a stuck
 // card stops the log, and a game reading its ROM from the card, without a
 // word; a slow card takes over 3 s for some writes once the log has grown a
 // few MB, and the game runs on meanwhile). When the
@@ -135,13 +137,13 @@ void running_game_thread(char* out, size_t size) {
 // Cleared once nothing has stopped (only after an alert, and not while the
 // HOME Menu or sleep has the screens: the main thread and the frames stop
 // there by design).
-void alert(u64 main_stalled, u64 frames_stalled, uint32_t write_ms, int busy0, int busy1, int busy2, const char* rates) {
+void alert(u64 main_stalled, u64 frames_stalled, u64 frames_limit_s, uint32_t write_ms, int busy0, int busy1, int busy2, const char* rates) {
     static bool shown = false;
     const float s = 1.0f / (float)SYSCLOCK_ARM11;
     char line[64] = "";
     int n = 0;
     if (main_stalled > 3ull * SYSCLOCK_ARM11) n += snprintf(line + n, sizeof(line) - n, "main %.0fs ", (float)main_stalled * s);
-    if (frames_stalled > 3ull * SYSCLOCK_ARM11) n += snprintf(line + n, sizeof(line) - n, "frames %.0fs ", (float)frames_stalled * s);
+    if (frames_stalled > frames_limit_s * SYSCLOCK_ARM11) n += snprintf(line + n, sizeof(line) - n, "frames %.0fs ", (float)frames_stalled * s);
     if (write_ms > 15000) n += snprintf(line + n, sizeof(line) - n, "card write %us ", (unsigned)(write_ms / 1000));
     if (n > 0) {
         char text[64];
@@ -183,6 +185,8 @@ void watch(void*) {
         const uint32_t beat = g_beat.load();
         const u64 now = svcGetSystemTick();
         const uint32_t frames = rt64_3ds::progress().frames;
+        // A blanked video (a load) draws nothing by design: 15 s before the frames count as stopped.
+        const bool blanked = rt64_3ds::progress().blanked != 0;
         // Not while the HOME prompt holds the game (stall_watch_pause) or the
         // HOME Menu or sleep has the application: the main thread and the
         // frames stop there by design.
@@ -206,7 +210,7 @@ void watch(void*) {
             for (int i = 0; i < 8; i++) prev[i] = cur[i];
             prev_t = now;
         }
-        if (beat != 0) alert(!quiet && beat == last ? now - since : 0, now - frames_since, recomp3ds::log_write_stuck_ms(), busy0, busy1, busy2, rates);
+        if (beat != 0) alert(!quiet && beat == last ? now - since : 0, now - frames_since, blanked ? 15ull : 3ull, recomp3ds::log_write_stuck_ms(), busy0, busy1, busy2, rates);
         // Not before the main thread's loop has begun (the runtime's start,
         // the renderer's, run on it first).
         if (beat == 0) {
@@ -232,19 +236,7 @@ void watch(void*) {
 }   // namespace
 
 void recomp3ds::stall_watch_beat() {
-    const uint32_t beat = g_beat.fetch_add(1, std::memory_order_relaxed);
-    // STALL_TEST.TXT: the main thread stalls itself for 4 s once, about 40 s
-    // in (the beat comes ~60 times a second), to check the report.
-    static int test = -1;
-    if (test < 0) {
-        FILE* f = rt64_3ds::data_fopen("STALL_TEST.TXT", "r");
-        test = f != nullptr ? 1 : 0;
-        if (f != nullptr) fclose(f);
-    }
-    if (test == 1 && beat == 2400) {
-        fprintf(stderr, "recomp3ds: STALL_TEST: the main thread sleeps for 4 s\n");
-        svcSleepThread(4000 * 1000000ll);
-    }
+    g_beat.fetch_add(1, std::memory_order_relaxed);
 }
 
 void recomp3ds::stall_watch_start(uint8_t* const* rdram, const GameDesc* desc) {
