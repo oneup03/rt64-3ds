@@ -1243,17 +1243,28 @@ fed from tables compiled into the executable.
 ### Game modes
 
 A `custom_gamemode` mod (a ROM hack as a mod) brings a `patch.bps` whose
-output ROM is usually 64 MB, too big for memory beside RDRAM. rt64-3ds
-handles these on its own when the game is built with static mods:
+output ROM is usually 64 MB, too big for memory beside RDRAM, and the 13-14
+MB patch alone ran an Old 3DS out of memory (38 MB of heap as a CIA). So
+the console never patches: the player makes the ROM on a PC with
+`tools/make_game_mode_rom.py` (standard-library Python), and rt64-3ds
+handles the rest when the game is built with static mods:
 
 - Bake the mode's code without `:embed`; the player copies the `.nrm` to
   `mods/`.
 - At start, a bottom-screen picker lists the game and each mode found. It
   remembers the last choice.
-- The first start of a mode writes the patched ROM to
-  `sdmc:/3ds/<sd_dir>/modes/<mod id>.z64`, checked against the patch's
-  CRCs (about 10 s). Later starts reuse that file, and the game streams its
-  ROM from it.
+- `make_game_mode_rom.py <game ROM> <mode .nrm>...` writes
+  `modes/<mod id>.z64` (checked against the patch's source and target
+  CRCs; a .v64 or .n64 ROM is read as .z64) and `modes/<mod id>.z64.ok`:
+  the patch's size and compressed size and the ROM's size. The player
+  copies `modes/` next to the game on the SD card.
+- The runtime asks the host for the ROM (`recomp::mods::set_rom_file_handler`,
+  nmr 0033) and never extracts `patch.bps`. `game_modes.cpp` compares the
+  stamp with the `.nrm`'s zip directory (nothing extracted; not the
+  patch's CRC32, which is the same for every BPS file since it ends with its
+  own CRC), and the game streams its ROM from that file. The picker lists a
+  mode whose ROM is missing or made from another `.nrm` in red, with what
+  to do, and logs it.
 - Saves go to `saves/<mod id>/`.
 - Check each built-in code mod against each mode (`mod_bake inspect`): a
   mod that replaces a function a mode also replaces makes that mode fail to

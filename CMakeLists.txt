@@ -110,7 +110,6 @@ add_library(recomp_3ds STATIC
     src/platform/audio_ndsp.cpp
     src/platform/rom_stream.cpp
     src/platform/game_modes.cpp
-    src/platform/bps_stream.cpp
     src/platform/touch_pad.cpp
     src/platform/naudio_hle.cpp
     src/platform/aspmain_hle.cpp

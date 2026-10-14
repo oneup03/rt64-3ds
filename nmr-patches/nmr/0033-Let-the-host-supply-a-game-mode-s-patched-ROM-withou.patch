@@ -1,0 +1,92 @@
+From eef5355afaa867f0d488070dc2308cf73ab9812d Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Wed, 14 Oct 2026 10:25:55 -0500
+Subject: [PATCH] Let the host supply a game mode's patched ROM without its
+ patch being read
+
+recomp::mods::set_rom_file_handler: a host that has the game mode's
+patched ROM already (made beforehand, on a PC) is told the mod's id and
+file instead of being handed patch.bps, which is never extracted. A ROM
+hack's patch is 13-14 MB, more than an Old 3DS has room for beside RDRAM
+and the renderer (it ran out of memory and crashed there). The host checks
+the ROM was made from that mod's patch; returning false fails the load.
+ModDetails::mod_path: the mod's file or folder, so a host can look at it
+before loading (a game mode picker).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/include/librecomp/mods.hpp | 10 +++++++++-
+ librecomp/src/mods.cpp               | 15 ++++++++++++++-
+ 2 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index 0695f34..3599bb2 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -240,6 +240,7 @@ namespace recomp {
+             bool runtime_toggleable;
+             bool enabled_by_default;
+             bool custom_gamemode;
++            std::filesystem::path mod_path;     // the mod's file (an .nrm) or folder
+         };
+ 
+         struct ModManifest {
+@@ -533,7 +534,8 @@ namespace recomp {
+                     .dependencies = manifest.dependencies,
+                     .runtime_toggleable = is_runtime_toggleable(),
+                     .enabled_by_default = manifest.enabled_by_default,
+-                    .custom_gamemode = manifest.custom_gamemode
++                    .custom_gamemode = manifest.custom_gamemode,
++                    .mod_path = manifest.mod_root_path
+                 };
+             }
+         private:
+@@ -683,6 +685,12 @@ namespace recomp {
+         // file it then streams the ROM from. Returning false fails the load.
+         using RomPatchHandler = bool (*)(const std::string& mod_id, std::span<const uint8_t> patch);
+         void set_rom_patch_handler(RomPatchHandler handler);
++        // Or the host supplies the patched ROM itself, made beforehand: the
++        // patch is never read (13-14 MB a game mode, more than an Old 3DS
++        // has room for beside RDRAM). It gets the mod's file, to check the
++        // ROM was made from its patch; returning false fails the load.
++        using RomFileHandler = bool (*)(const std::string& mod_id, const std::filesystem::path& mod_path);
++        void set_rom_file_handler(RomFileHandler handler);
+         void register_embedded_mod(const std::string& mod_id, std::span<const uint8_t> mod_bytes);
+ #ifdef RECOMP_STATIC_MODS
+         // Baked mods (static_mods.h), before recomp::start: their code, and the
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
+index fc718ff..4c6e2f1 100644
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -269,6 +269,12 @@ void recomp::mods::set_rom_patch_handler(RomPatchHandler handler) {
+     rom_patch_handler = handler;
+ }
+ 
++static recomp::mods::RomFileHandler rom_file_handler = nullptr;
++
++void recomp::mods::set_rom_file_handler(RomFileHandler handler) {
++    rom_file_handler = handler;
++}
++
+ namespace modpaths {
+     constexpr std::string_view default_mod_extension = "nrm";
+     constexpr std::string_view binary_path = "mod_binary.bin";
+@@ -1846,7 +1852,14 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+     }
+ 
+     // Apply a ROM patch if one was found.
+-    if (rom_patch_mod_index != (size_t)-1) {
++    if (rom_patch_mod_index != (size_t)-1 && rom_file_handler != nullptr) {
++        auto& mod = opened_mods[rom_patch_mod_index];
++        if (!rom_file_handler(mod.manifest.mod_id, mod.manifest.mod_root_path)) {
++            ret.emplace_back(mod.manifest.mod_id, ModLoadError::FailedToLoadPatch, std::string{});
++            return ret;
++        }
++    }
++    else if (rom_patch_mod_index != (size_t)-1) {
+         auto& mod = opened_mods[rom_patch_mod_index];
+         
+         bool patch_exists;
+-- 
+2.56.0
+
