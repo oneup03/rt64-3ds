@@ -61,10 +61,11 @@ Block* choose_victim() {
 // The card read itself, with no bookkeeping lock held.
 void read_block(Block* b, uint32_t index) {
     const uint64_t offset = (uint64_t)index * kBlockBytes;
-    const size_t want = offset + kBlockBytes <= g_size ? kBlockBytes : (size_t)(g_size - offset);
     size_t got = 0;
     LightLock_Lock(&g_file_lock);
-    if (fseek(g_file, (long)offset, SEEK_SET) == 0) got = fread(b->data, 1, want, g_file);
+    // The size under the file's lock: stream_open may have just changed it.
+    const size_t want = offset >= g_size ? 0 : offset + kBlockBytes <= g_size ? kBlockBytes : (size_t)(g_size - offset);
+    if (g_file != nullptr && want > 0 && fseek(g_file, (long)offset, SEEK_SET) == 0) got = fread(b->data, 1, want, g_file);
     LightLock_Unlock(&g_file_lock);
     if (got < kBlockBytes) memset(b->data + got, 0, kBlockBytes - got);
     g_misses = g_misses + 1;
@@ -136,6 +137,10 @@ bool stream_open(const std::filesystem::path& path, uint64_t* size) {
     // Another file (a game mode's ROM replacing the game's): what the cache
     // holds came from the old one.
     for (uint32_t i = 0; i < g_block_count; i++) g_blocks[i].index = UINT32_MAX;
+    g_reader_next = UINT32_MAX;
+    // The read-ahead thread may be reading the old file: the file changes
+    // between two of its reads, never under one.
+    LightLock_Lock(&g_file_lock);
     if (g_file != nullptr) fclose(g_file);
     g_file = fopen(path.string().c_str(), "rb");
     g_size = 0;
@@ -144,6 +149,7 @@ bool stream_open(const std::filesystem::path& path, uint64_t* size) {
         fseek(g_file, 0, SEEK_END);
         g_size = (uint64_t)ftell(g_file);
     }
+    LightLock_Unlock(&g_file_lock);
     LightLock_Unlock(&g_lock);
     if (g_file == nullptr) {
         fprintf(stderr, "recomp3ds: ROM stream: cannot open %s\n", path.string().c_str());
@@ -186,8 +192,12 @@ void recomp3ds::rom_stream_install(size_t cache_bytes, size_t block_bytes) {
     for (uint32_t i = 0; i < g_block_count; i++) g_blocks[i].data = (uint8_t*)malloc(kBlockBytes);
     // The read-ahead thread, on the system core when the game may use it
     // (a New 3DS: core 3 is idle), else wherever the kernel puts it; it
-    // waits on the card, so its priority hardly matters.
-    g_reader = threadCreate(reader_thread, nullptr, 16 * 1024, 0x38, 3, false);
+    // waits on the card, so its priority hardly matters. Core 3 is asked
+    // for on a New 3DS only: Azahar's Old 3DS hangs on a thread created
+    // there (the hardware refuses it).
+    bool is_new_3ds = false;
+    APT_CheckNew3DS(&is_new_3ds);
+    g_reader = is_new_3ds ? threadCreate(reader_thread, nullptr, 16 * 1024, 0x38, 3, false) : nullptr;
     if (g_reader == nullptr) g_reader = threadCreate(reader_thread, nullptr, 16 * 1024, 0x38, -2, false);
     fprintf(stderr, "recomp3ds: ROM stream: read-ahead thread %s\n", g_reader != nullptr ? "up" : "not created");
     recomp::set_rom_stream(&g_stream);
