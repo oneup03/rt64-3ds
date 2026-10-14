@@ -171,7 +171,7 @@ struct Nrm {
     fs::path path;
     bool embed = false;
     std::string id, version, display_name;
-    bool game_mode = false;     // custom_gamemode: a ROM hack, its .nrm brought by the player
+    bool game_mode = false;     // custom_gamemode: a ROM hack (its ROM made by the player)
     std::vector<uint8_t> manifest, syms, binary;
     std::string ident;      // C identifier derived from the id
 };
@@ -215,16 +215,23 @@ bool read_nrm(Nrm& n) {
 
 // The .nrm reduced to what the runtime reads (no thumbnail), for embedding.
 // A mod built into the executable starts disabled: the player turns it on.
+// A game mode keeps an empty patch.bps, so the runtime still takes it for
+// one with a ROM patch; the platform supplies the patched ROM, made on a PC
+// (rt64-3ds game_modes.cpp, tools/make_game_mod_rom.py), and the patch is
+// never read.
 std::vector<uint8_t> stripped_nrm(const Nrm& n) {
     mz_zip_archive zip{};
     std::vector<uint8_t> out;
     nlohmann::json j = nlohmann::json::parse(n.manifest.begin(), n.manifest.end());
-    j["enabled_by_default"] = false;
+    // A game mode stays enabled: the runtime loads one only when it is the
+    // mode played, and only if enabled.
+    if (!n.game_mode) j["enabled_by_default"] = false;
     const std::string manifest = j.dump(4);
     if (!mz_zip_writer_init_heap(&zip, 0, 0)) return out;
     bool ok = mz_zip_writer_add_mem(&zip, "mod.json", manifest.data(), manifest.size(), MZ_BEST_COMPRESSION) &&
               mz_zip_writer_add_mem(&zip, "mod_syms.bin", n.syms.data(), n.syms.size(), MZ_BEST_COMPRESSION) &&
-              mz_zip_writer_add_mem(&zip, "mod_binary.bin", n.binary.data(), n.binary.size(), MZ_BEST_COMPRESSION);
+              mz_zip_writer_add_mem(&zip, "mod_binary.bin", n.binary.data(), n.binary.size(), MZ_BEST_COMPRESSION) &&
+              (!n.game_mode || mz_zip_writer_add_mem(&zip, "patch.bps", "", 0, MZ_NO_COMPRESSION));
     void* buf = nullptr;
     size_t size = 0;
     if (ok && mz_zip_writer_finalize_heap_archive(&zip, &buf, &size)) {
@@ -463,14 +470,14 @@ int bake(int argc, char** argv) {
             }
         }
         o << "}\n";
-        // The game modes (their .nrm comes from the SD card, with the ROM
-        // patch), for the platform's picker: which it can offer, and the
-        // version and file each needs. Null-terminated.
+        // The game modes, for the platform's picker: which it can offer, and
+        // the version each needs and the .nrm it comes from (embedded, or
+        // else brought by the player). Null-terminated.
         o << "\n// The baked game modes, for a picker.\nextern \"C\" {\n"
           << "struct recomp_baked_game_mode { const char* mod_id; const char* display_name; const char* version; const char* file_name; };\n"
           << "extern const recomp_baked_game_mode recomp_baked_game_modes[] = {\n";
         for (const auto& n : mods) {
-            if (!n.game_mode || n.embed) continue;
+            if (!n.game_mode) continue;
             o << "    { " << c_string(n.id) << ", " << c_string(n.display_name) << ", " << c_string(n.version) << ", "
               << c_string(n.path.filename().string()) << " },\n";
         }

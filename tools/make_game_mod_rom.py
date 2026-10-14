@@ -6,13 +6,14 @@ hack's ROM, which the mod's .nrm makes from the game's ROM with its
 patch.bps. The 3DS doesn't make it: the patched ROM is 64 MB and the patch
 alone more than an Old 3DS has room for. This script does it once:
 
-    python3 make_game_mode_rom.py BK.z64 bk_jiggies_of_time.nrm
+    python3 make_game_mod_rom.py BK.z64 bk_jiggies_of_time.nrm
 
-It writes modes/<mod id>.z64 and modes/<mod id>.z64.ok (which .nrm it was
-made from) into the output folder (-o, default: the current folder). Copy
-the modes folder next to the game on the SD card (for Banjo:
-sdmc:/3ds/BanjoRecomp/modes/). Several .nrm files may be given at once. A
-ROM in .v64 or .n64 byte order is read as .z64. Standard library only.
+It writes mods/<mod id>.z64 and mods/<mod id>.z64.ok (the mode and version
+it was made from) into the output folder (-o, default: the current folder).
+Copy the files into the mods folder next to the game on the SD card (for
+Banjo: sdmc:/3ds/BanjoRecomp/mods/); the .nrm itself isn't needed there.
+Several .nrm files may be given at once. A ROM in .v64 or .n64 byte order is
+read as .z64. Standard library only.
 """
 import argparse
 import json
@@ -109,25 +110,22 @@ def make(rom, nrm_path, out_dir):
     with zipfile.ZipFile(nrm_path) as nrm:
         manifest = json.loads(nrm.read("mod.json"))
         try:
-            entry = nrm.getinfo("patch.bps")
+            patch = nrm.read("patch.bps")
         except KeyError:
             raise BpsError("isn't a game mode (it has no patch.bps)")
-        patch = nrm.read(entry)
     mod_id = manifest["id"]
     print(f"{os.path.basename(nrm_path)}: {manifest.get('display_name', mod_id)} {manifest.get('version', '')}")
     target = apply_bps(patch, rom)
-    modes = os.path.join(out_dir, "modes")
-    os.makedirs(modes, exist_ok=True)
-    rom_out = os.path.join(modes, mod_id + ".z64")
+    mods = os.path.join(out_dir, "mods")
+    os.makedirs(mods, exist_ok=True)
+    rom_out = os.path.join(mods, mod_id + ".z64")
     with open(rom_out + ".part", "wb") as f:
         f.write(target)
     os.replace(rom_out + ".part", rom_out)
-    # What the 3DS checks (rt64-3ds game_modes.cpp) without extracting the
-    # patch: its size and compressed size in the .nrm's zip directory, and
-    # the ROM's size. (Not the patch's CRC32: a BPS patch ends with its own
-    # CRC, so the whole file's is always 0x2144DF1C.)
+    # What the 3DS checks (rt64-3ds game_modes.cpp): the mode and its
+    # version against the one built in, and the ROM's size.
     with open(rom_out + ".ok", "w") as f:
-        f.write(f"{entry.file_size} {entry.compress_size} {len(target)}")
+        f.write(f"{mod_id} {manifest['version']} {len(target)}\n")
     print(f"  wrote {rom_out} ({len(target) >> 20} MB) and {os.path.basename(rom_out)}.ok")
 
 
@@ -135,7 +133,7 @@ def main():
     ap = argparse.ArgumentParser(description="Make game modes' ROMs from the game's ROM and the modes' .nrm files, for rt64-3ds.")
     ap.add_argument("rom", help="the game's ROM (the one the 3DS port uses, e.g. BK.z64)")
     ap.add_argument("nrm", nargs="+", help="game mode .nrm files")
-    ap.add_argument("-o", "--out", default=".", help="where to write the modes folder (default: here)")
+    ap.add_argument("-o", "--out", default=".", help="where to write the mods folder (default: here)")
     args = ap.parse_args()
     with open(args.rom, "rb") as f:
         rom = to_z64(f.read())
@@ -147,7 +145,7 @@ def main():
             print(f"{nrm}: {e}", file=sys.stderr)
             failed += 1
     if failed == 0:
-        print(f"Copy {os.path.join(args.out, 'modes')} to the game's folder on the SD card (for Banjo: sdmc:/3ds/BanjoRecomp/modes).")
+        print(f"Copy the files in {os.path.join(args.out, 'mods')} to the game's mods folder on the SD card (for Banjo: sdmc:/3ds/BanjoRecomp/mods).")
     return 1 if failed else 0
 
 

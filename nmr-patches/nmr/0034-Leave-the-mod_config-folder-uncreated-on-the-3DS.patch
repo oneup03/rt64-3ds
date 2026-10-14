@@ -1,0 +1,33 @@
+From 1ec8c944138000304e0309d6081959022afb3059 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Wed, 14 Oct 2026 16:31:15 -0500
+Subject: [PATCH] Leave the mod_config folder uncreated on the 3DS
+
+The 3DS host keeps mods' options in its own settings file and the
+runtime's config writer never runs there, so the mod_config folder stayed
+empty on the SD card.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/src/recomp.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index a914980..01b25a4 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -105,7 +105,11 @@ void recomp::mods::initialize_mods() {
+     N64Recomp::live_recompiler_init();
+ #endif
+     std::filesystem::create_directories(config_path / mods_directory);
++#ifndef __3DS__
++    // The 3DS keeps mod options in its own settings file and never writes
++    // here: no empty folder for the player to wonder about.
+     std::filesystem::create_directories(config_path / mod_config_directory);
++#endif
+     mod_context->set_mods_config_path(config_path / "mods.json");
+     mod_context->set_mod_config_directory(config_path / mod_config_directory);
+ }
+-- 
+2.56.0
+

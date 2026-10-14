@@ -1,15 +1,16 @@
 // Game modes (RT64_3DS_STATIC_MODS): mods that turn the game into another
-// one, a ROM hack plus its recompiled code. The code is baked into the
-// executable; the player brings the mod's .nrm, and the hack's ROM made from
-// it on a PC (rt64-3ds tools/make_game_mode_rom.py) as
-// modes/<mod id>.z64: its patch.bps makes a 64 MB ROM, and the 13-14 MB
-// patch alone is more than an Old 3DS has room for beside RDRAM. Before the
-// game starts a picker on the bottom screen offers the game and every game
-// mode it can play, and lists the others with the reason (the .nrm or its
-// ROM is missing, or either is another version than the one built in, or the
-// mode isn't built in at all). The runtime then asks use_mode_rom for the
-// chosen mode's ROM (recomp::mods::set_rom_file_handler, nmr 0033), never
-// reading the patch, and the ROM is streamed from the card.
+// one, a ROM hack plus its recompiled code. The code and the rest of the
+// mod's .nrm (bar its patch.bps) are built into the executable; the player
+// brings only the hack's ROM, made on a PC from the game's ROM and the .nrm
+// (rt64-3ds tools/make_game_mod_rom.py) as mods/<mod id>.z64 with
+// mods/<mod id>.z64.ok: the patch makes a 64 MB ROM, and the 13-14 MB patch
+// alone is more than an Old 3DS has room for beside RDRAM. Before the game
+// starts a picker on the bottom screen offers the game and every game mode
+// it can play, and lists the others with the reason (the ROM missing, of
+// another version than the one built in, or incomplete). The runtime then
+// asks use_mode_rom for the chosen mode's ROM
+// (recomp::mods::set_rom_file_handler, nmr 0033) and the ROM is streamed
+// from the card.
 #include <3ds.h>
 #include <cstdio>
 #include <cstring>
@@ -25,60 +26,64 @@
 #ifdef RECOMP_STATIC_MODS
 #include "librecomp/game.hpp"
 #include "librecomp/mods.hpp"
-#include "miniz.h"
+// What mod_bake writes into the game's static_mods.cpp (null-terminated);
+// weak, for a build without it.
+extern "C" {
+struct recomp_baked_game_mode { const char* mod_id; const char* display_name; const char* version; const char* file_name; };
+__attribute__((weak)) extern const recomp_baked_game_mode recomp_baked_game_modes[];
+}
 
 namespace {
 
 std::string g_base_path;
 const recomp3ds::GameDesc* g_desc = nullptr;
 
-// The .nrm's patch.bps sizes, from the zip's directory: nothing is
-// extracted. (Not its CRC32: a BPS patch ends with its own CRC, so the
-// whole file's is always the same.)
-bool patch_sizes(const std::filesystem::path& nrm, uint64_t& size, uint64_t& packed) {
-    mz_zip_archive zip;
-    memset(&zip, 0, sizeof(zip));
-    if (!mz_zip_reader_init_file(&zip, nrm.string().c_str(), 0)) return false;
-    const int index = mz_zip_reader_locate_file(&zip, "patch.bps", nullptr, 0);
-    mz_zip_archive_file_stat st;
-    const bool ok = index >= 0 && mz_zip_reader_file_stat(&zip, (mz_uint)index, &st);
-    if (ok) { size = st.m_uncomp_size; packed = st.m_comp_size; }
-    mz_zip_reader_end(&zip);
-    return ok;
+const recomp_baked_game_mode* baked_mode(const std::string& mod_id) {
+    for (const recomp_baked_game_mode* b = recomp_baked_game_modes; b != nullptr && b->mod_id != nullptr; b++) {
+        if (mod_id == b->mod_id) return b;
+    }
+    return nullptr;
 }
 
-std::string mode_rom_path(const std::string& mod_id) { return g_base_path + "/modes/" + mod_id + ".z64"; }
+std::string mode_rom_path(const std::string& mod_id) { return g_base_path + "/mods/" + mod_id + ".z64"; }
 
-// Whether modes/<mod id>.z64 was made from this .nrm's patch: the script
-// writes "<patch.bps's size> <its compressed size> <the ROM's size>" next
-// to it (<mod id>.z64.ok). Otherwise *why says what to do.
-bool mode_rom_ready(const std::string& mod_id, const std::filesystem::path& nrm, std::string* why) {
+// Whether mods/<mod id>.z64 is the ROM of the version built in: the script
+// writes "<mod id> <version> <the ROM's size>" next to it (<mod id>.z64.ok).
+// Otherwise *why says what to do.
+bool mode_rom_ready(const std::string& mod_id, std::string* why) {
+    const recomp_baked_game_mode* baked = baked_mode(mod_id);
     const std::string rom = mode_rom_path(mod_id);
     struct stat st;
-    char line[64] = "";
+    char line[160] = "";
     FILE* f = fopen((rom + ".ok").c_str(), "r");
     const bool stamped = f != nullptr && fgets(line, sizeof(line), f) != nullptr;
     if (f != nullptr) fclose(f);
-    unsigned long long patch_made = 0, packed_made = 0, size_made = 0;
-    if (stat(rom.c_str(), &st) != 0 || !stamped || sscanf(line, "%llu %llu %llu", &patch_made, &packed_made, &size_made) != 3) {
-        if (why) *why = "needs its ROM: make_game_mode_rom.py";
+    char id_made[64] = "", version_made[32] = "";
+    unsigned long long size_made = 0;
+    if (stat(rom.c_str(), &st) != 0 || !stamped || sscanf(line, "%63s %31s %llu", id_made, version_made, &size_made) != 3) {
+        if (why) *why = "ROM missing: make_game_mod_rom.py";
         return false;
     }
-    uint64_t patch = 0, packed = 0;
-    if (!patch_sizes(nrm, patch, packed)) {
-        if (why) *why = "its .nrm has no patch.bps";
+    if (mod_id != id_made) {
+        // Another mode's stamp, or one from an older script ("<patch size>
+        // <compressed size> <ROM size>").
+        if (why) *why = "ROM stamp outdated: rerun the script";
         return false;
     }
-    if (patch != patch_made || packed != packed_made || (unsigned long long)st.st_size != size_made) {
-        if (why) *why = "ROM from another .nrm: run the script again";
+    if (baked != nullptr && std::string(version_made) != baked->version) {
+        if (why) *why = std::string("ROM is of ") + version_made + ", needs " + baked->version;
+        return false;
+    }
+    if ((unsigned long long)st.st_size != size_made) {
+        if (why) *why = "ROM incomplete: copy it again";
         return false;
     }
     return true;
 }
 
-bool use_mode_rom(const std::string& mod_id, const std::filesystem::path& nrm) {
+bool use_mode_rom(const std::string& mod_id, const std::filesystem::path&) {
     std::string why;
-    if (!mode_rom_ready(mod_id, nrm, &why)) {
+    if (!mode_rom_ready(mod_id, &why)) {
         fprintf(stderr, "recomp3ds: %s %s\n", mod_id.c_str(), why.c_str());
         return false;
     }
@@ -94,13 +99,6 @@ void recomp3ds::game_modes_init(const char* base_path, const GameDesc& desc) {
     g_base_path = base_path;
     g_desc = &desc;
     recomp::mods::set_rom_file_handler(use_mode_rom);
-}
-
-// What mod_bake writes into the game's static_mods.cpp (null-terminated);
-// weak, for a build without it.
-extern "C" {
-struct recomp_baked_game_mode { const char* mod_id; const char* display_name; const char* version; const char* file_name; };
-__attribute__((weak)) extern const recomp_baked_game_mode recomp_baked_game_modes[];
 }
 
 std::string recomp3ds::pick_game_mode(const GameDesc& desc) {
@@ -133,7 +131,7 @@ std::string recomp3ds::pick_game_mode(const GameDesc& desc) {
             }
             else {
                 std::string why;
-                if (!mode_rom_ready(d.mod_id, d.mod_path, &why)) c.note = why;
+                if (!mode_rom_ready(d.mod_id, &why)) c.note = why;
             }
         }
         choices.push_back(std::move(c));
