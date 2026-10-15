@@ -578,7 +578,14 @@ public:
                     // then the game frame's, which the presenter queues), not
                     // the order they were recorded in, and each frame sets
                     // all of its state at its start.
-                    const bool game_first = build_busy_;
+                    // The game's frame goes first only when it does not store
+                    // the screen: the store's copy of the last game frame
+                    // (copy_snapshot) needs the GPU idle, which a recording
+                    // leaves out, so such a frame waits for the builder and
+                    // is drawn after its in-betweens. (Recorded, every store
+                    // after the first was dropped: DK64's warps and zipper
+                    // showed the first frame it ever stored.)
+                    const bool game_first = build_busy_ && !frame_.snapshot_request;
                     u64 waited_first = 0, built = 0;
                     pair_ = true;
                     if (game_first) {
@@ -587,7 +594,9 @@ public:
                         replay_and_present(Present::Paced, true);
                         record_only_ = false;
                         replay_real = svcGetSystemTick() - ta0;
-                        // What of the build the recording did not cover.
+                    }
+                    if (build_busy_) {
+                        // What of the build the recording (if any) did not cover.
                         const u64 tj0 = svcGetSystemTick();
                         const bool ok = join_build();
                         built = svcGetSystemTick() - tj0;
@@ -2372,10 +2381,15 @@ private:
         // With double eyes a snapshot is copied out of the game frames'
         // own set (snapshot_source), which the in-betweens never draw into,
         // and an in-between stores nothing itself (build_inbetween clears
-        // the request): a frame that stores the screen is safe then
-        // (Dinosaur Planet stores every frame for its effects).
+        // the request): a frame that stores the screen every frame is safe
+        // then (Dinosaur Planet's effects). A store the frame before did
+        // not make is a transition's (DK64's warps and zipper): the frame
+        // draws the scene it goes to, and an in-between toward it showed
+        // that scene for a refresh before the transition began.
+        const bool one_off_store = frame_.snapshot_request && !prev_stored_;
+        prev_stored_ = frame_.snapshot_request;
         uint32_t* unsafe = nullptr;
-        if (frame_.snapshot_request && !double_eyes_) unsafe = &inb_snapshot_;
+        if (frame_.snapshot_request && (!double_eyes_ || one_off_store)) unsafe = &inb_snapshot_;
         else if (frame_resized_) unsafe = &inb_resize_;
         else if (desc.depth_to_rdram && !double_eyes_) unsafe = &inb_depth_;
         else if (vi_blanked_) unsafe = &inb_blank_;
@@ -4104,6 +4118,7 @@ public:
     static constexpr uint32_t kProbeLists = 8, kProbeEvery = 30, kProbeEveryMax = 240;
     uint32_t probe_left_ = 0, probe_every_ = kProbeEvery, probes_ = 0;
     uint32_t inb_snapshot_ = 0, inb_rtt_ = 0, inb_offscreen_ = 0, inb_blank_ = 0, inb_depth_ = 0;   // unsafe, by what
+    bool prev_stored_ = false;                  // the last game list stored the screen (one_off_store)
     uint32_t inb_after60_ = 0, inb_after_unsafe_ = 0;   // unrelated: the list before asked 60 / was unsafe
     u64 acc_vsync_ = 0, vsync_at_dl_ = 0, acc_inb_interp_ = 0, acc_inb_replay_ = 0, acc_match_ = 0;
     uint32_t presented_ = 0, inb_drawn_ = 0, inb_late_ = 0, inb_budget_ = 0, inb_unsafe_ = 0, inb_unrelated_ = 0;
