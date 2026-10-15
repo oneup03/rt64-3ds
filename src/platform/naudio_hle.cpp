@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "librecomp/addresses.hpp"
 #include "librecomp/rsp.hpp"
 
 namespace {
@@ -66,8 +67,13 @@ inline void dww(uint32_t a, uint32_t v) {
     dbw(a, v >> 24); dbw(a + 1, v >> 16); dbw(a + 2, v >> 8); dbw(a + 3, v);
 }
 
-inline uint8_t rb(const uint8_t* rdram, uint32_t p) { return rdram[(p & 0xFFFFFF) ^ 3]; }
-inline void rbw(uint8_t* rdram, uint32_t p, uint8_t v) { rdram[(p & 0xFFFFFF) ^ 3] = v; }
+// RDRAM's size, which a game may set below 16 MB (RT64_3DS_MEM_SIZE_MB):
+// addresses wrap at 16 MB as the RSP's DMA does, then at its end, so a
+// corrupted one never reaches past it.
+constexpr uint32_t kRdram = (uint32_t)recomp::mem_size;
+inline uint32_t ra(uint32_t p) { p &= 0xFFFFFF; return p < kRdram ? p : p % kRdram; }
+inline uint8_t rb(const uint8_t* rdram, uint32_t p) { return rdram[ra(p) ^ 3]; }
+inline void rbw(uint8_t* rdram, uint32_t p, uint8_t v) { rdram[ra(p) ^ 3] = v; }
 
 #if defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 6
 inline int32_t sat16(int32_t v) { int32_t r; __asm__("ssat %0, #16, %1" : "=r"(r) : "r"(v)); return r; }
@@ -87,12 +93,13 @@ inline int16_t vmulf(int32_t a, int32_t b) { return clamp16((a * b + 0x4000) >> 
 
 // RSP DMA as librecomp implements it, for an exact byte count (librecomp
 // passes its inclusive count less one): the RDRAM address aligned down to 8,
-// DMEM wrapping at 4 KB.
+// DMEM wrapping at 4 KB, RDRAM at its end (byte by byte when the copy
+// would run past either).
 void dma_read(const uint8_t* rdram, uint32_t dmem, uint32_t dram, uint32_t len) {
     dram &= 0xFFFFF8;
-    if ((dmem & 3) == 0 && dmem + len <= 0x1000) {
+    if ((dmem & 3) == 0 && dmem + len <= 0x1000 && dram + len <= kRdram) {
         uint32_t whole = len & ~3u;
-        memcpy(&g_dm[dmem], &rdram[dram & 0xFFFFFF], whole);
+        memcpy(&g_dm[dmem], &rdram[dram], whole);
         for (uint32_t i = whole; i < len; i++) dbw(dmem + i, rb(rdram, dram + i));
         return;
     }
@@ -101,9 +108,9 @@ void dma_read(const uint8_t* rdram, uint32_t dmem, uint32_t dram, uint32_t len) 
 
 void dma_write(uint8_t* rdram, uint32_t dmem, uint32_t dram, uint32_t len) {
     dram &= 0xFFFFF8;
-    if ((dmem & 3) == 0 && dmem + len <= 0x1000) {
+    if ((dmem & 3) == 0 && dmem + len <= 0x1000 && dram + len <= kRdram) {
         uint32_t whole = len & ~3u;
-        memcpy(&rdram[dram & 0xFFFFFF], &g_dm[dmem], whole);
+        memcpy(&rdram[dram], &g_dm[dmem], whole);
         for (uint32_t i = whole; i < len; i++) rbw(rdram, dram + i, db(dmem + i));
         return;
     }

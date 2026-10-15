@@ -6,10 +6,18 @@
 #include <cstring>
 #include <vector>
 
+#include "librecomp/addresses.hpp"
+
 namespace {
 
-inline uint8_t rb(const uint8_t* rdram, uint32_t p) { return rdram[(p & 0xFFFFFF) ^ 3]; }
-inline void rbw(uint8_t* rdram, uint32_t p, uint8_t v) { rdram[(p & 0xFFFFFF) ^ 3] = v; }
+// RDRAM's size, which a game may set below 16 MB (RT64_3DS_MEM_SIZE_MB):
+// addresses wrap at 16 MB as the RSP's DMA does, then at its end, so a
+// corrupted one never reaches past it.
+constexpr uint32_t kRdram = (uint32_t)recomp::mem_size;
+inline uint32_t ra(uint32_t p) { p &= 0xFFFFFF; return p < kRdram ? p : p % kRdram; }
+
+inline uint8_t rb(const uint8_t* rdram, uint32_t p) { return rdram[ra(p) ^ 3]; }
+inline void rbw(uint8_t* rdram, uint32_t p, uint8_t v) { rdram[ra(p) ^ 3] = v; }
 inline uint32_t rw(const uint8_t* rdram, uint32_t p) {
     return ((uint32_t)rb(rdram, p) << 24) | ((uint32_t)rb(rdram, p + 1) << 16) | ((uint32_t)rb(rdram, p + 2) << 8) | rb(rdram, p + 3);
 }
@@ -34,11 +42,11 @@ void generic_dump(const recomp3ds::AudioHleFamily& f, uint32_t i, uint32_t w0, u
 void recomp3ds::audio_hle_dma_read(uint8_t* dm, const uint8_t* rdram, uint32_t dmem, uint32_t dram, uint32_t len) {
     dram &= 0xFFFFF8;
     // The copy in one piece only when it stays inside DMEM and RDRAM; byte by
-    // byte otherwise, wrapping at 4 KB and 16 MB (a corrupted address near
-    // the top of RDRAM must not read or write past its end).
-    if ((dmem & 3) == 0 && dmem + len <= 0x1000 && dram + len <= 0x1000000) {
+    // byte otherwise, wrapping at 4 KB and RDRAM's end (a corrupted address
+    // near the top of RDRAM must not read or write past it).
+    if ((dmem & 3) == 0 && dmem + len <= 0x1000 && dram + len <= kRdram) {
         uint32_t whole = len & ~3u;
-        memcpy(&dm[dmem], &rdram[dram & 0xFFFFFF], whole);
+        memcpy(&dm[dmem], &rdram[dram], whole);
         for (uint32_t i = whole; i < len; i++) dm[(dmem + i) ^ 3] = rb(rdram, dram + i);
         return;
     }
@@ -47,9 +55,9 @@ void recomp3ds::audio_hle_dma_read(uint8_t* dm, const uint8_t* rdram, uint32_t d
 
 void recomp3ds::audio_hle_dma_write(const uint8_t* dm, uint8_t* rdram, uint32_t dmem, uint32_t dram, uint32_t len) {
     dram &= 0xFFFFF8;
-    if ((dmem & 3) == 0 && dmem + len <= 0x1000 && dram + len <= 0x1000000) {
+    if ((dmem & 3) == 0 && dmem + len <= 0x1000 && dram + len <= kRdram) {
         uint32_t whole = len & ~3u;
-        memcpy(&rdram[dram & 0xFFFFFF], &dm[dmem], whole);
+        memcpy(&rdram[dram], &dm[dmem], whole);
         for (uint32_t i = whole; i < len; i++) rbw(rdram, dram + i, dm[(dmem + i) ^ 3]);
         return;
     }
@@ -64,7 +72,7 @@ void recomp3ds::audio_hle_lockstep(AudioHleFamily& f, uint8_t* rdram, const OSTa
     // the task at 0xFC0.
     audio_hle_dma_read(dm, rdram, 0, task.t.ucode_data, 0xF80);
     memcpy(&dm[0xFC0], &task, sizeof(OSTask));
-    const uint32_t list = task.t.data_ptr & 0xFFFFFF;
+    const uint32_t list = ra(task.t.data_ptr);
     const uint32_t n = task.t.data_size / 8;
     static uint8_t ref_dm[0x1000], pre_dm[0x1000];
     static std::vector<uint8_t> before, ref;

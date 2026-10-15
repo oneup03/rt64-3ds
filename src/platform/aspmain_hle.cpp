@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "librecomp/addresses.hpp"
 #include "librecomp/rsp.hpp"
 #ifdef __3DS__
 #include <3ds.h>
@@ -257,8 +258,11 @@ void cmd_savebuff_silence(uint8_t* rdram, uint32_t w1) {
     const uint32_t count = dhu(kCount);
     if (count == 0) return;
     const uint32_t a = seg_addr(w1) & 0xFFFFF8;
-    if (a + count <= 0x1000000) memset(&rdram[a], 0, count);
-    else for (uint32_t i = 0; i < count; i++) rdram[((a + i) & 0xFFFFFF) ^ 3] = 0;      // wraps at 16 MB, as the DMA would
+    // Wrapping at 16 MB, as the DMA would, then at RDRAM's end (a game may
+    // set it smaller), so a corrupted address never writes past it.
+    const uint32_t end = (uint32_t)recomp::mem_size;
+    if (a + count <= end) memset(&rdram[a], 0, count);
+    else for (uint32_t i = 0; i < count; i++) rdram[(((a + i) & 0xFFFFFF) % end) ^ 3] = 0;
 }
 
 void cmd_segment(uint32_t w1) {
