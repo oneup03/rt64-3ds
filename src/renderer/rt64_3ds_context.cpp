@@ -579,6 +579,9 @@ public:
         int inbs = 0;                   // in-betweens drawn
         if (present) {
             LightLock_Lock(&g_gpu_lock);
+            // The list before's recorded frame: every copy from here on
+            // follows an await_presenter (replay_and_present's first step).
+            uploads_held_ = false;
             bool handed = false;
             if (!gpu_away() && !g_quitting) {
                 if (inbetween) {
@@ -1464,7 +1467,20 @@ private:
         cur_eye_[0] = set != 0 ? inb_l_ : top_;
         cur_eye_[1] = set != 0 ? inb_r_ : top_r_;
         if (pair_ && !inbetween) pair_frames_++;
-        if (defer) begin_deferred();
+        if (defer) {
+            // The game's frame recorded before its in-betweens (send_dl,
+            // with the builder): the textures' copies to VRAM go now, ahead
+            // of the recording, and not at the in-betweens' frame starts
+            // until the presenter has it on the GPU (uploads_held_). Copies
+            // made between the recording and its replay broke the frames
+            // that drew textures they moved: Banjo's flipbook quicksand
+            // flashed black and its steam drew wrong, with double eyes only.
+            if (record_only_) {
+                textures_.upload_pending();
+                uploads_held_ = true;
+            }
+            begin_deferred();
+        }
         else {
             if (frame_.snapshot_request) copy_snapshot();
             const bool readback = start_readback();
@@ -1473,7 +1489,7 @@ private:
             retire_rtt_targets();
             // Textures' copies to VRAM, ahead of this frame's draws (out of a
             // frame: see TextureCache::upload_pending).
-            textures_.upload_pending();
+            if (!uploads_held_) textures_.upload_pending();
             { Waiting gw(g_wait_gpu, "C3D_FrameBegin, the frame's start"); C3D_FrameBegin(0); }
             const u64 waited = svcGetSystemTick() - tb0;
             acc_wait_ += waited;
@@ -1857,6 +1873,7 @@ private:
     // The game's frame recorded before its in-betweens (send_dl, with the
     // builder): what replay_and_present left for hand_off_recorded.
     bool record_only_ = false;
+    bool uploads_held_ = false;     // a recorded game frame waits for the presenter: no texture copies to VRAM
     rt64_3ds::StereoFrame rec_sfd_{};
     int rec_eyes_ = 1;
     bool rec_fill_ = false;
