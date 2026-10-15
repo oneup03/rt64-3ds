@@ -94,6 +94,9 @@ struct GameDesc {
     // Optional: a mod was switched on or off on the Mods page (it takes
     // effect at once), e.g. to give a mod's key a button.
     void (*on_mod_switched)(const char* mod_id, bool on) = nullptr;
+    // Optional: one of a mod's options changed on the Mods page (it takes
+    // effect at once), e.g. to fit the touch screen's buttons to it.
+    void (*on_mod_option_changed)(const char* mod_id, const char* option_id) = nullptr;
     recomp::rsp::callbacks_t rsp{};     // get_rsp_microcode
     void (*register_overlays)() = nullptr;
     void (*register_patches)() = nullptr;
@@ -213,6 +216,25 @@ void input_set_cstick_buttons(bool on);
 // settings menu is closed, for mods that read buttons the game's own map
 // leaves out; 0 hides them. Any thread.
 void touch_pad_set(uint16_t n64_buttons);
+// Labelled buttons on the touch screen, for what a mod does rather than the
+// N64 buttons it reads (in place of touch_pad_set's; count 0 hides them).
+// A touch sends `press` for its first press_ms, that long even when the
+// finger lifts sooner (a game that reads the pad at 20 or 30 fps sees it),
+// then `hold` for as long as the finger stays: L + A for one press and
+// then A alone, say, so a mod that wants L only to start sees it while
+// another that reads L held does only for that moment. Up to
+// kTouchButtonsMax, laid out in one column (up to four) or two; the label
+// fits 17 characters. `right` puts a button in the right-hand column (two
+// columns then, however few buttons), for one used with the right hand.
+// Copied: the array need not stay alive. Any thread.
+struct TouchButton {
+    const char* label;
+    uint16_t press;
+    uint16_t hold;
+    bool right = false;
+};
+constexpr size_t kTouchButtonsMax = 8;
+void touch_pad_set_buttons(const TouchButton* buttons, size_t count, int press_ms = 100);
 
 // Swap the button map while running (a setting that repurposes buttons).
 // The array must stay alive; GameDesc.button_map is the one at start.

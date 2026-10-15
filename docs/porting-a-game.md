@@ -1241,11 +1241,20 @@ fed from tables compiled into the executable.
   switched on; the runtime's `mods.json` is not used. Mods without `:embed`
   must also be on the SD card in `mods/`: they only run when their file is
   present.
-- **`GameDesc.on_mod_switched`**: told when a mod is switched on or off, for
-  a game whose map leaves out buttons a mod reads. `recomp3ds::touch_pad_set`
-  then offers those N64 buttons (the D-pad's directions, L) on the touch
-  screen while the settings are closed; a touch holds one. Banjo does that
-  by default, and can remap the D-pad and ZL instead ("Mod buttons").
+- **`GameDesc.on_mod_switched`** / **`on_mod_option_changed`**: told when a
+  mod is switched on or off, or one of its options changes, for a game whose
+  map leaves out buttons a mod reads. `recomp3ds::touch_pad_set` then offers
+  those N64 buttons (the D-pad's directions, L) on the touch screen while
+  the settings are closed; a touch holds one (DK64's Tag Anywhere).
+  `recomp3ds::touch_pad_set_buttons` offers labelled buttons for what the
+  mods do instead, each pressing a set of N64 buttons: `press` for the
+  touch's first 100 ms (that long even for a quick tap, so a game reading
+  the pad at 20 or 30 fps sees it), then `hold` while the finger stays. A
+  combination becomes one touch (Banjo's Fly: L + A, then A alone), and a
+  button needed only to start a move goes away before another mod reading
+  it held reacts much (Cheats' moon jump, on L). Banjo builds its buttons
+  from the mods on and their options; "Mod buttons" remaps the D-pad and ZL
+  instead.
 - **`GameDesc.rom_cache_mb` / `rom_block_kb`**: the ROM stream's cache and
   its block, the unit of one card read (2 MB of 128 KB by default). A card
   read has a high fixed cost: about 10 ms on a New 3DS (Dinosaur Planet's

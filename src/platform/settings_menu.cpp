@@ -441,6 +441,7 @@ bool touch_repeats(const TouchTarget& t) {
 
 std::string g_mod_game_id;
 void (*g_on_mod_switched)(const char* mod_id, bool on) = nullptr;
+void (*g_on_mod_option_changed)(const char* mod_id, const char* option_id) = nullptr;
 #ifdef RECOMP_STATIC_MODS
 struct ModRow {
     std::string mod_id, option_id;      // option_id empty: the mod's on/off row
@@ -485,6 +486,7 @@ void apply_mod_row(void* ctx, int v) {
         case ModRow::Bool: recomp::mods::set_mod_config_value(m.mod_id, m.option_id, v != 0); break;
         case ModRow::Number: recomp::mods::set_mod_config_value(m.mod_id, m.option_id, (double)v * m.num_step); break;
     }
+    if (m.kind != ModRow::Toggle && g_on_mod_option_changed != nullptr) g_on_mod_option_changed(m.mod_id.c_str(), m.option_id.c_str());
     g_mod_values[m.key] = v;
     changed();
 }
@@ -609,6 +611,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     g_row_count = 0;
     g_mod_game_id = desc.entry.mod_game_id;
     g_on_mod_switched = desc.on_mod_switched;
+    g_on_mod_option_changed = desc.on_mod_option_changed;
     add_row({ "separation", "3D depth", 0, 100, &st.sep_slider, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
     add_row({ "convergence_tenths", "Convergence", 1, 200, &g_conv_tenths, nullptr, true, nullptr, apply_conv, Page3D, 1, nullptr });
     add_row({ "hud_depth", "HUD depth", 0, 100, &st.hud_depth, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
