@@ -1294,8 +1294,13 @@ handles the rest when the game is built with static mods:
 - `make_game_mod_rom.py <game ROM> <mode .nrm>...` writes
   `mods/<mod id>.z64` (checked against the patch's source and target CRCs;
   a .v64 or .n64 ROM is read as .z64) and `mods/<mod id>.z64.ok`: the mod's
-  id, its version and the ROM's size. The player copies both into `mods/`
-  next to the game; the runtime's scan skips files that aren't `.nrm`.
+  id, its version and the ROM's size, next to the ROM (`-o` for elsewhere).
+  Run with no arguments, it takes the `.nrm` files next to itself and the
+  one ROM in a `3ds/<game>/` folder below it: ship it at the root of the
+  release's SD-card zip, and the player puts the ROM in the game's folder
+  and the `.nrm` files beside the script, runs it, and copies the `3ds`
+  folder over (Banjo's release does this). The runtime's scan skips files
+  in `mods/` that aren't `.nrm`.
 - At start, a bottom-screen picker lists the game and each built-in mode.
   It remembers the last choice, and lists (and logs) in red a mode whose
   ROM is missing, of another version than the one built in, or not the

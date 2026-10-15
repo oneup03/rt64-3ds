@@ -4,16 +4,20 @@
 A game mode (a ROM hack played through a recomp's built-in code) needs the
 hack's ROM, which the mod's .nrm makes from the game's ROM with its
 patch.bps. The 3DS doesn't make it: the patched ROM is 64 MB and the patch
-alone more than an Old 3DS has room for. This script does it once:
+alone more than an Old 3DS has room for. This script does it once.
+
+Run with no arguments (or double-clicked), it works in the folder it sits
+in, laid out like the SD card's root as a 3DS release zip extracts: the
+game's ROM in 3ds/<game>/ (Banjo: 3ds/BanjoRecomp/BK.z64) and the modes'
+.nrm files next to the script. Or name them:
 
     python3 make_game_mod_rom.py BK.z64 bk_jiggies_of_time.nrm
 
-It writes mods/<mod id>.z64 and mods/<mod id>.z64.ok (the mode and version
-it was made from) into the output folder (-o, default: the current folder).
-Copy the files into the mods folder next to the game on the SD card (for
-Banjo: sdmc:/3ds/BanjoRecomp/mods/); the .nrm itself isn't needed there.
-Several .nrm files may be given at once. A ROM in .v64 or .n64 byte order is
-read as .z64. Standard library only.
+Either way it writes mods/<mod id>.z64 and mods/<mod id>.z64.ok (the mode
+and version it was made from) next to the ROM (-o names another folder),
+which is where the game looks for them on the SD card; the .nrm itself
+isn't needed there. Several .nrm files may be given at once. A ROM in .v64
+or .n64 byte order is read as .z64. Standard library only.
 """
 import argparse
 import json
@@ -129,24 +133,80 @@ def make(rom, nrm_path, out_dir):
     print(f"  wrote {rom_out} ({len(target) >> 20} MB) and {os.path.basename(rom_out)}.ok")
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Make game modes' ROMs from the game's ROM and the modes' .nrm files, for rt64-3ds.")
-    ap.add_argument("rom", help="the game's ROM (the one the 3DS port uses, e.g. BK.z64)")
-    ap.add_argument("nrm", nargs="+", help="game mode .nrm files")
-    ap.add_argument("-o", "--out", default=".", help="where to write the mods folder (default: here)")
-    args = ap.parse_args()
-    with open(args.rom, "rb") as f:
+ROM_EXTS = (".z64", ".v64", ".n64")
+
+
+def find_inputs(base):
+    """No arguments: the .nrm files next to the script, and the one ROM in a
+    3ds/<game>/ folder under it (the SD card's layout)."""
+    nrms = sorted(os.path.join(base, n) for n in os.listdir(base) if n.lower().endswith(".nrm"))
+    roms = []
+    top = os.path.join(base, "3ds")
+    if os.path.isdir(top):
+        for game in sorted(os.listdir(top)):
+            folder = os.path.join(top, game)
+            if os.path.isdir(folder):
+                roms += [os.path.join(folder, n) for n in sorted(os.listdir(folder)) if n.lower().endswith(ROM_EXTS)]
+    if not nrms:
+        raise SystemExit(f"No .nrm files next to the script ({base}): put the game modes' .nrm files there.")
+    if not roms:
+        raise SystemExit(f"No ROM in {os.path.join(top, '<game>')}: put the game's ROM in its folder there "
+                         "(Banjo: 3ds/BanjoRecomp/BK.z64).")
+    if len(roms) > 1:
+        raise SystemExit("More than one ROM under 3ds/; name the one to use: make_game_mod_rom.py <ROM> <.nrm files>\n  "
+                         + "\n  ".join(roms))
+    return roms[0], nrms
+
+
+def run(args):
+    if args.rom is None:
+        rom_path, nrms = find_inputs(os.path.dirname(os.path.abspath(__file__)))
+    else:
+        if not args.nrm:
+            raise SystemExit("Name the game modes' .nrm files after the ROM.")
+        rom_path, nrms = args.rom, args.nrm
+    out = args.out if args.out is not None else os.path.dirname(os.path.abspath(rom_path))
+    print(f"ROM: {rom_path}")
+    with open(rom_path, "rb") as f:
         rom = to_z64(f.read())
     failed = 0
-    for nrm in args.nrm:
+    for nrm in nrms:
         try:
-            make(rom, nrm, args.out)
+            make(rom, nrm, out)
         except (BpsError, KeyError, ValueError, zipfile.BadZipFile, OSError) as e:
             print(f"{nrm}: {e}", file=sys.stderr)
             failed += 1
-    if failed == 0:
-        print(f"Copy the files in {os.path.join(args.out, 'mods')} to the game's mods folder on the SD card (for Banjo: sdmc:/3ds/BanjoRecomp/mods).")
+    if failed == 0 and args.out is None:
+        print(f"Done: the game modes' ROMs are in {os.path.join(out, 'mods')}, where the game looks for them "
+              "(copy the 3ds folder to the SD card's root if this isn't the SD card).")
+    elif failed == 0:
+        print(f"Done: copy the files in {os.path.join(out, 'mods')} to the mods folder next to the game on the SD card.")
     return 1 if failed else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Make game modes' ROMs from the game's ROM and the modes' .nrm files, for rt64-3ds. "
+                                 "With no arguments: the .nrm files next to this script and the ROM in its 3ds/<game>/ folder.")
+    ap.add_argument("rom", nargs="?", help="the game's ROM (the one the 3DS port uses, e.g. BK.z64)")
+    ap.add_argument("nrm", nargs="*", help="game mode .nrm files")
+    ap.add_argument("-o", "--out", default=None, help="where to write the mods folder (default: next to the ROM)")
+    args = ap.parse_args()
+    try:
+        status = run(args)
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            print(e.code, file=sys.stderr)
+            status = 1
+        else:
+            status = e.code or 0
+    # Double-clicked (no arguments, a console of its own): keep the window
+    # open until the result is read.
+    if args.rom is None and sys.stdin is not None and sys.stdin.isatty():
+        try:
+            input("Press Enter to close.")
+        except EOFError:
+            pass
+    return status
 
 
 if __name__ == "__main__":
