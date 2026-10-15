@@ -849,7 +849,11 @@ struct Interpreter::Impl {
             if (defer_active) dfr->position(dslot[i], x, y, z, w);
             else { x = vtx[i].x; y = vtx[i].y; z = vtx[i].z; w = vtx[i].w; }
             uint32_t f = 0;
-            if (!(w > 0.0f)) f = kAll;      // behind the eye: out on every side
+            // Behind the eye: out past the near plane only. Its x and y
+            // say nothing of the sides (a box from behind the camera to
+            // below the screen, DK64's ground, crosses the view: marking
+            // it out on every side culled it as "all below").
+            if (!(w > 0.0f)) f = kNear;
             else {
                 if (x < x_lo * w) f |= kNegX;
                 if (x > x_hi * w) f |= kPosX;
