@@ -160,6 +160,9 @@ void alert(u64 main_stalled, u64 frames_stalled, u64 frames_limit_s, uint32_t wr
         if (rates[0] != '\0') recomp3ds::screen_alert(rates, 27);
         if (!shown) {
             fprintf(stderr, "recomp3ds: STOPPED: %s(the touch screen's alert line); %s; %s\n", line, detail, rates);
+            // What the renderer's threads are waiting for (frames stopped
+            // with the main thread alive gets no STALL report).
+            rt64_3ds::dump_progress();
             recomp3ds::log_sync();
         }
         shown = true;

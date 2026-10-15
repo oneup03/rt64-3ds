@@ -92,6 +92,24 @@ volatile bool g_pair_request = false;   // rt64_3ds::request_capture_pair
 rt64_3ds::Progress g_progress{};
 const rt64_3ds::DrawRecord* g_progress_draw = nullptr;
 
+// What a renderer thread is blocked on, and since when (dump_progress, in
+// the stall watch's reports): a frozen picture names the wait it hangs in,
+// and the job counts tell a helper thread that stopped running from one
+// that is merely idle. Diagnostics only: a torn read just misreports once.
+struct WaitMark {
+    const char* volatile what = nullptr;
+    volatile u64 since = 0;
+    volatile uint32_t jobs = 0;
+};
+WaitMark g_wait_gfx, g_wait_builder, g_wait_helper, g_wait_presenter, g_wait_for_helper, g_wait_gpu;
+struct Waiting {
+    WaitMark& m;
+    const char* prev;
+    u64 prev_since;
+    Waiting(WaitMark& mark, const char* what) : m(mark), prev(mark.what), prev_since(mark.since) { m.since = svcGetSystemTick(); m.what = what; }
+    ~Waiting() { m.what = prev; m.since = prev_since; }
+};
+
 // ---- Frame captures on their way to the SD card (see maybe_capture and
 // maybe_capture_framebuffer). The SD card takes seconds for a capture's
 // 16 MB (about 1.5 MB/s on the console), so one writer thread, started with
@@ -411,7 +429,10 @@ public:
         if (!ok_ || g_quitting) return;
         // Hold the game while the GPU is away (it would only run ahead unseen)
         // or a prompt has it paused.
-        while ((gpu_away() || g_paused) && !g_quitting) svcSleepThread(10 * 1000000ll);
+        {
+            Waiting w(g_wait_gfx, "the HOME Menu, sleep or a prompt (gpu_away/paused)");
+            while ((gpu_away() || g_paused) && !g_quitting) svcSleepThread(10 * 1000000ll);
+        }
         if (g_quitting) return;
         u64 t0 = svcGetSystemTick();
         vsync_at_dl_ = acc_vsync_;
@@ -1129,12 +1150,16 @@ public:
                 interp_.drain_triangles();
                 drained += svcGetSystemTick() - d0;
                 if (LightSemaphore_TryAcquire(&read_done_, 1) == 0) break;
+                Waiting w(g_wait_gfx, "the list reader (core 0)");
                 LightEvent_Wait(&read_progress_);
             }
             acc_tris_ += drained;
             last_drain_ms_ = (float)drained * 1000.0f / (float)SYSCLOCK_ARM11;
         }
-        else LightSemaphore_Acquire(&read_done_, 1);
+        else {
+            Waiting w(g_wait_gfx, "the list reader (core 0)");
+            LightSemaphore_Acquire(&read_done_, 1);
+        }
         __dmb();
         return read_outcome_;
     }
@@ -1449,7 +1474,7 @@ private:
             // Textures' copies to VRAM, ahead of this frame's draws (out of a
             // frame: see TextureCache::upload_pending).
             textures_.upload_pending();
-            C3D_FrameBegin(0);
+            { Waiting gw(g_wait_gpu, "C3D_FrameBegin, the frame's start"); C3D_FrameBegin(0); }
             const u64 waited = svcGetSystemTick() - tb0;
             acc_wait_ += waited;
             // An interpolated pair's frames: what each waited for the GPU
@@ -1642,7 +1667,7 @@ private:
                 g_progress.phase = 4;
                 C3D_FrameEnd(0);
                 g_progress.phase = 2;
-                C3D_FrameBegin(0);
+                { Waiting gw(g_wait_gpu, "C3D_FrameBegin, debug sync"); C3D_FrameBegin(0); }
                 const int t = cur_target_;
                 cur_target_ = -4;
                 bind_target(t, pass);
@@ -1906,8 +1931,13 @@ private:
     static void presenter_main(void* arg) {
         C3dRenderContext* self = static_cast<C3dRenderContext*>(arg);
         for (;;) {
-            LightSemaphore_Acquire(&self->present_go_, 1);
+            {
+                Waiting w(g_wait_presenter, "work (idle)");
+                LightSemaphore_Acquire(&self->present_go_, 1);
+            }
             if (self->presenter_stop_) break;
+            g_wait_presenter.jobs = g_wait_presenter.jobs + 1;
+            Waiting busy(g_wait_presenter, "a frame to finish (GPU, screen)");
             if (self->job_inb_) self->present_pending_inbetween();
             if (self->job_deferred_) self->present_deferred();
             else {
@@ -1934,7 +1964,7 @@ private:
     // come after the in-between's transfers out of its own targets anyway.
     void present_deferred() {
         const u64 t0 = svcGetSystemTick();
-        C3D_FrameBegin(0);
+        { Waiting gw(g_wait_gpu, "C3D_FrameBegin, the in-between's GPU work (presenter)"); C3D_FrameBegin(0); }
         // citro3d asks for the in-between's swap (and stops its GPU clock)
         // in the queue's completion callback, just after the wait above can
         // return: the back buffer moves on then. Only when an in-between was
@@ -1959,7 +1989,7 @@ private:
         const u64 w0 = svcGetSystemTick();
         for (int i = 0; i < 400 && gspIsPresentPending(GSP_SCREEN_TOP); i++) svcSleepThread(100000);
         const u64 w1 = svcGetSystemTick();
-        C3D_FrameBegin(0);
+        { Waiting gw(g_wait_gpu, "C3D_FrameBegin, the frame's draws (presenter)"); C3D_FrameBegin(0); }
         const u64 t2 = svcGetSystemTick();
         link_eyes(0);
         top_->used = true;
@@ -1977,7 +2007,7 @@ private:
     // at their end. C3D_FrameBegin waits for its draws, which have been on
     // the GPU since it was recorded; returns their GPU time.
     float transfer_inbetween(bool stereo) {
-        C3D_FrameBegin(0);
+        { Waiting gw(g_wait_gpu, "C3D_FrameBegin, an in-between's transfer"); C3D_FrameBegin(0); }
         const float draws_ms = C3D_GetDrawingTime();
         LightEvent_Signal(&inb_free_);         // its vertices are read
         inb_fb_ = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
@@ -2027,7 +2057,10 @@ private:
     }
     void await_presenter() {
         if (!present_busy_) return;
-        LightSemaphore_Acquire(&present_done_, 1);
+        {
+            Waiting w(g_wait_gfx, "the presenter");
+            LightSemaphore_Acquire(&present_done_, 1);
+        }
         present_busy_ = false;
         if (job_deferred_) {
             // What the presenter read: the in-between's GPU time, and the
@@ -2075,9 +2108,13 @@ private:
     static void builder_main(void* arg) {
         C3dRenderContext* self = static_cast<C3dRenderContext*>(arg);
         for (;;) {
-            LightSemaphore_Acquire(&self->build_go_, 1);
+            {
+                Waiting w(g_wait_builder, "work (idle)");
+                LightSemaphore_Acquire(&self->build_go_, 1);
+            }
             if (self->builder_stop_) break;
             __dmb();
+            g_wait_builder.jobs = g_wait_builder.jobs + 1;
             const u64 t0 = svcGetSystemTick();
             self->last_match_ = self->interp_.match_previous(self->build_weight_);
             const rt64_3ds::interp::MatchResult& m = self->last_match_;
@@ -2112,9 +2149,13 @@ private:
         static void main(void* p) {
             CoreHelper* self = static_cast<CoreHelper*>(p);
             for (;;) {
-                LightSemaphore_Acquire(&self->go, 1);
+                {
+                    Waiting w(g_wait_helper, "work (idle)");
+                    LightSemaphore_Acquire(&self->go, 1);
+                }
                 if (self->stop) break;
                 __dmb();
+                g_wait_helper.jobs = g_wait_helper.jobs + 1;
                 const u64 t0 = svcGetSystemTick();
                 self->job(self->arg);
                 self->run_ticks = self->run_ticks + (svcGetSystemTick() - t0);
@@ -2131,6 +2172,7 @@ private:
         }
         void finish() override {
             const u64 t0 = svcGetSystemTick();
+            Waiting w(g_wait_for_helper, "the core-3 helper's result");
             LightSemaphore_Acquire(&done, 1);
             __dmb();
             wait_ticks = wait_ticks + (svcGetSystemTick() - t0);
@@ -2174,6 +2216,7 @@ private:
     }
     bool join_build() {
         if (!build_busy_) return true;
+        Waiting w(g_wait_gfx, "the in-between builder (core 1)");
         LightSemaphore_Acquire(&build_done_, 1);
         __dmb();
         build_busy_ = false;
@@ -2465,6 +2508,7 @@ private:
     void wait_inbetween_vbo() {
         if (present_busy_ && job_deferred_) {
             const u64 tw = svcGetSystemTick();
+            Waiting w(g_wait_gfx, "the last in-between's vertices (GPU)");
             LightEvent_WaitTimeout(&inb_free_, 200 * 1000000ll);
             acc_vbo_wait_ += svcGetSystemTick() - tw;
         }
@@ -2489,8 +2533,11 @@ private:
         const u32 kFlags = GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
                            GX_TRANSFER_IN_FORMAT(color16_ ? GX_TRANSFER_FMT_RGB565 : GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB5A1) |
                            GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO);
-        C3D_SyncDisplayTransfer((u32*)snapshot_source()->frameBuf.colorBuf, GX_BUFFER_DIM(240, 400),
-                                (u32*)g_readback[next], GX_BUFFER_DIM(240, 400), kFlags);
+        {
+            Waiting gw(g_wait_gpu, "C3D_SyncDisplayTransfer, the read-back");
+            C3D_SyncDisplayTransfer((u32*)snapshot_source()->frameBuf.colorBuf, GX_BUFFER_DIM(240, 400),
+                                    (u32*)g_readback[next], GX_BUFFER_DIM(240, 400), kFlags);
+        }
         readback_next_ = next;
         return true;
     }
@@ -2553,9 +2600,12 @@ private:
                 // transfer with whatever dimensions the last one left (our
                 // RGB8 screen output): the scrambled snapshot.
                 constexpr u32 kTextureCopyMode = BIT(3);
-                C3D_SyncTextureCopy((u32*)snapshot_source()->frameBuf.colorBuf, GX_BUFFER_DIM(row / 16, 0),
-                                    (u32*)snapshot_[slot].data, GX_BUFFER_DIM(row / 16, gap / 16), 240 * 400 * bpp,
-                                    kTextureCopyMode);
+                {
+                    Waiting gw(g_wait_gpu, "C3D_SyncTextureCopy, a snapshot");
+                    C3D_SyncTextureCopy((u32*)snapshot_source()->frameBuf.colorBuf, GX_BUFFER_DIM(row / 16, 0),
+                                        (u32*)snapshot_[slot].data, GX_BUFFER_DIM(row / 16, gap / 16), 240 * 400 * bpp,
+                                        kTextureCopyMode);
+                }
             }
             snapshots_++;
             // Checked once the copy has finished: out of a frame citro3d
@@ -4188,7 +4238,23 @@ rt64_3ds::create_render_context(uint8_t* rdram, ultramodern::renderer::WindowHan
 const rt64_3ds::Progress& rt64_3ds::progress() { return g_progress; }
 
 void rt64_3ds::dump_progress() {
-    fprintf(stderr, "rt64-3ds: progress: frame %u phase %u draw %u of %u\n", g_progress.frames, g_progress.phase, g_progress.draw_index, g_progress.draw_count);
+    fprintf(stderr, "rt64-3ds: progress: frame %u phase %u draw %u of %u%s%s%s\n", g_progress.frames, g_progress.phase, g_progress.draw_index, g_progress.draw_count,
+            g_suspended ? ", the HOME Menu has the GPU" : "", g_sleeping ? ", asleep" : "", g_paused ? ", paused (a prompt)" : "");
+    const u64 now = svcGetSystemTick();
+    auto mark = [&](const char* who, const WaitMark& m, bool counts) {
+        const char* what = m.what;
+        const float ms = what != nullptr ? (float)(now - m.since) * 1000.0f / (float)SYSCLOCK_ARM11 : 0.0f;
+        char jobs[32] = "";
+        if (counts) snprintf(jobs, sizeof(jobs), ", %lu jobs so far", (unsigned long)m.jobs);
+        if (what != nullptr) fprintf(stderr, "rt64-3ds:   %s waits for %s, %.0f ms%s\n", who, what, ms, jobs);
+        else fprintf(stderr, "rt64-3ds:   %s is working%s\n", who, jobs);
+    };
+    mark("gfx thread", g_wait_gfx, false);
+    mark("in-between builder (core 1)", g_wait_builder, true);
+    mark("core-3 helper", g_wait_helper, true);
+    if (g_wait_for_helper.what != nullptr) mark("a thread", g_wait_for_helper, false);
+    mark("presenter", g_wait_presenter, true);
+    if (g_wait_gpu.what != nullptr) mark("a thread", g_wait_gpu, false);
     if (g_progress.phase == 3 && g_progress_draw != nullptr) C3dRenderContext::describe_draw(g_progress.draw_index, *g_progress_draw);
 }
 
