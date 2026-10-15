@@ -61,7 +61,7 @@ namespace recomp3ds {
     // The ROM read from the SD card as the game needs it (rom_stream.cpp):
     // installs the runtime's RomStream with a block cache of about
     // cache_bytes, before start.
-    void rom_stream_install(size_t cache_bytes, size_t block_bytes = 32 * 1024);
+    void rom_stream_install(size_t cache_bytes, size_t block_bytes = 128 * 1024);
     // Game modes (game_modes.cpp; nothing without RT64_3DS_STATIC_MODS): the
     // ROM patch handler, and the picker before the game starts (returns the
     // chosen mode's id, empty for the game itself).
@@ -121,7 +121,7 @@ namespace recomp3ds {
     void set_cpu_speed(bool new3ds);    // the New 3DS clock and L2 on or off (recomp3ds_run.cpp)
     void settings_menu_update();        // ~60 times a second, main thread
     void settings_menu_toggle();
-    int settings_rom_stream();          // settings.ini's rom_stream: 0 auto, 1 in memory, 2 from the SD card
+    int settings_rom_stream();          // settings.ini's rom_stream: 0 the game's choice, 1 in memory, 2 from the SD card
     bool settings_debug_rows();         // settings.ini's dbg_rows: the touch screen's thread and audio rows
     int settings_cores();               // settings.ini's dbg_cores, read at start: 0 auto, 1 two cores with the game on core 1, 2 ... on core 0
     // settings.ini's dbg_* keys that the platform reads (hidden rows, 0 off;

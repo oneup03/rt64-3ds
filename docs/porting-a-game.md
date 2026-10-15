@@ -93,8 +93,10 @@ a port. Three games are the reference, each in its repository's
    key.
 9. **Memory for a big ROM.** `RT64_3DS_LINEAR_HEAP_MB` in the game's
    `CMakeLists.txt` sets the linear heap's size (32 MB with plenty of memory
-   and 16 otherwise by default); `GameDesc::rom_room_mb` (24) is the room the
-   ROM-in-memory decision wants beside the ROM and RDRAM. Dinosaur Planet's
+   and 16 otherwise by default); `GameDesc::rom_new3ds` / `rom_old3ds`
+   place the ROM on each console (`Memory`, `Stream` or `Auto`), and
+   `GameDesc::rom_room_mb` (24) is the room `Auto` wants beside the ROM and
+   RDRAM before it holds the ROM in memory. Dinosaur Planet's
    64 MB ROM fits a New 3DS's application heap with 16 MB of linear memory
    and 12 MB of room; the log's `heap in use` says what the game takes.
 10. **The game's own audio.** `SynthDesc::reserve_channels` leaves ndsp
@@ -891,10 +893,18 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   and DK64 have none, so 0025 does nothing for them).
 - **Game code at -Os.** No gain (Banjo, Old clock): recompiled code is
   straight-line loads and stores, and shrank only 4.5 %. It stays at -O2.
-- **ROM.** `rom_stream` (settings.ini: 0 auto, 1 in memory, 2 from the SD
-  card) streams the ROM through a 2 MB cache of 32 KB blocks. Auto streams
-  on an Old 3DS or when the heap is short. Every ROM read the runtime makes
-  goes through it.
+- **ROM.** Each game places its ROM per console: `GameDesc::rom_new3ds`
+  and `rom_old3ds`, each `Memory`, `Stream` (through the ROM stream's
+  cache, 2 MB of 128 KB blocks by default) or `Auto` (the default for
+  both): in memory when the heap has room for it beside RDRAM and
+  `GameDesc::rom_room_mb` (what the rest of the port takes: measure it as
+  the `after exit` line's arena with the ROM streamed, less RDRAM and the
+  cache), else streamed. `rom_stream` in settings.ini (1 in memory, 2 from
+  the SD card) overrides the game's choice; 0 keeps it. The ROM line of
+  the log prints the figures and whose choice it was. An Old 3DS CIA has about 37-40 MB of heap: Goemon holds its
+  16 MB ROM there with RDRAM cut to 12 MB and 5 MB of rest; Banjo (16 MB of
+  RDRAM, 12 MB of rest) and DK64 (32 MB ROM) stream. Every ROM read the
+  runtime makes goes through it.
 
 ### Freezes, and how to read one
 
@@ -1191,7 +1201,7 @@ library's keys:
 | `frame_cap` | 0; the games 2, which an Old 3DS turns into `old3ds_frame_cap` | Game | the gfx thread |
 | `dbg_old_clock` | 0 | none, New 3DS only | `set_cpu_speed` (1 runs at the Old 3DS clock) |
 | `dbg_cores` | 0 (Auto) | none, read at start | the core layout (1 two cores with the game on core 1, 2 on core 0) |
-| `rom_stream` | 0 (auto) | none, read at start | the ROM stream |
+| `rom_stream` | 0 (the game's choice: `GameDesc::rom_new3ds` / `rom_old3ds`) | none, read at start | the ROM stream |
 | `log_level` | 1 on a New 3DS, 0 on an Old | none | `log_set_level` |
 | `dbg_rows`, `dbg_capture` | 0, 0 | none | the touch screen's stats rows; SELECT held for a capture |
 | `dbg_*` | 0 | none, read at start | the table above |
@@ -1237,13 +1247,21 @@ fed from tables compiled into the executable.
   screen while the settings are closed; a touch holds one. Banjo does that
   by default, and can remap the D-pad and ZL instead ("Mod buttons").
 - **`GameDesc.rom_cache_mb` / `rom_block_kb`**: the ROM stream's cache and
-  its block, the unit of one card read (2 MB of 32 KB by default). A card
-  read costs about 10 ms whatever its size: a game that loads long runs
-  (Dinosaur Planet's maps, 244 reads stalling a load for 3 s on a New 3DS)
-  wants bigger blocks (128 KB), one that reads small pieces at random
-  wants small ones. A miss also queues the next block for a read-ahead
-  thread (core 3 on a New 3DS), so a run of reads finds its next block in
-  the cache while the game uses the one before. The stats line's
+  its block, the unit of one card read (2 MB of 128 KB by default). A card
+  read has a high fixed cost: about 10 ms on a New 3DS (Dinosaur Planet's
+  maps: 244 reads of 32 KB stalled a load for 3 s), and on an Old 3DS
+  about 70 ms for 32 KB and 100 ms for 128 KB, so 128 KB blocks suit most
+  games; one that reads small pieces at random may want smaller ones. The
+  cache wants to hold what the game rereads while it plays: DK64, walking
+  the Isles on an Old 3DS, read 139 MB in five minutes through 4 MB and
+  waited on the card a third of the time, 13 % with 12 MB; it sets 16 MB
+  (the heap peaked at 31 MB of 40 MB with 12). A ROM small enough to fit
+  in the heap beside everything else is better held in memory
+  (`RomPlace::Memory`, or `Auto` with a measured `rom_room_mb`). A miss also queues the next block for a read-ahead
+  thread (core 3 on a New 3DS; on an Old 3DS at priority 0x22, above the
+  renderer and the game, whose next read usually waits for it), so a run
+  of reads finds its next block in the cache while the game uses the one
+  before. The stats line's
   `rom N reads (M KB) waited T ms in W (max X)` counts the card reads and
   the game's waits in the stream (calls over 50 us), so a slow load can be
   told from a slow card: a 15-minute DK64 session on an Old 3DS made 148

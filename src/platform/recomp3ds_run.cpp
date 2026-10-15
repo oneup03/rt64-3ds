@@ -765,21 +765,35 @@ int recomp3ds::run(const GameDesc& desc) {
         }
     }
     {
-        // The ROM in memory, or read from the SD card as the game needs it
-        // (settings.ini rom_stream: 0 auto, 1 in memory, 2 from the SD
-        // card). Auto reads it from the card on an Old 3DS, or when the heap
-        // could not hold it beside RDRAM and some room for the rest.
+        // The ROM in memory, or read from the SD card as the game needs it:
+        // the game's choice for this console (GameDesc::rom_new3ds /
+        // rom_old3ds), unless settings.ini's rom_stream says (1 in memory, 2
+        // from the SD card). Auto holds it when the heap has room for it
+        // beside RDRAM and what the rest of the port takes
+        // (GameDesc::rom_room_mb, the game's measured figure), else streams.
         const int mode = recomp3ds::settings_rom_stream();
+        const recomp3ds::GameDesc::RomPlace place = is_new_3ds ? desc.rom_new3ds : desc.rom_old3ds;
         char rom_path[192];
         snprintf(rom_path, sizeof(rom_path), "%s/%s.z64", g_base_path, (const char*)desc.game_id.c_str());
         struct stat rom_st;
         const uint64_t rom_bytes = stat(rom_path, &rom_st) == 0 ? (uint64_t)rom_st.st_size : (32u << 20);
-        const uint64_t kRoomForTheRest = (uint64_t)(desc.rom_room_mb > 0 ? desc.rom_room_mb : 24) << 20;
-        const bool heap_short = envGetHeapSize() < rom_bytes + recomp::mem_size + kRoomForTheRest;
-        const bool stream = mode == 2 || (mode == 0 && (!is_new_3ds || heap_short));
+        const uint64_t room = (uint64_t)(desc.rom_room_mb > 0 ? desc.rom_room_mb : 24) << 20;
+        const uint64_t need = rom_bytes + recomp::mem_size + room;
+        const uint64_t heap = envGetHeapSize();
+        const bool heap_short = heap < need;
+        using RomPlace = recomp3ds::GameDesc::RomPlace;
+        const bool stream = mode == 2 || (mode == 0 && (place == RomPlace::Stream || (place == RomPlace::Auto && heap_short)));
         if (stream) recomp3ds::rom_stream_install((size_t)desc.rom_cache_mb << 20, (size_t)desc.rom_block_kb << 10);
-        fprintf(stderr, "recomp3ds: ROM %s (rom_stream %d%s)\n", stream ? "read from the SD card as needed" : "held in memory", mode,
-                mode != 0 ? "" : !is_new_3ds ? ", auto: an Old 3DS" : heap_short ? ", auto: the heap is short" : ", auto");
+        const char* why = mode != 0 ? ", settings.ini"
+                        : place != RomPlace::Auto ? ", the game's choice"
+                        : heap_short ? ", auto: the heap is short" : ", auto: it fits";
+        fprintf(stderr, "recomp3ds: ROM %s (rom_stream %d%s): heap %lu MB, ROM %lu + RDRAM %lu + room %lu = %lu MB\n",
+                stream ? "read from the SD card as needed" : "held in memory", mode, why,
+                (unsigned long)(heap >> 20), (unsigned long)(rom_bytes >> 20), (unsigned long)(recomp::mem_size >> 20),
+                (unsigned long)(room >> 20), (unsigned long)(need >> 20));
+        if (!stream && heap_short)
+            fprintf(stderr, "recomp3ds: the ROM held in a heap %lu MB short of the game's need: expect failed allocations\n",
+                    (unsigned long)((need - heap + (1u << 20) - 1) >> 20));
     }
     u32 cpu_mhz = log_cpu("boot");
     g_clock_booted = true;

@@ -13,7 +13,7 @@
 
 namespace {
 
-uint32_t kBlockBytes = 32 * 1024;      // set by rom_stream_install
+uint32_t kBlockBytes = 128 * 1024;     // set by rom_stream_install
 
 struct Block {
     uint32_t index = UINT32_MAX;        // block number in the file
@@ -202,15 +202,17 @@ void recomp3ds::rom_stream_install(size_t cache_bytes, size_t block_bytes) {
     if (g_block_count < 4) g_block_count = 4;
     g_blocks = new Block[g_block_count];
     for (uint32_t i = 0; i < g_block_count; i++) g_blocks[i].data = (uint8_t*)malloc(kBlockBytes);
-    // The read-ahead thread, on the system core when the game may use it
-    // (a New 3DS: core 3 is idle), else wherever the kernel puts it; it
-    // waits on the card, so its priority hardly matters. Core 3 is asked
-    // for on a New 3DS only: Azahar's Old 3DS hangs on a thread created
-    // there (the hardware refuses it).
+    // The read-ahead thread, on core 3 on a New 3DS, where it is idle. Core
+    // 3 is asked for on a New 3DS only: Azahar's Old 3DS hangs on a thread
+    // created there (the hardware refuses it). On an Old 3DS it shares a
+    // busy core with the renderer and audio, and the game's next read
+    // usually waits for the block it is reading: there it runs above them
+    // (it mostly waits on the card, so it takes little time from them),
+    // where the lowest priority left the game waiting on it.
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
     g_reader = is_new_3ds ? threadCreate(reader_thread, nullptr, 16 * 1024, 0x38, 3, false) : nullptr;
-    if (g_reader == nullptr) g_reader = threadCreate(reader_thread, nullptr, 16 * 1024, 0x38, -2, false);
+    if (g_reader == nullptr) g_reader = threadCreate(reader_thread, nullptr, 16 * 1024, is_new_3ds ? 0x38 : 0x22, -2, false);
     fprintf(stderr, "recomp3ds: ROM stream: read-ahead thread %s\n", g_reader != nullptr ? "up" : "not created");
     recomp::set_rom_stream(&g_stream);
 }

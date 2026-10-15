@@ -142,9 +142,9 @@ void apply_audio_engine(int v) { recomp3ds::dsp_synth_set_enabled(v == 1); }
 const char* const kFrameCapNames[] = { "Game", "30 fps", "60 interp." };
 
 // Where the ROM lives, set in settings.ini only (it takes effect at start,
-// so the menu does not show it): 0 auto (read from the SD card as needed on
-// an Old 3DS, or when the heap is short; else in memory), 1 in memory, 2
-// from the SD card. A row on no page: loaded and saved, never drawn.
+// so the menu does not show it): 0 the game's choice for the console
+// (GameDesc::rom_new3ds / rom_old3ds), 1 in memory, 2 from the SD card. A
+// row on no page: loaded and saved, never drawn.
 int g_rom_stream = 0;
 
 // Debugging, settings.ini only: 1 makes a SELECT hold save a frame capture

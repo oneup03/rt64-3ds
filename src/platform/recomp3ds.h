@@ -84,7 +84,7 @@ struct GameDesc {
     // maps) spends 10 ms per read on the card whatever the size, so bigger
     // blocks load faster; small random reads cost a block each.
     uint32_t rom_cache_mb = 2;
-    uint32_t rom_block_kb = 32;
+    uint32_t rom_block_kb = 128;
     // Built-in mods (RT64_3DS_STATIC_MODS) left out when a game mode is
     // played, whatever is enabled: ones that replace a function the game
     // modes replace too (the mode would not load), or that assume the
@@ -179,11 +179,20 @@ struct GameDesc {
     // game that plays something of its own on a channel (Dinosaur Planet's
     // MP3 voice acting).
     void (*on_audio_ready)(int first_free_channel) = nullptr;
-    // The room the ROM-in-memory decision wants beside the ROM and RDRAM in
-    // the application heap (recomp3ds_run.cpp; 24 MB by default). A game
-    // whose ROM only fits with less (Dinosaur Planet's 64 MB ROM with a 16 MB
-    // linear heap: ~20 MB left) lowers it; the log's "heap in use" says what
-    // the game really takes.
+    // Where the ROM lives, chosen by the game for each console: held in
+    // memory, read from the SD card as the game needs it (the ROM stream,
+    // rom_cache_mb / rom_block_kb), or Auto: in memory when the heap has
+    // room for it beside RDRAM and rom_room_mb, else streamed. settings.ini's
+    // rom_stream (1 in memory, 2 the card) overrides both; 0 is the game's
+    // choice.
+    enum class RomPlace : uint8_t { Auto, Memory, Stream };
+    RomPlace rom_new3ds = RomPlace::Auto;
+    RomPlace rom_old3ds = RomPlace::Auto;
+    // The room Auto wants beside the ROM and RDRAM in the application heap
+    // (recomp3ds_run.cpp; 24 MB by default). A game whose ROM only fits with
+    // less (Dinosaur Planet's 64 MB ROM with a 16 MB linear heap: ~20 MB
+    // left) lowers it; the log's "heap in use" says what the game really
+    // takes.
     int rom_room_mb = 24;
 };
 
