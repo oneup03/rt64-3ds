@@ -195,12 +195,14 @@ ultramodern::renderer::WindowHandle create_window(void*) {
     svcExitProcess();
 }
 
-// HOME: a quit prompt on the touch screen instead of going straight to the
-// HOME Menu (as in the Sonic R port). A quits, B resumes, HOME again goes to
-// the HOME Menu. While it is up the game is held (the renderer takes no
-// display list, so the game waits on its current one), its input is blocked
-// and sound is muted; the top screen keeps the last frame. It returns only
-// once B is released, so that press does not reach the game.
+// HOME: a quit prompt on the touch screen instead of the HOME Menu (as in
+// the Sonic R port). A quits; B (or HOME again) resumes. The HOME Menu is
+// not offered: coming back from it froze the GPU queue on the console.
+// While the prompt is up the game is held (the renderer takes no display
+// list, so the game waits on its current one), its input is blocked and its
+// sound paused where it is (audio_set_paused); the top screen keeps the last
+// frame. It returns only once B is released, so that press does not reach
+// the game.
 bool g_home_trapped = false;
 
 u32 prompt_keys() {
@@ -213,7 +215,7 @@ void draw_home_prompt(bool show) {
     if (show) {
         recomp3ds::screen_printf("\x1b[%d;0H----------------------------------------", kRow);
         recomp3ds::screen_printf("\x1b[%d;0H  Quit %-33s", kRow + 1, g_desc != nullptr ? g_desc->render.game_name : "the game");
-        recomp3ds::screen_printf("\x1b[%d;0H  A: quit   B: resume   HOME: HOME Menu ", kRow + 2);
+        recomp3ds::screen_printf("\x1b[%d;0H  A: quit   B: resume%19s", kRow + 2, "");
         recomp3ds::screen_printf("\x1b[%d;0H----------------------------------------", kRow + 3);
     }
     else {
@@ -230,25 +232,21 @@ bool home_prompt() {
     rt64_3ds::set_paused(true);
     recomp3ds::stall_watch_pause(true);    // the main thread and the frames stop here by design
     recomp3ds::input_set_blocked(true);
-    ndspSetMasterVol(0.0f);
+    recomp3ds::audio_set_paused(true);
     draw_home_prompt(true);
     u32 prev = prompt_keys();          // held on entry: not a press
-    bool quit = false, to_home = false;
+    bool quit = false;
     for (;;) {
         if (!aptMainLoop()) { quit = true; break; }
         const u32 keys = prompt_keys();
         const u32 down = keys & ~prev;
         prev = keys;
-        if (aptCheckHomePressRejected() || recomp3ds::autotest_take_home()) { to_home = true; break; }
+        if (aptCheckHomePressRejected() || recomp3ds::autotest_take_home()) break;
         if (down & KEY_A) { quit = true; break; }
         if (down & KEY_B) break;
         svcSleepThread(16 * 1000000ll);
     }
-    if (to_home) {
-        fprintf(stderr, "recomp3ds: HOME prompt -> HOME Menu\n");
-        aptJumpToHomeMenu();           // returns when the game is resumed (or is to close)
-    }
-    else if (!quit) {
+    if (!quit) {
         while ((prompt_keys() & KEY_B) != 0) {
             if (!aptMainLoop()) { quit = true; break; }
             svcSleepThread(16 * 1000000ll);
@@ -257,10 +255,14 @@ bool home_prompt() {
     draw_home_prompt(false);
     recomp3ds::stall_watch_pause(false);
     recomp3ds::settings_menu_redraw();
-    ndspSetMasterVol(1.0f);
     recomp3ds::input_set_blocked(false);
-    if (!quit) rt64_3ds::set_paused(false);   // quitting releases the renderer itself
-    fprintf(stderr, "recomp3ds: HOME prompt closed (%s)\n", quit ? "quit" : to_home ? "HOME Menu" : "resume");
+    // Quitting keeps the sound paused and the game's audio thread held for
+    // good (audio_queue_samples); it releases the renderer itself.
+    if (!quit) {
+        recomp3ds::audio_set_paused(false);
+        rt64_3ds::set_paused(false);
+    }
+    fprintf(stderr, "recomp3ds: HOME prompt closed (%s)\n", quit ? "quit" : "resume");
     return quit;
 }
 

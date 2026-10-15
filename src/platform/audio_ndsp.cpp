@@ -27,6 +27,7 @@ int g_next = 0;
 float g_volume = 1.0f;
 std::atomic<bool> g_enabled{ true };     // the menu's Audio setting
 bool g_started = false;
+volatile bool g_paused = false;         // audio_set_paused: the HOME prompt is up
 volatile uint32_t g_submitted = 0, g_dropped = 0, g_underruns = 0;
 volatile uint32_t g_added = 0;          // frames handed to the channel since init (the AI clock)
 volatile uint32_t g_low_water = 0xFFFFFFFFu;
@@ -108,6 +109,18 @@ bool recomp3ds::audio_init() {
 
 void recomp3ds::audio_set_volume(float v) { g_volume = v; }
 void recomp3ds::audio_set_enabled(bool on) { g_enabled = on; }
+
+// The HOME prompt: every DSP channel stops where it is (the AI stream and
+// the DSP synthesizer's voices, so their clock stops with them), and the
+// game's audio thread is held at its next buffer (audio_queue_samples)
+// rather than running the music on unheard: on resuming, sound and game
+// carry on together.
+void recomp3ds::audio_set_paused(bool paused) {
+    if (paused == g_paused) return;
+    g_paused = paused;
+    if (!g_ready) return;
+    for (int ch = 0; ch < 24; ch++) ndspChnSetPaused(ch, paused);
+}
 bool recomp3ds::audio_enabled() { return g_enabled; }
 
 void recomp3ds::audio_set_frequency(uint32_t freq) {
@@ -121,6 +134,11 @@ void recomp3ds::audio_queue_samples(int16_t* samples, size_t sample_count) {
     if (!g_ready) {
         return;
     }
+    // Held while paused. Quitting from the prompt never resumes: the thread
+    // stays here through the exit (let go, it ran the game's audio code on
+    // memory the exit was tearing down: a data abort in n_alAdpcmPull).
+    while (g_paused) svcSleepThread(10 * 1000000ll);
+    if (!g_ready) return;
     size_t frames = sample_count / 2;
     static bool wav_checked = false;
     if (!wav_checked) { wav_checked = true; wav_setup(); }

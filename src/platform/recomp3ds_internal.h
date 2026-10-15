@@ -36,6 +36,7 @@ namespace recomp3ds {
     // Audio off: the audio task is skipped (no microcode work, which the
     // CPU does here) and silence is queued in place of its output.
     void audio_set_enabled(bool on);
+    void audio_set_paused(bool paused);     // the HOME prompt (audio_ndsp.cpp)
     bool audio_enabled();
     // Since the previous call: frames the game queued, frames dropped because
     // the ring was full, and times the DSP had run dry before new samples came.
