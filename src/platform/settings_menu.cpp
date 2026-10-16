@@ -46,7 +46,6 @@ using recomp3ds::MenuPage;
 
 char g_path[160] = "";
 bool g_open = false, g_dirty = false, g_redraw = true;
-u64 g_changed_at = 0;
 int g_page = 0;
 int g_sel = -1;                         // row of the page, -1 = the tab row
 int g_top = 0;                          // the page's first visible row
@@ -280,23 +279,34 @@ bool mod_required(const std::string& id) {
 }
 LightLock g_file_lock;
 
+// What settings.ini holds now, as text (the main thread's values).
+std::string serialize() {
+    std::string out;
+    char line[192];
+    for (int i = 0; i < g_row_count; i++) {
+        if (g_rows[i].no_save) continue;
+        snprintf(line, sizeof(line), "%s=%d\n", g_rows[i].key, *g_rows[i].value);
+        out += line;
+    }
+    for (const auto& [key, v] : g_mod_values) {
+        snprintf(line, sizeof(line), "%s=%d\n", key.c_str(), v);
+        out += line;
+    }
+    if (!g_game_mode.empty()) out += "game_mode=" + g_game_mode + "\n";
+    return out;
+}
+
 // settings.ini is replaced, never truncated in place: written to a .part
 // file first, then moved over (the SD card's rename refuses an existing
 // destination, so the old file goes first; a power-off between the two
 // leaves the .part, which load() takes). A failed write keeps the old file.
-void save() {
+void write_settings(const std::string& text) {
     LightLock_Lock(&g_file_lock);
     char tmp[sizeof(g_path) + 8];
     snprintf(tmp, sizeof(tmp), "%s.part", g_path);
     bool ok = false;
     if (FILE* f = fopen(tmp, "w")) {
-        ok = true;
-        auto put = [&](int n) { if (n < 0) ok = false; };
-        for (int i = 0; i < g_row_count; i++) {
-            if (!g_rows[i].no_save) put(fprintf(f, "%s=%d\n", g_rows[i].key, *g_rows[i].value));
-        }
-        for (const auto& [key, v] : g_mod_values) put(fprintf(f, "%s=%d\n", key.c_str(), v));
-        if (!g_game_mode.empty()) put(fprintf(f, "game_mode=%s\n", g_game_mode.c_str()));
+        ok = fwrite(text.data(), 1, text.size(), f) == text.size();
         if (fclose(f) != 0) ok = false;
         if (ok) {
             remove(g_path);
@@ -312,6 +322,55 @@ void save() {
         }
     }
     LightLock_Unlock(&g_file_lock);
+}
+
+// The writes happen on a thread of their own: on some SD cards creating,
+// removing and renaming a file takes seconds (players saw the menu freeze
+// for ~10 s after each change, "STOPPED: main" at m@pad, when the main
+// thread, which also runs the menu, HOME and the touch screen, wrote it).
+// The main thread hands over the text; a newer text replaces one not yet
+// written.
+LightLock g_save_lock;
+LightEvent g_save_wake;
+std::string g_save_text;
+bool g_save_pending = false;
+volatile bool g_save_busy = false;
+Thread g_saver = nullptr;
+
+void saver_thread(void*) {
+    for (;;) {
+        LightEvent_Wait(&g_save_wake);
+        for (;;) {
+            LightLock_Lock(&g_save_lock);
+            if (!g_save_pending) {
+                g_save_busy = false;
+                LightLock_Unlock(&g_save_lock);
+                break;
+            }
+            std::string text = std::move(g_save_text);
+            g_save_pending = false;
+            g_save_busy = true;
+            LightLock_Unlock(&g_save_lock);
+            write_settings(text);
+        }
+    }
+}
+
+// The settings as they are now, written soon (main thread).
+void save() {
+    g_dirty = false;
+    std::string text = serialize();
+    if (g_saver == nullptr) {
+        // Before the thread exists (or without one): written here.
+        write_settings(text);
+        return;
+    }
+    LightLock_Lock(&g_save_lock);
+    g_save_text = std::move(text);
+    g_save_pending = true;
+    g_save_busy = true;
+    LightLock_Unlock(&g_save_lock);
+    LightEvent_Signal(&g_save_wake);
 }
 
 void load() {
@@ -338,9 +397,9 @@ void load() {
     fclose(f);
 }
 
+// Written when the menu closes (settings_menu_toggle), not on every step.
 void changed() {
     g_dirty = true;
-    g_changed_at = svcGetSystemTick();
 }
 
 void step(int slot, int d) {
@@ -604,6 +663,11 @@ void recomp3ds::settings_set_game_mode(const std::string& mod_id) {
 
 void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) {
     LightLock_Init(&g_file_lock);
+    LightLock_Init(&g_save_lock);
+    LightEvent_Init(&g_save_wake, RESET_ONESHOT);
+    // Just above the game threads (0x30), which can keep their core busy:
+    // it needs almost no CPU, it waits on the card.
+    if (g_saver == nullptr) g_saver = threadCreate(saver_thread, nullptr, 16 * 1024, 0x2F, -2, true);
     snprintf(g_path, sizeof(g_path), "%s/settings.ini", base_path);
     rt64_3ds::Settings& st = rt64_3ds::settings();
     g_conv_tenths = st.convergence_hundredths / 10;
@@ -711,6 +775,7 @@ const recomp3ds::DebugSettings& recomp3ds::debug_settings() { return g_dbg; }
 void recomp3ds::settings_menu_toggle() {
     g_open = !g_open;
     if (g_open) add_mod_rows();
+    else if (g_dirty) save();
     g_redraw = true;
 }
 
@@ -808,10 +873,13 @@ void recomp3ds::settings_menu_update() {
     }
     if (g_open) touch_pad_update(false, false, 0, 0, false);
     prev = keys;
-    // Written a second after the last change, not on every step.
-    if (g_dirty && now - g_changed_at > SYSCLOCK_ARM11) { save(); g_dirty = false; }
 }
 
+// At exit: what changed is handed to the saver, which gets a moment to
+// finish; a card that takes longer is left to it (the old file stays until
+// the new one is complete, and load() recovers a .part).
 void recomp3ds::settings_flush() {
-    if (g_dirty) { save(); g_dirty = false; }
+    if (g_dirty) save();
+    for (int i = 0; i < 75 && g_save_busy; i++) svcSleepThread(20 * 1000000ll);
+    if (g_save_busy) fprintf(stderr, "recomp3ds: settings.ini still being written at exit\n");
 }
