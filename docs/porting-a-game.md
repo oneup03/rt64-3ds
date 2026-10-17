@@ -1328,3 +1328,46 @@ handles the rest when the game is built with static mods:
   from about 400 separately textured objects (390-550 draws, 12,000 commands
   and 330 palette loads a list) reads in 25-27 ms on core 2 with no single
   hotspot, so even 30 fps is borderline there. Left as the mod's content.
+
+### Mods carried by the ROM
+
+A code mod can be too big for the console even streamed: Dinosaur Planet's
+Dinomod Enhanced is one 42.7 MB section, 40 MB of it the game's asset files
+rebuilt (it installs them whole through ReAsset), which took a 72 MB RDRAM
+model and left the renderer 5 MB of linear memory. Such a mod's data can go
+into the ROM instead, made once on a PC:
+
+- A game script (Dinosaur Planet's `platform/3ds/make_dino_rom.py`) writes
+  the ROM with the mod's files in place of the game's, and cuts them out of
+  the mod's section. Cut whole 64 KB blocks only: every offset after a cut
+  then moves by a multiple of 0x10000, which leaves the `R_MIPS_LO16`
+  halves alone (some of a mod's know their target only modulo 64 KB:
+  RecompModTool records the low half alone when it can't pair them). The
+  script moves the mod's functions, relocation sites and targets in
+  `mod_syms.bin`, rewrites the relocated words (jump tables, `R_MIPS_32`)
+  and instruction fields (`j` targets, which the recompiler reads from the
+  instruction; the address halves) as a linker would, and refuses a mod
+  that points into a cut anywhere but at a file's start or end.
+- The rest of the section (under 1 MB) goes after the ROM's files, with a
+  table the platform reads: the ROM's last 16 bytes are `RT64MODS`, the
+  table's offset and its entry count (little-endian); each 64-byte entry is
+  the mod's id (48 bytes, NUL-padded), its binary's offset and size in the
+  ROM file and an FNV-1a 64 hash of it.
+- The same script, run by the build, writes the cut-down `.nrm`, and
+  mod_bake bakes it with `:rom`: built in like `:embed`, without
+  `mod_binary.bin`. The runtime asks the platform for the binary
+  (`recomp::mods::set_mod_binary_source`, nmr 0035; `rom_mods.cpp` streams
+  it from `<game_id>.z64`) and checks its hash against the one baked.
+- The calls that install the cut files now pass what is left of each (a
+  few bytes or none): the game's patches skip those by file and size (the
+  script writes the list as a header).
+- The game's `GameEntry::rom_hash` is the made ROM's (a check target
+  rebuilds it from the original and compares), and `GameDesc::rom_hint` says
+  how to make it on the screen that reports a missing or wrong ROM. A ROM of
+  the wrong hash stays on the card (nmr 0036; the desktop deletes its copy).
+- Built-in mods open before the `mods/` folder's files (nmr 0035): an older
+  setup's `.nrm` of the same mod is refused as a duplicate, which is only
+  logged.
+
+Dinosaur Planet's ROM stays 64 MB; the model went back to 32 MB, the linear
+heap to 24 MB and the ROM cache to 24 MB.

@@ -839,7 +839,7 @@ int recomp3ds::run(const GameDesc& desc) {
         desc.register_patches();
     }
     // Hashes <config>/<game_id>.z64 and marks the game valid; is_rom_valid
-    // only reads that set. (A ROM with the wrong hash is deleted by this.)
+    // only reads that set. (A ROM with the wrong hash stays on the 3DS, nmr 0036.)
     recomp::check_all_stored_roms();
 
     ultramodern::renderer::callbacks_t renderer_callbacks{};
@@ -890,9 +890,15 @@ int recomp3ds::run(const GameDesc& desc) {
     cfg.message_queue_control.requeue_timer = false;
 
     if (!recomp::is_rom_valid(desc.game_id)) {
-        recomp3ds::screen_printf("\nROM not found or wrong hash.\nPut it at %s/%s.z64\n\nPress START to exit.\n",
-               g_base_path, (const char*)desc.game_id.c_str());
-        fprintf(stderr, "recomp3ds: no valid ROM at %s/%s.z64\n", g_base_path, (const char*)desc.game_id.c_str());
+        char rom_path[192];
+        snprintf(rom_path, sizeof(rom_path), "%s/%s.z64", g_base_path, (const char*)desc.game_id.c_str());
+        struct stat st;
+        const bool present = stat(rom_path, &st) == 0;
+        if (present) recomp3ds::screen_printf("\n%s is not the ROM this game needs (another version, or damaged).\n", rom_path);
+        else recomp3ds::screen_printf("\nNo ROM: put it at %s\n", rom_path);
+        if (desc.rom_hint != nullptr) recomp3ds::screen_printf("\n%s\n", desc.rom_hint);
+        recomp3ds::screen_printf("\nPress START to exit.\n");
+        fprintf(stderr, "recomp3ds: %s at %s\n", present ? "the wrong ROM (its hash)" : "no ROM", rom_path);
         while (aptMainLoop()) {
             hidScanInput();
             if (hidKeysDown() & KEY_START) break;
@@ -988,7 +994,13 @@ int recomp3ds::run(const GameDesc& desc) {
         if (t) { threadJoin(t, UINT64_MAX); threadFree(t); }
         fprintf(stderr, "recomp3ds: FPSCR main %08lx, new thread %08lx\n", (unsigned long)main_fpscr, (unsigned long)thread_fpscr);
     }
-    // The game or one of its game modes (with the mod system).
+    // The game or one of its game modes (with the mod system), and the
+    // built-in mods whose binary the game's ROM carries.
+    {
+        char rom_path[192];
+        snprintf(rom_path, sizeof(rom_path), "%s/%s.z64", g_base_path, (const char*)desc.game_id.c_str());
+        recomp3ds::rom_mods_install(rom_path);
+    }
     recomp3ds::game_modes_init(g_base_path, desc);
     const std::string game_mode = recomp3ds::pick_game_mode(desc);
     recomp3ds::game_mode_begin(desc, game_mode);

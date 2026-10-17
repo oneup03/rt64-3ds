@@ -71,6 +71,9 @@ namespace recomp3ds {
     // Before the game starts: with a game mode chosen, leaves out the mods
     // GameDesc::mods_not_in_game_modes names, for this session only.
     void game_mode_begin(const GameDesc& desc, const std::string& game_mode);
+    // Built-in mods whose binary the game's ROM carries (rom_mods.cpp,
+    // mod_bake :rom): the runtime streams it from that file.
+    void rom_mods_install(const char* rom_path);
     bool mod_left_out(const std::string& mod_id);
     bool rom_stream_active();
     // Since the last call: the card reads and their bytes, and the game's

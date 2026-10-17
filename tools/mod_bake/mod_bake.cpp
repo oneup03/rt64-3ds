@@ -3,7 +3,7 @@
 // RECOMP_STATIC_MODS mode).
 //
 //   mod_bake inspect <mod_syms.bin> <mod_binary.bin> <game syms.toml>
-//   mod_bake bake <game syms.toml> <patches.elf> <out dir> <mod.nrm>[:embed]...
+//   mod_bake bake <game syms.toml> <patches.elf> <out dir> <mod.nrm>[:embed|:rom]...
 //
 // inspect: what the mod needs from a static runtime: its sections, the game
 // functions it replaces and hooks, its dependencies, imports, exports, events
@@ -15,7 +15,10 @@
 //   static_dispatch.c  the base functions baked mods replace or hook
 //   static_mods.cpp    recomp_register_static_mods(): registers the above and
 //                      the .nrm files marked :embed (built into the executable,
-//                      without thumbnails, and disabled until turned on); and
+//                      without thumbnails, and disabled until turned on) or
+//                      :rom (the same without mod_binary.bin, which the
+//                      platform supplies: a ROM made on a PC carries it,
+//                      rt64-3ds rom_mods.cpp); and
 //                      recomp_baked_game_modes[], the game modes whose .nrm the
 //                      player brings (id, name, version, file), for a picker
 //   static_mods_data.c those .nrm files' bytes
@@ -170,6 +173,7 @@ std::string c_string(const std::string& s) {
 struct Nrm {
     fs::path path;
     bool embed = false;
+    bool rom_binary = false;    // :rom, embedded without mod_binary.bin (the ROM carries it)
     std::string id, version, display_name;
     bool game_mode = false;     // custom_gamemode: a ROM hack (its ROM made by the player)
     std::vector<uint8_t> manifest, syms, binary;
@@ -218,7 +222,8 @@ bool read_nrm(Nrm& n) {
 // A game mode keeps an empty patch.bps, so the runtime still takes it for
 // one with a ROM patch; the platform supplies the patched ROM, made on a PC
 // (rt64-3ds game_modes.cpp, tools/make_game_mod_rom.py), and the patch is
-// never read.
+// never read. A :rom mod leaves its binary out: the platform streams it from
+// the ROM (rom_mods.cpp), and its hash is still the one baked here.
 std::vector<uint8_t> stripped_nrm(const Nrm& n) {
     mz_zip_archive zip{};
     std::vector<uint8_t> out;
@@ -230,7 +235,7 @@ std::vector<uint8_t> stripped_nrm(const Nrm& n) {
     if (!mz_zip_writer_init_heap(&zip, 0, 0)) return out;
     bool ok = mz_zip_writer_add_mem(&zip, "mod.json", manifest.data(), manifest.size(), MZ_BEST_COMPRESSION) &&
               mz_zip_writer_add_mem(&zip, "mod_syms.bin", n.syms.data(), n.syms.size(), MZ_BEST_COMPRESSION) &&
-              mz_zip_writer_add_mem(&zip, "mod_binary.bin", n.binary.data(), n.binary.size(), MZ_BEST_COMPRESSION) &&
+              (n.rom_binary || mz_zip_writer_add_mem(&zip, "mod_binary.bin", n.binary.data(), n.binary.size(), MZ_BEST_COMPRESSION)) &&
               (!n.game_mode || mz_zip_writer_add_mem(&zip, "patch.bps", "", 0, MZ_NO_COMPRESSION));
     void* buf = nullptr;
     size_t size = 0;
@@ -390,6 +395,7 @@ int bake(int argc, char** argv) {
         Nrm n;
         std::string arg = argv[i];
         if (arg.size() > 6 && arg.ends_with(":embed")) { n.embed = true; arg.resize(arg.size() - 6); }
+        else if (arg.size() > 4 && arg.ends_with(":rom")) { n.embed = n.rom_binary = true; arg.resize(arg.size() - 4); }
         n.path = arg;
         if (!read_nrm(n)) return 1;
         if (!ids.insert(n.ident).second) { fprintf(stderr, "mod_bake: mod %s given twice\n", n.id.c_str()); return 1; }
@@ -410,7 +416,7 @@ int bake(int argc, char** argv) {
         if (!write_mod_c(n, mod, out_dir / ("mod_" + n.ident + ".c"))) return 1;
         printf("mod_bake: %s %s: %zu functions, %zu replacements, %zu hooks, %zu exports, %zu events%s\n", n.id.c_str(), n.version.c_str(),
                mod.functions.size(), mod.replacements.size(), mod.hooks.size(), mod.exported_funcs.size(), mod.event_symbols.size(),
-               n.embed ? " (embedded)" : "");
+               n.rom_binary ? " (embedded, its binary carried by the ROM)" : n.embed ? " (embedded)" : "");
         mods.push_back(std::move(n));
     }
 
@@ -494,6 +500,6 @@ int main(int argc, char** argv) {
     if (argc == 5 && strcmp(argv[1], "inspect") == 0) return inspect(argv[2], argv[3], argv[4]);
     if (argc >= 5 && strcmp(argv[1], "bake") == 0) return bake(argc, argv);
     fprintf(stderr, "usage: mod_bake inspect <mod_syms.bin> <mod_binary.bin> <game syms.toml>\n"
-                    "       mod_bake bake <game syms.toml> <patches.elf> <out dir> <mod.nrm>[:embed]...\n");
+                    "       mod_bake bake <game syms.toml> <patches.elf> <out dir> <mod.nrm>[:embed|:rom]...\n");
     return 2;
 }

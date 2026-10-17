@@ -70,6 +70,9 @@ struct MenuDefault {
 struct GameDesc {
     std::u8string game_id;              // u8"DK64": also the stored ROM name (<id>.z64) and save name
     const char* sd_dir = "";            // folder under sdmc:/3ds/ holding the ROM, saves and settings
+    // Shown when <game_id>.z64 is missing or not the ROM the game needs:
+    // where it comes from (a game whose ROM is made on a PC says how).
+    const char* rom_hint = nullptr;
     recomp::GameEntry entry;            // hash, save type, entrypoint, on_init_callback
     recomp::Version project_version{};  // the game's version, which mods check (minimum_recomp_version)
     // Mods baked in that are part of the game: on whatever settings.ini says,

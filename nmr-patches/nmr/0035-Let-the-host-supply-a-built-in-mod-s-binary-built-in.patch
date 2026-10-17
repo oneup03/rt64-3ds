@@ -1,0 +1,127 @@
+From 0bbcb2bdca180d7c3e117763209c5a94c83aecc1 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 17 Oct 2026 14:54:34 -0500
+Subject: [PATCH] Let the host supply a built-in mod's binary; built-in mods
+ open first
+
+Under RECOMP_STATIC_MODS, recomp::mods::set_mod_binary_source lets the host
+supply a built-in mod's mod_binary.bin in place of the mod's file: a mod
+baked without it, whose data a ROM made on a PC carries (Dinosaur Planet's
+Dinomod Enhanced: 40 MB of asset files in the ROM, its remaining 1 MB of
+data after them). Asked with a null sink whether it has the binary, then
+streamed through the same sink as the file's bytes, hashed on the way.
+
+Built-in mods also open before the mods folder's files: their code is the
+executable's, so a card's file of the same mod (an older setup's) could
+only fail its binary's check at load; it is now refused at open as a
+duplicate, which is only logged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/include/librecomp/mods.hpp |  7 ++++++
+ librecomp/src/mods.cpp               | 36 ++++++++++++++++++++++++++--
+ 2 files changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index 3599bb2..0274e93 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -697,6 +697,13 @@ namespace recomp {
+         // base functions instrumented for them.
+         void register_static_mod(const recomp_static_mod* mod);
+         void register_static_dispatch(const recomp_static_dispatch_entry* entries, size_t count, unsigned char* active);
++        // A built-in mod whose mod_binary.bin the host supplies instead of the
++        // mod's file (one baked without it: a big mod's data carried by a ROM
++        // made on a PC). Called with a null sink to ask whether it has the
++        // mod's binary (`exists`) and its size; then with a sink, to stream
++        // it in order. Returns false on a read error.
++        using ModBinarySource = bool (*)(const std::string& mod_id, ModFileHandle::Sink sink, void* opaque, bool& exists, uint64_t& size);
++        void set_mod_binary_source(ModBinarySource source);
+ #endif
+         void register_deprecated_mod(const std::string& mod_id, DeprecationStatus deprecation_status, const Version &maximum_version);
+         void scan_mods();
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
+index ed31f3e..9eb9fcb 100644
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -275,6 +275,14 @@ void recomp::mods::set_rom_file_handler(RomFileHandler handler) {
+     rom_file_handler = handler;
+ }
+ 
++#ifdef RECOMP_STATIC_MODS
++static recomp::mods::ModBinarySource mod_binary_source = nullptr;
++
++void recomp::mods::set_mod_binary_source(ModBinarySource source) {
++    mod_binary_source = source;
++}
++#endif
++
+ namespace modpaths {
+     constexpr std::string_view default_mod_extension = "nrm";
+     constexpr std::string_view binary_path = "mod_binary.bin";
+@@ -954,6 +962,18 @@ std::vector<recomp::mods::ModOpenErrorDetails> recomp::mods::ModContext::scan_mo
+     close_mods();
+ 
+     static const std::vector<ModContentTypeId> empty_content_types{};
++#ifdef RECOMP_STATIC_MODS
++    // Built-in mods first: their code is the executable's, so a file of the
++    // same mod on the card (an older setup's) can only fail its binary's
++    // check; it is refused as a duplicate instead.
++    for (const auto &mod_bytes : embedded_mod_bytes) {
++        std::string open_error_param;
++        ModOpenError open_error = open_mod_from_memory(mod_bytes.second, open_error_param, empty_content_types, true);
++        if (open_error != ModOpenError::Good) {
++            ret.emplace_back(mod_bytes.first, open_error, open_error_param);
++        }
++    }
++#endif
+     for (const auto& mod_path : std::filesystem::directory_iterator{mod_folder, std::filesystem::directory_options::skip_permission_denied, ec}) {
+         bool is_mod = false;
+         bool requires_manifest = true;
+@@ -983,6 +1003,7 @@ std::vector<recomp::mods::ModOpenErrorDetails> recomp::mods::ModContext::scan_mo
+         }
+     }
+ 
++#ifndef RECOMP_STATIC_MODS
+     for (const auto &mod_bytes : embedded_mod_bytes) {
+         if (opened_mods_by_id.contains(mod_bytes.first)) {
+             continue;
+@@ -994,6 +1015,7 @@ std::vector<recomp::mods::ModOpenErrorDetails> recomp::mods::ModContext::scan_mo
+             ret.emplace_back(mod_bytes.first, open_error, open_error_param);
+         }
+     }
++#endif
+ 
+     return ret;
+ }
+@@ -2417,7 +2439,14 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::init_mod_code(uint8_t*
+     // no bytes (the code is baked into the executable) and the sections are
+     // streamed into RDRAM below.
+     std::vector<char> binary_data;
+-    binary_exists = mod.manifest.file_handle->file_exists(std::string{ modpaths::binary_path });
++    // Or from the host (set_mod_binary_source), for a mod built in without it.
++    bool binary_from_host = false;
++    {
++        bool host_has = false;
++        uint64_t host_size = 0;
++        binary_from_host = mod_binary_source != nullptr && mod_binary_source(mod.manifest.mod_id, nullptr, nullptr, host_has, host_size) && host_has;
++    }
++    binary_exists = binary_from_host || mod.manifest.file_handle->file_exists(std::string{ modpaths::binary_path });
+ #else
+     std::vector<char> binary_data = mod.manifest.file_handle->read_file(std::string{ modpaths::binary_path }, binary_exists);
+ #endif
+@@ -2538,7 +2567,10 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::init_mod_code(uint8_t*
+         };
+         bool exists = false;
+         uint64_t size = 0;
+-        if (!mod.manifest.file_handle->read_file_to(std::string{ modpaths::binary_path }, section_sink, &st, exists, size) || !exists) {
++        const bool read = binary_from_host
++            ? mod_binary_source(mod.manifest.mod_id, section_sink, &st, exists, size)
++            : mod.manifest.file_handle->read_file_to(std::string{ modpaths::binary_path }, section_sink, &st, exists, size);
++        if (!read || !exists) {
+             return CodeModLoadError::FailedToParseSyms;
+         }
+         for (const N64Recomp::Section& section : mod_sections) {
+-- 
+2.56.0
+

@@ -1,0 +1,36 @@
+From 5c5a334030af5c0773f4352a8e2855c532acbdf3 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sat, 17 Oct 2026 14:55:55 -0500
+Subject: [PATCH] Keep a stored ROM of the wrong hash on the 3DS
+
+The desktop's stored ROM is a copy the launcher made, so one that fails its
+hash check is removed. On the 3DS it is the player's own file, put on the
+card by hand: an upgrade that wants another ROM (Dinosaur Planet's, made on
+a PC with its mod's files) deleted the player's original at the first start.
+It stays now; the platform says the ROM is not the one it needs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/src/recomp.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 01b25a4..47ffaa1 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -258,8 +258,12 @@ static bool check_file_hash(const std::filesystem::path& path, uint64_t expected
+ 
+ bool check_stored_rom(const recomp::GameEntry& game_entry) {
+     if (!check_file_hash(config_path / game_entry.stored_filename(), game_entry.rom_hash)) {
++#ifndef __3DS__
+         // Incorrect hash, remove the stored ROM file if it exists.
+         std::filesystem::remove(config_path / game_entry.stored_filename());
++#endif
++        // (On the 3DS the stored ROM is the player's own file, put there by
++        // hand: one of the wrong version stays for the player to replace.)
+         return false;
+     }
+ 
+-- 
+2.56.0
+
