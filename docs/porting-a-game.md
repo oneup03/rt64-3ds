@@ -121,7 +121,7 @@ renderer can't find out from the display lists:
 | `sample_drawn_frame` | For games that copy strips of the frame just drawn into images with texture rectangles and draw with them (Goemon's menu rims): a copy of each eye's frame is kept for the frames that do it. |
 | `force_lod_branch` | `true` (the desktop frontends' setting) always draws the near model of a `gSPBranchLessZ` pair. Set it `false` to keep the game's own level of detail, which is cheaper (Banjo and, since 2026-10-14, DK64 on both consoles). |
 | `cull_dl` | `true`: `gSPCullDisplayList` ends a list whose tested vertices all lie off one side of the visible area, as the RSP does (the AND of the vertices' clip codes), with a quarter of the frame's width and height of slack each way for the eyes' shifts and the in-betweens; the object's draws, vertex transforms and texture loads are skipped. The desktop renderer ignores the command, so this was off until 2026-10-14. DK64 tests up to 40 objects a frame: its three captures lost 12-31 % of their draws and 9-29 % of their interpreted commands with the renders pixel-identical (the culled objects were being clipped away triangle by triangle); Banjo never uses it, since its 3DS build keeps the game's own CPU culling on (`culling_patches.c`, the frustum widened 1.25x), while DK64's recomp patches disable the game's for widescreen. The frame line's `culldl N/M` is lists ended / tests. |
-| `depth_to_rdram` | Only for games that read the depth buffer on the CPU (DK64's camera). It costs a read-back every frame: the renderer's 8x8 grid is read from the GPU's depth copy (the auto-convergence and the aim depth use it too), then the whole 320x240 RDRAM buffer is filled from it, which is the expensive half (about 2 ms a frame on a New 3DS, three times that at the Old clock, on the renderer's core). `depth_to_rdram_every` fills it every Nth game frame instead (`depth_to_rdram_every_old3ds` is the Old 3DS's value); the grid is still read every frame, so nothing else changes. DK64 sets 2 on an Old 3DS. With `frame_interpolation` it needs `double_eyes`: with one set of eye targets the depth read back would be the in-between's, so every list goes without one. |
+| `depth_to_rdram` | Only for games that read the depth buffer on the CPU (DK64's camera). It costs a read-back every frame: the renderer's 8x8 grid is read from the GPU's depth copy (the auto-convergence and the aim depth use it too), then the whole 320x240 RDRAM buffer is filled from it, which is the expensive half (about 2 ms a frame on a New 3DS, three times that at the Old clock, on the renderer's core). `depth_to_rdram_every` fills it every Nth game frame instead (`depth_to_rdram_every_old3ds` is the Old 3DS's value); the grid is still read every frame, so nothing else changes. DK64 sets 2 on an Old 3DS. With `frame_interpolation` it needs `double_eyes`: with one set of eye targets the depth read back would be the in-between's, so every list goes without one. The write-back is the last game frame's, done while the next list is read: when that list changed the frame size (`frame_sizes`), the write is skipped, as it went out at the new size. Only a frame with a triangle that updates depth (`Z_UPD`) on the screen is written back: Dinosaur Planet's 640x480 menus keep naming its 320x240 depth buffer at 0x80200000, and 640x480 of depth written there ran 324 KB into the game's memory pool 1, whose slot list then looped (a hang at the game select). |
 | `rules` as depth cameras | Every `World` rule of kind `Any` or `Perspective`, ranges included, names the depth cameras (the depth statistics, auto-convergence, the aim depth, the cut test; up to 8 rules): a game that tags its camera `0x10 + selector` gives `{0x10, 0x1F}`. None: `frame_head_proj_id`. |
 | `autoconv` | Tuning for depth-driven auto-convergence: the screen region measured, history length and approach/retreat rates. The defaults are DK64's; Banjo's cutscenes (close-ups low in the frame, cuts at 20 fps) wanted 0.9 / 5 / 0.4 / 1.8. |
 | `autoconv.near_clamp` | How near convergence may come, in world units (DK64 4, Goemon 2). |
@@ -522,9 +522,18 @@ other target is made at start). A target that still finds no VRAM has the
 texture cache give some back (`make_vram_room`: textures leave VRAM least
 recently used first, freed three frames on), and raises the amount kept free
 to that target plus 128 KB; it tries again every four frames while it fails.
+A target bigger than VRAM's free space and all its textures together (Dinosaur
+Planet's 640x480 front end asks for 1024x512, 4 MB with depth) changes
+nothing: it raised the amount kept free for the rest of the session, and
+no texture went to VRAM in gameplay after it.
 When VRAM is short, textures unused for 30 frames make way (retired), and
 others stay linear. The frame line's `tex live N (K KB, V in VRAM, M
-mipmapped)` gives the split.
+mipmapped)` gives the split. The cache keeps up to 320 textures or 8 MB; it
+also gives back the ones unused for two frames whenever a texture found no
+linear memory or less than 512 KB is left: Dinosaur Planet's mods build,
+with 5.4 MB of linear memory left for textures and none of them in VRAM
+(its 640x480 frame copies kept it), filled it in its first scene and failed
+every new texture from then on (untextured draws, 50,000 failures a run).
 
 ### Mipmaps from the game's levels
 

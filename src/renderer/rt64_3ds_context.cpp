@@ -1914,7 +1914,19 @@ private:
         // Depth is read from top_ (read_depth_zp): with double eyes that
         // holds the last game frame, an in-between draws elsewhere.
         if (!(double_eyes_ && inbetween)) {
-            prev_depth_image_ = (frame_.color_width == (uint32_t)geo_.w) ? frame_.depth_image : 0;
+            // Only a frame that wrote depth (a triangle on the screen with
+            // Z_UPD) has its depth written back: a 2D frame may name a depth
+            // image it never uses, as Dinosaur Planet's 640x480 menus keep its
+            // 320x240 depth buffer at 0x80200000, where 640x480 of depth ran
+            // 324 KB into its memory pool 1 (its slot list then looped). The
+            // RDP writes nothing there; neither does the write-back now.
+            bool wrote_depth = false;
+            for (const rt64_3ds::DrawRecord& d : frame_.draws) {
+                if (d.kind == rt64_3ds::DrawRecord::Tris && (d.othermode_l & 0x20) != 0 && d.rtt < 0 && d.count > 0) { wrote_depth = true; break; }
+            }
+            prev_depth_image_ = (wrote_depth && frame_.color_width == (uint32_t)geo_.w) ? frame_.depth_image : 0;
+            prev_depth_w_ = geo_.w;
+            prev_depth_h_ = geo_.h;
             // The depth grid read at the next frame start is this frame's: keep
             // the world projection terms that turn it into distances.
             prev_cam_world_ = frame_.cam_is_world;
@@ -3252,6 +3264,8 @@ public:
     C3D_RenderTarget* top_ = nullptr;
     bool fb_capture_pending_ = false;
     uint32_t prev_depth_image_ = 0;
+    int prev_depth_w_ = 0, prev_depth_h_ = 0;   // its frame's size (depth_to_rdram)
+    uint32_t depth_size_skips_ = 0;
 
     // The finished frame's depth (the GPU is idle after C3D_FrameBegin) into
     // the game's screen-sized RDRAM depth buffer in the RDP's format: one sample
@@ -3367,6 +3381,17 @@ public:
         }
     }
     void depth_to_rdram(uint32_t zimg) {
+        // The depth image is the last game frame's, written while the next
+        // list is read: a list that changed the frame size (Dinosaur Planet's
+        // 640x480 front end after its 320x240 title) has the new size in
+        // geo_, which wrote a 320x240 buffer as 640x480. Its 600 KB from the
+        // 240p depth buffer at 0x80200000 ran over the game's memory pool 1
+        // and looped its slot list. That frame's depth stays as it was.
+        if (geo_.w != prev_depth_w_ || geo_.h != prev_depth_h_) {
+            if (depth_size_skips_++ < 8)
+                fprintf(stderr, "rt64-3ds: depth of a %dx%d frame not written back: the frame is %dx%d now\n", prev_depth_w_, prev_depth_h_, geo_.w, geo_.h);
+            return;
+        }
         const uint32_t pitch = (uint32_t)geo_.w * 2;
         if ((zimg & rt64_3ds::kRdramMask) + pitch * (uint32_t)geo_.h > rt64_3ds::kRdramBytes) return;
         uint8_t* z = rdram_ + (zimg & rt64_3ds::kRdramMask);
@@ -3809,6 +3834,7 @@ public:
     };
     RttTarget rtt_[rt64_3ds::kMaxRtt];
     uint32_t rtt_room_frame_ = ~0u - 8;          // the texture cache last gave VRAM back for a target
+    uint32_t rtt_no_vram_ = 0;                   // targets refused for VRAM, for the log's first lines
     int cur_target_ = -1;                        // the RTT slot drawn into, -1 = the eye
     RttTarget* ensure_rtt(int i) {
         const rt64_3ds::RttImage& img = frame_.rtts[i];
@@ -3824,7 +3850,8 @@ public:
             const uint32_t need = (uint32_t)img.pot_w * img.pot_h * 8;   // RGBA8 + D24S8
             if (!C3D_TexInitVRAM(&t.tex, img.pot_w, img.pot_h, GPU_RGBA8)) {
                 if (frames_ - rtt_room_frame_ >= 4) { textures_.make_vram_room(need); rtt_room_frame_ = frames_; }
-                fprintf(stderr, "rt64-3ds: no VRAM for a %ux%u render texture\n", (unsigned)img.pot_w, (unsigned)img.pot_h);
+                if (++rtt_no_vram_ <= 5 || (rtt_no_vram_ & 255) == 0)
+                    fprintf(stderr, "rt64-3ds: no VRAM for a %ux%u render texture (%u times)\n", (unsigned)img.pot_w, (unsigned)img.pot_h, (unsigned)rtt_no_vram_);
                 return nullptr;
             }
             t.rt = C3D_RenderTargetCreateFromTex(&t.tex, GPU_TEXFACE_2D, 0, GPU_RB_DEPTH24_STENCIL8);

@@ -19,6 +19,12 @@ namespace {
 
 constexpr uint32_t kMaxLive = 320;
 constexpr uint32_t kMaxBytes = 8u * 1024 * 1024;
+// Linear memory the cache leaves the rest of the renderer: below it (or
+// after a texture found no room at all) the textures not used for two
+// frames go, whatever kMaxBytes allows. A game with a small linear heap
+// (Dinosaur Planet's mods build had 5.4 MB left for textures) otherwise
+// filled it and every new texture failed from then on.
+constexpr uint32_t kLinearFloor = 512u * 1024;
 
 }   // namespace
 
@@ -82,6 +88,9 @@ struct TextureCache::Impl {
     std::unordered_map<uint64_t, Entry> map;
     std::vector<C3D_Tex> retired[3];
     uint32_t frame = 0;
+    bool alloc_failed = false;      // a texture found no memory since the last end_frame
+    uint32_t failures = 0;          // in all, for the log's first lines
+    bool said_unfit = false;        // make_vram_room logged a target VRAM can't hold
     // set_vram: copies waiting for upload_pending (the entry's key, its
     // linear texels and the VRAM block for them), and the linear copies of
     // those queued at the last upload_pending.
@@ -323,7 +332,12 @@ BoundTex TextureCache::decode_into(uint64_t key, uint32_t h, const uint8_t* src,
 
     Entry e;
     if (!C3D_TexInitWithParams(&e.tex, nullptr, C3D_TexInitParams{ (u16)potw, (u16)poth, (u8)(levels - 1), fmt, GPU_TEX_2D, false })) {
-        fprintf(stderr, "rt64-3ds: C3D_TexInit %ux%u (%u levels) failed\n", (unsigned)potw, (unsigned)poth, (unsigned)levels);
+        // The frame's end frees the unused ones (end_frame); the draw goes untextured meanwhile.
+        impl_->alloc_failed = true;
+        if (++impl_->failures <= 10 || (impl_->failures & 1023) == 0)
+            fprintf(stderr, "rt64-3ds: C3D_TexInit %ux%u (%u levels) failed (%u so far; %u textures live, %u KB, linear free %lu KB)\n",
+                    (unsigned)potw, (unsigned)poth, (unsigned)levels, (unsigned)impl_->failures, (unsigned)live_, (unsigned)(bytes_ >> 10),
+                    (unsigned long)(linearSpaceFree() >> 10));
         return b;
     }
     const uint32_t bytes = C3D_TexCalcTotalSize(e.tex.size, levels - 1);
@@ -372,7 +386,9 @@ void TextureCache::end_frame() {
     int slot = impl_->frame % 3;
     for (C3D_Tex& t : impl_->retired[slot]) C3D_TexDelete(&t);
     impl_->retired[slot].clear();
-    if (live_ > kMaxLive || bytes_ > kMaxBytes) {
+    const bool short_of_memory = impl_->alloc_failed || linearSpaceFree() < kLinearFloor;
+    impl_->alloc_failed = false;
+    if (live_ > kMaxLive || bytes_ > kMaxBytes || short_of_memory) {
         // Retire everything not used in the last 2 frames.
         for (auto it = impl_->map.begin(); it != impl_->map.end();) {
             if (it->second.last_frame + 2 < impl_->frame) {
@@ -424,6 +440,18 @@ void TextureCache::sweep_vram() {
 }
 
 void TextureCache::make_vram_room(uint32_t bytes) {
+    // A target bigger than VRAM's free space and every texture there
+    // together never fits: keeping that much free would only shut textures
+    // out of VRAM for good (Dinosaur Planet's 640x480 front end asks for a
+    // 1024x512 target, 4 MB with its depth, then plays at 320x240).
+    if ((uint64_t)bytes > (uint64_t)vramSpaceFree() + vram_bytes_) {
+        if (!impl_->said_unfit) {
+            impl_->said_unfit = true;
+            fprintf(stderr, "rt64-3ds: a render target of %u KB can't fit VRAM even without textures (%u KB free, %u KB of textures): textures stay\n",
+                    (unsigned)(bytes / 1024), (unsigned)(vramSpaceFree() / 1024), (unsigned)(vram_bytes_ / 1024));
+        }
+        return;
+    }
     if (impl_->vram_reserve < bytes + 128u * 1024) impl_->vram_reserve = bytes + 128u * 1024;
     std::vector<std::pair<uint32_t, uint64_t>> old;     // last use, key
     for (const auto& [key, e] : impl_->map) {
