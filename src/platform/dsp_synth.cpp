@@ -327,7 +327,10 @@ void apply_mix(Voice& v) {
     if (v.ch < 0) return;
     const int pan = v.pan < 0 ? 0 : (v.pan > 127 ? 127 : v.pan);
     const int fx = v.fx & 0x7F;
-    const float dry = g_eqpower[fx] / 32767.0f;
+    // Without the reverb a voice plays wholly dry: its fxmix would take the
+    // send away and give nothing back (DK64 underwater turns every voice to
+    // 127, fully wet, which was silence).
+    const float dry = recomp3ds::dsp_reverb_active() ? g_eqpower[fx] / 32767.0f : 1.0f;
     const float l = v.vol * (g_eqpower[pan] / 32767.0f) * dry;
     const float r = v.vol * (g_eqpower[127 - pan] / 32767.0f) * dry;
     float mix[12] = {};
