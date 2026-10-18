@@ -109,6 +109,14 @@ struct RenderDesc {
     // games' cameras; a fast-flying one (Dinosaur Planet's Cloudrunner
     // starting from rest) needs a higher floor, or its first move is a cut.
     float cut_min_jump = 5.0f;
+    // The game's gEXSetViewMatrixFloat carries a floating world origin in its
+    // translation (Dinosaur Planet: gWorldX/Z, moved 640 units at a time as
+    // the player crosses map blocks, the camera and everything with it): a
+    // list whose origin moved from the list before goes without in-betweens.
+    // The camera-cut rule above misses a move made at speed (the Cloudrunner
+    // flight), and an in-between then put the camera halfway between the two
+    // origins, everything not interpolated with it 320 units off for a frame.
+    bool view_float_origin = false;
     // The game copies parts of the frame it is still drawing into small
     // images of its own (texture rectangles out of the colour image, after
     // drawing into it) and draws with those copies in the same frame

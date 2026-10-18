@@ -759,10 +759,10 @@ public:
                 o[0] = 0;
                 auto add = [&](const char* name, uint32_t n) { if (n != 0 && at + 24 < cap) at += snprintf(o + at, cap - at, "%s%s %u", at ? " " : "", name, n); };
                 add("late", inb_late_); add("budget", inb_budget_); add("snapshot", inb_snapshot_); add("rtt", inb_rtt_);
-                add("offscreen", inb_offscreen_); add("blanked", inb_blank_); add("depth", inb_depth_); add("after60", inb_after60_);
+                add("offscreen", inb_offscreen_); add("blanked", inb_blank_); add("depth", inb_depth_); add("after60", inb_after60_); add("rebase", inb_rebase_);
                 add("after-unsafe", inb_after_unsafe_); add("cut", inb_cut_); add("untagged", inb_nothing_); add("diverged", inb_diverged_);
                 add("resize", inb_resize_);
-                inb_snapshot_ = inb_rtt_ = inb_offscreen_ = inb_blank_ = inb_depth_ = inb_after60_ = inb_after_unsafe_ = inb_resize_ = 0;
+                inb_snapshot_ = inb_rtt_ = inb_offscreen_ = inb_blank_ = inb_depth_ = inb_after60_ = inb_after_unsafe_ = inb_resize_ = inb_rebase_ = 0;
             }
             {
                 const float ms = 1000.0f / (float)SYSCLOCK_ARM11;
@@ -2469,12 +2469,30 @@ private:
         if (unsafe == nullptr) for (const rt64_3ds::RttImage& img : frame_.rtts) if (img.addr != 0 && img.addr == frame_.color_image) unsafe = &inb_offscreen_;
         const bool safe = unsafe == nullptr;
         const bool prev_60 = inbetweens_for(prev_rate_) == 0;
+        float prev_origin_copy[3];
+        memcpy(prev_origin_copy, prev_origin_, sizeof(prev_origin_copy));
+        memcpy(prev_origin_, frame_.view_float, sizeof(prev_origin_));
         prev_rate_ = rate;
         prev_list_ok_ = safe;
         engaged_ = rate_ok;
         if (!rate_ok) return false;
         if (!safe) { inb_unsafe_++; (*unsafe)++; return false; }
         if (!related) { inb_unrelated_++; (prev_60 ? inb_after60_ : inb_after_unsafe_)++; return false; }
+        // RenderDesc::view_float_origin: the world's origin moved since the
+        // list before (the camera and everything with it): as a camera cut,
+        // this list alone goes without in-betweens.
+        if (desc.view_float_origin) {
+            const float* o = frame_.view_float;
+            const float* p = prev_origin_copy;
+            const bool moved = std::fabs(o[0] - p[0]) > 1.0f || std::fabs(o[1] - p[1]) > 1.0f || std::fabs(o[2] - p[2]) > 1.0f;
+            if (moved) {
+                if (rebase_logged_++ < 20)
+                    fprintf(stderr, "rt64-3ds: frame %u: the world's origin moved by (%.0f, %.0f, %.0f): no in-between\n", frames_,
+                            o[0] - p[0], o[1] - p[1], o[2] - p[2]);
+                inb_rebase_++;
+                return false;
+            }
+        }
         // The pair may take the game's whole frame time. Tried on a console
         // with a setting from 70 to 100% (Banjo, New 3DS, 2026-10-08): with
         // probes that ramp up (send_dl's behind), 100% kept 60 in 158 of 186
@@ -4213,7 +4231,10 @@ public:
     uint32_t probe_left_ = 0, probe_every_ = kProbeEvery, probes_ = 0;
     uint32_t inb_snapshot_ = 0, inb_rtt_ = 0, inb_offscreen_ = 0, inb_blank_ = 0, inb_depth_ = 0;   // unsafe, by what
     bool prev_stored_ = false;                  // the last game list stored the screen (one_off_store)
-    uint32_t inb_after60_ = 0, inb_after_unsafe_ = 0;   // unrelated: the list before asked 60 / was unsafe
+    uint32_t inb_after60_ = 0, inb_after_unsafe_ = 0;
+    uint32_t inb_rebase_ = 0;                   // the world's origin moved (RenderDesc::view_float_origin)
+    float prev_origin_[3] = {};                 // the list before's origin
+    uint32_t rebase_logged_ = 0;   // unrelated: the list before asked 60 / was unsafe
     u64 acc_vsync_ = 0, vsync_at_dl_ = 0, acc_inb_interp_ = 0, acc_inb_replay_ = 0, acc_match_ = 0;
     uint32_t presented_ = 0, inb_drawn_ = 0, inb_late_ = 0, inb_budget_ = 0, inb_unsafe_ = 0, inb_unrelated_ = 0;
     uint32_t inb_late_resync_ = 0;              // ... of inb_late_, dropped to resync with the screen (resync_)

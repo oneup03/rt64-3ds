@@ -2494,7 +2494,26 @@ struct Interpreter::Impl {
             }
             // RT64 keeps these for its own interpolation and stereo; the 3DS
             // shifts the eyes in clip space and needs neither.
-            case EX_SETPROJMATRIXFLOAT: case EX_SETVIEWMATRIXFLOAT:
+            case EX_SETVIEWMATRIXFLOAT:
+                // Its translation, the first on the screen this frame
+                // (RenderDesc::view_float_origin reads it as the world's
+                // origin; a shadow pass resets it off screen).
+                // The first non-zero one: Dinosaur Planet's shadow pass loads
+                // an identity (a frame without any keeps the origin at 0).
+                if (cur_rtt < 0 && !out->has_view_float) {
+                    const uint32_t addr = seg(w1);
+                    float t[3];
+                    for (int k = 0; k < 3; k++) {
+                        const uint32_t bits = r32(addr + (uint32_t)(12 + k) * 4);
+                        memcpy(&t[k], &bits, 4);
+                    }
+                    if (t[0] != 0.0f || t[1] != 0.0f || t[2] != 0.0f) {
+                        memcpy(out->view_float, t, sizeof(t));
+                        out->has_view_float = true;
+                    }
+                }
+                return 0;
+            case EX_SETPROJMATRIXFLOAT:
                 return 0;
             default:
                 stats->ex_unknown++;

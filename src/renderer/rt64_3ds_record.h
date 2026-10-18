@@ -187,6 +187,10 @@ struct FrameRecord {
     uint32_t color_image = 0, color_width = 0, depth_image = 0;
     uint16_t frame_w = 0, frame_h = 0;  // the frame size the list was read at (RenderDesc::frame_sizes); 0 = the fixed one
     bool has_cam = false;               // a perspective projection was loaded this frame
+    // gEXSetViewMatrixFloat's translation, its first on the screen this frame
+    // (RenderDesc::view_float_origin: the game's floating world origin).
+    bool has_view_float = false;
+    float view_float[3] = {};
     bool cam_is_world = false;          // ... under the world projection group (stereo depth terms)
     float cam[16] = {};
     // The HUD camera's projection (RenderDesc::hud_camera_id), for a frame
@@ -220,6 +224,8 @@ struct FrameRecord {
         std::swap(frame_h, o.frame_h);
         std::swap(depth_image, o.depth_image);
         std::swap(has_cam, o.has_cam);
+        std::swap(has_view_float, o.has_view_float);
+        std::swap(view_float, o.view_float);
         std::swap(cam_is_world, o.cam_is_world);
         std::swap(cam, o.cam);
         std::swap(has_hud_cam, o.has_hud_cam);
@@ -238,6 +244,8 @@ struct FrameRecord {
         snapshot_request = false;
         snapshot_store = 0;
         has_cam = false;
+        has_view_float = false;
+        view_float[0] = view_float[1] = view_float[2] = 0.0f;
         cam_is_world = false;
         has_hud_cam = false;
         frame_sample_last = -1;
