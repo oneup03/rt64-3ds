@@ -590,9 +590,17 @@ void update_gfx_inner() {
                                   ? st.presented_per_sec : st.dl_per_sec - st.dl_skipped_per_sec;
         // All four cores (a New 3DS's core 3 when the system lets the
         // application use it) fit the row only as c0-c3.
-        if (busy2 >= 0 && busy3 >= 0) snprintf(line, sizeof(line), "%3d fps c0 %3d%% c1 %3d%% c2 %3d%% c3 %3d%%", shown_fps, busy0, busy1, busy2, busy3);
-        else if (busy2 >= 0) snprintf(line, sizeof(line), "%3d fps cpu0 %3d%% cpu1 %3d%% cpu2 %3d%%", shown_fps, busy0, busy1, busy2);
-        else snprintf(line, sizeof(line), "%3d fps cpu0 %3d%% cpu1 %3d%%", shown_fps, busy0, busy1);   // two cores
+        // A core without a monitor (none until the game is up, and only as
+        // many as the thread limit leaves room for: loadmon_resume) is left
+        // out rather than shown as -1%.
+        const int busy[4] = { busy0, busy1, busy2, busy3 };
+        int watched = 0;
+        for (int c = 0; c < 4; c++) watched += busy[c] >= 0;
+        int used = snprintf(line, sizeof(line), "%3d fps", shown_fps);
+        for (int c = 0; c < 4 && used < (int)sizeof(line); c++) {
+            if (busy[c] < 0) continue;
+            used += snprintf(line + used, sizeof(line) - used, watched > 3 ? " c%d %3d%%" : " cpu%d %3d%%", c, busy[c]);
+        }
         recomp3ds::screen_printf("\x1b[2;0H%-39.39s\n", line);
         // settings.ini's dbg_rows=1: the game threads' shares (wake-ups a
         // second last) and the audio rows below.
