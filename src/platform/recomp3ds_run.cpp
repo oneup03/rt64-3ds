@@ -174,11 +174,30 @@ ultramodern::renderer::WindowHandle create_window(void*) {
 // PrepareToClose and leaves the final APT_CloseApplication in
 // __system_retAddr, which __libctru_exit calls just before svcExitProcess;
 // skipping that left the HOME Menu with a half-closed application.
+// The main thread (run()'s), which polls the pad and APT ~60 times a
+// second (update_gfx). An exit begun on another thread (a fatal error, the
+// quit's 3 s fallback) parks it first: __appExit's hidExit unmapped the
+// pad's shared memory under its next hidScanInput, a data abort reading
+// 0x10000010 on core 0 (a New 3DS, 2026-10-18).
+u32 g_main_thread_id = 0;
+volatile bool g_park_main = false, g_main_parked = false;
+bool on_main_thread() {
+    u32 id = 0;
+    svcGetThreadId(&id, CUR_THREAD_HANDLE);
+    return id == g_main_thread_id;
+}
+void park_main_thread() {
+    if (g_main_thread_id == 0 || on_main_thread()) return;
+    g_park_main = true;
+    for (int i = 0; i < 40 && !g_main_parked; i++) svcSleepThread(10000000ll);   // it wakes every ~16 ms
+}
+
 [[noreturn]] void finish_exit() {
     static volatile u32 once = 0;
     if (__atomic_exchange_n(&once, 1u, __ATOMIC_SEQ_CST) != 0) {
         for (;;) svcSleepThread(1000000000ll);    // the other path is already leaving
     }
+    park_main_thread();
     fflush(stderr);
     // A frame capture still being written stops between two FS requests
     // (its file stays incomplete): nothing of ours is in flight on the card
@@ -211,19 +230,26 @@ ultramodern::renderer::WindowHandle create_window(void*) {
         for (;;) svcSleepThread(1000000000ll);    // another thread is already reporting
     }
     const struct mallinfo mi = mallinfo();
+    unsigned threads = 0, thread_limit = 0;
+    recomp3ds::thread_budget(&threads, &thread_limit);
     char line[320];
-    snprintf(line, sizeof(line), "FATAL: %s (heap %lu KB in use, %lu KB taken of %lu; linear free %lu KB)", what,
+    snprintf(line, sizeof(line), "FATAL: %s (heap %lu KB in use, %lu KB taken of %lu; linear free %lu KB; threads %u of %u)", what,
              (unsigned long)(mi.uordblks / 1024), (unsigned long)(mi.arena / 1024), (unsigned long)(envGetHeapSize() / 1024),
-             (unsigned long)(linearSpaceFree() / 1024));
+             (unsigned long)(linearSpaceFree() / 1024), threads, thread_limit);
     fprintf(stderr, "recomp3ds: %s\n", line);
     recomp3ds::log_flush();
     recomp3ds::stall_watch_stop();             // its reports would write over the message
+    park_main_thread();                        // the pad is read here now, and the screen left alone
     recomp3ds::screen_printf("\x1b[31m\n%s\x1b[0m\nPress START to exit.\n", line);
     for (int i = 0; i < 600; i++) {
         hidScanInput();
         if (hidKeysDown() & KEY_START) break;
         svcSleepThread(50000000ll);
     }
+    // The renderer stops before the GPU is shut down (as the quit's forced
+    // exit does): its command queue ran on after gfxExit otherwise.
+    rt64_3ds::set_quitting();
+    svcSleepThread(300000000ll);
     finish_exit();
 }
 
@@ -307,6 +333,10 @@ bool home_prompt() {
 // wakes ~60 times a second instead of 1000.
 void update_gfx_inner();
 void update_gfx(void*) {
+    if (g_park_main) {
+        g_main_parked = true;
+        for (;;) svcSleepThread(1000000000ll);    // another thread is ending the process (park_main_thread)
+    }
     update_gfx_inner();
     g_main_stage = 0;
     if (!g_exit_requested) svcSleepThread(15 * 1000000ll);
@@ -584,6 +614,15 @@ void update_gfx_inner() {
     // Watchdog: a frame that stays in the replay or the GPU wait for 4 s is
     // a hung GPU; say which draw it was on, once.
     g_main_stage = 7;
+    // The load monitor's idle threads, back once the game has made its own
+    // (loadmon_resume: only with thread slots to spare).
+    {
+        static bool resumed = false;
+        if (!resumed && rt64_3ds::progress().frames >= 300) {
+            resumed = true;
+            recomp3ds::loadmon_resume();
+        }
+    }
     {
         static u32 last_frames = 0; static u64 since = 0; static bool reported = false;
         const rt64_3ds::Progress& pg = rt64_3ds::progress();
@@ -682,13 +721,35 @@ void log_memory(const char* when) {
     // size says the same on the console (Azahar reports 96 MB there while
     // handing out 124 MB), and its free space reads 0 after the split.
     const struct mallinfo mi = mallinfo();
-    fprintf(stderr, "recomp3ds: %s: heap %lu KB + linear heap %lu KB (%s; app region %lu KB); heap in use %lu KB (%lu KB taken), linear free %lu KB\n", when,
+    unsigned threads = 0, thread_limit = 0;
+    recomp3ds::thread_budget(&threads, &thread_limit);
+    fprintf(stderr, "recomp3ds: %s: heap %lu KB + linear heap %lu KB (%s; app region %lu KB); heap in use %lu KB (%lu KB taken), linear free %lu KB; threads %u of %u\n", when,
             (unsigned long)(envGetHeapSize() / 1024), (unsigned long)(envGetLinearHeapSize() / 1024),
             envIsHomebrew() ? ".3dsx" : "title",
             (unsigned long)(osGetMemRegionSize(MEMREGION_APPLICATION) / 1024),
             (unsigned long)(mi.uordblks / 1024), (unsigned long)(mi.arena / 1024),
-            (unsigned long)(linearSpaceFree() / 1024));
+            (unsigned long)(linearSpaceFree() / 1024), threads, thread_limit);
 }
+
+}   // namespace
+
+// The process's threads in use and its limit (the resource limit's
+// RESLIMIT_THREAD: 32 for an application). false when it can't be read.
+bool recomp3ds::thread_budget(unsigned* used, unsigned* limit) {
+    Handle reslimit = 0;
+    if (R_FAILED(svcGetResourceLimit(&reslimit, CUR_PROCESS_HANDLE))) return false;
+    ResourceLimitType name = RESLIMIT_THREAD;
+    s64 cur = 0, max = 0;
+    const bool ok = R_SUCCEEDED(svcGetResourceLimitCurrentValues(&cur, reslimit, &name, 1)) &&
+                    R_SUCCEEDED(svcGetResourceLimitLimitValues(&max, reslimit, &name, 1));
+    svcCloseHandle(reslimit);
+    if (!ok) return false;
+    *used = (unsigned)cur;
+    *limit = (unsigned)max;
+    return true;
+}
+
+namespace {
 
 // The CPU clock, from a loop of single-cycle ALU ops timed against the system
 // tick (268 MHz whatever the CPU runs at). Best of three to ride out preemption.
@@ -783,6 +844,7 @@ extern "C" void __assert_func(const char* file, int line, const char* func, cons
 
 int recomp3ds::run(const GameDesc& desc) {
     g_desc = &desc;
+    svcGetThreadId(&g_main_thread_id, CUR_THREAD_HANDLE);
     std::set_new_handler(on_new_failed);
     std::set_terminate(on_terminate);
     atexit(on_exit_called);

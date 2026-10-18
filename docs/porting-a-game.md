@@ -915,6 +915,33 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   RDRAM, 12 MB of rest) and DK64 (32 MB ROM) stream. Every ROM read the
   runtime makes goes through it.
 
+### Threads, and fatal errors
+
+An application gets 32 threads (its resource limit; Azahar sets none, so a
+port can pass there and fail on a console). A New 3DS port comes near that
+before the game makes its own: the main thread, the log writer, the stall
+watch, the DSP synthesizer, the ROM stream's read-ahead, the settings
+writer, the renderer's gfx thread, presenter, in-between builder and core-3
+helper, the runtime's VI, timer, cleaner, saving and audio task threads,
+ndsp's, and a game's own (each osCreateThread is a host thread; Dinosaur
+Planet makes eight). The load monitor's four idle threads are let go after
+their calibration and come back once the game has drawn 300 frames, only as
+many as leave three slots free (`loadmon: N core monitors running (threads
+used of limit)`); the `before start` and `after exit` lines give the count.
+Dinosaur Planet's game thread failed at boot on a console when the settings
+writer took the last slot.
+
+A fatal error (a failed operator new, std::terminate, abort, a failed
+assert, or exit(): the runtime's error exits after "Failed to find
+function", a game's `break`, a message box) goes to the platform's
+`fatal()`: the reason with the heap, linear memory and thread figures in
+the log (flushed) and in red on the touch screen until START (30 s at
+most), then the main thread is parked, the renderer stopped, and the exit
+leaves the heap mapped. libctru's own exit unmapped the heap and the pad's
+shared memory under the threads still running, and the console showed only
+a data abort elsewhere (a thread reading its stack in svcArbitrateAddress,
+or hidScanInput at 0x10000010), the reason lost with the log's last lines.
+
 ### Freezes, and how to read one
 
 The 3DS does not time-slice: a thread runs until it waits, and threads of

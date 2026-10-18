@@ -40,7 +40,34 @@ void idle_thread(void* arg) {
 
 }   // namespace
 
+namespace {
+
+unsigned g_mask = 0;
+// Thread slots loadmon_resume leaves free (an application has 32, and a
+// game may still make one: a capture's writer, a game thread later on).
+constexpr unsigned kThreadsSpare = 3;
+
+void stop_threads() {
+    g_running = false;
+    for (int c = 0; c < kCores; c++) {
+        if (g_mon[c].thread != nullptr) {
+            if (R_SUCCEEDED(threadJoin(g_mon[c].thread, 200 * 1000000ull))) threadFree(g_mon[c].thread);
+            else fprintf(stderr, "loadmon: core %d's idle thread did not finish (left to the exit)\n", c);
+            g_mon[c].thread = nullptr;
+        }
+    }
+}
+
+}   // namespace
+
+// The calibration, then the idle threads let go until loadmon_resume: an
+// application gets 32 threads, and a New 3DS port with its renderer's
+// helpers, the DSP synthesizer, the ROM stream's read-ahead and the
+// settings writer comes near that before the game makes its own (Dinosaur
+// Planet's game thread failed at boot on a console, 2026-10-18; Azahar sets
+// no limit). Until then the core loads read "-".
 void recomp3ds::loadmon_start(unsigned core_mask) {
+    g_mask = core_mask;
     g_running = true;
     for (int c = 0; c < kCores; c++) {
         g_mon[c].core = c;
@@ -58,6 +85,24 @@ void recomp3ds::loadmon_start(unsigned core_mask) {
         used += snprintf(line + used, sizeof(line) - used, " core%d %lu/s", c, (unsigned long)g_mon[c].calibration);
     }
     fprintf(stderr, "%s\n", line);
+    stop_threads();
+}
+
+void recomp3ds::loadmon_resume() {
+    unsigned used = 0, limit = 0;
+    const bool known = recomp3ds::thread_budget(&used, &limit);
+    g_running = true;
+    int started = 0;
+    for (int c = 0; c < kCores; c++) {
+        if (!((g_mask >> c) & 1) || g_mon[c].calibration == 0) continue;
+        if (known && used + 1 + kThreadsSpare > limit) break;
+        g_mon[c].count = 0;
+        g_mon[c].last = 0;
+        g_mon[c].peek_tick = 0;
+        g_mon[c].thread = threadCreate(idle_thread, &g_mon[c], 4096, 0x3F, c, false);
+        if (g_mon[c].thread != nullptr) { started++; used++; }
+    }
+    fprintf(stderr, "loadmon: %d core monitors running (threads %u of %u in use)\n", started, used, limit);
 }
 
 // Busy percentage of a core since its previous call (call once a second
@@ -105,12 +150,5 @@ void recomp3ds::loadmon_set_mhz(unsigned mhz) {
 // drop: a bounded wait, and a thread that did not finish is left to die
 // with the process rather than joined forever.
 void recomp3ds::loadmon_stop() {
-    g_running = false;
-    for (int c = 0; c < kCores; c++) {
-        if (g_mon[c].thread != nullptr) {
-            if (R_SUCCEEDED(threadJoin(g_mon[c].thread, 200 * 1000000ull))) threadFree(g_mon[c].thread);
-            else fprintf(stderr, "loadmon: core %d's idle thread did not finish (left to the exit)\n", c);
-            g_mon[c].thread = nullptr;
-        }
-    }
+    stop_threads();
 }

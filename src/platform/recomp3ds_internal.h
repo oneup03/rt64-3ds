@@ -158,6 +158,12 @@ namespace recomp3ds {
     int loadmon_peek(int core);                  // the same apart from loadmon_sample's (the stall watch)
     void loadmon_set_mhz(unsigned mhz);          // the CPU clock now (the calibrations scale with it)
     void loadmon_stop();
+    // The idle threads are let go after the calibration, so the game's
+    // threads find slots at boot (an application has 32); this brings them
+    // back, as many as leave kThreadsSpare slots free.
+    void loadmon_resume();
+    // The process's threads in use and its limit; false if unreadable.
+    bool thread_budget(unsigned* used, unsigned* limit);
 
     // stall_watch.cpp: logs which game thread holds core 0 when the main
     // thread (stall_watch_beat, from update_gfx) has not run for 3 s, and
