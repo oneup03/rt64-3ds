@@ -5,7 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
+#include <new>
 #include <string>
 #include <sys/stat.h>
 
@@ -194,6 +196,40 @@ ultramodern::renderer::WindowHandle create_window(void*) {
     if (__system_retAddr) __system_retAddr();
     svcExitProcess();
 }
+
+// A fatal error anywhere: a failed operator new, std::terminate, abort, a
+// failed assert, or exit() itself (the runtime's quick_exit after its
+// message box). libctru's exit unmaps the heap while the other threads still
+// run, and one of them then faults on its own stack: a data abort reading
+// at SP on another core, with the cause lost (two console crashes showed
+// only that, a thread in svcArbitrateAddress). Instead the reason goes to
+// the log (flushed) and the touch screen, which waits for START (30 s at
+// most), then the exit above, which leaves the heap mapped.
+[[noreturn]] void fatal(const char* what) {
+    static volatile u32 once = 0;
+    if (__atomic_exchange_n(&once, 1u, __ATOMIC_SEQ_CST) != 0) {
+        for (;;) svcSleepThread(1000000000ll);    // another thread is already reporting
+    }
+    const struct mallinfo mi = mallinfo();
+    char line[320];
+    snprintf(line, sizeof(line), "FATAL: %s (heap %lu KB in use, %lu KB taken of %lu; linear free %lu KB)", what,
+             (unsigned long)(mi.uordblks / 1024), (unsigned long)(mi.arena / 1024), (unsigned long)(envGetHeapSize() / 1024),
+             (unsigned long)(linearSpaceFree() / 1024));
+    fprintf(stderr, "recomp3ds: %s\n", line);
+    recomp3ds::log_flush();
+    recomp3ds::stall_watch_stop();             // its reports would write over the message
+    recomp3ds::screen_printf("\x1b[31m\n%s\x1b[0m\nPress START to exit.\n", line);
+    for (int i = 0; i < 600; i++) {
+        hidScanInput();
+        if (hidKeysDown() & KEY_START) break;
+        svcSleepThread(50000000ll);
+    }
+    finish_exit();
+}
+
+void on_new_failed() { fatal("out of memory (operator new failed)"); }
+void on_terminate() { fatal("std::terminate (an uncaught exception or a failed new)"); }
+void on_exit_called() { fatal("exit() was called (an error exit; the message before it in the log says why)"); }
 
 // HOME: a quit prompt on the touch screen instead of the HOME Menu (as in
 // the Sonic R port). A quits; B (or HOME again) resumes. The HOME Menu is
@@ -734,8 +770,22 @@ const char* recomp3ds::base_path() { return g_base_path; }
 
 void recomp3ds::request_exit() { g_exit_requested = true; }
 
+// newlib's abort and assert, replaced: see fatal().
+extern "C" void abort(void) {
+    fatal("abort() was called");
+}
+extern "C" void __assert_func(const char* file, int line, const char* func, const char* expr) {
+    char what[256];
+    snprintf(what, sizeof(what), "assertion \"%s\" failed in %s (%s:%d)", expr != nullptr ? expr : "?", func != nullptr ? func : "?",
+             file != nullptr ? file : "?", line);
+    fatal(what);
+}
+
 int recomp3ds::run(const GameDesc& desc) {
     g_desc = &desc;
+    std::set_new_handler(on_new_failed);
+    std::set_terminate(on_terminate);
+    atexit(on_exit_called);
 
     gfxInitDefault();
     consoleInit(GFX_BOTTOM, nullptr);          // status text on the touch screen (screen_printf)
