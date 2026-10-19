@@ -1318,6 +1318,13 @@ fed from tables compiled into the executable.
   row on the Mods page (their options still show), and a message plus exit
   at start when one's file is not in `mods/` (`required_mods_hint` says
   where to get it).
+- **`GameDesc.mods_folder`**: whether the runtime makes the `mods/` folder
+  (yes by default) for the player's `.nrm` files and game modes' ROMs. A
+  game whose mods are all built in sets false (Dinosaur Planet: its mod's
+  data comes from its ROM). `mods.json` and the mod option files are never
+  written on the 3DS (nmr 0037): `settings.ini` holds whether each mod is
+  on, its options and the game mode, and their writer thread is not made
+  (one of an application's 32 threads).
 - **`GameDesc.project_version`**: set it to the desktop's version. Mods
   refuse to load against an older one.
 - Mods baked in are compiled with the game's `RECOMP_GPR32` setting; a mod

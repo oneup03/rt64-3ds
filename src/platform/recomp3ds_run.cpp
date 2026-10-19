@@ -15,6 +15,9 @@
 namespace recomp { uint32_t heap_rdram_address() __attribute__((weak)); }
 #include "librecomp/game.hpp"
 #include "librecomp/rsp.hpp"
+#ifdef RECOMP_STATIC_MODS
+#include "librecomp/mods.hpp"
+#endif
 #include "ultramodern/ultramodern.hpp"
 #include "ultramodern/error_handling.hpp"
 #include "ultramodern/events.hpp"
@@ -1121,6 +1124,9 @@ int recomp3ds::run(const GameDesc& desc) {
         snprintf(rom_path, sizeof(rom_path), "%s/%s.z64", g_base_path, (const char*)desc.game_id.c_str());
         recomp3ds::rom_mods_install(rom_path);
     }
+#ifdef RECOMP_STATIC_MODS
+    recomp::mods::set_create_mods_folder(desc.mods_folder);
+#endif
     recomp3ds::game_modes_init(g_base_path, desc);
     const std::string game_mode = recomp3ds::pick_game_mode(desc);
     recomp3ds::game_mode_begin(desc, game_mode);

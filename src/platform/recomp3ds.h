@@ -73,6 +73,12 @@ struct GameDesc {
     // Shown when <game_id>.z64 is missing or not the ROM the game needs:
     // where it comes from (a game whose ROM is made on a PC says how).
     const char* rom_hint = nullptr;
+    // Whether the runtime makes the mods folder (sdmc:/3ds/<sd_dir>/mods/)
+    // for the player's .nrm files and game modes' ROMs. A game whose mods
+    // are all built in (Dinosaur Planet: Dinomod Enhanced, its data in the
+    // ROM) sets false. mods.json and the mod option files are never written
+    // on the 3DS whatever this says (settings.ini holds what they would).
+    bool mods_folder = true;
     recomp::GameEntry entry;            // hash, save type, entrypoint, on_init_callback
     recomp::Version project_version{};  // the game's version, which mods check (minimum_recomp_version)
     // Mods baked in that are part of the game: on whatever settings.ini says,

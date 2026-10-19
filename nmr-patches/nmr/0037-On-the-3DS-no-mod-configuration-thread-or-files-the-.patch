@@ -1,0 +1,163 @@
+From 4596908ca61bda13c13b97c60db630db67927d3c Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sun, 18 Oct 2026 23:36:19 -0500
+Subject: [PATCH] On the 3DS, no mod configuration thread or files; the mods
+ folder optional
+
+The 3DS platform keeps whether each mod is on, its options and the game
+mode in its own settings file, so mods.json and the mod option files were
+only written to be ignored, by a thread of their own: one of the 32 an
+application gets (Dinosaur Planet's game thread failed at boot for the
+lack of one). On __3DS__ the configuration thread is not made and nothing
+is queued for it.
+
+recomp::mods::set_create_mods_folder(false) also leaves the mods folder
+uncreated, for a host whose mods are all built in (Dinosaur Planet: its
+mod's data comes from its ROM). Others keep it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/include/librecomp/mods.hpp |  6 +++++
+ librecomp/src/mods.cpp               | 33 +++++++++++++++++++++-------
+ librecomp/src/recomp.cpp             | 10 ++++++++-
+ 3 files changed, 40 insertions(+), 9 deletions(-)
+
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index 0274e93..675f07c 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -416,6 +416,9 @@ namespace recomp {
+                 const std::unordered_map<recomp_func_t*, overlays::BasePatchedFunction>& base_patched_funcs,
+                 std::span<const uint8_t> decompressed_rom);
+             void dirty_mod_configuration_thread_process();
++            // The configuration thread's queue (no thread, nothing queued, on
++            // the 3DS: see the constructor).
++            template <typename T> void queue_config(T&& item);
+             void rebuild_mod_order_lookup();
+ 
+             static void on_code_mod_enabled(ModContext& context, const ModHandle& mod);
+@@ -691,6 +694,9 @@ namespace recomp {
+         // ROM was made from its patch; returning false fails the load.
+         using RomFileHandler = bool (*)(const std::string& mod_id, const std::filesystem::path& mod_path);
+         void set_rom_file_handler(RomFileHandler handler);
++        // Whether initialize_mods creates the mods folder (yes by default). A
++        // host whose mods are all built in sets false: nothing is read there.
++        void set_create_mods_folder(bool create);
+         void register_embedded_mod(const std::string& mod_id, std::span<const uint8_t> mod_bytes);
+ #ifdef RECOMP_STATIC_MODS
+         // Baked mods (static_mods.h), before recomp::start: their code, and the
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
+index 9eb9fcb..a18fd69 100644
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -1095,7 +1095,22 @@ recomp::mods::ModContext::ModContext() {
+     // Register the default mod container type (.nrm) and allow it to have any content type by passing an empty vector.
+     register_container_type(std::string{ modpaths::default_mod_extension }, {}, true);
+ 
++#ifndef __3DS__
+     mod_configuration_thread = std::make_unique<std::thread>(&ModContext::dirty_mod_configuration_thread_process, this);
++#endif
++    // (The 3DS keeps whether each mod is on, its options and the game mode
++    // in its own settings file: mods.json and the mod option files are
++    // never written, and their thread, one of an application's 32, is not
++    // made.)
++}
++
++template <typename T>
++void recomp::mods::ModContext::queue_config(T&& item) {
++#ifndef __3DS__
++    mod_configuration_thread_queue.enqueue(std::forward<T>(item));
++#else
++    (void)item;
++#endif
+ }
+ 
+ void recomp::mods::ModContext::on_code_mod_enabled(ModContext& context, const ModHandle& mod) {
+@@ -1109,9 +1124,11 @@ void recomp::mods::ModContext::on_code_mod_enabled(ModContext& context, const Mo
+ }
+ 
+ recomp::mods::ModContext::~ModContext() {
+-    mod_configuration_thread_queue.enqueue(ModConfigQueueEnd());
+-    mod_configuration_thread->join();
+-    mod_configuration_thread.reset();
++    if (mod_configuration_thread) {
++        mod_configuration_thread_queue.enqueue(ModConfigQueueEnd());
++        mod_configuration_thread->join();
++        mod_configuration_thread.reset();
++    }
+ }
+ 
+ recomp::mods::ModContentTypeId recomp::mods::ModContext::register_content_type(const ModContentType& type) {
+@@ -1222,7 +1239,7 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
+             }
+             recomp::mods::set_code_mod_active(loaded_it->second, enabled);
+             if (trigger_save) {
+-                mod_configuration_thread_queue.enqueue(ModConfigQueueSave());
++                queue_config(ModConfigQueueSave());
+             }
+         }
+ #endif
+@@ -1340,7 +1357,7 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
+     }
+ 
+     if (trigger_save) {
+-        mod_configuration_thread_queue.enqueue(ModConfigQueueSave());
++        queue_config(ModConfigQueueSave());
+     }
+ }
+ 
+@@ -1669,7 +1686,7 @@ void recomp::mods::ModContext::set_mod_index(const std::string &mod_game_id, con
+         }
+     }
+ 
+-    mod_configuration_thread_queue.enqueue(ModConfigQueueSave());
++    queue_config(ModConfigQueueSave());
+ }
+ 
+ const recomp::config::ConfigSchema &recomp::mods::ModContext::get_mod_config_schema(const std::string &mod_id) const {
+@@ -1716,7 +1733,7 @@ void recomp::mods::ModContext::set_mod_config_value(size_t mod_index, const std:
+     mod.config.set_option_value(option_id, value);
+ 
+     // Notify the asynchronous thread it should save the configuration for this mod.
+-    mod_configuration_thread_queue.enqueue(ModConfigQueueSaveMod{ mod.manifest.mod_id });
++    queue_config(ModConfigQueueSaveMod{ mod.manifest.mod_id });
+ }
+ 
+ void recomp::mods::ModContext::set_mod_config_value(const std::string &mod_id, const std::string &option_id, const recomp::config::ConfigValueVariant &value) {
+@@ -1768,7 +1785,7 @@ void recomp::mods::ModContext::set_session_excluded_mods(const std::unordered_se
+ 
+ void recomp::mods::ModContext::set_latest_game_mode_id(const std::string& game_mode_id) {
+     latest_game_mode = game_mode_id;
+-    mod_configuration_thread_queue.enqueue(ModConfigSetLatestGamemode());
++    queue_config(ModConfigSetLatestGamemode());
+ }
+ 
+ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mods(const GameEntry& game_entry, const std::string& game_mode_id, uint8_t* rdram, int32_t load_address, uint32_t& ram_used) {
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 47ffaa1..1f3abae 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -100,11 +100,19 @@ bool recomp::register_game(const recomp::GameEntry& entry) {
+ }
+ 
+ #ifndef RECOMP_NO_MODS
++static bool create_mods_folder = true;
++
++void recomp::mods::set_create_mods_folder(bool create) {
++    create_mods_folder = create;
++}
++
+ void recomp::mods::initialize_mods() {
+ #ifndef RECOMP_STATIC_MODS
+     N64Recomp::live_recompiler_init();
+ #endif
+-    std::filesystem::create_directories(config_path / mods_directory);
++    if (create_mods_folder) {
++        std::filesystem::create_directories(config_path / mods_directory);
++    }
+ #ifndef __3DS__
+     // The 3DS keeps mod options in its own settings file and never writes
+     // here: no empty folder for the player to wonder about.
+-- 
+2.56.0
+
