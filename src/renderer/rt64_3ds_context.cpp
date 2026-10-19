@@ -1184,9 +1184,10 @@ private:
         LightLock_Init(&g_gpu_lock);
         aptHook(&g_apt_cookie, apt_hook, nullptr);
         textures_.set_compact_intensity(rt64_3ds::render_desc().intensity_textures16);
-        // Textures in VRAM (TextureCache::set_vram).
+        // Textures in VRAM (TextureCache::set_vram), unless the game keeps
+        // them out (RenderDesc::vram_textures).
         {
-            const bool vram = true;
+            const bool vram = rt64_3ds::render_desc().vram_textures;
             // Off-screen images' targets (colour and 24-bit depth) are the VRAM
             // made later, on demand: render_to_texture (Banjo's jiggy
             // transition, 512x256: 1 MB) and sample_drawn_frame (Goemon's menu
@@ -3060,9 +3061,11 @@ public:
             // waits for this list's completion before its next frame), about
             // 11 s on the console. The frame's image follows as ever.
             char name[32];
-            if (direct_captures_ == 0) snprintf(name, sizeof(name), "gfx_task.bin");
-            else snprintf(name, sizeof(name), "gfx_task%d.bin", direct_captures_);
-            direct_captures_++;
+            // Numbered as every capture is (capture_count_; the frame image
+            // that follows takes the same number): a second capture with a
+            // copy and one without both wrote gfx_task.bin, the first lost.
+            if (capture_count_ == 0) snprintf(name, sizeof(name), "gfx_task.bin");
+            else snprintf(name, sizeof(name), "gfx_task%d.bin", capture_count_);
             fprintf(stderr, "rt64-3ds: capture of frame %u: no memory for a copy of RDRAM, writing %s now (the game pauses)\n", frames_, name);
             capture::set_message(1, "Capture: no memory for a copy, writing %s now", name);
             const u64 t0 = svcGetSystemTick();
@@ -3132,7 +3135,7 @@ public:
                 fclose(f);
             }
         }
-        static int frame_captures = 0;
+        int& frame_captures = capture_count_;
         CaptureJob* job = new CaptureJob{};
         if (frame_captures == 0) snprintf(job->frame_name, sizeof(job->frame_name), "gfx_frame.ppm");
         else snprintf(job->frame_name, sizeof(job->frame_name), "gfx_frame%d.ppm", frame_captures);
@@ -4185,7 +4188,7 @@ public:
     int capture_snapshot_frames_ = 0;
     int capture_want_ = -2, store_delay_ = -1;
     bool capture_pair_ = false, capture_pair_next_ = false;   // GFX_CAPTURE.TXT "pair <frame>"
-    int direct_captures_ = 0;                                   // written without a copy (no memory for one)
+    int capture_count_ = 0;                     // captures so far: gfx_task<N>.bin and gfx_frame<N>.ppm
     bool rtt_capture_armed_ = false;            // GFX_CAPTURE.TXT "rtt"
     int seq_rtt_count_ = 0;                     // GFX_CAPTURE.TXT "seqrtt <count>"
     OSTask rtt_capture_task_{};

@@ -103,6 +103,14 @@ struct RenderDesc {
     // since an image drawn once and sampled for many frames (Banjo's jiggy
     // transition) must not be redrawn by an in-between.
     bool inbetween_offscreen = false;
+    // Textures copied to VRAM, where the GPU reads them faster, as room
+    // allows (TextureCache::set_vram). Off keeps them in the linear heap:
+    // Dinosaur Planet's VRAM holds its eyes, the in-betweens' eyes and its
+    // shadow targets (a 512x512 one is 2 MB with depth) with ~3 MB to spare,
+    // and once its textures went there (they never had before a front-end
+    // target stopped holding VRAM back) a New 3DS showed some white: the
+    // ground in places, the sky until a map had loaded for a while.
+    bool vram_textures = true;
     // Frame interpolation: a world camera that jumps between two lists is a
     // scene cut (no in-between): a move of more than this many units that
     // is also ten times the move before it. The default suits the sibling
