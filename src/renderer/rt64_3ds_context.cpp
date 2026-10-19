@@ -2877,6 +2877,7 @@ private:
         // dirties the whole stage set).
         if (d.cc_w0 != last_cc_[0] || d.cc_w1 != last_cc_[1] || d.othermode_h != last_omh_ || d.othermode_l != last_oml_ ||
             memcmp(d.prim, last_prim_, 4) != 0 || memcmp(d.env, last_env_, 4) != 0 || memcmp(d.fog, last_fog_, 4) != 0 ||
+            memcmp(d.blend, last_blend_, 4) != 0 ||
             d.prim_lod_frac != last_plf_ || d.kind != last_kind_ || d.geometry_mode != last_gm_) {
             // Plans are cached: the same combiner/mode/colour set recurs across
             // draws and frames.
@@ -2885,6 +2886,7 @@ private:
             pk.w[0] = d.cc_w0; pk.w[1] = d.cc_w1; pk.w[2] = d.othermode_h; pk.w[3] = d.othermode_l;
             memcpy(&pk.w[4], d.prim, 4); memcpy(&pk.w[5], d.env, 4); memcpy(&pk.w[6], d.fog, 4);
             pk.w[7] = (uint32_t)d.prim_lod_frac | ((uint32_t)d.kind << 8) | (d.geometry_mode & 0x10000);
+            memcpy(&pk.w[8], d.blend, 4);   // the blender's constant (a BLEND-colour source: plan_tev)
             uint32_t h = 2166136261u;
             for (uint32_t v : pk.w) { h ^= v; h *= 16777619u; h ^= h >> 15; }
             uint32_t slot = h & (kPlanCache - 1);
@@ -2904,7 +2906,7 @@ private:
                 last_plan_ = *plan;
             }
             last_cc_[0] = d.cc_w0; last_cc_[1] = d.cc_w1; last_omh_ = d.othermode_h; last_oml_ = d.othermode_l;
-            memcpy(last_prim_, d.prim, 4); memcpy(last_env_, d.env, 4); memcpy(last_fog_, d.fog, 4);
+            memcpy(last_prim_, d.prim, 4); memcpy(last_env_, d.env, 4); memcpy(last_fog_, d.fog, 4); memcpy(last_blend_, d.blend, 4);
             last_plf_ = d.prim_lod_frac; last_kind_ = d.kind; last_gm_ = d.geometry_mode;
         }
         if (fallbacks != nullptr && plan_fallbacks_ != 0) (*fallbacks)++;
@@ -4269,12 +4271,12 @@ public:
     C3D_Tex* last_tex_[2] = { nullptr, nullptr };
     uint32_t last_tex_param_[2] = { 0, 0 };
     uint32_t last_cc_[2] = { 0, 0 }, last_omh_ = 0, last_oml_ = 0, last_gm_ = 0;
-    uint8_t last_prim_[4] = {}, last_env_[4] = {}, last_fog_[4] = {}, last_plf_ = 0, last_kind_ = 0;
+    uint8_t last_prim_[4] = {}, last_env_[4] = {}, last_fog_[4] = {}, last_blend_[4] = {}, last_plf_ = 0, last_kind_ = 0;
     rt64_3ds::TevPlan last_plan_{};
     int plan_fallbacks_ = 0;            // the current plan's inexact constants
     static constexpr uint32_t kPlanCache = 256;
     rt64_3ds::TevPlan plan_cache_[kPlanCache]{};
-    struct PlanKey { uint32_t w[8]; };
+    struct PlanKey { uint32_t w[9]; };
     PlanKey plan_keys_[kPlanCache]{};
     bool plan_valid_[kPlanCache]{};
     // What apply_state's depth/blend/alpha-test/scissor block last applied.

@@ -2177,7 +2177,12 @@ struct Interpreter::Impl {
         if (textured) {
             describe_tile(tile, r.tex[0]);
             rect_load = last_best;
-            if (cyc == 2 && uses_texel(1)) describe_tile((tile + 1) & 7, r.tex[1]);
+            // TEXEL1 is the next tile's in 2-cycle mode (cyc is the raw
+            // field: 0 1-cycle, 1 2-cycle, 2 copy, 3 fill). This compared
+            // against 2 (copy), so no rectangle had a TEXEL1: Dinosaur
+            // Planet's sky, a 2-cycle rectangle blending two gradients by
+            // the environment's alpha, came out pale after a map load.
+            if (cyc == 1 && uses_texel(1)) describe_tile((tile + 1) & 7, r.tex[1]);
             set_uv1(r, tile);
         }
         else if (cyc == 3) {

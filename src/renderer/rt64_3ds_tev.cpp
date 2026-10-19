@@ -309,7 +309,29 @@ void plan_tev(const DrawRecord& d, TevPlan& plan) {
             else if (a == 1 && first_in_a) src = 1;
             else if (a == 2 && first_pass) src = 2;
         }
-        if (src >= 0) {
+        // A constant blended over memory: P the fog or blend colour, M MEM,
+        // B 1-A (Dinosaur Planet's fog haze, FOG * SHADE_A + MEM * (1 -
+        // SHADE_A), drawn with a combiner that puts out white). The fragment
+        // becomes that colour with the blender's A as its alpha; blended by
+        // source alpha, the PICA gives the RDP's result. Without this the
+        // combiner's white went on whole: white strips on the ground.
+        auto is_const_in_mem = [&](int cy) { const uint32_t p = sel(cy, 28); return (p == 2 || p == 3) && sel(cy, 20) == 1 && sel(cy, 16) == 0; };
+        const bool first_pass = (cyc != 1) || is_pass(0);
+        if (src < 0 && is_const_in_mem(last) && first_pass && !(sel(last, 28) == 2 && sel(last, 24) == 1)) {
+            const uint32_t p = sel(last, 28), a = sel(last, 24);
+            TevStage& st = plan.stage[plan.stages++];
+            Op rgb = { GPU_REPLACE, { S_PRIM, S_PRIM, S_PRIM }, 1 };
+            Op op_a;
+            if (a == 0) op_a = { GPU_REPLACE, { S_COMBINED_A, S_COMBINED_A, S_COMBINED_A }, 1 };      // the combiner's alpha
+            else if (a == 1) op_a = { GPU_REPLACE, { S_PRIM_A, S_PRIM_A, S_PRIM_A }, 1 };        // the fog colour's
+            else if (a == 2) op_a = { GPU_REPLACE, { S_SHADE_A, S_SHADE_A, S_SHADE_A }, 1 };     // shade (the fog factor under G_FOG)
+            else op_a = { GPU_REPLACE, { S_ZERO, S_ZERO, S_ZERO }, 1 };
+            Consts kf = k;   // the colour rides in the stage constant
+            const uint8_t* c = p == 3 ? d.fog : d.blend;
+            kf.prim = (uint32_t)c[0] | ((uint32_t)c[1] << 8) | ((uint32_t)c[2] << 16) | ((uint32_t)c[3] << 24);
+            build_stage(st, &rgb, &op_a, kf, buf, plan.fallbacks);
+        }
+        else if (src >= 0) {
             TevStage& st = plan.stage[plan.stages++];
             Op rgb = { GPU_REPLACE, { S_COMBINED, S_COMBINED, S_COMBINED }, 1 };
             Op a;
