@@ -1184,10 +1184,9 @@ private:
         LightLock_Init(&g_gpu_lock);
         aptHook(&g_apt_cookie, apt_hook, nullptr);
         textures_.set_compact_intensity(rt64_3ds::render_desc().intensity_textures16);
-        // Textures in VRAM (TextureCache::set_vram), unless the game keeps
-        // them out (RenderDesc::vram_textures).
+        // Textures in VRAM (TextureCache::set_vram).
         {
-            const bool vram = rt64_3ds::render_desc().vram_textures;
+            const bool vram = true;
             // Off-screen images' targets (colour and 24-bit depth) are the VRAM
             // made later, on demand: render_to_texture (Banjo's jiggy
             // transition, 512x256: 1 MB) and sample_drawn_frame (Goemon's menu
