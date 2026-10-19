@@ -50,6 +50,8 @@ int main(int argc, char** argv) {
     if (const char* e = getenv("DL_CULLDL")) interp.set_cull_dl(atoi(e) != 0);
     // DL_SCREEN_CULL=<slack>: the screen cull (0.10 an Old 3DS's, 0.25 a New 3DS's; the console adds the eyes' shift).
     if (const char* e = getenv("DL_SCREEN_CULL")) interp.set_screen_cull((float)atof(e));
+    // DL_EYE_CULL=<m>: the face cull's reach for the eyes (the console's separation * 200 * convergence).
+    if (const char* e = getenv("DL_EYE_CULL")) interp.set_eye_cull((float)atof(e));
     // RenderDesc::sample_drawn_frame (Goemon's menu box rims).
     if (getenv("DL_FRAME_COPY")) interp.set_sample_drawn_frame(true);
     // RenderDesc::primary_world_instance (the dump then lists each record's projection instance).
@@ -81,6 +83,10 @@ int main(int argc, char** argv) {
     if (getenv("DL_RECT_PARITY")) { interp.set_fix_rect_lr(true); interp.set_merge_rect_slices(true); }
     // RenderDesc::scissor_edge_slack (Goemon: 5).
     if (const char* e = getenv("DL_SCISSOR_SLACK")) interp.set_scissor_edge_slack(atoi(e));
+    // DL_AIM_HASH: the candidate reticle rectangles' texture hashes, as the
+    // console's dbg_aim_tex_log prints them (for RenderDesc::aim_texture_hashes).
+    const bool aim_hash = getenv("DL_AIM_HASH") != nullptr;
+    if (aim_hash) interp.set_aim_hash(true);
     // RenderDesc::merge_image_tiles (Goemon's sky). The rows of an image
     // texture come from the list before, so the task is run once first, as
     // the console runs the frame before it, and its frame presented
@@ -427,6 +433,20 @@ int main(int argc, char** argv) {
     names[0xF0] = "LOADTLUT"; names[0xF1] = "RDPHALF_2"; names[0xF2] = "SETTILESIZE"; names[0xF3] = "LOADBLOCK"; names[0xF4] = "LOADTILE"; names[0xF5] = "SETTILE"; names[0xF6] = "FILLRECT"; names[0xF7] = "SETFILLCOLOR";
     names[0xF8] = "SETFOGCOLOR"; names[0xF9] = "SETBLENDCOLOR"; names[0xFA] = "SETPRIMCOLOR"; names[0xFB] = "SETENVCOLOR"; names[0xFC] = "SETCOMBINE"; names[0xFD] = "SETTIMG"; names[0xFE] = "SETZIMG"; names[0xFF] = "SETCIMG"; names[0x64] = "EXTENDED";
     for (int op = 0; op < 256; op++) if (st.op_hist[op]) printf("  %02x %-16s %u\n", op, names[op] ? names[op] : "?", st.op_hist[op]);
+
+    if (aim_hash) {
+        for (size_t i = 0; i < frame.draws.size(); i++) {
+            const auto& d = frame.draws[i];
+            if (d.tex_hash == 0) continue;
+            float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+            for (uint32_t k = d.first; k < d.first + d.count; k++) {
+                const auto& v = frame.verts[k];
+                x0 = std::min(x0, v.x); x1 = std::max(x1, v.x); y0 = std::min(y0, v.y); y1 = std::max(y1, v.y);
+            }
+            printf("aim-tex: %016llx %ux%u fmt %u siz %u tlut %u, draw %zu tex %06x at %.0f,%.0f..%.0f,%.0f\n", (unsigned long long)d.tex_hash,
+                   d.tex[0].width, d.tex[0].height, d.tex[0].fmt, d.tex[0].siz, d.tex[0].tlut_mode, i, d.tex[0].addr, x0, y0, x1, y1);
+        }
+    }
 
     if (const char* dump = getenv("DL_DUMP")) {
         // Every vertex and draw in text form, for diffing two builds.

@@ -91,6 +91,13 @@ public:
     // frame's size, are dropped before the vertex buffer and left out of
     // the in-betweens (below zero: off, the default).
     void set_screen_cull(float slack);
+    // The eyes' reach for the face cull: m, where each eye shifts a world
+    // vertex by up to +-m / w N64 px beyond a constant (the stereo shift's
+    // separation * convergence). A world camera's triangle drawn to the
+    // screen is kept when either eye could see its front, and the renderer
+    // has the GPU cull each eye's back faces. 0 (the default): the centre
+    // view's winding alone, as with the 3D off.
+    void set_eye_cull(float m);
     // The display-list encoding the game's lists use (F3DEX2 by default).
     void set_gbi(Gbi gbi);
     // Draw off-screen colour images into textures of their own instead of

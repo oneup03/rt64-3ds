@@ -503,6 +503,17 @@ public:
             interp_.set_screen_cull(std::max(screen_cull_base_, eyes));
         }
         else interp_.set_screen_cull(-1.0f);
+        // The face cull's reach for the eyes (Interpreter::set_eye_cull):
+        // sep * 200 * conv, with the convergence this list's frame can reach
+        // (the last frame's, which auto convergence eases from by under a
+        // quarter a frame; else the setting's).
+        {
+            const rt64_3ds::Settings& st = rt64_3ds::settings();
+            const float sep_px = (float)st.sep_slider * 0.002f * slider_ * st.slider_gain * rt64_3ds::kPxPerNdc;
+            const float manual = (float)st.convergence_hundredths * 0.2f;
+            const float conv = st.auto_convergence && applied_conv_ > 0.0f ? 1.25f * applied_conv_ : manual;
+            interp_.set_eye_cull(top_r_ != nullptr && slider_ > 0.001f ? sep_px * conv : 0.0f);
+        }
         // The read, up to "parsed" (on the reader thread when there is one).
         depth_read_early_ = false;
         const ReadOutcome read = read_list(task);
@@ -1656,6 +1667,15 @@ private:
             }
             apply_state(d, i, (pass == 0 && tgt != kFrameTarget) ? &fallbacks : nullptr);
             {
+                // Face culling per eye: the interpreter keeps a world
+                // triangle either eye may see the front of (set_eye_cull),
+                // and the GPU drops what the eye being drawn sees from
+                // behind. Into the eyes only: off-screen images and the frame
+                // copy keep the interpreter's cull alone.
+                const uint32_t cull = d.kind == rt64_3ds::DrawRecord::Tris && tgt == -1 ? d.geometry_mode & 0x600u : 0u;   // G_CULL_FRONT | G_CULL_BACK
+                set_cull((cull & 0x400u) ? GPU_CULL_BACK_CCW : (cull & 0x200u) ? GPU_CULL_FRONT_CCW : GPU_CULL_NONE);
+            }
+            {
                 // The left eye's shift: the shader multiplies it by the
                 // eye's sign (u_eye_), so a draw's commands are the same for
                 // both eyes (every class's shift is odd in the eye).
@@ -1757,6 +1777,13 @@ private:
         }
         if (cur_target_ != -1 && !offscreen_frame) {
             bind_target(-1, pass);
+        }
+        // No face cull for what is drawn after the eye's draws (the ghost
+        // pass, the depth copy, overlays), in the list kept for the right
+        // eye too.
+        if (last_cull_ != GPU_CULL_NONE) {
+            set_cull(GPU_CULL_NONE);
+            C3Di_UpdateContext();
         }
         // The left eye's draws, a command list kept for the right eye.
         if (eye_replay && pass == 0) close_segment(&left_list, &left_words);
@@ -2950,9 +2977,8 @@ private:
         else if ((l & 0x3000) == 0x3000) C3D_AlphaTest(true, GPU_GEQUAL, 0x80);
         else C3D_AlphaTest(false, GPU_ALWAYS, 0);
 
-        // Culling.
-        // Face culling is done in the interpreter (screen-space winding).
-        C3D_CullFace(GPU_CULL_NONE);
+        // Culling: in the interpreter (screen-space winding), and per eye on
+        // the GPU (draw_rec, set_cull).
 
         // Scissor in N64 pixels -> target pixels (rotated framebuffer).
         // dbg_no_scissor disables it (to see draws a wrong clip would hide).
@@ -4130,9 +4156,17 @@ public:
     bool depth_copy_ready_ = false;             // the last game frame queued its copy
     const void* depth_read_ = nullptr;          // what read_depth_zp reads this frame
     uint32_t depth_checks_ = 0;                 // copies checked against VRAM (the first few)
+    // The GPU's face cull (draw_rec): set on a change; -1 not known.
+    int last_cull_ = -1;
+    void set_cull(GPU_CULLMODE mode) {
+        if ((int)mode == last_cull_) return;
+        C3D_CullFace(mode);
+        last_cull_ = (int)mode;
+    }
     // What apply_state and the shift cache: forgotten, so the next draw sets
     // all of its state itself.
     void forget_draw_state() {
+        last_cull_ = -1;
         last_tex_[0] = last_tex_[1] = nullptr;
         last_tex_param_[0] = last_tex_param_[1] = 0xFFFFFFFFu;
         last_us_ = last_vs_ = -1.0f;

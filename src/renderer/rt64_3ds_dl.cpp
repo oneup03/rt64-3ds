@@ -411,6 +411,44 @@ void clip_tri(const TriSink& s, const Vtx3ds* tri) {
     *s.count += (uint32_t)(n - 2) * 3;
 }
 
+// The eyes' reach for the face cull (Interpreter::set_eye_cull): while the
+// 3D is on, an eye moves a world vertex by e * s * (conv / w - 1) px (the
+// shader's shift), so the eyes see a triangle's winding as if each vertex
+// moved by +-m / w px plus a constant, m = s * conv. g_eye_cull is the
+// largest m this list's eyes can use (0: the 3D is off). A triangle the
+// centre view sees from behind can show its front to one eye: the side of
+// a step seen almost edge on, whose absence let the sky through a wedge
+// beside it in that eye (Dinosaur Planet). The cull keeps what either eye
+// may see the front of, and the GPU culls each eye's back faces
+// (kCullEyes marks the triangles that need it: a world camera's, drawn to
+// the screen).
+float g_eye_cull = 0.0f;
+constexpr uint32_t kCullEyes = 0x80000000u;
+
+// The winding test: whether a triangle with these cull bits is culled.
+// Winding in screen space (y down), each vertex scaled by the other two w's
+// so the comparison holds without dividing; a vertex behind the eye flips
+// it, hence the sign of the product. Front faces wind counter-clockwise on
+// the y-down screen (cross < 0).
+template <typename V>
+inline bool culled(const V& a, const V& b, const V& c, uint32_t cull) {
+    const float ab = a.w * b.w, bc = b.w * c.w, ac = a.w * c.w;
+    const float ax = a.x * bc, ay = a.y * bc;
+    const float bx = b.x * ac, by = b.y * ac;
+    const float cx = c.x * ab, cy = c.y * ab;
+    float cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (ab * c.w < 0.0f) cross = -cross;
+    float reach = 0.0f;
+    if ((cull & kCullEyes) && g_eye_cull > 0.0f && a.w > 0.0f && b.w > 0.0f && c.w > 0.0f) {
+        // A vertex's move of m / w is m * (the other two w's) scaled: the
+        // cross moves by m times this, either way.
+        reach = g_eye_cull * fabsf((ac - bc) * (cy - ay) - (by - ay) * (ab - bc));
+    }
+    if ((cull & G_CULL_BACK) && cross - reach > 0.0f) return true;
+    if ((cull & G_CULL_FRONT) && cross + reach < 0.0f) return true;
+    return false;
+}
+
 // A triangle's output (emit_tri's, or the deferred output's): culled by its
 // winding, its texel coordinates relative to the tile and then mapped by
 // remap, its depth the primitive's where zprim >= 0, clipped to the guard
@@ -418,20 +456,7 @@ void clip_tri(const TriSink& s, const Vtx3ds* tri) {
 template <typename Remap>
 inline void output_tri(const TriSink& s, const LoadedVertex& a, const LoadedVertex& b, const LoadedVertex& c, uint32_t cull,
                        float ss, float st, float uls, float ult, float zprim, Remap remap) {
-    if (cull) {
-        // Winding in screen space (y down), each vertex scaled by the
-        // other two w's so the comparison holds without dividing; a
-        // vertex behind the eye flips it, hence the sign of the product.
-        const float ab = a.w * b.w, bc = b.w * c.w, ac = a.w * c.w;
-        const float ax = a.x * bc, ay = a.y * bc;
-        const float bx = b.x * ac, by = b.y * ac;
-        const float cx = c.x * ab, cy = c.y * ab;
-        float cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-        if (ab * c.w < 0.0f) cross = -cross;
-        // Front faces wind counter-clockwise on the y-down screen (cross < 0).
-        if ((cull & G_CULL_BACK) && cross > 0.0f) return;
-        if ((cull & G_CULL_FRONT) && cross < 0.0f) return;
-    }
+    if (cull && culled(a, b, c, cull)) return;
     Vtx3ds tri[3];
     for (int k = 0; k < 3; k++) {
         const LoadedVertex& v = k == 0 ? a : (k == 1 ? b : c);
@@ -787,13 +812,26 @@ struct Interpreter::Impl {
         }
         return false;
     }
+    // The cull bits a triangle takes: kCullEyes added for a world camera's
+    // drawn to the screen (the eyes' shift turns its winding: g_eye_cull).
+    uint32_t cull_bits() const {
+        uint32_t c = geometry_mode & (G_CULL_FRONT | G_CULL_BACK);
+        if (c != 0 && cur_rtt < 0 && is_world_proj(proj_id)) c |= kCullEyes;
+        return c;
+    }
     bool split_untagged_ortho = false;
     bool aim_hash = false;             // Interpreter::set_aim_hash
-    // FNV-1a over the bytes the tile load reads (texel_span) and, with the
+    // FNV-1a over the image's bytes (its rows, in whole words) and, with the
     // TLUT on, the palette entries it indexes: RenderDesc::aim_texture_hashes.
+    // Not texel_span's slack past the last row: what follows a texture can
+    // be its display list, whose SETTIMG names where the texture sits in RAM
+    // (Dinosaur Planet's reticle), and the hash must not move with that.
     uint64_t hash_texture(const TexDesc& d) const {
-        uint32_t lo, hi;
-        texel_span(d, lo, hi);
+        const uint32_t addr = d.addr & kRdramMask;
+        const uint32_t rows = (d.wrap_rows != 0 && d.wrap_rows < d.height) ? d.wrap_rows : d.height;
+        const uint32_t bytes = ((((uint32_t)d.width + d.nibble) << d.siz) + 1) / 2;
+        const uint32_t lo = addr & ~3u;
+        const uint32_t hi = std::min<uint32_t>((addr + (rows > 0 ? rows - 1 : 0) * d.pitch + bytes + 3) & ~3u, kRdramBytes);
         uint64_t h = 1469598103934665603ull;
         for (uint32_t a = lo; a < hi; a++) h = (h ^ rdram[a]) * 1099511628211ull;
         if (d.tlut_mode != 0) {
@@ -1929,7 +1967,7 @@ struct Interpreter::Impl {
                 s.uls = (float)(tl.uls >> 2); s.ult = (float)(tl.ult >> 2);
                 s.zprim = (othermode_l & G_ZS_PRIM) != 0 ? prim_z() : -1.0f;
                 s.tile = tile_cur;
-                s.cull = geometry_mode & (G_CULL_FRONT | G_CULL_BACK);
+                s.cull = cull_bits();
                 s.plain = plain;
                 ip->tri_states.push_back(s);
             }
@@ -1957,7 +1995,7 @@ struct Interpreter::Impl {
         const float ss = shift_scale(tl.shifts), st = shift_scale(tl.shiftt);
         const bool snap = r->tex[0].snapshot;
         output_tri(TriSink{ &out->verts, &r->count, &stats->tris, &stats->clipped, screen_w, screen_h },
-                   a, b, c, geometry_mode & (G_CULL_FRONT | G_CULL_BACK), ss, st, uls, ult,
+                   a, b, c, cull_bits(), ss, st, uls, ult,
                    (othermode_l & G_ZS_PRIM) != 0 ? prim_z() : -1.0f, [&](float& u, float& v) {
             if (img) { u += img_du; v += img_dv; }
             else if (snap) snapshot_uv(r->tex[0], u, v, u, v, proj_stretch());
@@ -1979,7 +2017,7 @@ struct Interpreter::Impl {
             const Tile& tl = tiles[texture.tile & 7];
             D.runs[D.nruns++] = { draw, D.ntris, shift_scale(tl.shifts), shift_scale(tl.shiftt),
                                   (float)(tl.uls >> 2) + tile_du[0], (float)(tl.ult >> 2) + tile_dv[0],
-                                  (othermode_l & G_ZS_PRIM) != 0 ? prim_z() : -1.0f, geometry_mode & (G_CULL_FRONT | G_CULL_BACK), 0, 0 };
+                                  (othermode_l & G_ZS_PRIM) != 0 ? prim_z() : -1.0f, cull_bits(), 0, 0 };
         }
         Interpreter::Defer::Tri& T = D.tris[D.ntris++];
         T.v[0] = dslot[i0]; T.v[1] = dslot[i1]; T.v[2] = dslot[i2];
@@ -3513,17 +3551,7 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
                         }
                     }
                     if (off_screen(tri, r.screen_w, r.screen_h)) continue;
-                    if (s.cull != 0) {
-                        const Vtx3ds& a = tri[0]; const Vtx3ds& b = tri[1]; const Vtx3ds& c = tri[2];
-                        const float ab = a.w * b.w, bc = b.w * c.w, ac = a.w * c.w;
-                        const float ax = a.x * bc, ay = a.y * bc;
-                        const float bx = b.x * ac, by = b.y * ac;
-                        const float cx = c.x * ab, cy = c.y * ab;
-                        float cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-                        if (ab * c.w < 0.0f) cross = -cross;
-                        if ((s.cull & G_CULL_BACK) && cross > 0.0f) continue;
-                        if ((s.cull & G_CULL_FRONT) && cross < 0.0f) continue;
-                    }
+                    if (s.cull != 0 && culled(tri[0], tri[1], tri[2], s.cull)) continue;
                     r.emitted++;
                     if (!in_guard_band(tri[0], r.screen_w, r.screen_h) || !in_guard_band(tri[1], r.screen_w, r.screen_h) ||
                         !in_guard_band(tri[2], r.screen_w, r.screen_h)) {
@@ -3713,6 +3741,7 @@ void Interpreter::set_aim_hash(bool on) { impl_->aim_hash = on; }
 void Interpreter::set_force_branch_z(bool on) { impl_->force_branch_z = on; }
 void Interpreter::set_cull_dl(bool on) { impl_->cull_dl = on; }
 void Interpreter::set_screen_cull(float slack) { g_screen_cull_slack = slack; }
+void Interpreter::set_eye_cull(float m) { g_eye_cull = m > 0.0f ? m : 0.0f; }
 void Interpreter::set_gbi(Gbi gbi) {
     impl_->gbi = gbi;
     impl_->op_table = gbi == Gbi::F3DEX ? kF3dexOp.v : kF3dex2Op.v;
