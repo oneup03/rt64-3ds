@@ -1,6 +1,7 @@
 // The 3DS entry point: console services, the runtime's callbacks, and the
 // runtime itself. The game supplies a GameDesc; everything else is shared.
 #include <3ds.h>
+#include <opendsp.h>
 #include <malloc.h>
 #include <cstdio>
 #include <cstdlib>
@@ -529,14 +530,21 @@ void update_gfx_inner() {
             memcpy(prev, loads, n * sizeof(loads[0]));
             prev_n = n;
         }
-        char dsp_stats[256] = "";
+        char dsp_stats[320] = "";
         if (recomp3ds::dsp_synth_enabled()) {
             const recomp3ds::DspSynthStats ds = recomp3ds::dsp_synth_take_stats();
-            snprintf(dsp_stats, sizeof(dsp_stats), " dsp-synth %lu playing, %lu starts, %lu events, busy %lu us (decode %lu, events %lu), %lu starved, %lu ms late, %lu remaps, %lu callbacks, %lu ndsp-dropped, reverb %lu us %lu gaps, %lu lists skipped",
+            // OpenDSP's own load: the last DSP frame's share of its time, the
+            // peak since the last line, and the frames it rendered late (the
+            // DSP overloaded: its output, and the synth's clock, fall behind).
+            opendspStats os = {};
+            os.struct_size = sizeof(os);
+            const bool have_os = recomp3ds::audio_opendsp() && R_SUCCEEDED(opendspGetStats(&os, true));
+            snprintf(dsp_stats, sizeof(dsp_stats), " dsp-synth %lu playing, %lu starts, %lu events, busy %lu us (decode %lu, events %lu), %lu starved, %lu ms late, %lu remaps, %lu callbacks, %lu ndsp-dropped, reverb %lu us, DSP load %d%% max %d%% late %lu, %lu lists skipped",
                      (unsigned long)ds.playing, (unsigned long)ds.starts, (unsigned long)ds.events, (unsigned long)ds.decode_us,
                      (unsigned long)ds.decode_only_us, (unsigned long)ds.apply_us, (unsigned long)ds.starved, (unsigned long)ds.late,
                      (unsigned long)ds.remaps, (unsigned long)ds.callbacks, (unsigned long)ds.ndsp_dropped,
-                     (unsigned long)ds.reverb_us, (unsigned long)ds.reverb_gaps, (unsigned long)ds.lists_skipped);
+                     (unsigned long)ds.reverb_us, have_os ? (int)(os.load * 100.0f + 0.5f) : -1, have_os ? (int)(os.load_max * 100.0f + 0.5f) : -1,
+                     have_os ? (unsigned long)os.late_frames : 0ul, (unsigned long)ds.lists_skipped);
         }
         char want_fps[240] = "";
         if (st.game_fps > 0) snprintf(want_fps, sizeof(want_fps), ", game asks %d", st.game_fps);

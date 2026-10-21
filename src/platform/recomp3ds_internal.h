@@ -19,6 +19,7 @@ namespace recomp3ds {
     inline uint64_t wall_ms() { return svcGetSystemTick() / 268123ull; }
 
     bool audio_init();
+    bool audio_opendsp();               // OpenDSP's firmware runs (its reverb on the aux buses)
     void audio_shutdown();
     void audio_set_frequency(uint32_t freq);
     void audio_queue_samples(int16_t* samples, size_t sample_count);

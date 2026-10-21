@@ -330,7 +330,13 @@ void apply_mix(Voice& v) {
     // Without the reverb a voice plays wholly dry: its fxmix would take the
     // send away and give nothing back (DK64 underwater turns every voice to
     // 127, fully wet, which was silence).
-    const float dry = recomp3ds::dsp_reverb_active() ? g_eqpower[fx] / 32767.0f : 1.0f;
+    // With the reverb, its early part (ReverbMatch::early) is heard dry: the
+    // wet send's share of it added to the dry level, as energy.
+    float dry = 1.0f;
+    if (recomp3ds::dsp_reverb_active()) {
+        const float d = g_eqpower[fx] / 32767.0f, e = recomp3ds::dsp_reverb_early() * g_eqpower[127 - fx] / 32767.0f;
+        dry = sqrtf(d * d + e * e);
+    }
     const float l = v.vol * (g_eqpower[pan] / 32767.0f) * dry;
     const float r = v.vol * (g_eqpower[127 - pan] / 32767.0f) * dry;
     float mix[12] = {};
@@ -466,7 +472,7 @@ void apply_event(const Event& e) {
 
 void synth_thread(void*) {
     std::vector<Event> due;
-    bool sends = false;         // the channels' mixes include the reverb's sends
+    uint32_t reverb_gen = 0;    // the effect the channels' mixes were made for (dsp_reverb_generation)
     while (!g_quit) {
         LightEvent_Wait(&g_frame_event);
         if (g_quit) break;
@@ -479,8 +485,9 @@ void synth_thread(void*) {
             LightLock_Unlock(&g_lock);
         }
         recomp3ds::dsp_reverb_process();
-        if (recomp3ds::dsp_reverb_active() != sends) {
-            sends = !sends;
+        const uint32_t gen = recomp3ds::dsp_reverb_generation();
+        if (gen != reverb_gen) {
+            reverb_gen = gen;
             for (Voice& v : g_voices) if (v.key != 0) apply_mix(v);
         }
         const uint32_t before = g_played;
@@ -720,6 +727,13 @@ extern "C" void recomp3ds_synth_hook(uint8_t* rdram, void* ctx_, int which) {
         recomp3ds::ReverbConfig fx;
         if (!read_reverb(rdram, g_synth, fx)) fx = recomp3ds::ReverbConfig{};
         recomp3ds::dsp_reverb_configure(fx);
+        // n_audio's aux bus count (maxAuxBusses, after auxBus and numPVoices),
+        // once: only bus 0's effect is played, every voice sending to it.
+        static bool told = false;
+        if (!told && g_desc.flavor == recomp3ds::SynthFlavor::NAudio) {
+            told = true;
+            fprintf(stderr, "dsp-synth: %ld aux bus(es); bus 0's effect is played\n", (long)(int32_t)rw(rdram, g_synth + g_desc.aux_bus + 8));
+        }
         return;
     }
     const int vreg = naudio ? 0 : 1;

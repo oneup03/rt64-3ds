@@ -841,12 +841,49 @@ Checking a game's synth:
   audio stream: `pw-dump` gives the stream's `object.serial`, and
   `pw-record --target <serial>` records it.
 
+**Reverb, on OpenDSP.** ndsp runs on OpenDSP's firmware
+(`third_party/OpenDSP`, a submodule at v1.2.2, embedded in the executable;
+`audio_ndsp.cpp` starts it, and falls back to the console's own firmware
+from `sdmc:/3ds/dspfirm.cdc`, without reverb, if it fails). Players need no
+dumped `dspfirm.cdc`. Its aux buses run a reverb on the DSP, and the voices
+send to bus 0 with their wet amount (`apply_mix`). That reverb is OpenDSP's
+own (four diffusers, a four-line feedback network), set by room size,
+decay, damping, diffusion, width and level, and nothing comes back to the
+CPU (libctru's ndsp never returns an aux bus), so the game's effect is
+matched, not run:
+- When the game sets an effect (each change of its `ALFx`, read every audio
+  frame), `dsp_reverb_match.cpp` runs its sections on an impulse at the
+  DSP's rate, measures the decay (RT60, Schroeder's backward integration)
+  and the energy, takes the echo spacing from the heard sections' taps
+  (room size), their low-pass pole (damping) and whether any section is an
+  all-pass (diffusion), with width 0 (the N64's reverb is mono). A model of
+  OpenDSP's network, on the same impulse, then sets the decay (once more,
+  scaled to what it measured: the damping shortens it) and the level (past
+  1, the bus's return volume, up to 2: the firmware's Q14).
+- An effect that is one echo (a single section reading the newest input
+  and feeding its output back, no feedforward: Goemon's 162 ms) goes to
+  OpenDSP's delay instead, which is the same thing: echoes at the taps'
+  distance (in DSP frames, 4.9 ms), each `fb` times the last, the first at
+  1.414 x the section's gain. OpenDSP's echoes keep each voice's pan where
+  the N64's are mono.
+- `tools/reverb_match` checks that against OpenDSP's own firmware reverb
+  (`firmware/reverb.c` built for the host, with `opendspReverbSet`'s
+  arithmetic; the delay, DSP assembly only, as its echo series): run
+  `tools/reverb_match/build.sh`, then `reverb_match <log.txt>` on any log
+  with the `dsp-reverb: effect` lines a game prints when it sets an effect.
+  It flags more than 1.5 dB or 25 % of decay apart. DK64 (8 sections):
+  decay 3.28 s against the firmware's 3.34, +0.1 dB; Goemon (one echo):
+  0.75 s against 0.74, 0.0 dB.
+- Azahar's default (HLE) DSP never runs the firmware: OpenDSP reads version
+  0.0 and its capabilities fail there, so the reverb stays off and the
+  voices play dry. `azahar-run.sh --lle` runs the firmware (slowly).
+- About 13 % of the DSP's time while a tail plays (OpenDSP's figure), none
+  once it has died away; the CPU only matches (a few ms per change).
+
 Not done:
-- **Reverb.** libctru's ndsp stores an aux callback but never calls it, and
-  never moves the aux bus's samples between the DSP and the CPU. An enabled
-  bus mixes its raw sends back into the output. `dsp_reverb.cpp` keeps a
-  working effect engine (libaudio and n_audio's sections, with DK64's
-  layout) behind `kAuxReturn = false`.
+- **The N64's own effect.** OpenDSP's reverb is matched in decay, loudness,
+  echo spacing and damping, not echo for echo; DK64's stereo reverb mode
+  (two delay lines) and chorus sections' modulation are not modelled.
 - **Sample-accurate starts.** Events land on DSP frames (4.9 ms).
 - **More channels.** There are 23 voice channels; Banjo's 24 and DK64's 30
   physical voices share them, the least recently used going first.
@@ -920,8 +957,16 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   code has no such hook gets no preemption: a thread that polls between
   messages then holds every other game thread back for good (Dinomod
   Enhanced's title froze that way until the hook carried the check).
-  A game without such a hook needs the recompiler to emit the check (Banjo
-  and DK64 have none, so 0025 does nothing for them).
+  A game without such a hook gets one from N64Recomp's `trace_mode = true`,
+  which starts every recompiled function with `TRACE_ENTRY()` and includes
+  `trace.h`: DK64 sets it in `us.toml` with `include/trace.h` (the check on
+  the 3DS, nothing on desktop); Banjo turns it on only in its 3DS copy of
+  the config (`platform/3ds/Makefile`'s codegen) with
+  `platform/3ds/trace.h`. Both needed it: at the Old clock DK64's game
+  thread held core 1 at 85-100 %, and its audio thread, waiting for a
+  message call, handed over as few as 12,700 of 22,050 samples a second,
+  so the music slowed and its notes came up to 2.4 s late. The check is a
+  load and a branch per call (about 200 KB more code in DK64).
 - **Game code at -Os.** No gain (Banjo, Old clock): recompiled code is
   straight-line loads and stores, and shrank only 4.5 %. It stays at -O2.
 - **ROM.** Each game places its ROM per console: `GameDesc::rom_new3ds`

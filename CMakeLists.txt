@@ -104,6 +104,23 @@ target_include_directories(rt64_3ds PUBLIC src/renderer)
 target_link_libraries(rt64_3ds PUBLIC ultramodern librecomp citro3d ctru m)
 target_compile_features(rt64_3ds PUBLIC cxx_std_20)
 
+# OpenDSP (third_party/OpenDSP, a submodule at v1.2.2): open DSP firmware
+# that libctru's ndsp runs on, so no dumped dspfirm.cdc is needed, and whose
+# aux buses run a reverb and a delay on the DSP (dsp_reverb.cpp). Its
+# library's sources are built here (its own Makefile builds in-tree); the
+# firmware image is embedded by firmware.s. The AAC sources are needed by
+# its init and exit; the file streaming in audio/ is optional (weak) and
+# left out. The glob is re-read at each build (CONFIGURE_DEPENDS): a new
+# release adds sources (1.2.2: codec_events.c, the MP3 ones).
+set(OPENDSP_DIR "${CMAKE_CURRENT_LIST_DIR}/third_party/OpenDSP")
+file(GLOB OPENDSP_SOURCES CONFIGURE_DEPENDS "${OPENDSP_DIR}/library/source/*.c" "${OPENDSP_DIR}/library/source/aac/*.c")
+add_library(opendsp STATIC ${OPENDSP_SOURCES} "${OPENDSP_DIR}/library/source/firmware.s")
+target_include_directories(opendsp PUBLIC "${OPENDSP_DIR}/library/include"
+                           PRIVATE "${OPENDSP_DIR}/library/source" "${OPENDSP_DIR}/firmware")
+target_compile_options(opendsp PRIVATE $<$<COMPILE_LANGUAGE:C>:-std=gnu11 -O2 -w>
+                       $<$<COMPILE_LANGUAGE:ASM>:-Wa,-I,${OPENDSP_DIR}/firmware>)
+target_link_libraries(opendsp PUBLIC ctru m)
+
 add_library(recomp_3ds STATIC
     src/platform/recomp3ds_run.cpp
     src/platform/settings_menu.cpp
@@ -117,6 +134,7 @@ add_library(recomp_3ds STATIC
     src/platform/audio_hle_diff.cpp
     src/platform/dsp_synth.cpp
     src/platform/dsp_reverb.cpp
+    src/platform/dsp_reverb_match.cpp
     src/platform/input_hid.cpp
     src/platform/loadmon.cpp
     src/platform/stall_watch.cpp
@@ -132,5 +150,5 @@ if(DEFINED RT64_3DS_LINEAR_HEAP_MB)
     target_compile_definitions(recomp_3ds PRIVATE RT64_3DS_LINEAR_HEAP_MB=${RT64_3DS_LINEAR_HEAP_MB})
 endif()
 target_include_directories(recomp_3ds PRIVATE third_party/GamepadMotionHelpers)
-target_link_libraries(recomp_3ds PUBLIC rt64_3ds ultramodern librecomp ctru m)
+target_link_libraries(recomp_3ds PUBLIC rt64_3ds ultramodern librecomp opendsp ctru m)
 target_compile_features(recomp_3ds PUBLIC cxx_std_20)

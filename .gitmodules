@@ -1,3 +1,6 @@
 [submodule "third_party/GamepadMotionHelpers"]
 	path = third_party/GamepadMotionHelpers
 	url = https://github.com/JibbSmart/GamepadMotionHelpers.git
+[submodule "third_party/OpenDSP"]
+	path = third_party/OpenDSP
+	url = https://github.com/Cellenseres/OpenDSP.git

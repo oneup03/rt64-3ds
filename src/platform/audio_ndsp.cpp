@@ -3,6 +3,7 @@
 // are, apart from the L/R swap the runtime's byte-swapped RDRAM imposes.
 #include <atomic>
 #include <3ds.h>
+#include <opendsp.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +19,7 @@ constexpr int kChannel = 0;
 constexpr int kNumBufs = 24;            // ~ a quarter second at 60 chunks/s
 constexpr size_t kMaxFramesPerBuf = 4096;
 bool g_ready = false;
+bool g_opendsp = false;     // OpenDSP's firmware runs (audio_init)
 uint32_t g_rate = 32000;
 int g_margin_frames = 1;   // video frames reported fewer than are queued (GameDesc::audio_margin_frames)
 ndspWaveBuf g_bufs[kNumBufs];
@@ -82,9 +84,26 @@ void wav_record(const int16_t* src, size_t frames) {
 }   // namespace
 
 bool recomp3ds::audio_init() {
-    if (R_FAILED(ndspInit())) {
-        fprintf(stderr, "recomp3ds: ndspInit failed (no sdmc:/3ds/dspfirm.cdc?); audio off\n");
-        return false;
+    // OpenDSP's firmware (third_party/OpenDSP, embedded) under libctru's
+    // ndsp: no dumped dspfirm.cdc needed, and its aux buses run the reverb
+    // (dsp_reverb.cpp). Should it fail, the console's own firmware from
+    // sdmc:/3ds/dspfirm.cdc, the component reset first (OpenDSP's init set it).
+    if (R_SUCCEEDED(opendspInit())) {
+        g_opendsp = true;
+        u16 version = 0;
+        u32 caps = 0;
+        opendspGetFirmwareVersion(&version);
+        opendspGetCapabilities(&caps);
+        fprintf(stderr, "recomp3ds: OpenDSP firmware %u.%u (capabilities %08lx)\n", (unsigned)(version >> 8), (unsigned)(version & 0xFF),
+                (unsigned long)caps);
+    }
+    else {
+        ndspUseComponent(nullptr, 0, 0xFF, 0xFF);
+        if (R_FAILED(ndspInit())) {
+            fprintf(stderr, "recomp3ds: OpenDSP and ndspInit failed (no sdmc:/3ds/dspfirm.cdc either); audio off\n");
+            return false;
+        }
+        fprintf(stderr, "recomp3ds: OpenDSP failed to start; the console's DSP firmware (dspfirm.cdc) runs instead\n");
     }
     ndspSetOutputMode(NDSP_OUTPUT_STEREO);
     ndspChnReset(kChannel);
@@ -264,11 +283,14 @@ recomp3ds::AudioCounters recomp3ds::audio_take_counters() {
     return c;
 }
 
+bool recomp3ds::audio_opendsp() { return g_opendsp; }
+
 void recomp3ds::audio_shutdown() {
     if (g_ready) {
         g_ready = false;     // the audio task thread may still queue samples
         ndspChnWaveBufClear(kChannel);
-        ndspExit();
+        if (g_opendsp) opendspExit();
+        else ndspExit();
         for (int i = 0; i < kNumBufs; i++) {
             linearFree(g_storage[i]);
         }

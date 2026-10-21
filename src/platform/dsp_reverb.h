@@ -2,12 +2,17 @@
 // libaudio's effect (reverb.c's alFxPull, which n_audio keeps) is a delay
 // line with sections, each reading two taps, mixing them with a feedforward
 // and a feedback coefficient, low-passing and adding into one mono output
-// heard on both sides. The voices send to it on the DSP's aux bus 0 (each
-// channel's wet amount); the bus comes back to the CPU through ndsp's aux
-// callback, the decoding thread runs the sections at the DSP's rate, and the
-// callback hands the result back to the DSP, which mixes it into the output.
-// The callback (on ndsp's thread) only copies; the reverb costs core 1 time.
-// It is heard about two DSP frames (10 ms) later than on the N64.
+// heard on both sides. The voices send to the DSP's aux bus 0 (each
+// channel's wet amount), where OpenDSP's firmware (third_party/OpenDSP) runs
+// its own reverb: four diffusers and a four-line feedback network, set by
+// room size, decay time, damping, diffusion, width and level. Nothing comes
+// back to the CPU (libctru's ndsp never returns an aux bus), so the game's
+// effect is not run itself but matched: when the game sets an effect, its
+// sections are run here on an impulse, and the decay time, loudness, echo
+// spacing and low-pass measured from that response choose OpenDSP's
+// settings (a model of OpenDSP's network, run on the same impulse, sets the
+// level). Without OpenDSP's firmware (the console's own from dspfirm.cdc)
+// there is no reverb and the voices play dry.
 #ifndef RECOMP3DS_DSP_REVERB_H
 #define RECOMP3DS_DSP_REVERB_H
 
@@ -30,20 +35,24 @@ struct ReverbConfig {
     bool same(const ReverbConfig& o) const;
 };
 
-// After ndspInit: registers the aux callback (the bus stays off until a
-// configuration comes).
+// After ndspInit: the bus off until a configuration comes.
 void dsp_reverb_init();
 void dsp_reverb_shutdown();
-// From any thread: the effect to run; count 0 turns the bus off. Taken up
-// by the next dsp_reverb_process.
+// From any thread: the effect to run; count 0 turns it off. Taken up by the
+// next dsp_reverb_process.
 void dsp_reverb_configure(const ReverbConfig& c);
-// Whether the voices should send to the aux bus (an effect is running).
+// Whether the voices should send to the aux bus (OpenDSP's reverb runs).
 bool dsp_reverb_active();
-// The decoding thread, after each DSP frame: runs the reverb over what the
-// bus brought back since the last call.
+// The effect's early part played dry: this much of a voice's wet send added
+// to its dry level, as energy (ReverbMatch::early; 0 without the reverb).
+float dsp_reverb_early();
+// Changes whenever the active effect does (the voices' mixes to re-apply).
+uint32_t dsp_reverb_generation();
+// The decoding thread, after each DSP frame: a new configuration, if any,
+// matched and handed to the firmware.
 void dsp_reverb_process();
-// Since the last call: ticks spent in dsp_reverb_process, and the times
-// the callback found no output ready (the thread fell behind; silence then).
+// Since the last call: ticks spent matching configurations, and gaps (none
+// since the reverb runs on the DSP; kept for the stats line).
 void dsp_reverb_take_stats(uint32_t* ticks, uint32_t* gaps);
 
 }   // namespace recomp3ds
