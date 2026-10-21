@@ -1,13 +1,21 @@
 # add_cia(<target> RSF <template.rsf> TITLE .. PRODUCT .. UNIQUEID 0x.....
 #         [ICON png] [DESCRIPTION ..] [AUTHOR ..]
-#         [BANNER_PNG png | BANNER_CGFX cgfx] [BANNER_WAV wav])
-# Produces <target>.cia from the target's ELF with makerom. With bannertool
+#         [BANNER_PNG png | BANNER_CGFX cgfx] [BANNER_WAV wav]
+#         [OLD3DS_MODE 64MB|72MB|80MB])
+# Produces <target>.cia from the target's ELF with makerom. OLD3DS_MODE is
+# the memory mode the title asks of an Old 3DS (64MB by default; a larger
+# one leaves the system less, and the console reboots after the title
+# closes; 96MB crashed the HOME Menu at launch); a New 3DS gives 124MB
+# either way. With bannertool
 # (found through the toolchain file) the SMDH is made by it, so it can carry
 # the flags the HOME Menu needs for a 3D banner (smdhtool cannot set them),
 # and the banner is either a flat image or a CGFX model, with its sound
 # (3 s at most, two channels). Without makerom the target is skipped.
 function(add_cia target)
-    cmake_parse_arguments(A "" "RSF;TITLE;PRODUCT;UNIQUEID;ICON;DESCRIPTION;AUTHOR;BANNER_PNG;BANNER_CGFX;BANNER_WAV" "" ${ARGN})
+    cmake_parse_arguments(A "" "RSF;TITLE;PRODUCT;UNIQUEID;ICON;DESCRIPTION;AUTHOR;BANNER_PNG;BANNER_CGFX;BANNER_WAV;OLD3DS_MODE" "" ${ARGN})
+    if(NOT A_OLD3DS_MODE)
+        set(A_OLD3DS_MODE 64MB)
+    endif()
     if(NOT A_DESCRIPTION)
         set(A_DESCRIPTION "${A_TITLE}")
     endif()
@@ -27,6 +35,7 @@ function(add_cia target)
     string(REPLACE "@TITLE@" "${A_TITLE}" rsf_text "${rsf_text}")
     string(REPLACE "@PRODUCT@" "${A_PRODUCT}" rsf_text "${rsf_text}")
     string(REPLACE "@UNIQUEID@" "${A_UNIQUEID}" rsf_text "${rsf_text}")
+    string(REPLACE "@OLD3DS_MODE@" "${A_OLD3DS_MODE}" rsf_text "${rsf_text}")
     file(WRITE "${rsf}" "${rsf_text}")
     set(deps "${target}" "${rsf}")
     set(extra)

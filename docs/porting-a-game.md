@@ -52,10 +52,16 @@ a port. Three games are the reference, each in its repository's
      declaration.
    - The CIA: `add_cia(<target> RSF ${RT64_3DS_DIR}/cia/template.rsf TITLE
      .. PRODUCT .. UNIQUEID 0x..... ICON .. [BANNER_CGFX|BANNER_PNG ..]
-     [BANNER_WAV ..])` (`cmake/Cia.cmake`) fills the template's `@TITLE@`,
-     `@PRODUCT@` and `@UNIQUEID@` and runs makerom and bannertool; no game
-     keeps an RSF of its own. The template asks for `SystemModeExt 124MB`
-     (`SystemMode 64MB` on an Old 3DS), `CpuSpeed 804MHz` + `EnableL2Cache`,
+     [BANNER_WAV ..] [OLD3DS_MODE 80MB])` (`cmake/Cia.cmake`) fills the
+     template's `@TITLE@`, `@PRODUCT@`, `@UNIQUEID@` and `@OLD3DS_MODE@` and
+     runs makerom and bannertool; no game keeps an RSF of its own. The
+     template asks for `SystemModeExt 124MB` (`SystemMode` `OLD3DS_MODE` on
+     an Old 3DS, 64MB unless the game asks for more: a larger mode leaves
+     the system less and the console reboots when the title closes; the
+     `.3dsx` gets the Homebrew Launcher's mode instead). 80MB is the most
+     that works: 96MB crashed the HOME Menu at launch on an Old 3DS. DK64
+     and Banjo ask for 80MB to hold their ROMs there (DK64 with 12 MB of
+     RDRAM), `CpuSpeed 804MHz` + `EnableL2Cache`,
      `StackSize 0x80000`, `AffinityMask 3` / `CanAccessCore2` and the
      services `dsp::DSP`, `ptm:sysm`, `nwm::UDS`, `soc:U`. The New 3DS clock
      comes from `osSetSpeedupEnable(true)` at start, CIA and `.3dsx` alike.

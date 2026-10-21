@@ -1,10 +1,11 @@
 # makerom RSF for the @TITLE@ CIA (installable title). rt64-3ds's
-# cmake/Cia.cmake (add_cia) fills in @TITLE@, @PRODUCT@ and @UNIQUEID@ from
-# the game's CMakeLists.txt.
+# cmake/Cia.cmake (add_cia) fills in @TITLE@, @PRODUCT@, @UNIQUEID@ and
+# @OLD3DS_MODE@ from the game's CMakeLists.txt.
 #
 # Why a CIA at all: an installable title the HOME Menu starts, with the
 # memory mode its exheader asks for (SystemModeExt 124MB on a New 3DS,
-# SystemMode 64MB on an Old). The New 3DS clock + L2 cache come from
+# SystemMode on an Old: 64MB unless the game asks add_cia for more; an Old
+# 3DS reboots after closing a title that ran in a larger mode). The New 3DS clock + L2 cache come from
 # osSetSpeedupEnable(true) at start (recomp3ds_run.cpp), for the CIA and the
 # .3dsx alike: neither launch path applies CpuSpeed/EnableL2Cache by itself
 # (measured on Luma3DS, 2026-09-28). Based on the standard homebrew template
@@ -79,7 +80,7 @@ AccessControlInfo:
 
   # Process Settings
   MemoryType                    : Application # Application/System/Base
-  SystemMode                    : 64MB # 64MB(Default)/96MB/80MB/72MB/32MB
+  SystemMode                    : @OLD3DS_MODE@ # 64MB(Default)/96MB/80MB/72MB/32MB
   IdealProcessor                : 0
   AffinityMask                  : 3 # cores 0 and 1 (the audio task may run on core 1)
   Priority                      : 16
