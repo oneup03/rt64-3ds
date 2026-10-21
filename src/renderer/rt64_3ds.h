@@ -117,6 +117,13 @@ struct RenderDesc {
     // flight), and an in-between then put the camera halfway between the two
     // origins, everything not interpolated with it 320 units off for a frame.
     bool view_float_origin = false;
+    // Decals (ZMODE_DEC) pass within RT64's window instead of a fixed 0.0004
+    // of depth: max(the coplanar tolerance at their depth, 0.0005 halved per
+    // leading one of the N64 depth up to an eighth, and their own depth
+    // change per pixel). Far away the fixed nudge took in surfaces a few
+    // units apart: Dinosaur Planet's wall switch went black under the dark
+    // decal on the wall behind it. Off by default.
+    bool decal_window = false;
     // The game copies parts of the frame it is still drawing into small
     // images of its own (texture rectangles out of the colour image, after
     // drawing into it) and draws with those copies in the same frame

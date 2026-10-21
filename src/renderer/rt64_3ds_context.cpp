@@ -2813,6 +2813,16 @@ private:
         const uint32_t b2 = (cyc == 1) ? ((l >> 16) & 3) : ((l >> 18) & 3);
         return force_bl && m2 == 1 && (b2 == 0 || b2 == 1);
     }
+    // The blender keeps memory's colour: A 0, M MEM, B 1-A in the last
+    // cycle, IN * 0 + MEM * 1 (Dinosaur Planet draws an effect faded out to
+    // nothing so, a red band behind General Scales blended in by the
+    // combiner's alpha here). Only its depth is written then.
+    static bool keeps_memory(const rt64_3ds::DrawRecord& d) {
+        const uint32_t l = d.othermode_l, cyc = (d.othermode_h >> 20) & 3;
+        if ((l & 0x4000) == 0 || cyc >= 2 || d.kind == rt64_3ds::DrawRecord::FillRect) return false;
+        const int s = cyc == 1 ? 0 : 2;   // cycle 0's fields sit 2 bits higher
+        return ((l >> (24 + s)) & 3) == 3 && ((l >> (20 + s)) & 3) == 1 && ((l >> (16 + s)) & 3) == 0;
+    }
 
     // fallbacks: counts the draws whose combiner is inexact (null: don't).
     void apply_state(const rt64_3ds::DrawRecord& d, size_t index, int* fallbacks) {
@@ -2942,6 +2952,16 @@ private:
         // Depth: reversed map, so "less" becomes GEQUAL. Rects ignore depth
         // unless the RDP compares (they carry z = 0 = near).
         uint32_t l = d.othermode_l;
+        // Decals sit on coplanar surfaces: moved toward the viewer (reversed
+        // depth: nearer is larger) by 0.0004 of depth, or by RT64's window
+        // for this decal (RenderDesc::decal_window), set per draw.
+        {
+            const float zoff = ((l >> 10) & 3) == 3 ? (rt64_3ds::render_desc().decal_window ? decal_window_of(d) : 0.0004f) : 0.0f;
+            if (zoff != last_zoff_) {
+                C3D_DepthMap(true, -1.0f, zoff);
+                last_zoff_ = zoff;
+            }
+        }
         // Everything below reads exactly these fields (and the target, whose
         // change invalidates the key): compared whole, never folded into a
         // lossy hash (a packed key let a 1-cycle rectangle equal a 2-cycle
@@ -2953,17 +2973,14 @@ private:
         misc_valid_ = true;
         bool zcmp = (l & 0x10) != 0 && d.kind == rt64_3ds::DrawRecord::Tris;
         bool zupd = (l & 0x20) != 0 && d.kind == rt64_3ds::DrawRecord::Tris;
-        uint32_t zmode = (l >> 10) & 3;
         GPU_WRITEMASK wmask = zupd ? GPU_WRITE_ALL : GPU_WRITE_COLOR;
+        if (keeps_memory(d)) wmask = (GPU_WRITEMASK)(wmask & ~GPU_WRITE_COLOR);
         // The frame copy keeps the alpha it was cleared to: full coverage,
         // what the RDP leaves in a 5551 framebuffer under opaque pixels and
         // what copy-mode alpha compares test (the eye's alpha is whatever
         // the combiner put out).
         if (frame_viewport_) wmask = (GPU_WRITEMASK)(wmask & ~GPU_WRITE_ALPHA);
         C3D_DepthTest(zcmp, zcmp ? GPU_GEQUAL : GPU_ALWAYS, wmask);
-        // Decals sit on coplanar surfaces: nudge them toward the viewer
-        // (reversed depth: nearer is larger).
-        C3D_DepthMap(true, -1.0f, zmode == 3 ? 0.0004f : 0.0f);
 
         // Blending: force-blend with memory colour by source alpha.
         const bool blend = draw_blends(d);
@@ -4163,10 +4180,40 @@ public:
         C3D_CullFace(mode);
         last_cull_ = (int)mode;
     }
+    // The depth offset in force (apply_state): -1 not known.
+    float last_zoff_ = -1.0f;
+    // RenderDesc::decal_window: RT64's decal test (RasterPS.hlsl) passes
+    // where the surface's depth is within max(CoplanarDepthTolerance at the
+    // decal's depth, the decal's depth change per pixel). The PICA has one
+    // depth test, so the decal is moved that much nearer and drawn GEQUAL: a
+    // surface up to the window in front of it still takes it, one further in
+    // front (a switch on the wall the decal lies on) does not.
+    float decal_window_of(const rt64_3ds::DrawRecord& d) const {
+        float zmin = 1.0f, slope = 0.0f;
+        for (uint32_t i = d.first; i + 2 < d.first + d.count && i + 2 < frame_.verts.size(); i += 3) {
+            const rt64_3ds::Vtx3ds* v = &frame_.verts[i];
+            if (!(v[0].w > 0.0f) || !(v[1].w > 0.0f) || !(v[2].w > 0.0f)) continue;
+            float x[3], y[3], z[3];
+            for (int k = 0; k < 3; k++) { x[k] = v[k].x / v[k].w; y[k] = v[k].y / v[k].w; z[k] = v[k].z / v[k].w; zmin = std::min(zmin, z[k]); }
+            const float det = (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0]);
+            if (std::fabs(det) < 1e-6f) continue;
+            // The plane's depth change per N64 pixel, as ddx + ddy.
+            const float dzdx = ((z[1] - z[0]) * (y[2] - y[0]) - (z[2] - z[0]) * (y[1] - y[0])) / det;
+            const float dzdy = ((z[2] - z[0]) * (x[1] - x[0]) - (z[1] - z[0]) * (x[2] - x[0])) / det;
+            slope = std::max(slope, std::fabs(dzdx) + std::fabs(dzdy));
+        }
+        // CoplanarDepthTolerance: 0.0005 halved for each leading one of the
+        // depth in the RDP's 15.3 fixed point (its depth format's exponent),
+        // at most three times.
+        const uint32_t fixed = (uint32_t)lroundf(std::max(0.0f, std::min(1.0f, zmin)) * 262143.0f);
+        const uint32_t ones = (uint32_t)__builtin_clz(~(fixed << 14) | 1u);
+        return std::max(0.0005f / (float)(1u << std::min<uint32_t>(ones, 3u)), slope);
+    }
     // What apply_state and the shift cache: forgotten, so the next draw sets
     // all of its state itself.
     void forget_draw_state() {
         last_cull_ = -1;
+        last_zoff_ = -1.0f;
         last_tex_[0] = last_tex_[1] = nullptr;
         last_tex_param_[0] = last_tex_param_[1] = 0xFFFFFFFFu;
         last_us_ = last_vs_ = -1.0f;

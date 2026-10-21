@@ -1093,6 +1093,10 @@ struct Interpreter::Impl {
     float rect_align[4]{};     // left/top/right/bottom offsets (extended), pixels
     uint32_t rect_lorigin = 0x800, rect_rorigin = 0x800;
     uint8_t rect_aspect = 0;
+    // gEXSetScissorAlign: the origins, offsets and bounds (pixels; left,
+    // top, right, bottom) the next G_SETSCISSORs take.
+    uint32_t sc_lorigin = 0x800, sc_rorigin = 0x800;
+    float sc_off[4]{}, sc_bound[4]{};
 
     // Framebuffer effects: the game copies the front buffer into a storage
     // buffer in RDRAM with texture rectangles, then draws with it. Draws
@@ -2144,9 +2148,16 @@ struct Interpreter::Impl {
         return (float)(1 << (16 - s));
     }
 
-    // Rectangles are emitted in N64 pixels with w = 1.
+    // Rectangles are emitted in N64 pixels with w = 1. An anchored edge moves
+    // by its offset and by its origin's place in the frame (RT64's
+    // movedFromOrigin: origin / G_EX_ORIGIN_RIGHT of the width), so the usual
+    // right origin with a -width * 4 offset (Dinosaur Planet's command menu,
+    // DK64's HUD) keeps the game's coordinate, which origin_shift then puts
+    // on the wide screen's right edge. Without the origin's place those
+    // rectangles landed a frame's width to the left.
     void emit_rect(float ulx, float uly, float lrx, float lry, bool textured, int tile, float s, float t, float dsdx, float dtdy, bool flip) {
-        emit_rect_aligned(ulx, uly, lrx, lry, textured, tile, s, t, dsdx, dtdy, flip, origin_shift(rect_lorigin), origin_shift(rect_rorigin), rect_align,
+        const float align[4] = { rect_align[0] + origin_place(rect_lorigin), rect_align[1], rect_align[2] + origin_place(rect_rorigin), rect_align[3] };
+        emit_rect_aligned(ulx, uly, lrx, lry, textured, tile, s, t, dsdx, dtdy, flip, origin_shift(rect_lorigin), origin_shift(rect_rorigin), align,
                           rect_lorigin == 0x800 && rect_rorigin == 0x800);
     }
     // The edges arrive as the command has them (plus the alignment offsets);
@@ -2441,7 +2452,22 @@ struct Interpreter::Impl {
                 scissor[2] = (int16_t)lroundf((float)((int16_t)(b >> 16) / 4) + origin_x(rorigin)); scissor[3] = (int16_t)(b & 0xFFFF) / 4;
                 return 1;
             }
-            case EX_SETSCISSORALIGN: return 2;
+            case EX_SETSCISSORALIGN: {
+                // The next scissors' x edges move by an offset and their
+                // origin's place, are held within the bounds (the frame's
+                // coordinates) and then sit on the wide screen's edge for
+                // that origin, as RT64's setScissor has them (Dinosaur
+                // Planet's command menu: left and right origins, -320 on the
+                // right, so the inventory scroll's strip shows where the
+                // scroll is drawn, by the right edge).
+                sc_lorigin = w1 & 0xFFF; sc_rorigin = (w1 >> 12) & 0xFFF;
+                const uint32_t a = r32(pc + 8), b = r32(pc + 12), c = r32(pc + 16), e = r32(pc + 20);
+                sc_off[0] = (float)(int16_t)(a >> 16) * 0.25f; sc_off[1] = (float)(int16_t)(a & 0xFFFF) * 0.25f;
+                sc_off[2] = (float)(int16_t)(b >> 16) * 0.25f; sc_off[3] = (float)(int16_t)(b & 0xFFFF) * 0.25f;
+                sc_bound[0] = (float)(int16_t)(c >> 16) * 0.25f; sc_bound[1] = (float)(int16_t)(c & 0xFFFF) * 0.25f;
+                sc_bound[2] = (float)(int16_t)(e >> 16) * 0.25f; sc_bound[3] = (float)(int16_t)(e & 0xFFFF) * 0.25f;
+                return 2;
+            }
             case EX_SETVIEWPORT: {
                 uint32_t addr = seg(r32(pc + 12));
                 load_viewport(addr);
@@ -2574,6 +2600,11 @@ struct Interpreter::Impl {
     }
     float origin_shift(uint32_t origin) const {
         switch (origin) { case 0x000: return -geo.x0; case 0x400: return geo.x0; default: return 0.0f; }
+    }
+    // An origin's place in the frame (RT64's movedFromOrigin: origin /
+    // G_EX_ORIGIN_RIGHT of the width); none for G_EX_ORIGIN_NONE.
+    float origin_place(uint32_t origin) const {
+        return origin < 0x800 ? (float)origin * (float)screen_w / 1024.0f : 0.0f;
     }
 
     float raw_vtrans_x = 640.0f;   // quarter pixels, as loaded
@@ -2958,7 +2989,17 @@ struct Interpreter::Impl {
                 case G_SETSCISSOR:
                     scissor[0] = ((w0 >> 12) & 0xFFF) / 4; scissor[1] = (w0 & 0xFFF) / 4;
                     scissor[2] = ((w1 >> 12) & 0xFFF) / 4; scissor[3] = (w1 & 0xFFF) / 4;
-                    if (scissor_slack > 0) {
+                    if (sc_lorigin < 0x800 || sc_rorigin < 0x800) {
+                        // gEXSetScissorAlign (EX_SETSCISSORALIGN).
+                        auto held = [](float v, float lo, float hi) { return lo <= hi ? std::max(lo, std::min(hi, v)) : v; };
+                        const float ulx = ((w0 >> 12) & 0xFFF) * 0.25f, uly = (w0 & 0xFFF) * 0.25f;
+                        const float lrx = ((w1 >> 12) & 0xFFF) * 0.25f, lry = (w1 & 0xFFF) * 0.25f;
+                        scissor[0] = (int16_t)lroundf(held(ulx + sc_off[0] + origin_place(sc_lorigin), sc_bound[0], sc_bound[2]) + origin_shift(sc_lorigin));
+                        scissor[1] = (int16_t)lroundf(held(uly + sc_off[1], sc_bound[1], sc_bound[3]));
+                        scissor[2] = (int16_t)lroundf(held(lrx + sc_off[2] + origin_place(sc_rorigin), sc_bound[0], sc_bound[2]) + origin_shift(sc_rorigin));
+                        scissor[3] = (int16_t)lroundf(held(lry + sc_off[3], sc_bound[1], sc_bound[3]));
+                    }
+                    else if (scissor_slack > 0) {
                         // RenderDesc::scissor_edge_slack: the frame's edges.
                         if (scissor[0] <= scissor_slack) scissor[0] = 0;
                         if (scissor[1] <= scissor_slack) scissor[1] = 0;
