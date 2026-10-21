@@ -2813,16 +2813,6 @@ private:
         const uint32_t b2 = (cyc == 1) ? ((l >> 16) & 3) : ((l >> 18) & 3);
         return force_bl && m2 == 1 && (b2 == 0 || b2 == 1);
     }
-    // The blender keeps memory's colour: A 0, M MEM, B 1-A in the last
-    // cycle, IN * 0 + MEM * 1 (Dinosaur Planet draws an effect faded out to
-    // nothing so, a red band behind General Scales blended in by the
-    // combiner's alpha here). Only its depth is written then.
-    static bool keeps_memory(const rt64_3ds::DrawRecord& d) {
-        const uint32_t l = d.othermode_l, cyc = (d.othermode_h >> 20) & 3;
-        if ((l & 0x4000) == 0 || cyc >= 2 || d.kind == rt64_3ds::DrawRecord::FillRect) return false;
-        const int s = cyc == 1 ? 0 : 2;   // cycle 0's fields sit 2 bits higher
-        return ((l >> (24 + s)) & 3) == 3 && ((l >> (20 + s)) & 3) == 1 && ((l >> (16 + s)) & 3) == 0;
-    }
 
     // fallbacks: counts the draws whose combiner is inexact (null: don't).
     void apply_state(const rt64_3ds::DrawRecord& d, size_t index, int* fallbacks) {
@@ -2974,7 +2964,6 @@ private:
         bool zcmp = (l & 0x10) != 0 && d.kind == rt64_3ds::DrawRecord::Tris;
         bool zupd = (l & 0x20) != 0 && d.kind == rt64_3ds::DrawRecord::Tris;
         GPU_WRITEMASK wmask = zupd ? GPU_WRITE_ALL : GPU_WRITE_COLOR;
-        if (keeps_memory(d)) wmask = (GPU_WRITEMASK)(wmask & ~GPU_WRITE_COLOR);
         // The frame copy keeps the alpha it was cleared to: full coverage,
         // what the RDP leaves in a 5551 framebuffer under opaque pixels and
         // what copy-mode alpha compares test (the eye's alpha is whatever
