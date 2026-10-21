@@ -183,17 +183,24 @@ void watch(void*) {
     size_t before_n = 0;
     uint32_t last_frames = rt64_3ds::progress().frames;
     u64 frames_since = since;
+    u64 prev_now = since;
     while (g_run) {
         svcSleepThread(250 * 1000000ll);
         const uint32_t beat = g_beat.load();
         const u64 now = svcGetSystemTick();
+        // A pass more than 2 s after the last one: this thread was suspended
+        // too (the console asleep with the lid shut), so the time since is
+        // the sleep, not a stall. Without this, waking reported the sleep as
+        // "STOPPED: main 20s frames 20s" (m@apt, the wake still in APT).
+        const bool resumed = now - prev_now > 2ull * SYSCLOCK_ARM11;
+        prev_now = now;
         const uint32_t frames = rt64_3ds::progress().frames;
         // A blanked video (a load) draws nothing by design: 15 s before the frames count as stopped.
         const bool blanked = rt64_3ds::progress().blanked != 0;
         // Not while the HOME prompt holds the game (stall_watch_pause) or the
         // HOME Menu or sleep has the application: the main thread and the
         // frames stop there by design.
-        const bool quiet = g_paused.load(std::memory_order_relaxed) || !aptIsActive();
+        const bool quiet = g_paused.load(std::memory_order_relaxed) || !aptIsActive() || resumed;
         if (frames != last_frames || frames == 0 || beat == 0 || quiet) { last_frames = frames; frames_since = now; }
         const int busy0 = recomp3ds::loadmon_peek(0), busy1 = recomp3ds::loadmon_peek(1), busy2 = recomp3ds::loadmon_peek(2);
         // The runtime's counts a second since the last pass: e queued
