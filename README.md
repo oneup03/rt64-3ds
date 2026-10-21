@@ -40,7 +40,11 @@ recompiled microcode), `mod_bake` (bakes `.nrm` mods into C) and
 `azahar-run.sh` (unattended runs in the Azahar emulator).
 
 Dependencies: devkitARM with libctru and citro3d (devkitPro packages),
-the game's own N64ModernRuntime, and GamepadMotionHelpers (a submodule; clone
-with `--recursive` or run `git submodule update --init`).
+the game's own N64ModernRuntime, and two submodules (clone with
+`--recursive` or run `git submodule update --init`): GamepadMotionHelpers
+(MIT) and OpenDSP (BSD 2-Clause, Copyright (c) 2026 Cellenseres), the open
+DSP firmware the audio runs on, embedded in the executable. A game's
+binary release carries OpenDSP's `LICENSE` beside its README, as its
+licence asks.
 
 Licence: MIT, the same licence as RT64 (`LICENSE`).
