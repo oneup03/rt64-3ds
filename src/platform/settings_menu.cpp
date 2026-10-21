@@ -161,6 +161,12 @@ int g_cstick_up = 1;
 const char* const kCstickUpNames[] = { "Off", "C-Up" };
 void apply_cstick_up(int v) { recomp3ds::input_set_cstick_up(v != 0); }
 
+// What X and Y press: the game's map (C-Up and C-Down, the default) or
+// C-Right and C-Left (input_hid.cpp; the D-pad keeps C-Up and C-Down).
+int g_xy_buttons = 0;
+const char* const kXyButtonNames[] = { "C-Up/Down", "C-Left/Right" };
+void apply_xy_buttons(int v) { recomp3ds::input_set_xy_left_right(v != 0); }
+
 // GameDesc::cstick_camera_hold games: the C-Stick as the game's button
 // camera (1, the default) or the plain C buttons (0).
 int g_cstick_camera = 1;
@@ -231,8 +237,23 @@ void blank_rows(int from, int to) {
     for (int r = from; r <= to; r++) recomp3ds::screen_printf("\x1b[%d;0H%40s", r, "");
 }
 
+// The performance monitor: the touch screen's text while the menu is closed
+// (the game's name, the frame rate and the cores' load, the SELECT hint).
+// Off leaves the touch buttons, the alerts and the menu itself.
+int g_perf_monitor = 1;
+const char* const kPerfMonitorNames[] = { "Off", "On" };
+const char* g_game_name = "";
+void apply_perf_monitor(int v) {
+    // The name on row 1 (printed at boot); the stats line on row 2 is the
+    // stats loop's (recomp3ds_run.cpp), blanked here and left so while off.
+    if (v != 0) recomp3ds::screen_printf("\x1b[1;0H%-40.40s", g_game_name);
+    else blank_rows(1, 2);
+    g_redraw = true;
+}
+
 void draw_hint() {
-    recomp3ds::screen_printf("\x1b[%d;0H%-40s", kHintRow, g_open ? "SELECT: close   D-Pad: choose, change" : "SELECT: settings");
+    const char* hint = g_open ? "SELECT: close   D-Pad: choose, change" : g_perf_monitor != 0 ? "SELECT: settings" : "";
+    recomp3ds::screen_printf("\x1b[%d;0H%-40s", kHintRow, hint);
 }
 
 void draw_page() {
@@ -697,7 +718,10 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
         add_row({ "cstick_camera", "C-Stick", 0, 1, &g_cstick_camera, kCstickCameraNames, false, nullptr, apply_cstick_camera, PageControls, 1, nullptr });
     }
     add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, PageControls, 1, nullptr });
+    add_row({ "xy_buttons", "X / Y buttons", 0, 1, &g_xy_buttons, kXyButtonNames, false, nullptr, apply_xy_buttons, PageControls, 1, nullptr });
     add_row({ "audio", "Audio", 0, 1, &g_audio_on, kAudioNames, false, nullptr, apply_audio, PageGame, 1, nullptr });
+    g_game_name = desc.render.game_name != nullptr ? desc.render.game_name : "";
+    add_row({ "perf_monitor", "Performance monitor", 0, 1, &g_perf_monitor, kPerfMonitorNames, false, nullptr, apply_perf_monitor, PageGame, 1, nullptr });
     add_row({ "frame_cap", "Frame rate", 0, desc.render.frame_interpolation ? 2 : 1, &st.frame_cap, kFrameCapNames, false, nullptr, nullptr, PageGame, 1, nullptr });
     add_row({ "rom_stream", "ROM stream", 0, 2, &g_rom_stream, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "dbg_capture", "Debug capture", 0, 1, &g_debug_capture, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
@@ -769,6 +793,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
 int recomp3ds::settings_rom_stream() { return g_rom_stream; }
 int recomp3ds::settings_cores() { return g_cores; }
 bool recomp3ds::settings_debug_rows() { return g_debug_rows != 0; }
+bool recomp3ds::settings_perf_monitor() { return g_perf_monitor != 0; }
 bool recomp3ds::settings_debug_capture() { return g_debug_capture != 0; }
 const recomp3ds::DebugSettings& recomp3ds::debug_settings() { return g_dbg; }
 

@@ -27,6 +27,7 @@ circlePosition g_cstick{};
 volatile bool g_blocked = false;
 volatile bool g_cstick_buttons = true;
 volatile bool g_cstick_up = true;       // C-Stick up presses C-Up (settings menu)
+volatile bool g_xy_left_right = false;  // X and Y press C-Right and C-Left, not C-Up and C-Down (settings menu)
 volatile float g_stick_dz = 0.05f, g_cstick_dz = 0.20f;
 
 // GameDesc::cstick_camera_*: the C-Stick holds these buttons and repeats a C
@@ -109,6 +110,7 @@ void recomp3ds::input_set_cstick_camera(uint16_t hold, uint16_t lead_ms, uint16_
     g_cam_cfg.store(uint64_t(hold) | (uint64_t(lead_ms) << 16) | (uint64_t(press_ms) << 32) | (uint64_t(period_ms) << 48));
 }
 void recomp3ds::input_set_cstick_up(bool on) { g_cstick_up = on; }
+void recomp3ds::input_set_xy_left_right(bool on) { g_xy_left_right = on; }
 
 // Motion (gyro aiming), through JibbSmart's GamepadMotionHelpers (MIT, as
 // the desktop uses): gyro calibration while the console is still, gravity
@@ -244,8 +246,18 @@ bool recomp3ds::input_get(int controller_num, uint16_t* buttons, float* x, float
     uint16_t b = 0;
     const u32 h = g_held & ~settings_menu_keys();
     const MapRef m = g_map.load();
+    // "X / Y" at C-Left/Right: what the game's map gives X and Y, with X's
+    // C-Up as C-Right and Y's C-Down as C-Left (Y is the left-hand button).
+    // The other keys on those entries (the D-pad's up and down) keep C-Up
+    // and C-Down.
+    const bool lr = g_xy_left_right;
+    const u32 xy = lr ? h & (KEY_X | KEY_Y) : 0;
+    const u32 rest = h & ~xy;
     for (uint32_t i = 0; i < m.count; i++) {
-        if (h & m.map[i].keys) b |= m.map[i].n64;
+        const uint16_t n = m.map[i].n64;
+        if (rest & m.map[i].keys) b |= n;
+        if (xy & m.map[i].keys & KEY_X) b |= (n & N64_CUP) ? (uint16_t)((n & ~N64_CUP) | N64_CRIGHT) : n;
+        if (xy & m.map[i].keys & KEY_Y) b |= (n & N64_CDOWN) ? (uint16_t)((n & ~N64_CDOWN) | N64_CLEFT) : n;
     }
     if (g_cstick_buttons) {
         float cx, cy;

@@ -1255,7 +1255,9 @@ library's keys:
 |---|---|---|---|
 | `separation`, `convergence_tenths`, `hud_depth`, `auto_convergence`, `comfort_target`, `stereo_ghost_contrast`, `stereo_ghost_black_floor` | 25, 60, 50, 1, 0, 100, 0 (the games set their own) | 3D page | the gfx thread each frame |
 | `stick_deadzone`, `cstick_deadzone`, `cstick_up`, `cstick_camera` | 5, 20, 1, 1 (`cstick_camera` only with `GameDesc::cstick_camera_hold`) | Controls | `input_set_*` |
+| `xy_buttons` | 0: X and Y as the game's map has them (C-Up, C-Down); 1: X C-Right, Y C-Left (the map's other keys keep C-Up and C-Down) | Controls | `input_set_xy_left_right` |
 | `audio` | 1 | Game | `audio_set_enabled` |
+| `perf_monitor` | 1: the touch screen's game name, frame rate and SELECT hint; 0: none of them (the touch buttons, alerts and the menu stay) | Game | `settings_perf_monitor` |
 | `frame_cap` | 0; the games 2, which an Old 3DS turns into `old3ds_frame_cap` | Game | the gfx thread |
 | `dbg_old_clock` | 0 | none, New 3DS only | `set_cpu_speed` (1 runs at the Old 3DS clock) |
 | `dbg_cores` | 0 (Auto) | none, read at start | the core layout (1 two cores with the game on core 1, 2 on core 0) |

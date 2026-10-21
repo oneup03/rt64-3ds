@@ -604,7 +604,8 @@ void update_gfx_inner() {
             if (busy[c] < 0) continue;
             used += snprintf(line + used, sizeof(line) - used, watched > 3 ? " c%d %3d%%" : " cpu%d %3d%%", c, busy[c]);
         }
-        recomp3ds::screen_printf("\x1b[2;0H%-39.39s\n", line);
+        // Performance monitor off: the row stays blank (settings_menu.cpp).
+        if (recomp3ds::settings_perf_monitor()) recomp3ds::screen_printf("\x1b[2;0H%-39.39s\n", line);
         // settings.ini's dbg_rows=1: the game threads' shares (wake-ups a
         // second last) and the audio rows below.
         const bool debug_rows = recomp3ds::settings_debug_rows();

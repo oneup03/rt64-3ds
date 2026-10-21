@@ -48,6 +48,7 @@ namespace recomp3ds {
 
     void input_set_deadzones(int stick_percent, int cstick_percent);
     void input_set_cstick_up(bool on);  // C-Stick up presses C-Up (off: nothing)
+    void input_set_xy_left_right(bool on);  // X / Y press C-Right / C-Left (off: the game's map, C-Up / C-Down)
     // GameDesc::cstick_camera_*: hold 0 turns the camera mode off.
     void input_set_cstick_camera(uint16_t hold, uint16_t lead_ms, uint16_t press_ms, uint16_t period_ms);
     void input_poll();
@@ -126,6 +127,7 @@ namespace recomp3ds {
     void settings_menu_update();        // ~60 times a second, main thread
     void settings_menu_toggle();
     int settings_rom_stream();          // settings.ini's rom_stream: 0 the game's choice, 1 in memory, 2 from the SD card
+    bool settings_perf_monitor();       // the touch screen's name, frame rate and SELECT hint (Performance monitor)
     bool settings_debug_rows();         // settings.ini's dbg_rows: the touch screen's thread and audio rows
     int settings_cores();               // settings.ini's dbg_cores, read at start: 0 auto, 1 two cores with the game on core 1, 2 ... on core 0
     // settings.ini's dbg_* keys that the platform reads (hidden rows, 0 off;
