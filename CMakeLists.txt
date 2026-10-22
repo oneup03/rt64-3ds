@@ -152,5 +152,11 @@ if(DEFINED RT64_3DS_LINEAR_HEAP_MB)
     target_compile_definitions(recomp_3ds PRIVATE RT64_3DS_LINEAR_HEAP_MB=${RT64_3DS_LINEAR_HEAP_MB})
 endif()
 target_include_directories(recomp_3ds PRIVATE third_party/GamepadMotionHelpers)
+# RT64_3DS_GU_NATIVE (a game sets it before add_subdirectory, beside the
+# ignored list in its 3DS config): libultra's matrix helpers as host
+# functions (gu_native.cpp). Off, the file defines none of them.
+if(RT64_3DS_GU_NATIVE)
+    target_compile_definitions(recomp_3ds PRIVATE RT64_3DS_GU_NATIVE=1)
+endif()
 target_link_libraries(recomp_3ds PUBLIC rt64_3ds ultramodern librecomp opendsp ctru m)
 target_compile_features(recomp_3ds PUBLIC cxx_std_20)

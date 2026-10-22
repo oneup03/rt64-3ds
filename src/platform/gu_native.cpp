@@ -15,9 +15,12 @@
 // recompiled functions' bit for bit. tools/gu_test checks that against the
 // recompiled bodies on the host over random inputs.
 //
-// The definitions are weak: a game whose config does not ignore the helpers
-// links its own recompiled ones, and these give way (every game links this
-// object, through gu_native_count).
+// Only with RT64_3DS_GU_NATIVE (the game's CMake sets it beside the ignored
+// list): defined here, the symbols satisfy the game's references before the
+// linker reaches its archive, so its own recompiled versions are never
+// linked, whatever their strength: Banjo booted to a black screen with
+// weak definitions here, its guRotateF calling a sqrtf_recomp it does not
+// have. A game that does not opt in gets no definitions from this file.
 //
 // Arguments as the MIPS o32 ABI passes them: a0-a3 in r4-r7, floats after
 // a pointer argument in the integer registers as their bits, the rest on
@@ -30,13 +33,14 @@
 #include "recomp.h"
 #include "recomp3ds_internal.h"
 
+#ifdef RT64_3DS_GU_NATIVE
+
 // The game's recompiled libultra sinf, cosf and sqrtf under N64Recomp's
-// renamed symbols. Weak: a game whose symbols name them otherwise links
-// without them (and cannot ignore the helpers: gu_native_count says 0).
+// renamed symbols (a game whose symbols name them otherwise cannot opt in).
 extern "C" {
-void sinf_recomp(uint8_t* rdram, recomp_context* ctx) __attribute__((weak));
-void cosf_recomp(uint8_t* rdram, recomp_context* ctx) __attribute__((weak));
-void sqrtf_recomp(uint8_t* rdram, recomp_context* ctx) __attribute__((weak));
+void sinf_recomp(uint8_t* rdram, recomp_context* ctx);
+void cosf_recomp(uint8_t* rdram, recomp_context* ctx);
+void sqrtf_recomp(uint8_t* rdram, recomp_context* ctx);
 }
 
 namespace {
@@ -126,31 +130,31 @@ inline void xfmf(const float mf[4][4], float x, float y, float z, float* ox, flo
 
 extern "C" {
 
-__attribute__((weak)) void guMtxL2F(uint8_t* rdram, recomp_context* ctx) {
+void guMtxL2F(uint8_t* rdram, recomp_context* ctx) {
     float mf[4][4];
     l2f(rdram, mf, arg(ctx, 1));
     store(rdram, arg(ctx, 0), mf);
 }
 
-__attribute__((weak)) void guMtxF2L(uint8_t* rdram, recomp_context* ctx) {
+void guMtxF2L(uint8_t* rdram, recomp_context* ctx) {
     float mf[4][4];
     load(rdram, mf, arg(ctx, 0));
     f2l(rdram, mf, arg(ctx, 1));
 }
 
-__attribute__((weak)) void guMtxIdentF(uint8_t* rdram, recomp_context* ctx) {
+void guMtxIdentF(uint8_t* rdram, recomp_context* ctx) {
     float mf[4][4];
     identf(mf);
     store(rdram, arg(ctx, 0), mf);
 }
 
-__attribute__((weak)) void guMtxIdent(uint8_t* rdram, recomp_context* ctx) {
+void guMtxIdent(uint8_t* rdram, recomp_context* ctx) {
     float mf[4][4];
     identf(mf);
     f2l(rdram, mf, arg(ctx, 0));
 }
 
-__attribute__((weak)) void guMtxCatF(uint8_t* rdram, recomp_context* ctx) {
+void guMtxCatF(uint8_t* rdram, recomp_context* ctx) {
     float mf[4][4], nf[4][4], temp[4][4];
     load(rdram, mf, arg(ctx, 0));
     load(rdram, nf, arg(ctx, 1));
@@ -163,7 +167,7 @@ __attribute__((weak)) void guMtxCatF(uint8_t* rdram, recomp_context* ctx) {
     store(rdram, arg(ctx, 2), temp);        // res may be an input: written after
 }
 
-__attribute__((weak)) void guMtxXFMF(uint8_t* rdram, recomp_context* ctx) {
+void guMtxXFMF(uint8_t* rdram, recomp_context* ctx) {
     float mf[4][4], ox, oy, oz;
     load(rdram, mf, arg(ctx, 0));
     xfmf(mf, argf(rdram, ctx, 1), argf(rdram, ctx, 2), argf(rdram, ctx, 3), &ox, &oy, &oz);
@@ -172,7 +176,7 @@ __attribute__((weak)) void guMtxXFMF(uint8_t* rdram, recomp_context* ctx) {
     stf(rdram, argp(rdram, ctx, 6), oz);
 }
 
-__attribute__((weak)) void guMtxXFML(uint8_t* rdram, recomp_context* ctx) {
+void guMtxXFML(uint8_t* rdram, recomp_context* ctx) {
     float mf[4][4], ox, oy, oz;
     l2f(rdram, mf, arg(ctx, 0));
     xfmf(mf, argf(rdram, ctx, 1), argf(rdram, ctx, 2), argf(rdram, ctx, 3), &ox, &oy, &oz);
@@ -181,7 +185,7 @@ __attribute__((weak)) void guMtxXFML(uint8_t* rdram, recomp_context* ctx) {
     stf(rdram, argp(rdram, ctx, 6), oz);
 }
 
-__attribute__((weak)) void guNormalize(uint8_t* rdram, recomp_context* ctx) {
+void guNormalize(uint8_t* rdram, recomp_context* ctx) {
     const uint32_t px = arg(ctx, 0), py = arg(ctx, 1), pz = arg(ctx, 2);
     float x = ldf(rdram, px), y = ldf(rdram, py), z = ldf(rdram, pz);
     const float m = 1.0f / call_f(sqrtf_recomp, rdram, ctx, x * x + y * y + z * z);
@@ -190,7 +194,7 @@ __attribute__((weak)) void guNormalize(uint8_t* rdram, recomp_context* ctx) {
     stf(rdram, pz, z * m);
 }
 
-__attribute__((weak)) void guRotateF(uint8_t* rdram, recomp_context* ctx) {
+void guRotateF(uint8_t* rdram, recomp_context* ctx) {
     static const float dtor = (float)(3.1415926 / 180.0);
     const uint32_t p = arg(ctx, 0);
     float a = argf(rdram, ctx, 1), x = argf(rdram, ctx, 2), y = argf(rdram, ctx, 3), z = argf(rdram, ctx, 4);
@@ -219,7 +223,7 @@ __attribute__((weak)) void guRotateF(uint8_t* rdram, recomp_context* ctx) {
     store(rdram, p, mf);
 }
 
-__attribute__((weak)) void guTranslateF(uint8_t* rdram, recomp_context* ctx) {
+void guTranslateF(uint8_t* rdram, recomp_context* ctx) {
     float mf[4][4];
     identf(mf);
     mf[3][0] = argf(rdram, ctx, 1);
@@ -228,7 +232,7 @@ __attribute__((weak)) void guTranslateF(uint8_t* rdram, recomp_context* ctx) {
     store(rdram, arg(ctx, 0), mf);
 }
 
-__attribute__((weak)) void guScaleF(uint8_t* rdram, recomp_context* ctx) {
+void guScaleF(uint8_t* rdram, recomp_context* ctx) {
     float mf[4][4];
     identf(mf);
     mf[0][0] = argf(rdram, ctx, 1);
@@ -240,9 +244,15 @@ __attribute__((weak)) void guScaleF(uint8_t* rdram, recomp_context* ctx) {
 
 }   // extern "C"
 
+#endif   // RT64_3DS_GU_NATIVE
+
 // Referenced from the run loop so this object is linked in: the game's
 // recompiled code and patches are linked after this library, and nothing
 // else here uses these functions.
 int recomp3ds::gu_native_count() {
-    return sinf_recomp != nullptr && cosf_recomp != nullptr && sqrtf_recomp != nullptr ? 11 : 0;
+#ifdef RT64_3DS_GU_NATIVE
+    return 11;
+#else
+    return 0;
+#endif
 }

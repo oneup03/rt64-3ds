@@ -984,8 +984,13 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   the game's renamed recompiled ones), for a game whose 3DS copy of its
   recompiler config lists them in `[patches] ignored` (DK64's
   `platform/3ds/Makefile` codegen makes `us.3ds.toml`; the desktop config
-  is untouched): they are then not recompiled, and the game's calls and
-  its patches' resolve to the host functions. The recompiled versions do
+  is untouched) and whose CMake sets `RT64_3DS_GU_NATIVE` before
+  `add_subdirectory`: they are then not recompiled, and the game's calls
+  and its patches' resolve to the host functions. Both together, always:
+  defined without the ignored list, the host functions satisfy the game's
+  references before the linker reaches its archive and its own are never
+  linked (weak or not; Banjo booted black that way, its `guRotateF` calling
+  a `sqrtf_recomp` it has no such name for). The recompiled versions do
   every floating-point operation through the context in memory; DK64's
   attract demo spent 9 % of its game core in them. Before turning them on
   for a game, run `tools/gu_test/build.sh <game>` with the game's
