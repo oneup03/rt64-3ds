@@ -138,6 +138,7 @@ add_library(recomp_3ds STATIC
     src/platform/input_hid.cpp
     src/platform/loadmon.cpp
     src/platform/game_profile.cpp
+    src/platform/gu_native.cpp
     src/platform/stall_watch.cpp
     src/platform/log.cpp
     src/platform/autotest.cpp

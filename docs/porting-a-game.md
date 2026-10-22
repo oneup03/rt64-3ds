@@ -976,6 +976,22 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   caller's put back at `TRACE_RETURN`, so a sample names the function
   executing, a self-time profile). The macros' cost, a load and two stores
   a call, is paid whether the profile runs or not.
+- **libultra's matrix helpers as host functions.** `src/platform/gu_native.cpp`
+  implements `guMtxL2F`, `guMtxF2L`, `guMtxIdentF`, `guMtxIdent`,
+  `guMtxCatF`, `guMtxXFMF`, `guMtxXFML`, `guNormalize`, `guRotateF`,
+  `guTranslateF` and `guScaleF` as host functions of those names
+  (libultra's own C in its operation order; `sinf`, `cosf` and `sqrtf` go to
+  the game's renamed recompiled ones), for a game whose 3DS copy of its
+  recompiler config lists them in `[patches] ignored` (DK64's
+  `platform/3ds/Makefile` codegen makes `us.3ds.toml`; the desktop config
+  is untouched): they are then not recompiled, and the game's calls and
+  its patches' resolve to the host functions. The recompiled versions do
+  every floating-point operation through the context in memory; DK64's
+  attract demo spent 9 % of its game core in them. Before turning them on
+  for a game, run `tools/gu_test/build.sh <game>` with the game's
+  RecompiledFuncs generated without the ignored list, then
+  `gu_test 20000 <rom.z64>`: it compares the host functions with the
+  recompiled bodies bit for bit over random inputs (DK64: 12 of 12).
 - **Game code at -Os.** No gain (Banjo, Old clock): recompiled code is
   straight-line loads and stores, and shrank only 4.5 %. It stays at -O2.
 - **ROM.** Each game places its ROM per console: `GameDesc::rom_new3ds`

@@ -128,6 +128,7 @@ namespace recomp3ds {
     void settings_menu_update();        // ~60 times a second, main thread
     void settings_menu_toggle();
     int settings_rom_stream();          // settings.ini's rom_stream: 0 the game's choice, 1 in memory, 2 from the SD card
+    int gu_native_count();              // libultra's matrix helpers as host functions (gu_native.cpp), how many
     bool settings_perf_monitor();       // the touch screen's name, frame rate and SELECT hint (Performance monitor)
     bool settings_debug_rows();         // settings.ini's dbg_rows: the touch screen's thread and audio rows
     int settings_cores();               // settings.ini's dbg_cores, read at start: 0 auto, 1 two cores with the game on core 1, 2 ... on core 0

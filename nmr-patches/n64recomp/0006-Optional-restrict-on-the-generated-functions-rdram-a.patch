@@ -1,0 +1,65 @@
+From af0f84f0be0369fe80c6deb35d4dfb521e339535 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Wed, 21 Oct 2026 21:42:27 -0500
+Subject: [PATCH] Optional restrict on the generated functions' rdram and ctx
+ (RECOMP_RESTRICT_ARGS)
+
+Built without strict aliasing, a store to RDRAM may alias the context, so
+the compiler reloads the context's registers after every one: recompiled
+code is mostly loads and stores, and every floating-point operation goes
+through the context in memory. With RECOMP_RESTRICT_ARGS the generated
+signature declares both parameters restrict (nothing reaches one through
+the other), and the registers can stay in host registers across RDRAM
+stores. It requires RECOMP_VOLATILE_RDRAM, so a loop polling RDRAM for
+another thread's write is not hoisted. Off by default: the macro expands
+to nothing.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ include/recomp.h   | 16 ++++++++++++++++
+ src/cgenerator.cpp |  2 +-
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/include/recomp.h b/include/recomp.h
+index 8d358ea..9b5c882 100644
+--- a/include/recomp.h
++++ b/include/recomp.h
+@@ -134,6 +134,22 @@ typedef uint64_t gpr;
+ #define RECOMP_RDRAM_V
+ #endif
+ 
++// With RECOMP_RESTRICT_ARGS the generated functions declare rdram and ctx
++// restrict: nothing reaches the context through rdram nor RDRAM through
++// ctx, so the compiler may keep the context's registers in host registers
++// across stores to RDRAM instead of reloading them after every store (as it
++// must without, the code being built without strict aliasing). It needs
++// RECOMP_VOLATILE_RDRAM, or a loop polling RDRAM for another thread's write
++// could be hoisted.
++#ifdef RECOMP_RESTRICT_ARGS
++#ifndef RECOMP_VOLATILE_RDRAM
++#error "RECOMP_RESTRICT_ARGS needs RECOMP_VOLATILE_RDRAM"
++#endif
++#define RECOMP_RESTRICT __restrict
++#else
++#define RECOMP_RESTRICT
++#endif
++
+ #ifdef RECOMP_GPR32
+ #define SIGNED(val) \
+     ((int32_t)(val))
+diff --git a/src/cgenerator.cpp b/src/cgenerator.cpp
+index 94f85c5..6d312a9 100644
+--- a/src/cgenerator.cpp
++++ b/src/cgenerator.cpp
+@@ -395,7 +395,7 @@ void N64Recomp::CGenerator::get_binary_expr_string(BinaryOpType type, const Bina
+ void N64Recomp::CGenerator::emit_function_start(const std::string& function_name, size_t func_index) const {
+     (void)func_index;
+     fmt::print(output_file,
+-        "RECOMP_FUNC void {}(uint8_t* rdram, recomp_context* ctx) {{\n"
++        "RECOMP_FUNC void {}(uint8_t* RECOMP_RESTRICT rdram, recomp_context* RECOMP_RESTRICT ctx) {{\n"
+         // these variables shouldn't need to be preserved across function boundaries, so make them local for more efficient output
+         "    uint64_t hi = 0, lo = 0, result = 0;\n"
+         "    int c1cs = 0;\n", // cop1 conditional signal
+-- 
+2.56.0
+

@@ -887,6 +887,7 @@ int recomp3ds::run(const GameDesc& desc) {
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
     fprintf(stderr, "recomp3ds: %s starting on %s 3DS\n", desc.render.game_name, is_new_3ds ? "a New" : "an Old");
+    fprintf(stderr, "recomp3ds: %d libultra matrix helpers as host functions (for a config that ignores them; 0: the game's sinf, cosf or sqrtf are not sinf_recomp and the like)\n", recomp3ds::gu_native_count());
     recomp3ds::screen_printf("%s\n", desc.render.game_name);
     log_memory("boot");
     // Before the settings: a loaded setting's on_change may pick another map.
