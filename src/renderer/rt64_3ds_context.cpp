@@ -1401,7 +1401,7 @@ private:
                 debug_from_ = (uint32_t)st.dbg_gpu_debug_from; debug_count_ = (uint32_t)st.dbg_gpu_debug_count; debug_sync_ = st.dbg_gpu_debug_sync != 0; debug_step_ = 1;
                 fprintf(stderr, "rt64-3ds: GPU debug mode from frame %u for %u frames, sync %d\n", debug_from_, debug_count_, (int)debug_sync_);
             }
-            prof_on_ = st.dbg_profile != 0;
+            prof_on_ = (st.dbg_profile & 1) != 0;
             interp_.set_profile(prof_on_);
             // dbg_draw_first / _last: replay only those draws of every frame
             // (to find which draw goes wrong against the host reference).

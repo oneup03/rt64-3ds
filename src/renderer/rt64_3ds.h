@@ -380,7 +380,7 @@ struct Settings {
     // the normal behaviour): A/B switches and diagnostics for the console,
     // nothing a player needs. The platform's own are recomp3ds::DebugSettings.
     // docs/porting-a-game.md, "Files, switches and settings keys".
-    int dbg_profile = 0;              // the read profile per list (the clock read once per command: costly)
+    int dbg_profile = 0;              // bit 0: the read profile per list (the clock read once per command: costly); bit 1: the game's functions sampled (recomp3ds game_profile.h)
     int dbg_screen_cull_off = 0;      // the screen cull off
     int dbg_screen_cull_pct = 0;      // its base slack in percent of the frame (0: the console's default)
     int dbg_interp_check = 0;         // each in-between's flat draws checked against their frames (costly)

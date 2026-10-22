@@ -105,6 +105,19 @@ void recomp3ds::loadmon_resume() {
     fprintf(stderr, "loadmon: %d core monitors running (threads %u of %u in use)\n", started, used, limit);
 }
 
+// A core's idle count now and the idle thread's rate with the core to
+// itself (counts a second at the current clock); both 0 for a core not
+// watched. The game profile reads the count a thousand times a second.
+void recomp3ds::loadmon_idle_counts(int core, uint32_t* count, uint32_t* per_second) {
+    *count = 0;
+    *per_second = 0;
+    if (core < 0 || core >= kCores) return;
+    const Monitor& m = g_mon[core];
+    if (m.thread == nullptr || m.calibration == 0) return;
+    *count = m.count;
+    *per_second = (uint32_t)((u64)m.calibration * g_mhz / g_cal_mhz);
+}
+
 // Busy percentage of a core since its previous call (call once a second
 // for each core), or -1 for a core not watched.
 int recomp3ds::loadmon_sample(int core) {

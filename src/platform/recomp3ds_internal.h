@@ -159,6 +159,7 @@ namespace recomp3ds {
     void loadmon_start(unsigned core_mask);     // the cores to watch (bit n: core n)
     int loadmon_sample(int core);                // busy % since the last call, -1 if not watched
     int loadmon_peek(int core);                  // the same apart from loadmon_sample's (the stall watch)
+    void loadmon_idle_counts(int core, uint32_t* count, uint32_t* per_second);   // the idle count and its full-idle rate (the game profile)
     void loadmon_set_mhz(unsigned mhz);          // the CPU clock now (the calibrations scale with it)
     void loadmon_stop();
     // The idle threads are let go after the calibration, so the game's

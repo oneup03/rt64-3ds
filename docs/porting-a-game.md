@@ -967,6 +967,15 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   message call, handed over as few as 12,700 of 22,050 samples a second,
   so the music slowed and its notes came up to 2.4 s late. The check is a
   load and a branch per call (about 200 KB more code in DK64).
+- **Profiling the game's code.** `dbg_profile=2` in settings.ini (3 with the
+  renderer's read profile) samples which recompiled function the game's core is in, a thousand times
+  a second from the renderer's core, and logs the top functions every 10 s
+  and at exit (`game-profile:` lines, with the share of the time the game's
+  core was idle: the game waiting). It needs the game's `trace.h` to keep
+  `recomp3ds_trace_func` (DK64's and Banjo's do: set at `TRACE_ENTRY`, the
+  caller's put back at `TRACE_RETURN`, so a sample names the function
+  executing, a self-time profile). The macros' cost, a load and two stores
+  a call, is paid whether the profile runs or not.
 - **Game code at -Os.** No gain (Banjo, Old clock): recompiled code is
   straight-line loads and stores, and shrank only 4.5 %. It stays at -O2.
 - **ROM.** Each game places its ROM per console: `GameDesc::rom_new3ds`
@@ -1274,7 +1283,7 @@ the early-drawn, eye-replay, depth-copy, build-split and CULLDL A/Bs, and the
 
 | key | effect |
 |---|---|
-| `dbg_profile` | The `read profile per list:` line (costly: it reads the clock once per command). |
+| `dbg_profile` | 1: the `read profile per list:` line (costly: it reads the clock once per command); 2: the game's functions sampled, the `game-profile:` lines every 10 s (see "CPU budget"); 3: both. |
 | `dbg_screen_cull_off`, `dbg_screen_cull_pct` | The screen cull off, or its base slack in percent of the frame (`10`, `25`) in place of the console's default; see "Culling". |
 | `dbg_interp_check` | Checks each in-between's flat draws against their game frames and logs the ones that land outside (costs the gfx thread every frame). |
 | `dbg_no_scissor` | No scissor, to see draws a wrong clip would hide. |

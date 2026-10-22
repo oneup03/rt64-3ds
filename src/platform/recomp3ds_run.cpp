@@ -31,6 +31,7 @@ namespace recomp { uint32_t heap_rdram_address() __attribute__((weak)); }
 #include "dsp_synth.h"
 #include "aspmain_hle.h"
 #include "audio_hle_diff.h"
+#include "game_profile.h"
 
 // libctru's default main stack is 32 KB; the runtime's start path and the
 // C++ library want more.
@@ -210,6 +211,7 @@ void park_main_thread() {
     recomp3ds::settings_flush();           // a change inside the save's one-second debounce
     recomp3ds::log_flush();
     recomp3ds::stall_watch_stop();
+    recomp3ds::game_profile_stop();
     recomp3ds::loadmon_stop();
     recomp3ds::dsp_synth_shutdown();
     recomp3ds::audio_shutdown();
@@ -593,6 +595,8 @@ void update_gfx_inner() {
                 (unsigned long)(mallinfo().arena / 1024), rheap, hle_stats, hle_ms.c_str(), "", rom_stats, game_stats, thread_stats.c_str());
         // On a line of its own: the log cuts lines at 512 characters.
         if (log_stats && dsp_stats[0] != '\0') fprintf(stderr, "%s\n", dsp_stats + 1);
+        // dbg_profile 2 or 3: the game's hottest functions, every 10 s whatever the log level.
+        if (stats_tick % 10 == 0) recomp3ds::game_profile_report(false);
         // One 40-column row: frames drawn and each core's load.
         char line[64];
         // Frames drawn (the frame cap passes some over; frame interpolation
@@ -659,6 +663,7 @@ void update_gfx_inner() {
         if (!quitting) {
             quitting = true;
             fprintf(stderr, "recomp3ds: quitting\n");
+            recomp3ds::game_profile_report(true);
             rt64_3ds::set_quitting();      // no more frames: the renderer's thread can leave its loop
             ultramodern::quit();
             // The runtime joins its own threads and recomp::start returns
@@ -1089,6 +1094,8 @@ int recomp3ds::run(const GameDesc& desc) {
                     (unsigned long)limit, (unsigned long)rc, core2 ? "three cores" : "two cores",
                     g_game_core, g_sp_core, g_gfx_core, g_helper_core);
         }
+        // settings.ini's dbg_profile bit 1 (2 or 3): the game's functions sampled from the renderer's core.
+        if ((rt64_3ds::settings().dbg_profile & 2) != 0) recomp3ds::game_profile_start(g_game_core, g_gfx_core);
         if (is_new_3ds) {
             // Core 3 is the system's (head tracking and other services): an
             // application's threads are refused there. Logged as evidence.

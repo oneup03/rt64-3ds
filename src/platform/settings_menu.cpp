@@ -741,7 +741,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     // default, settings.ini only (hidden rows). The renderer's in
     // rt64_3ds::Settings, the platform's in g_dbg (recomp3ds::debug_settings).
     const int kBig = 1000000000;
-    add_row({ "dbg_profile", "Read profile per list", 0, 1, &st.dbg_profile, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_profile", "Profile (1 read, 2 game, 3 both)", 0, 3, &st.dbg_profile, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "dbg_screen_cull_off", "Screen cull off", 0, 1, &st.dbg_screen_cull_off, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "dbg_screen_cull_pct", "Screen cull slack %", 0, 400, &st.dbg_screen_cull_pct, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "dbg_interp_check", "Interpolation check", 0, 1, &st.dbg_interp_check, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
