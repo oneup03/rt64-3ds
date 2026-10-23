@@ -63,6 +63,12 @@ The budget this has to fit, measured before any code:
   CPU's floats.
 - **The Old 3DS's other core** is untouched: this moves work off core 0,
   nothing onto core 1.
+- **The New 3DS keeps the CPU path.** Its GPU is the same chip at the same
+  clock, and at 60 fps a frame is 16.7 ms: the 14-16 ms the GPU takes for
+  both eyes in a heavy scene is already most of it, with the CPU at 804
+  MHz and an L2 doing the transform in time. The row defaults on for an
+  Old 3DS and off for a New one; the CPU path is a first-class option,
+  not a fallback to retire.
 
 ## What the CPU keeps
 
@@ -72,7 +78,7 @@ Each feature that reads transformed positions today, and where it goes:
 |---|---|
 | back-face cull, with the eyes' shift turning near triangles' winding (`culled`, `kCullEyes`) | the GPU's cull mode, as the replay sets it now; the shift is in the shader, so the winding the GPU tests is the eye's own |
 | the screen cull (`off_screen`) | the rasteriser rejects them; the vertex shader still runs for them, counted in the margin above |
-| the guard-band and near-plane clip (`clip_tri`, `kGuard`): the PICA200 clips z only and drops a triangle with a far-off corner | a position-only transform on the CPU (4 `dp4` and the band test a vertex, no lighting or texels: 2-3 ms for 4,000 vertices) flags the vertices outside the band; a triangle with one goes through today's clip path, the rest (96 % in the captures) go as indices |
+| the guard-band and near-plane clip (`clip_tri`, `kGuard`): the PICA200 clips z only and drops a triangle with a far-off corner whole | a position-only transform on the CPU (4 `dp4` and the band test a vertex, no lighting or texels: 2-3 ms for 4,000 vertices, and only under a perspective camera) flags the vertices outside the band; a triangle with one goes through today's clip path, the rest (96 % in the captures) go as indices. Decided: the clip stays. Dropping such triangles (tried on the captures) loses the floor under the player, a slab beside DK in the outdoor capture, which would flicker with the camera |
 | gSPCullDisplayList and G_BRANCH_Z, on a few test vertices | the same position-only transform, on demand for those loads |
 | lighting as the RSP's integers (`shade_vertex`) | the shader's floats: a colour off by one in the last bit here and there; dl_test's check gains a tolerance for this path |
 | texgen (sphere mapping, `acosf` in the linear case), image-tile and snapshot/frame/render-texture texel mappings (`frame_uv`, `snapshot_uv`, `rtt_uv`) | those draws stay on today's CPU path; a draw record says which path built it |
@@ -106,7 +112,8 @@ until phase 3) so the console can A/B the two paths in the same session.
 
 0. **Measure the margin** (first, short). A vertex shader with the full
    per-vertex math, benchmarked on the console at 4,000 and 8,000 vertices
-   a frame, two eyes: the GPU time it adds. A console breakdown of the
+   a frame, two eyes: the GPU time it adds, on both consoles (the New
+   3DS at 60 fps is the tighter GPU budget). A console breakdown of the
    triangle path (the write-out against the tests) with `dl_bench_3ds`'s
    `DL_BENCH_*` cuts, to confirm the expected saving before the work. If
    the shader costs over 8 ms at 8,000 vertices, or the triangle path's
