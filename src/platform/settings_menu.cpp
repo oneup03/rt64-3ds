@@ -108,9 +108,10 @@ void apply_old_clock(int v) { recomp3ds::set_cpu_speed(v == 0); }
 
 // An Old 3DS's layout on a New 3DS (read at start; recomp3ds_run.cpp):
 // core 2 left unused, the game on core 1 and the rest on core 0, or the
-// other way round. Auto: three cores on a New 3DS, and on an Old 3DS the
-// game's own choice (GameDesc::two_cores_game_on_core0).
-const char* const kCoresNames[] = { "Auto", "2, game on 1", "2, game on 0" };
+// other way round, or that with the lists read on core 0 too (Banjo's
+// GameDesc::two_cores_read_on_game_core). Auto: three cores on a New 3DS,
+// and on an Old 3DS the game's own choice (GameDesc::two_cores_game_on_core0).
+const char* const kCoresNames[] = { "Auto", "2, game on 1", "2, game on 0", "2, game+read on 0" };
 int g_cores = 0;
 // settings.ini only: the touch screen's game-thread shares and audio rows.
 int g_debug_rows = 0;
@@ -432,6 +433,9 @@ void step(int slot, int d) {
     else v = v < r.lo ? r.lo : v > r.hi ? r.hi : v;
     if (v == *r.value) return;
     *r.value = v;
+    // In the log, so a session's stats and profile lines can be split at the
+    // player's changes.
+    fprintf(stderr, "settings: %s=%d\n", r.key, v);
     if (r.on_change != nullptr) r.on_change(v);
     if (r.on_change_ctx != nullptr) r.on_change_ctx(r.ctx, v);
     if (!r.no_save) changed();
@@ -760,7 +764,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     // Testing an Old 3DS on a New 3DS (settings.ini only): the Old clock, and
     // the two-core layouts an Old 3DS has (read at start).
     if (is_new_3ds) add_row({ "dbg_old_clock", "Old 3DS clock", 0, 1, &g_dbg_old_clock, nullptr, false, nullptr, apply_old_clock, recomp3ds::PageCount, 1, nullptr });
-    add_row({ "dbg_cores", "Cores (at restart)", 0, 2, &g_cores, kCoresNames, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_cores", "Cores (at restart)", 0, 3, &g_cores, kCoresNames, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "dbg_rows", "Debug rows", 0, 1, &g_debug_rows, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     g_log_level = is_new_3ds ? 1 : 0;
     add_row({ "log_level", "Log level", 0, 2, &g_log_level, nullptr, false, nullptr, apply_log_level, recomp3ds::PageCount, 1, nullptr });

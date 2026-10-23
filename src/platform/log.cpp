@@ -19,6 +19,7 @@
 
 #include "recomp3ds_internal.h"
 #include "recomp3ds.h"
+#include "rt64_3ds.h"
 
 namespace {
 
@@ -51,6 +52,10 @@ inline bool starts(const char* s, const char* p) { return strncmp(s, p, strlen(p
 // A hard freeze leaves its trace through them.
 bool dropped_at_level(const char* l) {
     if (g_level >= 2) return false;
+    // The renderer's profile (settings.ini's dbg_profile 1 or 3) is the
+    // periodic report's indented lines and the frame line it explains: kept
+    // at any level once asked for.
+    if ((rt64_3ds::settings().dbg_profile & 1) && (starts(l, "rt64-3ds: frame ") || starts(l, "rt64-3ds:   "))) return false;
     if (starts(l, "rt64-3ds: late frame") || starts(l, "rt64-3ds: frame ") || starts(l, "rt64-3ds:   ")) return true;
     if (g_level >= 1) return false;
     return starts(l, "stats:") || starts(l, "dsp-synth ");

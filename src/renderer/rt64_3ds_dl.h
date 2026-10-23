@@ -83,6 +83,11 @@ public:
     void set_split_untagged_ortho(bool on);
     // Always take G_BRANCH_Z (the near model), as the recomp frontends do.
     void set_force_branch_z(bool on);
+    // The world distance (rt64_3ds::set_world_distance), a fraction of the
+    // perspective camera's far plane (0 = off): triangles wholly beyond it
+    // aren't drawn, and gSPCullDisplayList also ends a list whose tested
+    // vertices all lie beyond it.
+    void set_world_far(float fraction);
     // gSPCullDisplayList honoured (RenderDesc::cull_dl): a list whose tested
     // vertices all lie off one side of the visible area ends there.
     void set_cull_dl(bool on);

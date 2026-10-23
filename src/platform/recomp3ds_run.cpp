@@ -905,6 +905,7 @@ int recomp3ds::run(const GameDesc& desc) {
         }
     }
     {
+        constexpr int kReadRoomMb = 6;
         // The ROM in memory, or read from the SD card as the game needs it:
         // the game's choice for this console (GameDesc::rom_new3ds /
         // rom_old3ds), unless settings.ini's rom_stream says (1 in memory, 2
@@ -917,7 +918,12 @@ int recomp3ds::run(const GameDesc& desc) {
         snprintf(rom_path, sizeof(rom_path), "%s/%s.z64", g_base_path, (const char*)desc.game_id.c_str());
         struct stat rom_st;
         const uint64_t rom_bytes = stat(rom_path, &rom_st) == 0 ? (uint64_t)rom_st.st_size : (32u << 20);
-        const uint64_t room = (uint64_t)(desc.rom_room_mb > 0 ? desc.rom_room_mb : 24) << 20;
+        // The Cores row's "game+read on 0" on a game that doesn't choose it
+        // (its rom_room_mb measured without it): the read's deferred
+        // triangles and vertices take a few MB more (DK64 ran out at its
+        // first frames with 8 MB).
+        const bool forced_read = recomp3ds::settings_cores() == 3 && !desc.two_cores_read_on_game_core;
+        const uint64_t room = (uint64_t)((desc.rom_room_mb > 0 ? desc.rom_room_mb : 24) + (forced_read ? kReadRoomMb : 0)) << 20;
         const uint64_t need = rom_bytes + recomp::mem_size + room;
         const uint64_t heap = envGetHeapSize();
         const bool heap_short = heap < need;
@@ -1063,7 +1069,7 @@ int recomp3ds::run(const GameDesc& desc) {
         const bool two_cores = !is_new_3ds || cores_row != 0;
         const bool core2 = !two_cores;
         // With two cores, which one the game gets (GameDesc::two_cores_game_on_core0).
-        const bool game_on_0 = cores_row == 2 || (cores_row == 0 && desc.two_cores_game_on_core0);
+        const bool game_on_0 = cores_row == 2 || cores_row == 3 || (cores_row == 0 && desc.two_cores_game_on_core0);
         g_sp_core = core2 ? 2 : 0;
         g_gfx_core = core2 ? 2 : 0;
         g_watch_cores = core2 ? 0x5 : 0x1;
@@ -1112,7 +1118,8 @@ int recomp3ds::run(const GameDesc& desc) {
         rt64_3ds::settings().no_core2 = two_cores;
         // GameDesc::two_cores_read_on_game_core: the lists' read on core 0
         // with the game, the renderer on core 1.
-        rt64_3ds::settings().read_core = (two_cores && desc.two_cores_read_on_game_core && g_game_core == 0 && g_gfx_core == 1) ? 0 : -1;
+        const bool read_on_game = cores_row == 3 || (cores_row == 0 && desc.two_cores_read_on_game_core);
+        rt64_3ds::settings().read_core = (two_cores && read_on_game && g_game_core == 0 && g_gfx_core == 1) ? 0 : -1;
         // Just below the game's threads (host_thread_spec): they go first.
         rt64_3ds::settings().read_priority = 0x31;
         ultramodern::set_host_thread_spec_callback(host_thread_spec);

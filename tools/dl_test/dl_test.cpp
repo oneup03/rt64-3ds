@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
     if (getenv("DL_RTT")) interp.set_render_to_texture(true);
     // RenderDesc::force_lod_branch = false (Banjo): G_BRANCH_Z tests the depth.
     if (getenv("DL_LOD_BRANCH")) interp.set_force_branch_z(false);
+    if (const char* e = getenv("DL_WORLD_FAR")) interp.set_world_far((float)atof(e));   // rt64_3ds::set_world_distance / 100
     // DL_CULLDL=0: gSPCullDisplayList ignored (RenderDesc::cull_dl off), for A/B.
     if (const char* e = getenv("DL_CULLDL")) interp.set_cull_dl(atoi(e) != 0);
     // DL_SCREEN_CULL=<slack>: the screen cull (0.10 an Old 3DS's, 0.25 a New 3DS's; the console adds the eyes' shift).

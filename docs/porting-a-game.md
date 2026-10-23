@@ -975,7 +975,29 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   `recomp3ds_trace_func` (DK64's and Banjo's do: set at `TRACE_ENTRY`, the
   caller's put back at `TRACE_RETURN`, so a sample names the function
   executing, a self-time profile). The macros' cost, a load and two stores
-  a call, is paid whether the profile runs or not.
+  a call, is paid whether the profile runs or not. The patches want
+  `trace_mode` too (DK64's and Banjo's Makefiles recompile a copy of
+  patches.toml with it): a patched function without it has no preemption
+  check, and its time is booked to its nearest traced caller (Banjo's
+  `mainLoop` read as 35 % until its patched draw functions were traced).
+  Every change made in the settings menu is logged (`settings: key=value`),
+  so a session's stats and profile lines can be split at them.
+- **A game's own hot routine as a host function.** DK64's bone-matrix
+  builder (`func_global_asm_806195D0`, hand-written MIPS: FR=1 float
+  registers, 64-bit bit-stream reads) was 16-22 % of the game core on an
+  Old 3DS recompiled, 4-7 % as the game's `platform/3ds/bones_native.cpp`,
+  on the `ignored` list like the gu helpers. Its port was checked bit for
+  bit against the recompiled routine on every actor in the console
+  captures plus fuzzed variants (a host harness); `-ffp-contract=off` keeps
+  the float operations one for one. Worth it only for a routine the game
+  profile puts at the top; the harness is the part not to skip.
+- **A world draw distance.** `rt64_3ds::set_world_distance(percent)` (a
+  game's settings row, DK64's World distance) drops triangles wholly beyond
+  that share of the perspective camera's far plane, and ends a
+  gSPCullDisplayList'd list whose tested vertices all lie beyond it. It
+  saves the GPU and the triangles' output, not the vertices' transforms,
+  which are done before the test: on DK64 it moved no frame rate, the
+  read of the list being the cost.
 - **libultra's matrix helpers as host functions.** `src/platform/gu_native.cpp`
   implements `guMtxL2F`, `guMtxF2L`, `guMtxIdentF`, `guMtxIdent`,
   `guMtxCatF`, `guMtxXFMF`, `guMtxXFML`, `guNormalize`, `guRotateF`,
@@ -1262,7 +1284,7 @@ What has frozen a console so far:
   a list), then the read (about 14). Running the game a list ahead (the
   read on core 1, beside the game) would put about 42 ms a list on core 1,
   about 19 lists a second: no gain.
-- `settings.ini`'s `dbg_cores` (0 auto, 1 "2, game on 1", 2 "2, game on 0",
+- `settings.ini`'s `dbg_cores` (0 auto, 1 "2, game on 1", 2 "2, game on 0", 3 "2, game+read on 0",
   read at start) gives a New 3DS the Old 3DS's layout, to test it on one;
   Auto on an Old 3DS uses the game's choice. The renderer's in-between
   builder (core 1) is off without core 2 (`Settings::no_core2`), and the
@@ -1313,7 +1335,7 @@ the early-drawn, eye-replay, depth-copy, build-split and CULLDL A/Bs, and the
 | `dbg_gpu_debug_from`, `dbg_gpu_debug_count`, `dbg_gpu_debug_sync` | With `count` above 0: the GPU debug mode (a sync per draw with `sync` 1, to find the draw that hangs the GPU) for `count` frames from `from`. |
 | `dbg_aim_tex_log` | Logs every candidate reticle texture's hash once (`RenderDesc::aim_texture_hashes`). |
 | `dbg_old_clock` | A New 3DS at the Old 3DS clock (268 MHz, no L2), applied at start. |
-| `dbg_cores` | The two-core layouts an Old 3DS has, on a New 3DS: 1 the game on core 1, 2 on core 0 (read at start). |
+| `dbg_cores` | The two-core layouts an Old 3DS has, on a New 3DS: 1 the game on core 1, 2 on core 0, 3 on core 0 with the lists read there too (read at start). |
 | `dbg_slow_gfx_ms`, `dbg_slow_audio_ms` | Pads every display list and audio task by that much, to mimic a slower console in the emulator. |
 | `dbg_audio_rsp` | Runs the recompiled audio microcode instead of the interpreter. |
 
@@ -1335,7 +1357,7 @@ library's keys:
 | `perf_monitor` | 1: the touch screen's game name, frame rate and SELECT hint; 0: none of them (the touch buttons, alerts and the menu stay) | Game | `settings_perf_monitor` |
 | `frame_cap` | 0; the games 2, which an Old 3DS turns into `old3ds_frame_cap` | Game | the gfx thread |
 | `dbg_old_clock` | 0 | none, New 3DS only | `set_cpu_speed` (1 runs at the Old 3DS clock) |
-| `dbg_cores` | 0 (Auto) | none, read at start | the core layout (1 two cores with the game on core 1, 2 on core 0) |
+| `dbg_cores` | 0 (Auto) | none, read at start | the core layout (1 two cores with the game on core 1, 2 on core 0, 3 on core 0 with the lists read there) |
 | `rom_stream` | 0 (the game's choice: `GameDesc::rom_new3ds` / `rom_old3ds`) | none, read at start | the ROM stream |
 | `log_level` | 1 on a New 3DS, 0 on an Old | none | `log_set_level` |
 | `dbg_rows`, `dbg_capture` | 0, 0 | none | the touch screen's stats rows; SELECT held for a capture |
