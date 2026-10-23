@@ -1,0 +1,36 @@
+; test: the GPU layout through the smallest shader: no palette.
+.fvec xform[4]
+.fvec stereo
+.fvec eye
+.fvec uvscale
+.fvec uv1
+.fvec uvraw
+.fvec lcol[4]
+.fvec amb
+.fvec fogp
+.fvec pal[4]
+.bool lit, fogged, texgen
+.constf consts(0.00392156862745, 0.0, 1.0, 128.0)
+.out opos position
+.out otc0 texcoord0
+.out otc1 texcoord1
+.out oclr color
+.alias ipos v0
+.alias ist v1
+.alias irgba v2
+.alias ipal v3
+.proc main
+	mov r0.xyz, ipos.xyz
+	mov r0.w, consts.z
+	dp4 opos.x, xform[0], r0
+	dp4 opos.y, xform[1], r0
+	dp4 opos.z, xform[2], r0
+	dp4 opos.w, xform[3], r0
+	mov r4.xy, ist.xy
+	mov r4.zw, consts.yy
+	mov otc0, r4
+	mov otc1, r4
+	mov r8, irgba
+	mul oclr, consts.xxxx, r8
+	end
+.end

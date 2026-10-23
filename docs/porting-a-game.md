@@ -991,6 +991,32 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   captures plus fuzzed variants (a host harness); `-ffp-contract=off` keeps
   the float operations one for one. Worth it only for a routine the game
   profile puts at the top; the harness is the part not to skip.
+- **The vertex transform on the GPU.** The Transform row (`gpu_transform`,
+  CPU by default on both consoles: docs/gpu-transform-plan.md has the
+  measurements and the reasoning). On, the interpreter keeps the
+  vertices of a load as the game loaded them (`Interpreter::set_gpu_transform`;
+  they go into `FrameRecord::verts` beside the transformed ones, 32 bytes
+  each with the palette entry in the fourth attribute, `gidx` and `gpu`
+  hold the indices and the draws) and only transforms their positions,
+  for gSPCullDisplayList, G_BRANCH_Z and the guard band; a triangle of such
+  vertices under a perspective camera, inside the band and drawn plainly goes
+  to a GPU record as three indices, with its loads' matrices, rotated light
+  directions and texture-generation look-at vectors in the record's palette
+  (6 entries of 10 uniform vectors, one GPU command; a full palette starts a new record), and
+  the one vertex shader (`shaders/rt64_3ds.v.pica`, its `pre` bool false)
+  transforms, lights, generates texture coordinates and fogs it; a CPU-path
+  draw runs the same program with `pre` true, so a frame mixing the two
+  switches no program, layout or buffer, and the GPU-path uniforms go out
+  only when a draw's differ from the last. Everything else (a vertex behind the eye or beyond
+  the band, a decal, primitive depth, an orthographic draw, an image tile, a
+  snapshot, frame or render texture, linear texture generation, more than
+  four lights, an edited vertex) goes the CPU way as before, the raw slots
+  shaded on demand. Not with deferred triangles or frame interpolation.
+  dl_test's `DL_GPU=1` runs the path and does its records in software
+  (`resolve_gpu_draws`) for the reference render: the captures came out
+  pixel-identical at a 2 % tolerance (the lighting is float there, integer
+  on the CPU). The frame line's `GPU path:` note counts the triangles taken
+  and refused by reason.
 - **A world draw distance.** `rt64_3ds::set_world_distance(percent)` (a
   game's settings row, DK64's World distance) drops triangles wholly beyond
   that share of the perspective camera's far plane, and ends a

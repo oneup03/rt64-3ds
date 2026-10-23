@@ -243,6 +243,7 @@ void blank_rows(int from, int to) {
 // Off leaves the touch buttons, the alerts and the menu itself.
 int g_perf_monitor = 1;
 const char* const kPerfMonitorNames[] = { "Off", "On" };
+const char* const kTransformNames[] = { "CPU", "GPU" };
 const char* g_game_name = "";
 void apply_perf_monitor(int v) {
     // The name on row 1 (printed at boot); the stats line on row 2 is the
@@ -731,6 +732,12 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "dbg_capture", "Debug capture", 0, 1, &g_debug_capture, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
+    // The vertex transform on the CPU or the GPU (rt64_3ds::Settings::gpu_transform; read at every list).
+    // CPU on both consoles: the GPU path saved no read time on an Old 3DS
+    // (docs/gpu-transform-plan.md), and costs more in the replay.
+    st.gpu_transform = 0;
+    add_row({ "gpu_transform", "Transform", 0, 1, &st.gpu_transform, kTransformNames, false, nullptr, nullptr, PageGame, 1, nullptr });
+    add_row({ "dbg_gpu_resolve", "GPU path on CPU (dbg)", 0, 1, &st.dbg_gpu_resolve, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     // RenderDesc::double_eyes, settings.ini only and read at start: the
     // game's choice unless the file says otherwise.
     g_required_mods.assign(desc.required_mods, desc.required_mods + desc.required_mod_count);

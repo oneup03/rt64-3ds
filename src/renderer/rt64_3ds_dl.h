@@ -22,6 +22,15 @@ struct InterpreterStats {
     uint32_t mtx_loads = 0, vtx_loaded = 0, draws_merged = 0, probes = 0, clipped = 0;
     uint32_t rects_merged = 0;     // rectangles stretched as slices of a full-width row (merge_rect_slices)
     uint32_t branch_z_taken = 0, branch_z_not = 0, cull_dl = 0;   // level-of-detail branches, cull tests
+    uint32_t gpu_tris = 0, gpu_draws = 0, gpu_splits = 0;   // the GPU path's triangles and records (set_gpu_transform), records a full palette started
+    // ... and the triangles it refused, by reason: 0 a slot the CPU shaded
+    // (texture generation, too many lights, an edit), 1 outside the guard
+    // band, 2 not a perspective camera, 3 a decal or primitive depth, 4 an
+    // image tile or off-screen target, 5 lighting or fog changed since the
+    // load, 6 a snapshot, frame or render texture, 7 the buffers full.
+    uint32_t gpu_refused[8] = {};
+    uint32_t gpu_load_cpu[2] = {};      // vertices loaded the CPU way for linear texture generation, for too many lights
+    uint32_t gpu_dropped = 0;           // band-refused triangles dropped unshaded (a back face, off the screen)
     uint32_t cull_dl_culled = 0;   // ... of cull_dl, tests that ended their list (set_cull_dl)
     uint32_t refresh_rate = 0;     // the game's intended frame rate (gEXSetRefreshRate), 0 = not given
     uint32_t image_tris = 0;       // triangles sampled from a whole image (merge_image_tiles)
@@ -91,6 +100,16 @@ public:
     // gSPCullDisplayList honoured (RenderDesc::cull_dl): a list whose tested
     // vertices all lie off one side of the visible area ends there.
     void set_cull_dl(bool on);
+    // The GPU path (Settings::gpu_transform): the vertices of plain
+    // perspective draws go to the GPU as the game loaded them, with their
+    // loads' matrices and rotated light directions in a palette, and the
+    // vertex shader transforms, lights and fogs them (DrawRecord::gpu,
+    // FrameRecord::gidx, gpu; its raw vertices sit in FrameRecord::verts
+    // beside the CPU path's). The CPU keeps the positions for the
+    // cull tests and the guard band: a triangle with a corner outside it,
+    // and every other kind of draw, goes the CPU way as before. Not with
+    // deferred triangles or frame interpolation (then nothing changes).
+    void set_gpu_transform(bool on);
     // The screen cull: triangles wholly beyond one edge of the visible area
     // (the frame and the wide screen's margins), by more than slack * the
     // frame's size, are dropped before the vertex buffer and left out of
@@ -212,6 +231,12 @@ private:
     Helper* helper_ = nullptr;  // set_inbetween_helper
     InterpreterStats stats_;
 };
+
+// The GPU path's records done on the CPU (host tools, and a backend
+// without the shader): every GpuDraw's triangles transformed, lit, fogged
+// and culled as the shader would, into `f.verts`, the records turned into
+// records of transformed vertices.
+void resolve_gpu_draws(FrameRecord& f);
 
 }   // namespace rt64_3ds
 

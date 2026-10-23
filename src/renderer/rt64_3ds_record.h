@@ -10,56 +10,99 @@
 
 namespace rt64_3ds {
 
-// One vertex, in "N64 screen homogeneous" space: x/w and y/w are N64 screen
+// One vertex, 32 bytes, the vertex shader's layout for both paths.
+// The CPU path's: in "N64 screen homogeneous" space, x/w and y/w N64 screen
 // pixels (viewport applied), z/w in [0,1] near to far, so every draw shares
-// one projection matrix per render target. u/v are texels relative to the
-// draw's tile origin; the backend scales them by the PICA texture size.
+// one projection matrix per render target; u/v texels relative to the
+// draw's tile origin (the backend scales them by the PICA texture size);
+// the colour its bytes; pal 0.
+// The GPU path's (Interpreter::set_gpu_transform): the vertex as the game
+// loaded it, x, y, z the model's coordinates (w 1), u, v the N64's s and t,
+// the bytes a colour or, lit, a normal (signed) and the alpha, and pal the
+// first register of its palette entry in the draw's uniforms (GpuDraw).
 struct Vtx3ds {
     float x, y, z, w;
     float u, v;
     uint8_t r, g, b, a;
+    uint8_t pal, pad0, pad1, pad2;
 };
 
-// The frame's vertices. The backend hands it the linear-memory vertex buffer
-// the GPU reads, so the interpreter writes the triangles it emits straight
-// into place; without storage it allocates its own (host tools).
-class VtxArray {
+// The frame's vertices (and the GPU path's raw vertices and indices). The
+// backend hands it the linear-memory buffer the GPU reads, so the
+// interpreter writes what it emits straight into place; without storage it
+// allocates its own (host tools).
+template <typename T>
+class FixedArray {
 public:
-    ~VtxArray() { if (owned_) free(data_); }
-    void set_storage(Vtx3ds* p, uint32_t cap) { if (owned_) free(data_); owned_ = false; data_ = p; cap_ = cap; size_ = 0; }
+    ~FixedArray() { if (owned_) free(data_); }
+    void set_storage(T* p, uint32_t cap) { if (owned_) free(data_); owned_ = false; data_ = p; cap_ = cap; size_ = 0; }
+    bool has_storage() const { return data_ != nullptr || owned_ || cap_ == 0; }
     void clear() { size_ = 0; }
     uint32_t size() const { return size_; }
     bool empty() const { return size_ == 0; }
-    // How many more vertices fit (fixed storage; any number when it grows).
+    // How many more fit (fixed storage; any number when it grows).
     uint32_t room() const { return (!owned_ && data_ != nullptr) ? cap_ - size_ : UINT32_MAX; }
-    Vtx3ds* data() { return data_; }
-    void swap(VtxArray& o) {
-        Vtx3ds* d = data_; data_ = o.data_; o.data_ = d;
+    T* data() { return data_; }
+    void swap(FixedArray& o) {
+        T* d = data_; data_ = o.data_; o.data_ = d;
         uint32_t s = size_; size_ = o.size_; o.size_ = s;
         s = cap_; cap_ = o.cap_; o.cap_ = s;
         bool w = owned_; owned_ = o.owned_; o.owned_ = w;
     }
-    const Vtx3ds* data() const { return data_; }
-    Vtx3ds& operator[](uint32_t i) { return data_[i]; }
-    const Vtx3ds& operator[](uint32_t i) const { return data_[i]; }
-    // Room for n more vertices; returns where to write them or nullptr when
-    // the buffer is full (fixed storage) and the triangle must be dropped.
-    Vtx3ds* append(uint32_t n) {
+    const T* data() const { return data_; }
+    T& operator[](uint32_t i) { return data_[i]; }
+    const T& operator[](uint32_t i) const { return data_[i]; }
+    // Room for n more; returns where to write them or nullptr when the
+    // buffer is full (fixed storage) and the triangle must be dropped.
+    T* append(uint32_t n) {
         if (size_ + n > cap_) {
             if (!owned_ && data_ != nullptr) return nullptr;
             uint32_t nc = cap_ ? cap_ * 2 : 4096;
             while (nc < size_ + n) nc *= 2;
-            data_ = (Vtx3ds*)realloc(data_, nc * sizeof(Vtx3ds));
+            data_ = (T*)realloc(data_, nc * sizeof(T));
             cap_ = nc; owned_ = true;
         }
-        Vtx3ds* p = data_ + size_;
+        T* p = data_ + size_;
         size_ += n;
         return p;
     }
 private:
-    Vtx3ds* data_ = nullptr;
+    T* data_ = nullptr;
     uint32_t size_ = 0, cap_ = 0;
     bool owned_ = false;
+};
+using VtxArray = FixedArray<Vtx3ds>;
+
+// A GPU-path draw's own data (DrawRecord::gpu): its indices (into
+// FrameRecord::gidx; they index FrameRecord::verts, where its raw vertices
+// sit among the CPU path's), and the vertex shader's uniforms: a palette of up to
+// kSlots entries of 10 vectors (the model -> N64 screen homogeneous matrix
+// by columns, up to 4 light directions rotated into the model's space,
+// unit over 127, zero past the lights, and texture generation's two
+// look-at directions likewise), the lights' colours and the ambient over
+// 255, the fog's multiplier and offset, the texel mapping (u = s * uv[0] +
+// uv[2], v = t * uv[1] + uv[3]: G_TEXTURE's scale, the tile's shift and
+// origin; with texture generation s and t are the normal's dots with the
+// look-at directions and uv folds in the (d + 1) / 4), and what the draw is.
+struct GpuDraw {
+    // kSlots: a GPU command carries at most 256 words, 64 vectors; citro3d
+    // uploads a run of dirty uniforms in one, so the palette stays under it.
+    static constexpr int kSlots = 6, kLights = 4, kVecsPerSlot = 10;
+    uint32_t first = 0, count = 0;      // indices in FrameRecord::gidx
+    uint32_t nslots = 0;
+    float pal[kSlots][kVecsPerSlot][4];
+    float lcol[kLights][4];
+    float amb[4];
+    float fog[2];
+    float uv[4];
+    bool lit = false, fogged = false, texgen = false;
+    // The interpreter's (run): the state these came from, to tell a
+    // continuing draw from one that must start anew.
+    uint32_t ctx_of_slot[kSlots];       // the load context of each palette entry
+    uint32_t last_slot = 0;             // the entry used last (a one-entry cache)
+    float uscale = 0.0f, vscale = 0.0f, ss = 0.0f, st = 0.0f, uls = 0.0f, ult = 0.0f;
+    int16_t fog_mul = 0, fog_off = 0;
+    uint32_t light_seq = 0;
 };
 
 // A texture as the RDP would sample it: where the texels come from and the
@@ -157,6 +200,9 @@ struct DrawRecord {
     // rectangle's texels (8..64 px, roughly square), computed in the read
     // while RDRAM still holds them; 0 when not a candidate.
     uint64_t tex_hash = 0;
+    // The GPU path: this draw's FrameRecord::gpu entry (its vertices are
+    // raw, its triangles indices), -1 for a draw of transformed vertices.
+    int32_t gpu = -1;
     uint32_t dbg_vtx = 0;               // RDRAM address of the last vertex load (debug)
     float dbg_vp[4] = {};               // viewport scale x/y, translate x/y (debug logging)
     float dbg_proj[4] = {};             // projection m[1][1], m[3][1], m[2][3], m[3][3]
@@ -179,6 +225,10 @@ constexpr int kMaxSnapshots = 4;
 struct FrameRecord {
     VtxArray verts;
     std::vector<DrawRecord> draws;
+    // The GPU path (DrawRecord::gpu): its triangles' indices into verts,
+    // and the draws' data.
+    FixedArray<uint16_t> gidx;
+    std::vector<GpuDraw> gpu;
     std::vector<uint16_t> tlut;         // palettes referenced by draws, 256 entries each
     std::vector<TexDesc> mips;          // mipmap levels past the base (TexDesc::mip_index)
     bool has_fullsync = false;
@@ -213,6 +263,8 @@ struct FrameRecord {
     void swap(FrameRecord& o) {
         verts.swap(o.verts);
         draws.swap(o.draws);
+        gidx.swap(o.gidx);
+        gpu.swap(o.gpu);
         tlut.swap(o.tlut);
         mips.swap(o.mips);
         std::swap(has_fullsync, o.has_fullsync);
@@ -238,6 +290,8 @@ struct FrameRecord {
     void clear() {
         verts.clear();
         draws.clear();
+        gidx.clear();
+        gpu.clear();
         tlut.clear();
         mips.clear();
         has_fullsync = false;

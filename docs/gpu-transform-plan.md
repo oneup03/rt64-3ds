@@ -1,7 +1,38 @@
 # Plan: the vertex transform on the GPU
 
-Status: planned, not started (October 2026). The measurements are DK64's on
-an Old 3DS, the game on core 1 and the renderer on core 0 (the Auto layout).
+Status (October 23, 2026): phase 1 built and correct (pixel-identical to
+the CPU path in dl_test, the demos right in Azahar), and **measured as no
+gain**: on the Old 3DS the A/B showed the same 17-21 fps in the rap and
+13-19 in the DK TV maps either way with core 0 at 91-97 %, and Azahar's
+renderer profile shows why: the read's vertex and triangle stages cost
+the same with 95 % of the rap's triangles on the GPU (vertices 4.0 vs 4.4
+ms, triangles 9.4 vs 8.6) while the replay's draws cost three times more
+(3.5 vs 1.2 ms). The per-vertex transform and lighting this moved were a
+fifth of the read at most; the rest is the interpreter's per-command,
+per-load and per-triangle bookkeeping, which the path still does and adds
+to (program switches, palette uploads, the band and palette tests). Since
+then the two programs became one (`rt64_3ds.v.pica`, a `pre` bool telling
+a CPU-path draw from a GPU-path one, one 32-byte vertex layout for both,
+the raw vertices in the same buffer as the transformed ones) and the GPU
+path's uniforms go out only when a draw's differ from the last: no program,
+layout or buffer switch per draw. Azahar's renderer profile of the rap
+with that (the same demo, both rows): the read's vertex stage 3.9 ms
+against the CPU path's 4.1 and its triangle stage 8.5 against 7.9, the
+replay's draws 3.6 ms against 1.3. The read cannot shrink much: the
+guard-band test transforms every position anyway (the clip stays, see
+below), so only the lighting left the CPU; and the replay's draws cost
+the palette uploads, since DK64 loads a matrix every 15 triangles or so
+and each slot is 40 words of uniforms per draw, which is about what
+transforming its dozen vertices cost. The path cannot pay off for a game
+with that matrix churn; it might for one that loads a few matrices per
+hundreds of triangles. The
+Transform row stays, off by default on both consoles, as an experiment;
+the work goes to the interpreter's own overhead, measured on the console
+with tools/dl_bench_3ds's stage cuts (DL_BENCH_SKIP_VTX / SKIP_TRI /
+NO_EMIT / NO_PROBE), which is the phase 0 this plan skipped. Lessons from
+the shader debugging are in the port skill's pitfalls. Phase 0 was skipped at the owner's call (the logs
+covered the margin). The measurements are DK64's on an Old 3DS, the game
+on core 1 and the renderer on core 0 (the Auto layout).
 
 ## Why
 
@@ -91,12 +122,13 @@ Each feature that reads transformed positions today, and where it goes:
 
 The N64 vertex in RDRAM is 16 bytes (x, y, z, flag, s, t as 16-bit, r g b
 a as bytes), stored byte-swapped within 32-bit words as the recompiled
-code expects. A linear-memory copy keeps that order and the attribute
-loader reads it as `GPU_SHORT` pairs and a `GPU_UNSIGNED_BYTE` quad, the
-shader swizzling (y, x), (flag, z), (t, s), (a, b, g, r) back; a fifth
-byte-sized attribute carries the palette index (a 20-byte stride). Normals
-share the colour bytes as on the N64; the shader's lighting reads them
-signed. No per-vertex conversion on the CPU beyond the copy.
+code expects. As built, the interpreter copies it into the CPU path's own
+32-byte `Vtx3ds` (x, y, z as floats with w 1, s and t as floats, the colour
+bytes, and the palette entry's register in a fourth byte attribute), so
+both paths share one attribute layout, one buffer and one shader program;
+the planned 20-byte raw copy would save the conversion but cost a layout
+switch per path change. Normals share the colour bytes as on the N64; the
+shader's lighting reads them signed.
 
 A draw's matrices are a palette: a vertex load under a new matrix takes
 the next palette slot, and a draw ends when the palette is full (16) or
