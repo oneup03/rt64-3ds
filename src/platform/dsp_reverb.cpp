@@ -23,6 +23,16 @@ recomp3ds::ReverbConfig g_pending;
 bool g_has_pending = false;
 recomp3ds::ReverbConfig g_config;       // the thread's
 
+// Sleep unloads the DSP's firmware and wake loads it afresh, without the
+// effect: the thread sets it again (dsp_reverb_process). A setting made
+// while asleep failed (OpenDSP's mailbox refuses then) and is set again
+// the same way.
+dspHookCookie g_dsp_hook;
+volatile bool g_woke = false;
+void on_dsp_power(DSP_HookType type) {
+    if (type == DSPHOOK_ONWAKEUP) g_woke = true;
+}
+
 void apply(const recomp3ds::ReverbConfig& c) {
     g_config = c;
     // The game's effect as set (each change), with or without OpenDSP.
@@ -110,9 +120,11 @@ void recomp3ds::dsp_reverb_init() {
     u32 caps = 0;
     g_has_reverb = recomp3ds::audio_opendsp() && R_SUCCEEDED(opendspGetCapabilities(&caps)) && (caps & OPENDSP_CAP_REVERB) != 0;
     fprintf(stderr, "dsp-reverb: %s\n", g_has_reverb ? "OpenDSP's reverb on aux bus 0" : "no DSP reverb (the voices play dry)");
+    if (g_has_reverb) dspHook(&g_dsp_hook, on_dsp_power);
 }
 
 void recomp3ds::dsp_reverb_shutdown() {
+    if (g_has_reverb) dspUnhook(&g_dsp_hook);
     if (g_running) {
         opendspReverbSet(0, nullptr);
         opendspDelaySet(0, nullptr);
@@ -139,6 +151,16 @@ void recomp3ds::dsp_reverb_process() {
     recomp3ds::ReverbConfig c;
     if (take) { c = g_pending; g_has_pending = false; }
     LightLock_Unlock(&g_lock);
+    if (g_woke) {
+        // After sleep: the effect the game has now, set again.
+        g_woke = false;
+        if (!take) c = g_config;
+        fprintf(stderr, "dsp-reverb: the DSP woke: the effect set again\n");
+        const u64 t0 = svcGetSystemTick();
+        apply(c);
+        g_ticks = g_ticks + (uint32_t)(svcGetSystemTick() - t0);
+        return;
+    }
     if (!take || c.same(g_config)) return;
     const u64 t0 = svcGetSystemTick();
     apply(c);

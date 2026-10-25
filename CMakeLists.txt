@@ -112,11 +112,30 @@ target_compile_features(rt64_3ds PUBLIC cxx_std_20)
 # its init and exit; the file streaming in audio/ is optional (weak) and
 # left out. The glob is re-read at each build (CONFIGURE_DEPENDS): a new
 # release adds sources (1.2.2: codec_events.c, the MP3 ones).
+# rt64-3ds's fixes to it (opendsp-patches/*.patch, against the submodule's
+# tree) are applied at configure time to a copy of its library sources in
+# the build directory, which is what gets compiled: the submodule stays
+# as upstream has it. A patch that no longer applies stops the configure.
 set(OPENDSP_DIR "${CMAKE_CURRENT_LIST_DIR}/third_party/OpenDSP")
-file(GLOB OPENDSP_SOURCES CONFIGURE_DEPENDS "${OPENDSP_DIR}/library/source/*.c" "${OPENDSP_DIR}/library/source/aac/*.c")
+set(OPENDSP_SRC "${CMAKE_CURRENT_BINARY_DIR}/opendsp-patched")
+file(GLOB OPENDSP_PATCHES CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/opendsp-patches/*.patch")
+list(SORT OPENDSP_PATCHES)
+file(GLOB_RECURSE OPENDSP_ORIGINALS CONFIGURE_DEPENDS "${OPENDSP_DIR}/library/source/*")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${OPENDSP_PATCHES} ${OPENDSP_ORIGINALS})
+file(REMOVE_RECURSE "${OPENDSP_SRC}")
+file(MAKE_DIRECTORY "${OPENDSP_SRC}/library")
+file(COPY "${OPENDSP_DIR}/library/source" DESTINATION "${OPENDSP_SRC}/library")
+foreach(patch_file ${OPENDSP_PATCHES})
+    execute_process(COMMAND patch -p1 --forward --silent -i "${patch_file}" WORKING_DIRECTORY "${OPENDSP_SRC}"
+                    RESULT_VARIABLE patch_result)
+    if(NOT patch_result EQUAL 0)
+        message(FATAL_ERROR "OpenDSP: ${patch_file} did not apply to third_party/OpenDSP")
+    endif()
+endforeach()
+file(GLOB OPENDSP_SOURCES "${OPENDSP_SRC}/library/source/*.c" "${OPENDSP_SRC}/library/source/aac/*.c")
 add_library(opendsp STATIC ${OPENDSP_SOURCES} "${OPENDSP_DIR}/library/source/firmware.s")
 target_include_directories(opendsp PUBLIC "${OPENDSP_DIR}/library/include"
-                           PRIVATE "${OPENDSP_DIR}/library/source" "${OPENDSP_DIR}/firmware")
+                           PRIVATE "${OPENDSP_SRC}/library/source" "${OPENDSP_DIR}/firmware")
 target_compile_options(opendsp PRIVATE $<$<COMPILE_LANGUAGE:C>:-std=gnu11 -O2 -w>
                        $<$<COMPILE_LANGUAGE:ASM>:-Wa,-I,${OPENDSP_DIR}/firmware>)
 target_link_libraries(opendsp PUBLIC ctru m)

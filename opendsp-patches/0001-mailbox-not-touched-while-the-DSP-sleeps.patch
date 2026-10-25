@@ -1,0 +1,45 @@
+--- a/library/source/mailbox.c
++++ b/library/source/mailbox.c
+@@ -11,6 +11,25 @@
+ 
+ static LightLock lock;
+ static bool lock_ready;
++// The DSP is powered down from its sleep hook until it wakes (its memory
++// then raises a precise external abort on the ARM11 at any access): the
++// mailbox is not touched meanwhile. Set under the lock, so a request in
++// flight finishes first. A cancelled sleep leaves the component unloaded:
++// still asleep.
++static dspHookCookie sleep_hook;
++static volatile bool asleep;
++
++static void sleep_hook_fn(DSP_HookType type)
++{
++    if (type == DSPHOOK_ONSLEEP || type == DSPHOOK_ONCANCEL) {
++        LightLock_Lock(&lock);
++        asleep = true;
++        LightLock_Unlock(&lock);
++    } else if (type == DSPHOOK_ONWAKEUP) {
++        // libctru reloads the component before it calls the wake hooks.
++        asleep = false;
++    }
++}
+ 
+ void opendsp_mailbox_setup(void)
+ {
+@@ -18,6 +37,7 @@
+     if (!lock_ready) {
+         LightLock_Init(&lock);
+         lock_ready = true;
++        dspHook(&sleep_hook, sleep_hook_fn);
+     }
+ }
+ 
+@@ -25,6 +45,8 @@
+ {
+     u32 address;
+     vu16 *box;
++    if (asleep)
++        return NULL;
+     if (R_FAILED(DSP_ConvertProcessAddressFromDspDram(EXT_BASE, &address)))
+         return NULL;
+     box = (vu16 *)address;
