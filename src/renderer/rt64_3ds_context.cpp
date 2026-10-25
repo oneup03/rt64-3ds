@@ -1734,7 +1734,14 @@ private:
                 // both eyes (every class's shift is odd in the eye).
                 float sa = 0.0f, sb = 0.0f;
                 if (sfd.on && d.rtt < 0) {
-                    if (classes_[i] == kReticle) sa = rt64_3ds::snap_to_pixels(-sfd.aim_ndc * 200.0f, sfd.px_scale);
+                    if (classes_[i] == kReticle && rt64_3ds::settings().crosshair_hud != 0) {
+                        // The Crosshair row's "HUD depth": where the HUD is
+                        // (a rectangle as the rectangles, triangles as the
+                        // orthographic HUD).
+                        const rt64_3ds::StereoClass hud = d.kind == rt64_3ds::DrawRecord::Tris ? rt64_3ds::StereoClass::Hud : rt64_3ds::StereoClass::Rect;
+                        rt64_3ds::stereo_shift(sfd, hud, d, 1, &sa, &sb);
+                    }
+                    else if (classes_[i] == kReticle) sa = rt64_3ds::snap_to_pixels(-sfd.aim_ndc * 200.0f, sfd.px_scale);
                     else rt64_3ds::stereo_shift(sfd, (rt64_3ds::StereoClass)classes_[i], d, 1, &sa, &sb);
                 }
                 if (sa != last_sa_ || sb != last_sb_) {

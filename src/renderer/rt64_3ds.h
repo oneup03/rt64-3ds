@@ -356,6 +356,9 @@ struct Settings {
     int sep_slider = 25;             // 0..100 (the desktop stops at 50), x0.002 = per-eye separation (fraction of half width)
     int convergence_hundredths = 600; // 10..2000, x0.2 = world units
     int hud_depth = 50;               // 0..100, 50 = screen plane
+    // The crosshair (a draw classify_frame takes for the reticle): 0 at the
+    // depth under it (dynamic, the default), 1 at the HUD's depth (hud_depth).
+    int crosshair_hud = 0;
     bool auto_convergence = true;
     int comfort_target = 0;           // auto-convergence pop-out budget, thousandths of width (-20..30)
     bool hud_on_bottom = true;

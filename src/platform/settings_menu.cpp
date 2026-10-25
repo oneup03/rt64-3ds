@@ -89,6 +89,7 @@ struct Row {
     bool no_save;
     void (*on_change_ctx)(void* ctx, int value);
     void* ctx;
+    int def;                        // its default, before settings.ini (Reset controls)
 };
 constexpr int kMaxRows = 160;
 Row g_rows[kMaxRows];
@@ -99,6 +100,7 @@ int g_row_count = 0;
 int g_conv_tenths = 60;
 int g_auto = 1;
 const char* const kOffOn[] = { "off", "on" };
+const char* const kCrosshairNames[] = { "Dynamic", "HUD depth" };
 
 void apply_conv(int v) { rt64_3ds::settings().convergence_hundredths = v * 10; }
 void apply_auto(int v) { rt64_3ds::settings().auto_convergence = v != 0; }
@@ -444,30 +446,18 @@ void load() {
     FILE* f = fopen(g_path, "r");
     if (f == nullptr) return;
     char line[192];
-    // The old "X / Y buttons" row (xy_buttons=1: X C-Right, Y C-Left),
-    // carried into the X and Y rows when the file has no word of them yet.
-    int old_xy = 0;
-    bool saw_x = false, saw_y = false;
     while (fgets(line, sizeof(line), f)) {
         char key[128], text[64];
         int v;
         if (sscanf(line, "game_mode=%63s", text) == 1) { g_game_mode = text; continue; }
         if (sscanf(line, "%127[^=]=%d", key, &v) != 2) continue;
         if (strncmp(key, "mod.", 4) == 0) { g_mod_values[key] = v; continue; }
-        if (strcmp(key, "xy_buttons") == 0) old_xy = v;
-        if (strcmp(key, "button_x") == 0) saw_x = true;
-        if (strcmp(key, "button_y") == 0) saw_y = true;
         for (int i = 0; i < g_row_count; i++) {
             const Row& r = g_rows[i];
             if (!r.no_save && strcmp(key, r.key) == 0) *r.value = v < r.lo ? r.lo : v > r.hi ? r.hi : v;
         }
     }
     fclose(f);
-    if (old_xy == 1) {
-        // A, B, X, Y, ... (input_mappable_key's order): X is 2, Y is 3.
-        if (!saw_x && recomp3ds::kN64ChoiceButtons[g_button_choice[2]] == recomp3ds::N64_CUP) g_button_choice[2] = recomp3ds::n64_choice_of(recomp3ds::N64_CRIGHT);
-        if (!saw_y && recomp3ds::kN64ChoiceButtons[g_button_choice[3]] == recomp3ds::N64_CDOWN) g_button_choice[3] = recomp3ds::n64_choice_of(recomp3ds::N64_CLEFT);
-    }
 }
 
 // Written when the menu closes (settings_menu_toggle), not on every step.
@@ -493,6 +483,28 @@ void step(int slot, int d) {
     draw_row(slot);
 }
 
+// "Reset controls" (the Controls page's last row): a first press of left
+// or right arms it, a second puts every Controls row back to its default
+// (the game's, before settings.ini), the ZL and ZR rows an Old 3DS hides
+// included. Choosing another row disarms it.
+int g_reset_value = 0;
+const char* const kResetNames[] = { "Press >", "Again: reset" };
+void reset_controls(void*, int) {
+    if (g_reset_value == 1) return;     // stepped onto "Again": armed
+    // Stepped off "Again" (either way): reset.
+    for (int i = 0; i < g_row_count; i++) {
+        Row& r = g_rows[i];
+        const bool controls = r.page == recomp3ds::PageControls || strncmp(r.key, "button_", 7) == 0;
+        if (!controls || r.no_save || *r.value == r.def) continue;
+        *r.value = r.def;
+        fprintf(stderr, "settings: %s=%d (reset)\n", r.key, r.def);
+        if (r.on_change != nullptr) r.on_change(r.def);
+    }
+    g_reset_value = 0;
+    changed();
+    draw_page();
+}
+
 void select_slot(int s) {
     const int n = page_count(g_page);
     if (s >= n) s = n - 1;
@@ -500,6 +512,7 @@ void select_slot(int s) {
     if (s == g_sel) return;
     const int old = g_sel;
     g_sel = s;
+    g_reset_value = 0;                  // a Reset controls left armed: disarmed (redrawn below)
     if (old < 0 || s < 0) draw_tabs();
     // Scroll the chosen row into view (redraws the page), else redraw the two.
     const int top = g_top;
@@ -755,6 +768,8 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "separation", "3D depth", 0, 100, &st.sep_slider, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
     add_row({ "convergence_tenths", "Convergence", 1, 200, &g_conv_tenths, nullptr, true, nullptr, apply_conv, Page3D, 1, nullptr });
     add_row({ "hud_depth", "HUD depth", 0, 100, &st.hud_depth, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
+    // The crosshair at the depth under it (dynamic) or the HUD's (rt64_3ds::Settings::crosshair_hud).
+    add_row({ "crosshair", "Crosshair", 0, 1, &st.crosshair_hud, kCrosshairNames, false, nullptr, nullptr, Page3D, 1, nullptr });
     add_row({ "auto_convergence", "Auto convergence", 0, 1, &g_auto, kOffOn, false, nullptr, apply_auto, Page3D, 1, nullptr });
     add_row({ "comfort_target", "Comfort target", -20, 30, &st.comfort_target, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
     // The desktop's ghost reduction: 100% contrast and a 0% floor are off.
@@ -802,6 +817,8 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
                   apply_touch, PageControls, 1, nullptr });
         add_row({ "touch_button_2", "Touch button 2", 0, recomp3ds::kN64Choices - 1, &g_touch_choice[1], recomp3ds::kN64ChoiceNames, false, nullptr,
                   apply_touch, PageControls, 1, nullptr });
+        add_row({ "reset_controls", "Reset controls", 0, 1, &g_reset_value, kResetNames, false, nullptr, nullptr, PageControls, 1, nullptr,
+                  true, reset_controls, nullptr });
     }
     add_row({ "audio", "Audio", 0, 1, &g_audio_on, kAudioNames, false, nullptr, apply_audio, PageGame, 1, nullptr });
     g_game_name = desc.render.game_name != nullptr ? desc.render.game_name : "";
@@ -873,6 +890,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     // the games run below their own rate there): a game's default of
     // "60 interp." is its old3ds_frame_cap there. settings.ini still decides.
     if (!is_new_3ds && st.frame_cap == 2) st.frame_cap = desc.old3ds_frame_cap < 0 ? 0 : desc.old3ds_frame_cap > 1 ? 1 : desc.old3ds_frame_cap;
+    for (int i = 0; i < g_row_count; i++) g_rows[i].def = *g_rows[i].value;
     load();
     for (int i = 0; i < g_row_count; i++) {
         if (g_rows[i].on_change != nullptr) g_rows[i].on_change(*g_rows[i].value);
