@@ -1,144 +1,52 @@
-; rt64-3ds vertex shader, for both of the renderer's paths.
+; rt64-3ds vertex shader.
 ;
-; Every vertex is 32 bytes: v0 = (x, y, z, w) floats, v1 = (u, v) floats,
-; v2 = (r, g, b, a) bytes, v3.x = a palette entry's first register (byte).
-;
-; A draw of the CPU path (`pre`): the vertex arrives in N64 screen
-; homogeneous space, (x, y) / w N64 pixels (the viewport already applied),
-; z / w in [0, 1], u and v texel coordinates relative to the draw's tile,
-; the colour its bytes.
-;
-; A draw of the GPU path (Interpreter::set_gpu_transform): the vertex as
-; the game loaded it, (x, y, z) the model's coordinates (w unused), (u, v)
-; the N64's s and t, the bytes a colour or, lit, a normal (signed) and the
-; alpha. The palette entry (GpuDraw, 10 vectors at pal[v3.x]) holds the
-; model -> N64 screen homogeneous matrix by columns (the viewport applied,
-; z' = (z + w) / 2 as the CPU path makes it), four light directions
-; rotated into the model's space (unit over 127, zero past the draw's
-; lights) and texture generation's two look-at directions; `uvraw` maps
-; s, t (or the texture generation's dots) to the tile's texels, `lcol` and
-; `amb` are the lights' colours and the ambient over 255, `fogp` the fog's
-; multiplier and offset.
-;
-; Then for both: the stereo shift x += e * (a * w + b) (`stereo` = (a, b),
-; `eye` = e, +1 left, -1 right; a draw's (a, b) is the same for both eyes,
-; so the right eye can run the left eye's commands again), `xform` (the
-; Mtx_OrthoTilt over the N64 screen for the target), `uvscale` (texels to
-; the bound PICA texture's normalized coordinates) and `uv1` (the second
-; texture's: itc * uv1.xy + uv1.zw).
+; Vertices arrive in N64 screen homogeneous space: (x, y) / w are N64 pixels
+; (the viewport already applied on the CPU), z / w in [0, 1] near to far.
+; `xform` is the Mtx_OrthoTilt over the N64 screen for the render target
+; being drawn. `stereo` = (a, b) and `eye` = (e): x' = x + e*(a*w + b), the
+; per-draw shift (zero for mono) for the eye being drawn, e = +1 left, -1
+; right; a draw's (a, b) is the same for both eyes, so the right eye can run
+; the left eye's commands again. `uvscale` turns texel coordinates into
+; normalized ones for the PICA texture actually bound (power-of-two padded).
+; `uv1` maps them to the second texture's normalized coordinates:
+; itc * uv1.xy + uv1.zw.
+
 .fvec xform[4]
 .fvec stereo
 .fvec eye
 .fvec uvscale
 .fvec uv1
-.fvec uvraw
-.fvec lcol[4]
-.fvec amb
-.fvec fogp
-.fvec pal[60]        ; 6 entries of 10 (60 vectors: one GPU command, see GpuDraw::kSlots)
-.bool pre, lit, fogged, texgen
 
-.constf consts(0.00392156862745, 0.0, 1.0, 128.0)   ; 1/255, 0, 1, 128
-.constf consts2(256.0, 255.0, 0.5, 2.0)
+.constf consts(0.00392156862745, 0.0, 1.0, 0.0)
 
 .out opos position
 .out otc0 texcoord0
 .out otc1 texcoord1
 .out oclr color
 
-.alias ipos v0
-.alias iuv v1
-.alias irgba v2
-.alias ipal v3
+.alias ipos v0   ; float4 (x, y, z, w)
+.alias itc  v1   ; float2 texels
+.alias iclr v2   ; ubyte4 RGBA
 
 .proc main
-	; the palette entry (0 for a CPU-path vertex), before anything reads it
-	mova a0.x, ipal.x
+	mov r0, ipos
+	mul r1.x, stereo.x, ipos.w
+	add r1.x, stereo.y, r1.x
+	mul r1.x, eye.x, r1.x
+	add r0.x, r0.x, r1.x
 
-	; the colour bytes as a signed normal: n = c - 256 * (c >= 128)
-	mov r5.xyz, irgba.xyz
-	mov r7.xyz, consts.www
-	sge r6.xyz, r5.xyz, r7.xyz
-	mul r6.xyz, consts2.xxx, r6.xyz
-	add r5.xyz, r5.xyz, -r6.xyz
+	dp4 opos.x, xform[0], r0
+	dp4 opos.y, xform[1], r0
+	dp4 opos.z, xform[2], r0
+	dp4 opos.w, xform[3], r0
 
-	; texel source: texture generation's dots, else (u, v) / (s, t)
-	ifu texgen
-		dp3 r3.x, pal[a0.x + 8], r5
-		dp3 r3.y, pal[a0.x + 9], r5
-		max r3.xy, -consts.zz, r3.xy
-		min r3.xy, consts.zz, r3.xy
-	.else
-		mov r3.xy, iuv.xy
-	.end
-
-	ifu pre
-		; the CPU path: the position as it is, the texels as they are
-		mov r1, ipos
-	.else
-		; the GPU path: (x, y, z, 1) times the entry's matrix, s, t mapped
-		mov r0.xyz, ipos.xyz
-		mov r0.w, consts.z
-		dp4 r1.x, pal[a0.x + 0], r0
-		dp4 r1.y, pal[a0.x + 1], r0
-		dp4 r1.z, pal[a0.x + 2], r0
-		dp4 r1.w, pal[a0.x + 3], r0
-		mul r3.xy, uvraw.xy, r3.xy
-		add r3.xy, uvraw.zw, r3.xy
-	.end
-
-	; the stereo shift, then the screen's projection
-	mul r2.x, stereo.x, r1.w
-	add r2.x, stereo.y, r2.x
-	mul r2.x, eye.x, r2.x
-	add r2.x, r1.x, r2.x
-	mov r2.yzw, r1   ; (a swizzle is applied by lane: r1.yzw here would read z, w, w)
-	dp4 opos.x, xform[0], r2
-	dp4 opos.y, xform[1], r2
-	dp4 opos.z, xform[2], r2
-	dp4 opos.w, xform[3], r2
-
-	; the two textures' coordinates
-	mul r4.xy, uvscale.xy, r3.xy
-	mov r4.zw, consts.yy
-	mov otc0, r4
-	mul r4.xy, uv1.xy, r3.xy
-	add r4.xy, uv1.zw, r4.xy
-	mov otc1, r4
-
-	; the colour: lit from the normal, else the bytes; alpha the byte or the fog
-	ifu lit
-		mov r8.xyz, amb.xyz
-		dp3 r9.x, pal[a0.x + 4], r5
-		max r9.x, consts.y, r9.x
-		mad r8.xyz, r9.xxx, lcol[0].xyz, r8.xyz
-		dp3 r9.x, pal[a0.x + 5], r5
-		max r9.x, consts.y, r9.x
-		mad r8.xyz, r9.xxx, lcol[1].xyz, r8.xyz
-		dp3 r9.x, pal[a0.x + 6], r5
-		max r9.x, consts.y, r9.x
-		mad r8.xyz, r9.xxx, lcol[2].xyz, r8.xyz
-		dp3 r9.x, pal[a0.x + 7], r5
-		max r9.x, consts.y, r9.x
-		mad r8.xyz, r9.xxx, lcol[3].xyz, r8.xyz
-		min r8.xyz, consts.zzz, r8.xyz
-	.else
-		mul r8.xyz, consts.xxx, irgba.xyz
-	.end
-	mul r8.w, consts.x, irgba.w
-	ifu fogged
-		; 2z' - w over w, clamped at zero, times the multiplier plus the offset
-		rcp r10.x, r1.w
-		mul r10.y, consts2.w, r1.z
-		add r10.y, r10.y, -r1.w
-		max r10.y, consts.y, r10.y
-		mul r10.y, r10.y, r10.x
-		mul r10.y, fogp.x, r10.y
-		add r10.y, fogp.y, r10.y
-		max r10.y, consts.y, r10.y
-		min r10.y, consts2.y, r10.y
-		mul r8.w, consts.x, r10.y
-	.end
-	mov oclr, r8
+	mul r2.xy, uvscale.xy, itc.xy
+	mov r2.zw, consts.yyyy
+	mov otc0, r2
+	mul r3.xy, uv1.xy, itc.xy
+	add r3.xy, uv1.zw, r3.xy
+	mov r3.zw, consts.yyyy
+	mov otc1, r3
+	mul oclr, consts.xxxx, iclr
 	end
 .end

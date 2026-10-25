@@ -47,10 +47,6 @@ int main(int argc, char** argv) {
     // RenderDesc::force_lod_branch = false (Banjo): G_BRANCH_Z tests the depth.
     if (getenv("DL_LOD_BRANCH")) interp.set_force_branch_z(false);
     if (const char* e = getenv("DL_WORLD_FAR")) interp.set_world_far((float)atof(e));   // rt64_3ds::set_world_distance / 100
-    // DL_GPU=1: the GPU path (Settings::gpu_transform); its records are then
-    // done here (resolve_gpu_draws) for the reference render and the stats.
-    const bool gpu_path = getenv("DL_GPU") != nullptr;
-    interp.set_gpu_transform(gpu_path);
     // DL_CULLDL=0: gSPCullDisplayList ignored (RenderDesc::cull_dl off), for A/B.
     if (const char* e = getenv("DL_CULLDL")) interp.set_cull_dl(atoi(e) != 0);
     // DL_SCREEN_CULL=<slack>: the screen cull (0.10 an Old 3DS's, 0.25 a New 3DS's; the console adds the eyes' shift).
@@ -118,14 +114,6 @@ int main(int argc, char** argv) {
         }
         else r = interp.run(data_ptr, f);
         interp.finish_triangles(f);
-        if (gpu_path) {
-            const rt64_3ds::InterpreterStats& st = interp.stats();
-            printf("gpu path: %u of %u triangles in %u records (%u started by a full palette), %u vertices in all (raw and transformed), %u indices; refused: cpu slot %u band %u ortho %u decal/primz %u image/rtt %u lit/fog %u texture %u full %u\n",
-                   st.gpu_tris, st.tris, st.gpu_draws, st.gpu_splits, f.verts.size(), f.gidx.size(),
-                   st.gpu_refused[0], st.gpu_refused[1], st.gpu_refused[2], st.gpu_refused[3], st.gpu_refused[4], st.gpu_refused[5], st.gpu_refused[6], st.gpu_refused[7]);
-            printf("gpu path: vertices loaded the CPU way: %u linear texgen, %u too many lights; %u band-refused triangles dropped unshaded\n", st.gpu_load_cpu[0], st.gpu_load_cpu[1], st.gpu_dropped);
-            rt64_3ds::resolve_gpu_draws(f);
-        }
         return r;
     };
     rt64_3ds::FrameRecord frame;

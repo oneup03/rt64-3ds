@@ -843,12 +843,6 @@ public:
                         (float)prof_[0] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[1] * 1000.0f / SYSCLOCK_ARM11 / fpw,
                         (float)prof_[2] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[4] * 1000.0f / SYSCLOCK_ARM11 / fpw,
                         (float)prof_[3] * 1000.0f / SYSCLOCK_ARM11 / fpw);
-                if (gpu_frames_rep_ > 0) {
-                    fprintf(stderr, "rt64-3ds:   GPU path: %u triangles in %u draws a frame (%u frames); the read refused %u to a CPU slot, %u for the band (%u dropped unshaded), %u orthographic, %u decal/prim depth, %u full; %u draws by a full palette\n",
-                            gpu_tris_rep_ / gpu_frames_rep_, gpu_draws_rep_ / gpu_frames_rep_, gpu_frames_rep_,
-                            is.gpu_refused[0], is.gpu_refused[1], is.gpu_dropped, is.gpu_refused[2], is.gpu_refused[3], is.gpu_refused[7], is.gpu_splits);
-                    gpu_tris_rep_ = gpu_draws_rep_ = gpu_frames_rep_ = 0;
-                }
                 fprintf(stderr, "rt64-3ds: frame %u: %u draws %u verts, interp %.1f ms replay %.1f ms (gpu wait %.1f, end %.1f, depth %.1f), tex live %u (%u KB, %u in VRAM, %u mipmapped) %u uploads/frame, linear free %u KB, unknown ops %u ex %u, tev fallbacks %d, cimg %06x w%u, snapshots %u, lod branches %u/%u, culldl %u/%u\n",
                         frames_, (unsigned)last_draws_, (unsigned)last_verts_, g_stats.gfx_ms, g_stats.replay_ms, wait_ms_, end_ms_, depth_ms_, textures_.live(), textures_.bytes() / 1024, textures_.vram_bytes() / 1024, textures_.mipmapped(), last_uploads_,
                         (unsigned)(linearSpaceFree() / 1024), is.unknown, is.ex_unknown, g_stats.combiner_fallbacks, frame_.color_image, frame_.color_width, snapshots_,
@@ -1034,13 +1028,6 @@ public:
         frame_.clear();
         vbo_idx_ ^= 1;
         frame_.verts.set_storage((rt64_3ds::Vtx3ds*)vbo_[vbo_idx_], kVboVerts);
-        {
-            // The GPU path (its row read every list; the buffers made when
-            // first on).
-            const bool gpu = gpu_ready_ && rt64_3ds::settings().gpu_transform != 0 && gpu_buffers();
-            interp_.set_gpu_transform(gpu);
-            frame_.gidx.set_storage(gpu ? gidx_[vbo_idx_] : nullptr, gpu ? kGpuIdx : 0);
-        }
         g_progress.phase = 1;
         maybe_capture(task);
         // In first person the reticle's quads must stay one per record.
@@ -1056,9 +1043,6 @@ public:
                     (unsigned)task->t.data_ptr, (unsigned)task->t.data_size, (unsigned)task->t.ucode, (unsigned)task->t.output_buff, (unsigned)task->t.yield_data_ptr);
         }
         const bool present = interp_.run(task->t.data_ptr, frame_);
-        if (!frame_.gpu.empty()) {
-            if (rt64_3ds::settings().dbg_gpu_resolve == 1) rt64_3ds::resolve_gpu_draws(frame_);
-        }
         pass_next_ = present && interp_.last_list_plain();
         // Everything the replay reads from RDRAM is read by now once the
         // textures are decoded: let a game waiting on "parsed" (Banjo's
@@ -1073,10 +1057,7 @@ public:
         // The reader's core wrote the vertices: flushed from it (the
         // replay's flush, on the gfx thread's core, covers what that core
         // writes). The textures flush themselves as they are decoded.
-        if (reader_ != nullptr) {
-            flush_dcache(frame_.verts.data(), frame_.verts.size() * sizeof(GpuVertex));
-            if (!frame_.gidx.empty()) flush_dcache(frame_.gidx.data(), frame_.gidx.size() * sizeof(uint16_t));
-        }
+        if (reader_ != nullptr) flush_dcache(frame_.verts.data(), frame_.verts.size() * sizeof(GpuVertex));
         return present ? ReadOutcome::Drawn : ReadOutcome::NotDrawn;
     }
     void tell_parsed(uint32_t data_ptr, ReadOutcome read) {
@@ -1287,31 +1268,11 @@ private:
         u_uvscale_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "uvscale");
         u_uv1_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "uv1");
 
-        u_uvraw_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "uvraw");
-        u_lcol_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "lcol");
-        u_amb_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "amb");
-        u_fogp_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "fogp");
-        u_pal_ = shaderInstanceGetUniformLocation(prog_.vertexShader, "pal");
-        // The bools: C3D_BoolUnifSet takes 0x68 + the bool's index.
-        auto bool_id = [&](const char* name) {
-            const int raw = shaderInstanceGetUniformLocation(prog_.vertexShader, name);
-            return raw < 0 ? -1 : 0x68 + ((raw - 0x68) & 0xF);
-        };
-        b_pre_ = bool_id("pre"); b_lit_ = bool_id("lit"); b_fogged_ = bool_id("fogged"); b_texgen_ = bool_id("texgen");
-        gpu_ready_ = u_uvraw_ >= 0 && u_lcol_ >= 0 && u_amb_ >= 0 && u_fogp_ >= 0 && u_pal_ >= 0 && b_pre_ >= 0 && b_lit_ >= 0 && b_fogged_ >= 0 && b_texgen_ >= 0;
-        if (!gpu_ready_)
-            fprintf(stderr, "rt64-3ds: the shader's GPU path uniforms are missing (uvraw %d lcol %d amb %d fogp %d pal %d, bools %d %d %d %d): the Transform row is off\n",
-                    u_uvraw_, u_lcol_, u_amb_, u_fogp_, u_pal_, b_pre_, b_lit_, b_fogged_, b_texgen_);
-
-        // One attribute layout for both paths (Vtx3ds), kept here and set
-        // by pointer: C3D_SetAttrInfo copies a layout over the context's.
-        AttrInfo_Init(&ai_);
-        AttrInfo_AddLoader(&ai_, 0, GPU_FLOAT, 4);
-        AttrInfo_AddLoader(&ai_, 1, GPU_FLOAT, 2);
-        AttrInfo_AddLoader(&ai_, 2, GPU_UNSIGNED_BYTE, 4);
-        AttrInfo_AddLoader(&ai_, 3, GPU_UNSIGNED_BYTE, 4);
-        C3D_SetAttrInfo(&ai_);
-        if (gpu_ready_ && rt64_3ds::settings().gpu_transform != 0) gpu_buffers();
+        C3D_AttrInfo* ai = C3D_GetAttrInfo();
+        AttrInfo_Init(ai);
+        AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 4);
+        AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 2);
+        AttrInfo_AddLoader(ai, 2, GPU_UNSIGNED_BYTE, 4);
 
         for (int i = 0; i < 2; i++) vbo_[i] = (GpuVertex*)linearAlloc(kVboVerts * sizeof(GpuVertex));
         // Frame interpolation: the in-between frames' vertices (the GPU may
@@ -1642,19 +1603,9 @@ private:
         // The kernel's flush, on this core: GSPGPU_FlushDataCache is a
         // request to the GSP module on core 1, which waits for that core.
         flush_dcache(vb, (n + (ghost ? 6 : 0)) * sizeof(GpuVertex));
-        C3D_BufInfo* bi = &bi_;
+        C3D_BufInfo* bi = C3D_GetBufInfo();
         BufInfo_Init(bi);
-        BufInfo_Add(bi, vb, sizeof(GpuVertex), 4, 0x3210);
-        C3D_SetAttrInfo(&ai_);
-        C3D_SetBufInfo(bi);
-        // The GPU path's indices (this frame's), the same way.
-        const uint16_t* gidx = frame_.gidx.data();
-        if (!frame_.gpu.empty() && gidx != nullptr) {
-            flush_dcache((void*)gidx, frame_.gidx.size() * sizeof(uint16_t));
-            gpu_frames_rep_++;
-        }
-        forget_gpu_uniforms();
-        set_path(true);
+        BufInfo_Add(bi, vb, sizeof(GpuVertex), 3, 0x210);
 
         int fallbacks = 0;
         int dbg_issued = 0;             // dbg_frame_trace: draws sent to the GPU
@@ -1753,14 +1704,7 @@ private:
             C3Di_UpdateContext();          // the state flush, timed apart from the draw itself
             u64 tf = tick();
             prof_[4] += tf - td;
-            if (d.gpu >= 0) {
-                draw_gpu(d, gidx);
-                if (pass == 0) { gpu_tris_rep_ += frame_.gpu[d.gpu].count / 3; gpu_draws_rep_++; }
-            }
-            else {
-                set_path(true);
-                C3D_DrawArrays(GPU_TRIANGLES, d.first, d.count);
-            }
+            C3D_DrawArrays(GPU_TRIANGLES, d.first, d.count);
             dbg_issued++;
             prof_[3] += tick() - tf;
             if (debug_frame && debug_sync_) {
@@ -1780,23 +1724,14 @@ private:
                 C3D_FVUnifSet(GPU_VERTEX_SHADER, u_eye_, (float)eye, 0.0f, 0.0f, 0.0f);
                 C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uvscale_, last_us_, last_vs_, 0.0f, 0.0f);
                 C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uv1_, last_uv1_[0], last_uv1_[1], last_uv1_[2], last_uv1_[3]);
+                bi = C3D_GetBufInfo();
                 BufInfo_Init(bi);
-                BufInfo_Add(bi, vb, sizeof(GpuVertex), 4, 0x3210);
-                C3D_SetAttrInfo(&ai_);
-                C3D_SetBufInfo(bi);
-                forget_gpu_uniforms();
-                set_path(true);
+                BufInfo_Add(bi, vb, sizeof(GpuVertex), 3, 0x210);
             }
         };
         auto replayable = [&](size_t i) {
             const rt64_3ds::DrawRecord& d = frame_.draws[i];
-            if ((int)i < draw_lo_ || (int)i > draw_hi_) return false;
-            if (d.gpu >= 0) {
-                if ((size_t)d.gpu >= frame_.gpu.size() || gidx == nullptr) return false;
-                const rt64_3ds::GpuDraw& g = frame_.gpu[d.gpu];
-                return g.count >= 3 && g.first + g.count <= frame_.gidx.size();
-            }
-            return d.count >= 3 && d.first + d.count <= n;
+            return d.count >= 3 && d.first + d.count <= n && (int)i >= draw_lo_ && (int)i <= draw_hi_;
         };
         if (!split) {
             for (size_t i = 0; i < frame_.draws.size(); i++) {
@@ -2854,12 +2789,11 @@ private:
         const float l = -geo_.x0, r = (float)geo_.w + geo_.x0, bot = (float)geo_.h;
         const float xs[6] = { l, r, r, l, r, l }, ys[6] = { 0, 0, bot, 0, bot, bot };
         for (int i = 0; i < 6; i++) {
-            q[i] = GpuVertex{ xs[i], ys[i], 0.0f, 1.0f, 0.0f, 0.0f, bb, bb, bb, 255, 0, 0, 0, 0 };
+            q[i] = GpuVertex{ xs[i], ys[i], 0.0f, 1.0f, 0.0f, 0.0f, bb, bb, bb, 255 };
         }
         return true;
     }
     void ghost_pass(uint32_t first) {
-        set_path(true);
         for (int i = 0; i < 6; i++) {
             C3D_TexEnv* env = C3D_GetTexEnv(i);
             C3D_TexEnvInit(env);
@@ -4279,7 +4213,6 @@ public:
     // What apply_state and the shift cache: forgotten, so the next draw sets
     // all of its state itself.
     void forget_draw_state() {
-        forget_gpu_uniforms();
         last_cull_ = -1;
         last_zoff_ = -1.0f;
         last_tex_[0] = last_tex_[1] = nullptr;
@@ -4357,94 +4290,6 @@ public:
     DVLB_s* dvlb_ = nullptr;
     shaderProgram_s prog_{};
     int u_xform_ = -1, u_stereo_ = -1, u_eye_ = -1, u_uvscale_ = -1, u_uv1_ = -1;
-    // ---- the GPU path (Interpreter::set_gpu_transform, Settings::
-    // gpu_transform): the shader's second set of uniforms (its draws'
-    // matrices, lights, texels and fog, GpuDraw), its bools (`pre` tells a
-    // CPU-path draw from a GPU-path one), and the index buffers, two like
-    // vbo_ (the vertices sit in vbo_ among the CPU path's).
-    bool gpu_ready_ = false;
-    int u_uvraw_ = -1, u_lcol_ = -1, u_amb_ = -1, u_fogp_ = -1, u_pal_ = -1;
-    int b_pre_ = -1, b_lit_ = -1, b_fogged_ = -1, b_texgen_ = -1;
-    // The layout and buffer, kept here and set by pointer: C3D_SetAttrInfo
-    // copies a given layout over the context's own.
-    C3D_AttrInfo ai_{};
-    C3D_BufInfo bi_{};
-    static constexpr uint32_t kGpuIdx = 98304;
-    uint16_t* gidx_[2] = { nullptr, nullptr };
-    // The bools and the GPU-path uniforms as last sent (-1 / unknown after
-    // forget_gpu_uniforms), so a run of like draws sends none of them.
-    int cur_pre_ = -1, cur_lit_ = -1, cur_fogged_ = -1, cur_texgen_ = -1;
-    bool gu_valid_ = false;
-    float gu_lcol_[rt64_3ds::GpuDraw::kLights][4] = {}, gu_amb_[4] = {}, gu_fog_[2] = {}, gu_uv_[4] = {};
-    uint32_t gpu_tris_rep_ = 0, gpu_draws_rep_ = 0, gpu_frames_rep_ = 0;   // this report
-    bool gpu_buffers() {
-        if (gidx_[0] != nullptr) return true;
-        for (int i = 0; i < 2; i++) gidx_[i] = (uint16_t*)linearAlloc(kGpuIdx * sizeof(uint16_t));
-        if (gidx_[0] == nullptr || gidx_[1] == nullptr) {
-            fprintf(stderr, "rt64-3ds: the GPU path's index buffers (%u KB) could not be allocated\n", (unsigned)(2 * kGpuIdx * 2 / 1024));
-            for (int i = 0; i < 2; i++) { if (gidx_[i]) linearFree(gidx_[i]); gidx_[i] = nullptr; }
-            return false;
-        }
-        fprintf(stderr, "rt64-3ds: GPU path: the vertex transform, lighting, texture generation and fog in the vertex shader (index buffers %u KB, linear free %u KB)\n",
-                (unsigned)(2 * kGpuIdx * 2 / 1024), (unsigned)(linearSpaceFree() / 1024));
-        return true;
-    }
-    void forget_gpu_uniforms() {
-        cur_pre_ = cur_lit_ = cur_fogged_ = cur_texgen_ = -1;
-        gu_valid_ = false;
-    }
-    // `pre`: the vertices arrive transformed (the CPU path, the ghost quad),
-    // and the shader's other branches are off (the bools are one register:
-    // whatever changed goes out in one write).
-    void set_path(bool pre) {
-        if (pre) {
-            if (cur_lit_ != 0) { cur_lit_ = 0; if (b_lit_ >= 0) C3D_BoolUnifSet(GPU_VERTEX_SHADER, b_lit_, false); }
-            if (cur_fogged_ != 0) { cur_fogged_ = 0; if (b_fogged_ >= 0) C3D_BoolUnifSet(GPU_VERTEX_SHADER, b_fogged_, false); }
-            if (cur_texgen_ != 0) { cur_texgen_ = 0; if (b_texgen_ >= 0) C3D_BoolUnifSet(GPU_VERTEX_SHADER, b_texgen_, false); }
-        }
-        if (cur_pre_ == (int)pre) return;
-        cur_pre_ = (int)pre;
-        if (b_pre_ >= 0) C3D_BoolUnifSet(GPU_VERTEX_SHADER, b_pre_, pre);
-    }
-    // A GPU-path draw's uniforms (those that changed) and its indexed draw.
-    void draw_gpu(const rt64_3ds::DrawRecord& d, const uint16_t* indices) {
-        const rt64_3ds::GpuDraw& g = frame_.gpu[d.gpu];
-        set_path(false);
-        if (cur_lit_ != (int)g.lit) { cur_lit_ = g.lit; C3D_BoolUnifSet(GPU_VERTEX_SHADER, b_lit_, g.lit); }
-        if (cur_fogged_ != (int)g.fogged) { cur_fogged_ = g.fogged; C3D_BoolUnifSet(GPU_VERTEX_SHADER, b_fogged_, g.fogged); }
-        if (cur_texgen_ != (int)g.texgen) { cur_texgen_ = g.texgen; C3D_BoolUnifSet(GPU_VERTEX_SHADER, b_texgen_, g.texgen); }
-        // (C3D_FVec holds w, z, y, x: the record's x, y, z, w go in by name.)
-        if (!gu_valid_ || memcmp(gu_lcol_, g.lcol, sizeof(gu_lcol_)) != 0) {
-            memcpy(gu_lcol_, g.lcol, sizeof(gu_lcol_));
-            C3D_FVec* lc = C3D_FVUnifWritePtr(GPU_VERTEX_SHADER, u_lcol_, rt64_3ds::GpuDraw::kLights);
-            for (int l = 0; l < rt64_3ds::GpuDraw::kLights; l++) { lc[l].x = g.lcol[l][0]; lc[l].y = g.lcol[l][1]; lc[l].z = g.lcol[l][2]; lc[l].w = 0.0f; }
-        }
-        if (!gu_valid_ || memcmp(gu_amb_, g.amb, sizeof(gu_amb_)) != 0) {
-            memcpy(gu_amb_, g.amb, sizeof(gu_amb_));
-            C3D_FVUnifSet(GPU_VERTEX_SHADER, u_amb_, g.amb[0], g.amb[1], g.amb[2], 0.0f);
-        }
-        if (!gu_valid_ || memcmp(gu_fog_, g.fog, sizeof(gu_fog_)) != 0) {
-            memcpy(gu_fog_, g.fog, sizeof(gu_fog_));
-            C3D_FVUnifSet(GPU_VERTEX_SHADER, u_fogp_, g.fog[0], g.fog[1], 0.0f, 0.0f);
-        }
-        if (!gu_valid_ || memcmp(gu_uv_, g.uv, sizeof(gu_uv_)) != 0) {
-            memcpy(gu_uv_, g.uv, sizeof(gu_uv_));
-            C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uvraw_, g.uv[0], g.uv[1], g.uv[2], g.uv[3]);
-        }
-        gu_valid_ = true;
-        // A GPU command carries at most 256 words and citro3d sends a run of
-        // dirty uniforms as one: the small uniforms go out first, then the
-        // palette (at most 60 vectors) as a command of its own.
-        C3Di_UpdateContext();
-        if (g.nslots > 0) {
-            C3D_FVec* pal = C3D_FVUnifWritePtr(GPU_VERTEX_SHADER, u_pal_, (int)g.nslots * rt64_3ds::GpuDraw::kVecsPerSlot);
-            const float* src = &g.pal[0][0][0];
-            for (uint32_t i = 0; i < g.nslots * rt64_3ds::GpuDraw::kVecsPerSlot; i++, src += 4) {
-                pal[i].x = src[0]; pal[i].y = src[1]; pal[i].z = src[2]; pal[i].w = src[3];
-            }
-        }
-        C3D_DrawElements(GPU_TRIANGLES, (int)g.count, C3D_UNSIGNED_SHORT, indices + g.first);
-    }
     float last_uv1_[4] = { -1.0f, -1.0f, -1.0f, -1.0f };
     C3D_Mtx proj_{};
     GpuVertex* vbo_[4] = { nullptr, nullptr, nullptr, nullptr };

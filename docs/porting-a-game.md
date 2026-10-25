@@ -991,32 +991,17 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   captures plus fuzzed variants (a host harness); `-ffp-contract=off` keeps
   the float operations one for one. Worth it only for a routine the game
   profile puts at the top; the harness is the part not to skip.
-- **The vertex transform on the GPU.** The Transform row (`gpu_transform`,
-  CPU by default on both consoles: docs/gpu-transform-plan.md has the
-  measurements and the reasoning). On, the interpreter keeps the
-  vertices of a load as the game loaded them (`Interpreter::set_gpu_transform`;
-  they go into `FrameRecord::verts` beside the transformed ones, 32 bytes
-  each with the palette entry in the fourth attribute, `gidx` and `gpu`
-  hold the indices and the draws) and only transforms their positions,
-  for gSPCullDisplayList, G_BRANCH_Z and the guard band; a triangle of such
-  vertices under a perspective camera, inside the band and drawn plainly goes
-  to a GPU record as three indices, with its loads' matrices, rotated light
-  directions and texture-generation look-at vectors in the record's palette
-  (6 entries of 10 uniform vectors, one GPU command; a full palette starts a new record), and
-  the one vertex shader (`shaders/rt64_3ds.v.pica`, its `pre` bool false)
-  transforms, lights, generates texture coordinates and fogs it; a CPU-path
-  draw runs the same program with `pre` true, so a frame mixing the two
-  switches no program, layout or buffer, and the GPU-path uniforms go out
-  only when a draw's differ from the last. Everything else (a vertex behind the eye or beyond
-  the band, a decal, primitive depth, an orthographic draw, an image tile, a
-  snapshot, frame or render texture, linear texture generation, more than
-  four lights, an edited vertex) goes the CPU way as before, the raw slots
-  shaded on demand. Not with deferred triangles or frame interpolation.
-  dl_test's `DL_GPU=1` runs the path and does its records in software
-  (`resolve_gpu_draws`) for the reference render: the captures came out
-  pixel-identical at a 2 % tolerance (the lighting is float there, integer
-  on the CPU). The frame line's `GPU path:` note counts the triangles taken
-  and refused by reason.
+- **The vertex transform on the GPU: tried, removed.** A path (October
+  2026) kept plain perspective draws' vertices as the game loaded them and
+  had the vertex shader transform, light, fog and texture them from a
+  per-draw palette of matrices, the CPU keeping only positions for the
+  culls and the guard band. It drew pixel-identically, but on an Old 3DS
+  the list's read cost the same (the interpreter's per-command and
+  per-triangle bookkeeping is the cost, not the vertex maths, and the
+  guard band still needs every position) and the replay three times more
+  (DK64 loads a matrix every 15 triangles or so: each palette entry is 40
+  words of uniforms a draw). citro3d lessons from it are in the port
+  skill's pitfalls.
 - **A world draw distance.** `rt64_3ds::set_world_distance(percent)` (a
   game's settings row, DK64's World distance) drops triangles wholly beyond
   that share of the perspective camera's far plane, and ends a
@@ -1310,7 +1295,7 @@ What has frozen a console so far:
   a list), then the read (about 14). Running the game a list ahead (the
   read on core 1, beside the game) would put about 42 ms a list on core 1,
   about 19 lists a second: no gain.
-- `settings.ini`'s `dbg_cores` (0 auto, 1 "2, game on 1", 2 "2, game on 0", 3 "2, game+read on 0",
+- `settings.ini`'s `dbg_cores` (0 auto, 1 "2, game on 1", 2 "2, game on 0",
   read at start) gives a New 3DS the Old 3DS's layout, to test it on one;
   Auto on an Old 3DS uses the game's choice. The renderer's in-between
   builder (core 1) is off without core 2 (`Settings::no_core2`), and the

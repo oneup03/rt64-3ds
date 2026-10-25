@@ -364,7 +364,6 @@ inline Vtx3ds lerp_vtx(const Vtx3ds& p, const Vtx3ds& q, float t) {
     o.u = p.u + (q.u - p.u) * t; o.v = p.v + (q.v - p.v) * t;
     auto mix = [t](uint8_t a, uint8_t b) { float f = (float)a + ((float)b - (float)a) * t; return (uint8_t)(f < 0.0f ? 0.0f : (f > 255.0f ? 255.0f : f + 0.5f)); };
     o.r = mix(p.r, q.r); o.g = mix(p.g, q.g); o.b = mix(p.b, q.b); o.a = mix(p.a, q.a);
-    o.pal = o.pad0 = o.pad1 = o.pad2 = 0;
     return o;
 }
 void clip_tri(const TriSink& s, const Vtx3ds* tri) {
@@ -489,7 +488,6 @@ inline void output_tri(const TriSink& s, const LoadedVertex& a, const LoadedVert
         t.v = v.v * st - ult;
         remap(t.u, t.v);
         t.r = v.r; t.g = v.g; t.b = v.b; t.a = v.a;
-        t.pal = t.pad0 = t.pad1 = t.pad2 = 0;
     }
     (*s.tris)++;
     if (off_screen(tri, s.screen_w, s.screen_h)) return;
@@ -760,7 +758,6 @@ struct Interpreter::Impl {
     bool extended_rdram = false;
     bool ex_enabled = false;
     Mtx proj{}, mv_stack[kMaxMtxStack]{};
-    bool proj_persp = false;            // is_perspective(proj), kept at every write of proj (tested per triangle)
     int mv_depth = 0;
     Mtx mvp{};
     bool mvp_dirty = true;
@@ -889,62 +886,7 @@ struct Interpreter::Impl {
     int32_t defer_open = -1;               // the record taking deferred triangles (while it is the last)
     uint32_t defer_key_draw = ~0u, defer_key_state = 0;   // the state of dfr's last run
     uint32_t dslot[kMaxVerts] = {};
-    // ---- Interpreter::set_gpu_transform: the GPU transforms, lights and
-    // fogs the vertices (the shader rt64_3ds_gpu.v.pica). A load whose
-    // vertices it can take (no texture generation, at most GpuDraw::kLights
-    // lights, no interpolation) keeps them raw (graw) with their load's
-    // context (gctx, into gctxs) and only transforms their positions here
-    // (vtx's x, y, z, w: for gSPCullDisplayList, G_BRANCH_Z and the guard
-    // band, gband). A triangle of such vertices inside the band, under a
-    // perspective camera, drawn plainly (no decal, primitive depth, image
-    // tile, snapshot, frame or off-screen texture) goes to a GPU record as
-    // three indices of raw vertices appended once per record (gemit), with
-    // the load's matrix and rotated light directions in the record's
-    // palette; anything else resolves the slots the CPU way (slot) and goes
-    // as before. The palette full, a new record starts.
-    bool gpu_on = false;                   // the setting
-    bool gpu_frame = false;                // this list: on and nothing in the way
-    static constexpr uint32_t kGpuFull = 0xFFFFFFFFu;   // gctx: vtx holds the vertex transformed and shaded
-    struct GpuLoadCtx { VtxCtx x; VtxShade sh; float dir[GpuDraw::kLights][3]; float lk[2][3]; uint64_t key; };
-    // What a triangle's record must match of a load: lit, fogged, texture
-    // generation, and the fog's terms when fogged (fog_mul, fog_off).
-    uint64_t gpu_state_key() const {
-        const bool lit = (geometry_mode & G_LIGHTING) != 0, fogged = (geometry_mode & G_FOG) != 0;
-        uint64_t k = (lit ? 1u : 0u) | (fogged ? 2u : 0u) | ((lit && (geometry_mode & G_TEXTURE_GEN) != 0) ? 4u : 0u);
-        if (fogged) k |= ((uint64_t)(uint16_t)fog_mul << 16) | ((uint64_t)(uint16_t)fog_off << 32);
-        return k;
-    }
-    std::vector<GpuLoadCtx> gctxs;         // this list's loads (cleared when the list ends)
-    uint8_t graw[kMaxVerts][16] = {};
-    uint32_t gctx[kMaxVerts] = {};
-    uint8_t gband[kMaxVerts] = {};         // the position inside the guard band and in front of the eye
-    uint8_t gshaded[kMaxVerts] = {};       // vtx holds the raw vertex shaded too (resolve_gpu_slot); the raw one stays
-    int32_t gemit_draw[kMaxVerts] = {};    // the record the slot's raw vertex was last appended for
-    uint16_t gemit_idx[kMaxVerts] = {};    // ... its index there
-    inline bool band_ok(float x, float y, float z, float w) const {
-        if (!(w > 0.0f) || z < 0.0f) return false;
-        const float gx = kGuard * w;
-        const float dx = x - (float)screen_w * 0.5f * w, dy = y - (float)screen_h * 0.5f * w;
-        return dx <= gx && dx >= -gx && dy <= gx && dy >= -gx;
-    }
-    // A raw slot transformed and shaded the CPU way, for a triangle the GPU
-    // path doesn't take (or a vertex edit).
-    void resolve_gpu_slot(int i) {
-        const uint32_t ci = gctx[i];
-        if (ci == kGpuFull || gshaded[i]) return;
-        gshaded[i] = 1;
-        if (ci >= gctxs.size()) return;
-        const GpuLoadCtx& c = gctxs[ci];
-        const uint8_t* src = graw[i];
-        const float ob0 = (float)*(const int16_t*)(src + 2), ob1 = (float)*(const int16_t*)(src + 0), ob2 = (float)*(const int16_t*)(src + 6);
-        const float tu = (float)*(const int16_t*)(src + 10), tv = (float)*(const int16_t*)(src + 8);
-        shade_vertex(vtx[i], c.x, &c.sh, ob0, ob1, ob2, tu, tv, src[15], src[14], src[13], src[12]);
-    }
-    LoadedVertex& slot(int i) {
-        if (defer_active) return dfr->resolve(dslot[i]);
-        if (gctx[i] != kGpuFull && !gshaded[i]) resolve_gpu_slot(i);
-        return vtx[i];
-    }
+    LoadedVertex& slot(int i) { return defer_active ? dfr->resolve(dslot[i]) : vtx[i]; }
     // gSPCullDisplayList(v0, vn): true when every vertex from v0 to vn lies
     // off the same side of the visible area, or behind the eye, as the RSP's
     // clip codes decide it (the AND of the vertices' codes); the list then
@@ -1733,40 +1675,8 @@ struct Interpreter::Impl {
             }
             dlog = D.verts.data();
         }
-        // The GPU path: the vertices kept raw with their load's context,
-        // their positions alone transformed here.
-        const bool texgen_linear = texgen && (geometry_mode & G_TEXTURE_GEN_LINEAR) != 0;
-        if (gpu_frame && hi > lo && lit && (texgen_linear || num_lights > GpuDraw::kLights)) stats->gpu_load_cpu[texgen_linear ? 0 : 1] += (uint32_t)(hi - lo);
-        if (gpu_frame && hi > lo && xe == nullptr && vprev == nullptr && !(lit && (texgen_linear || num_lights > GpuDraw::kLights))) {
-            const uint32_t ci = (uint32_t)gctxs.size();
-            gctxs.emplace_back();
-            GpuLoadCtx& c = gctxs.back();
-            c.key = gpu_state_key();
-            c.x = x;
-            if (lit) c.sh = sh; else memset(&c.sh, 0, sizeof(c.sh));
-            for (int l = 0; l < GpuDraw::kLights; l++)
-                for (int k = 0; k < 3; k++) c.dir[l][k] = (lit && l < num_lights) ? ldir[l][k] : 0.0f;
-            for (int l = 0; l < 2; l++)
-                for (int k = 0; k < 3; k++) c.lk[l][k] = (lit && texgen) ? lk[l][k] : 0.0f;
-            for (int i = lo; i < hi; i++) {
-                const uint8_t* src = rdram + ((addr + i * 16) & 0xFFFFFC);
-                memcpy(graw[v0 + i], src, 16);
-                const float ob0 = (float)*(const int16_t*)(src + 2), ob1 = (float)*(const int16_t*)(src + 0), ob2 = (float)*(const int16_t*)(src + 6);
-                LoadedVertex& v = vtx[v0 + i];
-                v.x = ob0 * m[0][0] + ob1 * m[1][0] + ob2 * m[2][0] + m[3][0];
-                v.y = ob0 * m[0][1] + ob1 * m[1][1] + ob2 * m[2][1] + m[3][1];
-                v.z = ob0 * m[0][2] + ob1 * m[1][2] + ob2 * m[2][2] + m[3][2];
-                v.w = ob0 * m[0][3] + ob1 * m[1][3] + ob2 * m[2][3] + m[3][3];
-                gctx[v0 + i] = ci;
-                gshaded[v0 + i] = 0;
-                gband[v0 + i] = band_ok(v.x, v.y, v.z, v.w) ? 1 : 0;
-                gemit_draw[v0 + i] = -1;
-            }
-            return;
-        }
         for (int i = lo; i < hi; i++) {
             const uint8_t* src = rdram + ((addr + i * 16) & 0xFFFFFC);
-            gctx[v0 + i] = kGpuFull;
             // RDRAM is stored in 32-bit little-endian words: halves are at ^2, bytes at ^3.
             float ob0 = (float)*(const int16_t*)(src + 2), ob1 = (float)*(const int16_t*)(src + 0), ob2 = (float)*(const int16_t*)(src + 6);
             const int16_t tc0 = *(const int16_t*)(src + 10), tc1 = *(const int16_t*)(src + 8);
@@ -2006,142 +1916,6 @@ struct Interpreter::Impl {
         return (cimg >= 0x800000 && !is_presented_fb(cimg)) || cur_rtt >= 0;
     }
 
-    // A new record of triangles for the state now (and the GPU path's
-    // data when it is to take them and its textures are plain).
-    DrawRecord* open_record(bool img, bool as_gpu) {
-        if (!rect_slices.empty()) flush_rect_slices();   // the run of rectangles ends
-        last_draw_seq = state_seq;
-        const TexDesc* tex = img ? img_tex : current_textures();
-        out->draws.emplace_back();
-        DrawRecord* r = &out->draws.back();
-        r->kind = DrawRecord::Tris;
-        r->first = (uint32_t)out->verts.size();
-        r->count = 0;
-        snapshot(*r);
-        r->tex[0] = tex[0];
-        r->tex[1] = tex[1];
-        if (frame_copy) note_draw(*r);
-        if (inst_track) start_instance(*r);
-        if (as_gpu && !r->tex[0].snapshot && !r->tex[0].frame && r->tex[0].rtt < 0 &&
-            !r->tex[1].snapshot && !r->tex[1].frame && r->tex[1].rtt < 0) {
-            r->gpu = (int32_t)out->gpu.size();
-            out->gpu.emplace_back();
-            open_gpu_draw(out->gpu.back());
-            stats->gpu_draws++;
-        }
-        // Deferred triangles: a record whose texel coordinates are the
-        // vertices' own (not mapped onto an image, a frame, a snapshot
-        // or a render texture) takes them all.
-        if (defer_active && !img && !r->tex[0].snapshot && !r->tex[0].frame && r->tex[0].rtt < 0)
-            defer_open = (int32_t)out->draws.size() - 1;
-        return r;
-    }
-    // The shader's per-draw uniforms from the state: the texel mapping
-    // (G_TEXTURE's scale, the tile's shift and origin), the lights' colours
-    // and the ambient, the fog, and what the draw is.
-    void gpu_draw_state(GpuDraw& g) const {
-        const Tile& tl = tiles[texture.tile & 7];
-        g.lit = (geometry_mode & G_LIGHTING) != 0;
-        g.fogged = (geometry_mode & G_FOG) != 0;
-        g.texgen = g.lit && (geometry_mode & G_TEXTURE_GEN) != 0;
-        g.fog_mul = fog_mul; g.fog_off = fog_off;
-        g.fog[0] = (float)fog_mul; g.fog[1] = (float)fog_off;
-        g.uscale = (float)texture.scaleS / (65536.0f * 32.0f); g.vscale = (float)texture.scaleT / (65536.0f * 32.0f);
-        g.ss = shift_scale(tl.shifts); g.st = shift_scale(tl.shiftt);
-        g.uls = (float)(tl.uls >> 2) + tile_du[0]; g.ult = (float)(tl.ult >> 2) + tile_dv[0];
-        if (g.texgen) {
-            // shade_vertex: u = (d + 1) / 4 * scale / 32, then the tile's u * ss - uls.
-            const float as = 0.25f * (float)texture.scaleS / 32.0f * g.ss, at = 0.25f * (float)texture.scaleT / 32.0f * g.st;
-            g.uv[0] = as; g.uv[1] = at; g.uv[2] = as - g.uls; g.uv[3] = at - g.ult;
-        }
-        else {
-            g.uv[0] = g.uscale * g.ss; g.uv[1] = g.vscale * g.st; g.uv[2] = -g.uls; g.uv[3] = -g.ult;
-        }
-        for (int l = 0; l < GpuDraw::kLights; l++) {
-            const bool on = g.lit && l < num_lights;
-            for (int k = 0; k < 3; k++) g.lcol[l][k] = on ? (float)lights[l].col[k] / 255.0f : 0.0f;
-            g.lcol[l][3] = 0.0f;
-        }
-        for (int k = 0; k < 3; k++) g.amb[k] = g.lit ? (float)ambient[k] / 255.0f : 0.0f;
-        g.amb[3] = 0.0f;
-    }
-    void open_gpu_draw(GpuDraw& g) const {
-        g.first = out->gidx.size();
-        g.count = 0;
-        g.nslots = 0;
-        gpu_draw_state(g);
-    }
-    // After state commands: the record's uniforms still those the state gives.
-    bool gpu_params_same(const GpuDraw& g) const {
-        GpuDraw now;
-        gpu_draw_state(now);
-        return now.lit == g.lit && now.fogged == g.fogged && now.texgen == g.texgen && now.fog_mul == g.fog_mul && now.fog_off == g.fog_off &&
-               memcmp(now.uv, g.uv, sizeof(g.uv)) == 0 && memcmp(now.lcol, g.lcol, sizeof(g.lcol)) == 0 && memcmp(now.amb, g.amb, sizeof(g.amb)) == 0;
-    }
-    // A GPU record's triangle: its three raw vertices appended for the
-    // record (once each, with their loads' palette entries) and three
-    // indices. A full palette starts a new record of the same state (r
-    // then points at it). False when the buffers are full.
-    bool emit_gpu_tri(DrawRecord*& r, int i0, int i1, int i2) {
-        const int sl[3] = { i0, i1, i2 };
-        uint16_t idx[3] = {};
-        for (int attempt = 0; attempt < 2; attempt++) {
-            GpuDraw* g = &out->gpu[r->gpu];
-            const int32_t rec = (int32_t)(r - out->draws.data());
-            bool need_split = false;
-            for (int k = 0; k < 3; k++) {
-                const int s = sl[k];
-                if (gemit_draw[s] == rec) { idx[k] = gemit_idx[s]; continue; }
-                const uint32_t ci = gctx[s];
-                int ps = -1;
-                if (g->nslots > 0 && g->ctx_of_slot[g->last_slot] == ci) ps = (int)g->last_slot;
-                else for (uint32_t q = 0; q < g->nslots; q++) if (g->ctx_of_slot[q] == ci) { ps = (int)q; break; }
-                if (ps < 0) {
-                    if (g->nslots >= (uint32_t)GpuDraw::kSlots) { need_split = true; break; }
-                    ps = (int)g->nslots++;
-                    g->ctx_of_slot[ps] = ci;
-                    const GpuLoadCtx& c = gctxs[ci];
-                    for (int col = 0; col < 4; col++)
-                        for (int row = 0; row < 4; row++) g->pal[ps][col][row] = c.x.m[row][col];
-                    for (int l = 0; l < GpuDraw::kLights; l++) {
-                        for (int k2 = 0; k2 < 3; k2++) g->pal[ps][4 + l][k2] = c.dir[l][k2];
-                        g->pal[ps][4 + l][3] = 0.0f;
-                    }
-                    for (int l = 0; l < 2; l++) {
-                        for (int k2 = 0; k2 < 3; k2++) g->pal[ps][8 + l][k2] = c.lk[l][k2];
-                        g->pal[ps][8 + l][3] = 0.0f;
-                    }
-                }
-                g->last_slot = (uint32_t)ps;
-                if (out->verts.size() >= 65535) return false;
-                Vtx3ds* v = out->verts.append(1);
-                if (v == nullptr) return false;
-                const uint8_t* src = graw[s];
-                v->x = (float)*(const int16_t*)(src + 2); v->y = (float)*(const int16_t*)(src + 0); v->z = (float)*(const int16_t*)(src + 6); v->w = 1.0f;
-                v->u = (float)*(const int16_t*)(src + 10); v->v = (float)*(const int16_t*)(src + 8);
-                v->r = src[15]; v->g = src[14]; v->b = src[13]; v->a = src[12];
-                v->pal = (uint8_t)(ps * GpuDraw::kVecsPerSlot);
-                v->pad0 = v->pad1 = v->pad2 = 0;
-                idx[k] = (uint16_t)(out->verts.size() - 1);
-                gemit_draw[s] = rec;
-                gemit_idx[s] = idx[k];
-            }
-            if (!need_split) {
-                uint16_t* p = out->gidx.append(3);
-                if (p == nullptr) return false;
-                p[0] = idx[0]; p[1] = idx[1]; p[2] = idx[2];
-                g->count += 3;
-                stats->tris++;
-                stats->gpu_tris++;
-                return true;
-            }
-            stats->gpu_splits++;
-            r = open_record(false, true);
-            if (r->gpu < 0) return false;
-        }
-        return false;
-    }
-
     void emit_tri(int i0, int i1, int i2) {
 #ifdef DL_BENCH_SKIP_TRI
         return;
@@ -2162,41 +1936,6 @@ struct Interpreter::Impl {
                 else stats->image_fallbacks++;
             }
         }
-        // The GPU path for this triangle: its slots raw and inside the
-        // band, under a perspective camera, drawn plainly, their loads lit
-        // and fogged as the state is now (open_gpu_draw's uniforms).
-        bool want_gpu = gpu_frame;
-        if (want_gpu) {
-            int why = -1;
-            if (gctx[i0] == kGpuFull || gctx[i1] == kGpuFull || gctx[i2] == kGpuFull) why = 0;
-            else if (!gband[i0] || !gband[i1] || !gband[i2]) why = 1;
-            else if (!proj_persp) why = 2;
-            else if ((othermode_l & 0xC00) == 0xC00 || (othermode_l & G_ZS_PRIM) != 0) why = 3;
-            else if (img || cur_rtt >= 0) why = 4;
-            else {
-                const uint64_t key = gpu_state_key();
-                if (gctxs[gctx[i0]].key != key || gctxs[gctx[i1]].key != key || gctxs[gctx[i2]].key != key) why = 5;
-            }
-            if (why >= 0) {
-                want_gpu = false;
-                stats->gpu_refused[why]++;
-                // Outside the band: what the CPU path would drop anyway
-                // (a back face, off the screen), dropped here before any
-                // shading; the rest is clipped the CPU way below.
-                if (why == 1) {
-                    const LoadedVertex &a = vtx[i0], &b = vtx[i1], &c = vtx[i2];
-                    const uint32_t cb = cull_bits();
-                    if (cb != 0 && culled(a, b, c, cb)) { stats->gpu_dropped++; return; }
-                    if (a.w > 0.0f && b.w > 0.0f && c.w > 0.0f) {
-                        Vtx3ds t[3];
-                        t[0].x = a.x; t[0].y = a.y; t[0].z = a.z; t[0].w = a.w;
-                        t[1].x = b.x; t[1].y = b.y; t[1].z = b.z; t[1].w = b.w;
-                        t[2].x = c.x; t[2].y = c.y; t[2].z = c.z; t[2].w = c.w;
-                        if (off_screen(t, screen_w, screen_h)) { stats->gpu_dropped++; return; }
-                    }
-                }
-            }
-        }
         DrawRecord* r = nullptr;
         if (!out->draws.empty()) {
             DrawRecord& last = out->draws.back();
@@ -2205,10 +1944,8 @@ struct Interpreter::Impl {
             bool split = split_untagged_ortho && !last.perspective && last.mv_auto && last.mv_seq != mv_seq;
             if (inst_track && new_instance_pending()) split = true;
             // (A record taking deferred triangles has no vertices yet.)
-            const bool tail = last.gpu >= 0 ? out->gpu[last.gpu].first + out->gpu[last.gpu].count == out->gidx.size()
-                                            : defer_open == (int32_t)out->draws.size() - 1 || last.first + last.count == out->verts.size();
-            // A GPU record continues with GPU triangles alone, a CPU one with the CPU's.
-            if (last.kind == DrawRecord::Tris && tail && !split && (last.gpu >= 0) == want_gpu) {
+            const bool tail = defer_open == (int32_t)out->draws.size() - 1 || last.first + last.count == out->verts.size();
+            if (last.kind == DrawRecord::Tris && tail && !split) {
                 if (last_draw_seq == state_seq && last_tri_img == img) {
                     r = &last;
                 }
@@ -2220,7 +1957,7 @@ struct Interpreter::Impl {
 #ifdef DL_BENCH_NO_PROBE
                     if (false)
 #endif
-                    if (same_as_last(last, img ? img_tex : current_textures()) && (!want_gpu || gpu_params_same(out->gpu[last.gpu]))) {
+                    if (same_as_last(last, img ? img_tex : current_textures())) {
                         last_draw_seq = state_seq;
                         r = &last;
                         stats->draws_merged++;
@@ -2228,17 +1965,27 @@ struct Interpreter::Impl {
                 }
             }
         }
-        if (r == nullptr) r = open_record(img, want_gpu);
-        if (want_gpu && r->gpu < 0) stats->gpu_refused[6]++;
-        last_tri_img = img;
-        if (r->gpu >= 0) {
-            if (emit_gpu_tri(r, i0, i1, i2)) return;
-            // The GPU buffers are full: this triangle and the rest of the
-            // list the CPU way.
-            gpu_frame = false;
-            stats->gpu_refused[7]++;
-            r = open_record(img, false);
+        if (r == nullptr) {
+            if (!rect_slices.empty()) flush_rect_slices();   // the run of rectangles ends
+            last_draw_seq = state_seq;
+            const TexDesc* tex = img ? img_tex : current_textures();
+            out->draws.emplace_back();
+            r = &out->draws.back();
+            r->kind = DrawRecord::Tris;
+            r->first = (uint32_t)out->verts.size();
+            r->count = 0;
+            snapshot(*r);
+            r->tex[0] = tex[0];
+            r->tex[1] = tex[1];
+            if (frame_copy) note_draw(*r);
+            if (inst_track) start_instance(*r);
+            // Deferred triangles: a record whose texel coordinates are the
+            // vertices' own (not mapped onto an image, a frame, a snapshot
+            // or a render texture) takes them all.
+            if (defer_active && !img && !r->tex[0].snapshot && !r->tex[0].frame && r->tex[0].rtt < 0)
+                defer_open = (int32_t)out->draws.size() - 1;
         }
+        last_tri_img = img;
 #ifdef DL_BENCH_NO_EMIT
         return;
 #endif
@@ -2609,7 +2356,6 @@ struct Interpreter::Impl {
             else if (r.tex[0].frame) frame_uv(r.tex[0], q[i].u, q[i].v, q[i].u, q[i].v, stretch);
             else if (r.tex[0].rtt >= 0) rtt_uv(r.tex[0], q[i].u, q[i].v);
             q[i].r = q[i].g = q[i].b = q[i].a = 0;   // rectangles have no shade: SHADE reads as 0 (as RT64)
-            q[i].pal = q[i].pad0 = q[i].pad1 = q[i].pad2 = 0;
         }
         Vtx3ds* o = out->verts.append(u_clamp >= 0.0f ? 12 : 6);
         if (o == nullptr) { out->draws.pop_back(); return; }
@@ -2841,7 +2587,7 @@ struct Interpreter::Impl {
                 return 0;
             case EX_POPPROJMATRIX:
                 if (proj_depth > 0) {
-                    proj = proj_stack[--proj_depth]; proj_persp = is_perspective(proj); mvp_dirty = true; inst_dirty = true;
+                    proj = proj_stack[--proj_depth]; mvp_dirty = true; inst_dirty = true;
                     update_depth_terms();
                     if (ip != nullptr) { pv_view = pv_view_stack[proj_depth]; pv_proj = pv_proj_stack[proj_depth]; proj_addr = proj_addr_stack[proj_depth]; proj_seq++; }
                 }
@@ -2952,7 +2698,6 @@ struct Interpreter::Impl {
     void apply_matrix(const Mtx& m, uint8_t p) {
         if (p & 4) {
             if (p & 2) proj = m; else mul(proj, m, proj);
-            proj_persp = is_perspective(proj);
             update_depth_terms();
             if (ip != nullptr) interp_proj_matrix(m, p);
             inst_dirty = true;
@@ -3128,9 +2873,6 @@ struct Interpreter::Impl {
                             slot_src[v] = (uint32_t)ip->lv.size();
                             ip->lv.push_back(q);
                         }
-                        // A raw vertex of the GPU path: shaded here and
-                        // edited below, the raw one no longer the vertex.
-                        if (gctx[v] != kGpuFull) { resolve_gpu_slot(v); gctx[v] = kGpuFull; }
                         // Deferred triangles: the triangles before keep the vertex as it was.
                         if (defer_active && (where == 0x10 || where == 0x14)) {
                             const LoadedVertex was = slot(v);
@@ -3599,12 +3341,8 @@ struct Interpreter::Impl {
 
     void begin_list(FrameRecord& o) {
         out = &o;
-        gctxs.clear();
-        gpu_frame = gpu_on && !defer_active && ip == nullptr && o.gidx.has_storage();
-        for (int i = 0; i < kMaxVerts; i++) { gctx[i] = kGpuFull; gemit_draw[i] = -1; }
         mv_depth = 0;
         mvp_dirty = true;
-        proj_persp = is_perspective(proj);
         proj_group_depth = mv_group_depth = 0;
         proj_groups[0] = 0;
         // Untagged modelview draws carry G_EX_ID_AUTO, as RT64's TransformGroup
@@ -4089,7 +3827,6 @@ void Interpreter::set_aim_hash(bool on) { impl_->aim_hash = on; }
 void Interpreter::set_force_branch_z(bool on) { impl_->force_branch_z = on; }
 void Interpreter::set_world_far(float fraction) { impl_->world_far = fraction; if (fraction <= 0.0f) g_world_far_w = 0.0f; }
 void Interpreter::set_cull_dl(bool on) { impl_->cull_dl = on; }
-void Interpreter::set_gpu_transform(bool on) { impl_->gpu_on = on; }
 void Interpreter::set_screen_cull(float slack) { g_screen_cull_slack = slack; }
 void Interpreter::set_eye_cull(float m) { g_eye_cull = m > 0.0f ? m : 0.0f; }
 void Interpreter::set_gbi(Gbi gbi) {
@@ -4133,69 +3870,3 @@ void Interpreter::set_screen(const ScreenGeometry& geo) {
 }
 
 }   // namespace rt64_3ds
-
-// The GPU path's records done here instead (rt64_3ds_dl.h): the shader's
-// arithmetic in floats, the N64's integer lighting within a bit.
-void rt64_3ds::resolve_gpu_draws(FrameRecord& f) {
-    for (DrawRecord& d : f.draws) {
-        if (d.gpu < 0 || (size_t)d.gpu >= f.gpu.size()) { d.gpu = -1; continue; }
-        const GpuDraw& g = f.gpu[d.gpu];
-        d.first = f.verts.size();
-        d.count = 0;
-        const uint32_t cull = d.geometry_mode & (G_CULL_FRONT | G_CULL_BACK);
-        for (uint32_t t = 0; t + 2 < g.count; t += 3) {
-            Vtx3ds tri[3];
-            bool ok = true;
-            for (int k = 0; k < 3 && ok; k++) {
-                const uint32_t ii = g.first + t + k;
-                if (ii >= f.gidx.size() || f.gidx[ii] >= f.verts.size()) { ok = false; break; }
-                const Vtx3ds rv = f.verts[f.gidx[ii]];   // (a copy: verts grows below)
-                const int slot = rv.pal / GpuDraw::kVecsPerSlot;
-                if (slot >= GpuDraw::kSlots) { ok = false; break; }
-                const float ob[4] = { rv.x, rv.y, rv.z, 1.0f };
-                const float s = rv.u, tt = rv.v;
-                Vtx3ds& v = tri[k];
-                float o[4];
-                for (int c = 0; c < 4; c++) o[c] = ob[0] * g.pal[slot][c][0] + ob[1] * g.pal[slot][c][1] + ob[2] * g.pal[slot][c][2] + g.pal[slot][c][3];
-                v.x = o[0]; v.y = o[1]; v.z = o[2]; v.w = o[3];
-                const uint8_t c0 = rv.r, c1 = rv.g, c2 = rv.b, c3 = rv.a;
-                if (g.texgen) {
-                    const float n[3] = { (float)(int8_t)c0, (float)(int8_t)c1, (float)(int8_t)c2 };
-                    float dx = n[0] * g.pal[slot][8][0] + n[1] * g.pal[slot][8][1] + n[2] * g.pal[slot][8][2];
-                    float dy = n[0] * g.pal[slot][9][0] + n[1] * g.pal[slot][9][1] + n[2] * g.pal[slot][9][2];
-                    if (dx < -1.0f) dx = -1.0f; if (dx > 1.0f) dx = 1.0f;
-                    if (dy < -1.0f) dy = -1.0f; if (dy > 1.0f) dy = 1.0f;
-                    v.u = dx * g.uv[0] + g.uv[2];
-                    v.v = dy * g.uv[1] + g.uv[3];
-                }
-                else {
-                    v.u = s * g.uv[0] + g.uv[2];
-                    v.v = tt * g.uv[1] + g.uv[3];
-                }
-                if (g.lit) {
-                    const float n[3] = { (float)(int8_t)c0, (float)(int8_t)c1, (float)(int8_t)c2 };
-                    float col[3] = { g.amb[0], g.amb[1], g.amb[2] };
-                    for (int l = 0; l < GpuDraw::kLights; l++) {
-                        const float* dir = g.pal[slot][4 + l];
-                        float dd = n[0] * dir[0] + n[1] * dir[1] + n[2] * dir[2];
-                        if (dd < 0.0f) dd = 0.0f;
-                        for (int q = 0; q < 3; q++) col[q] += dd * g.lcol[l][q];
-                    }
-                    for (int q = 0; q < 3; q++) { if (col[q] > 1.0f) col[q] = 1.0f; if (col[q] < 0.0f) col[q] = 0.0f; }
-                    v.r = (uint8_t)(col[0] * 255.0f + 0.5f); v.g = (uint8_t)(col[1] * 255.0f + 0.5f); v.b = (uint8_t)(col[2] * 255.0f + 0.5f);
-                }
-                else { v.r = c0; v.g = c1; v.b = c2; }
-                v.a = g.fogged ? rsp_fog(v.z, v.w, g.fog[0], g.fog[1]) : c3;
-            }
-            if (!ok) continue;
-            if (cull != 0 && culled(tri[0], tri[1], tri[2], cull)) continue;
-            Vtx3ds* p = f.verts.append(3);
-            if (p == nullptr) break;
-            for (int k = 0; k < 3; k++) { tri[k].pal = tri[k].pad0 = tri[k].pad1 = tri[k].pad2 = 0; p[k] = tri[k]; }
-            d.count += 3;
-        }
-        d.gpu = -1;
-    }
-    f.gpu.clear();
-    f.gidx.clear();
-}

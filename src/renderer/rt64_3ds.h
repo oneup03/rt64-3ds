@@ -376,15 +376,6 @@ struct Settings {
     // 2 (RenderDesc::frame_interpolation only): 60 a second while the game
     // asks for 30, an interpolated frame between each two of the game's.
     int frame_cap = 0;
-    // The GPU path (Interpreter::set_gpu_transform): the vertex transform,
-    // lighting, texture generation and fog in the vertex shader for plain
-    // perspective draws, the CPU keeping the positions for its culls and the
-    // guard band. The Transform row (CPU / GPU), off by default on both
-    // consoles: measured on an Old 3DS, the read cost the same with the
-    // path on (the interpreter's bookkeeping, not the vertex math, is its
-    // cost) and the replay more (docs/gpu-transform-plan.md).
-    int gpu_transform = 0;
-    int dbg_gpu_resolve = 0;          // settings.ini: 1 the GPU path's records done on the CPU after the read (resolve_gpu_draws), to tell the read from the shader
     // RenderDesc::double_eyes, as the game sets it unless settings.ini says
     // otherwise (read at start; off on an Old 3DS by default).
     int gpu_double_eyes = 0;
