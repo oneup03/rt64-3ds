@@ -1002,13 +1002,11 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   (DK64 loads a matrix every 15 triangles or so: each palette entry is 40
   words of uniforms a draw). citro3d lessons from it are in the port
   skill's pitfalls.
-- **A world draw distance.** `rt64_3ds::set_world_distance(percent)` (a
-  game's settings row, DK64's World distance) drops triangles wholly beyond
-  that share of the perspective camera's far plane, and ends a
-  gSPCullDisplayList'd list whose tested vertices all lie beyond it. It
-  saves the GPU and the triangles' output, not the vertices' transforms,
-  which are done before the test: on DK64 it moved no frame rate, the
-  read of the list being the cost.
+- **A world draw distance: tried, removed.** Dropping triangles wholly
+  beyond a share of the camera's far plane (and gSPCullDisplayList'd lists
+  whose tested vertices all were) saved no frame rate on DK64: they are
+  dropped after their vertices are transformed and lit, the read's cost,
+  and the slowest scenes have little far away.
 - **libultra's matrix helpers as host functions.** `src/platform/gu_native.cpp`
   implements `guMtxL2F`, `guMtxF2L`, `guMtxIdentF`, `guMtxIdent`,
   `guMtxCatF`, `guMtxXFMF`, `guMtxXFML`, `guNormalize`, `guRotateF`,

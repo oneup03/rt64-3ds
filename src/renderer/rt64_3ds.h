@@ -398,12 +398,6 @@ Settings& settings();
 // Fed by the game's patches through host functions.
 void set_first_person(bool on);
 bool first_person_scene();
-// The world's draw distance (a game's setting, for an Old 3DS), in percent
-// of the camera's far plane: triangles wholly farther away aren't drawn, and
-// a gSPCullDisplayList'd list whose tested vertices all are ends there (with
-// cull_dl). 100 (or 0) is the game's own.
-void set_world_distance(int percent);
-int world_distance();
 
 // Copy a region of the last finished frame (the left eye) into the game's
 // RGBA16 framebuffer in RDRAM, for game code that reads pixels (DK64's fairy

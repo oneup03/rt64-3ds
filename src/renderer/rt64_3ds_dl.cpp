@@ -335,13 +335,7 @@ constexpr float kGuard = 1024.0f;   // pixels beyond the screen centre, each axi
 // and what the in-betweens move; the context sets it per list.
 float g_screen_cull_slack = -1.0f;
 float g_screen_cull_x0 = 0.0f;
-// The world distance (Interpreter::set_world_far): a triangle whose three
-// vertices all lie beyond this w (the eye's depth times the projection's
-// scale) isn't drawn. 0 = off; kept by update_mvp from the projection in
-// effect (a perspective one's far plane times the fraction).
-float g_world_far_w = 0.0f;
 inline bool off_screen(const Vtx3ds* t, int screen_w, int screen_h) {
-    if (fpos(g_world_far_w) && fpos(t[0].w - g_world_far_w) && fpos(t[1].w - g_world_far_w) && fpos(t[2].w - g_world_far_w)) return true;
     if (fneg(g_screen_cull_slack)) return false;
     if (!fpos(t[0].w) || !fpos(t[1].w) || !fpos(t[2].w)) return false;
     const float sx = g_screen_cull_slack * (float)screen_w, sy = g_screen_cull_slack * (float)screen_h;
@@ -866,7 +860,6 @@ struct Interpreter::Impl {
         return h == 0 ? 1 : h;
     }
     bool force_branch_z = true;        // RenderDesc::force_lod_branch, or gEXForceBranch
-    float world_far = 0.0f;            // rt64_3ds::set_world_distance: a fraction of the far plane, 0 = off
     bool cull_dl = true;               // RenderDesc::cull_dl: gSPCullDisplayList ends a list (cull_dl_test)
     bool fix_rect_lr = false;          // RenderDesc::fix_rect_lr
     int scissor_slack = 0;             // RenderDesc::scissor_edge_slack
@@ -903,10 +896,8 @@ struct Interpreter::Impl {
         if (!cull_dl || skim || cur_rtt >= 0 || v0 < 0 || vn < v0 || vn >= kMaxVerts) return false;
         const float sx = 0.25f * (float)screen_w, sy = 0.25f * (float)screen_h;
         const float x_lo = -geo.x0 - sx, x_hi = (float)screen_w + geo.x0 + sx, y_lo = -sy, y_hi = (float)screen_h + sy;
-        enum : uint32_t { kNegX = 1, kPosX = 2, kNegY = 4, kPosY = 8, kNear = 16, kFar = 32, kAll = 63 };
+        enum : uint32_t { kNegX = 1, kPosX = 2, kNegY = 4, kPosY = 8, kNear = 16, kAll = 31 };
         uint32_t all = kAll;
-        // world_far: beyond that fraction of the camera's far plane (world_far_w).
-        const float far_w = world_far_w();
         for (int i = v0; i <= vn && all != 0; i++) {
             float x, y, z, w;
             if (defer_active) dfr->position(dslot[i], x, y, z, w);
@@ -923,7 +914,6 @@ struct Interpreter::Impl {
                 if (y < y_lo * w) f |= kNegY;
                 if (y > y_hi * w) f |= kPosY;
                 if (z < 0.0f) f |= kNear;   // z' = (z + w) / 2: before the near plane
-                if (far_w > 0.0f && w > far_w) f |= kFar;
             }
             all &= f;
         }
@@ -1377,22 +1367,8 @@ struct Interpreter::Impl {
         memset(&m, 0, sizeof(m));
         m.m[0][0] = m.m[1][1] = m.m[2][2] = m.m[3][3] = 1.0f;
     }
-    // world_far's distance in w for the projection in effect, or -1: the
-    // far plane from the projection as depth_camera keeps it (z_clip =
-    // a*z_eye + b with the w column's length s: the far plane is where
-    // z_clip = w, at b / (s + a) eye units). Only on screen (not an
-    // off-screen image's camera).
-    float world_far_w() const {
-        if (world_far <= 0.0f || cur_rtt >= 0 || !is_perspective(proj)) return -1.0f;
-        const Mtx c = depth_camera(proj);
-        const float s = sqrtf(proj.m[0][3] * proj.m[0][3] + proj.m[1][3] * proj.m[1][3] + proj.m[2][3] * proj.m[2][3]);
-        if (!(s > 0.0f) || s + c.m[2][2] == 0.0f) return -1.0f;
-        const float f = c.m[3][2] / (s + c.m[2][2]);
-        return f > 0.0f ? world_far * f * s : -1.0f;
-    }
     void update_mvp(uint32_t vtx_addr) {
         if (mvp_dirty) {
-            g_world_far_w = world_far > 0.0f ? world_far_w() : 0.0f;
             if (ip != nullptr) {
                 interp_point(vtx_addr);
                 if (ip->applying) { mul(mvp, eff_mv, eff_proj); mvp_dirty = false; return; }
@@ -3825,7 +3801,6 @@ void Interpreter::set_world_proj_ids(const uint32_t* ids, int count) {
 void Interpreter::set_split_untagged_ortho(bool on) { impl_->split_untagged_ortho = on; }
 void Interpreter::set_aim_hash(bool on) { impl_->aim_hash = on; }
 void Interpreter::set_force_branch_z(bool on) { impl_->force_branch_z = on; }
-void Interpreter::set_world_far(float fraction) { impl_->world_far = fraction; if (fraction <= 0.0f) g_world_far_w = 0.0f; }
 void Interpreter::set_cull_dl(bool on) { impl_->cull_dl = on; }
 void Interpreter::set_screen_cull(float slack) { g_screen_cull_slack = slack; }
 void Interpreter::set_eye_cull(float m) { g_eye_cull = m > 0.0f ? m : 0.0f; }

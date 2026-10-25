@@ -1032,10 +1032,6 @@ public:
         maybe_capture(task);
         // In first person the reticle's quads must stay one per record.
         interp_.set_split_untagged_ortho(rt64_3ds::first_person_scene());
-        {
-            const int wd = rt64_3ds::world_distance();
-            interp_.set_world_far(wd > 0 && wd < 100 ? (float)wd / 100.0f : 0.0f);
-        }
         maybe_switch_frame_size();
         if (dbg_tasks_ < 3) {
             dbg_tasks_++;

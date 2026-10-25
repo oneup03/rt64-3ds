@@ -9,7 +9,6 @@ rt64_3ds::RenderDesc g_desc{};
 rt64_3ds::Settings g_settings{};
 rt64_3ds::FrameStats g_stats{};
 volatile bool g_first_person = false;
-volatile int g_world_distance = 100;
 char g_data_dir[160] = "sdmc:/3ds";
 }
 
@@ -29,7 +28,5 @@ const rt64_3ds::FrameStats& rt64_3ds::stats() { return g_stats; }
 rt64_3ds::FrameStats& rt64_3ds::mutable_stats() { return g_stats; }
 void rt64_3ds::set_first_person(bool on) { g_first_person = on; }
 bool rt64_3ds::first_person_scene() { return g_first_person; }
-void rt64_3ds::set_world_distance(int percent) { g_world_distance = percent; }
-int rt64_3ds::world_distance() { return g_world_distance; }
 
 
