@@ -1440,8 +1440,8 @@ fed from tables compiled into the executable.
   combination becomes one touch (Banjo's Fly: L + A, then A alone), and a
   button needed only to start a move goes away before another mod reading
   it held reacts much (Cheats' moon jump, on L). Banjo builds its buttons
-  from the mods on and their options; "Mod buttons" remaps the D-pad and ZL
-  instead. All of these share one grid under the status lines: the
+  from the mods on and their options; a player who wants a mod's N64
+  buttons on the 3DS's maps them on the Controls page. All of these share one grid under the status lines: the
   player's two touch buttons (the Controls page) at the top of the right
   column, then the buttons that ask for it (`TouchButton::right`; of
   `touch_pad_set`'s, Right and L), the left column the rest. A game's
