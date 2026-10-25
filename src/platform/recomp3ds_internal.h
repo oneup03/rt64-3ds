@@ -14,6 +14,7 @@ extern "C" {
 
 namespace recomp3ds {
     struct GameDesc;
+    struct ButtonMap;
     // Milliseconds on the ARM11 system tick (268 MHz whatever the CPU clock).
     // Not libctru's osGetTime: ultramodern's N64 osGetTime shadows that name.
     inline uint64_t wall_ms() { return svcGetSystemTick() / 268123ull; }
@@ -49,7 +50,31 @@ namespace recomp3ds {
 
     void input_set_deadzones(int stick_percent, int cstick_percent);
     void input_set_cstick_up(bool on);  // C-Stick up presses C-Up (off: nothing)
-    void input_set_xy_left_right(bool on);  // X / Y press C-Right / C-Left (off: the game's map, C-Up / C-Down)
+    void input_set_cstick_down(bool on);    // C-Stick down presses C-Down (off: nothing)
+    // The buttons the Controls page maps, in its order (input_hid.cpp):
+    // A, B, X, Y, L, R, ZL, ZR, D-pad up, down, left, right. START, SELECT
+    // and HOME are not mapped there (START stays the game's, SELECT and HOME
+    // are the system's).
+    constexpr int kMappableKeys = 12;
+    // The N64 buttons a Controls row can choose, by index: none, then A, B,
+    // Z, START, L, R, the D-pad's four and the C buttons' four (names up to
+    // 12 characters, as the menu shows them and the touch buttons label).
+    constexpr int kN64Choices = 15;
+    extern const char* const kN64ChoiceNames[kN64Choices];
+    extern const uint16_t kN64ChoiceButtons[kN64Choices];
+    int n64_choice_of(uint16_t n64);    // the index of a button set (a set of more than one: its first in this order)
+    u32 input_mappable_key(int i);
+    // The game's own map, as it starts (GameDesc::button_map, else the
+    // library's default): the Controls page's defaults, and what tells a
+    // mod mode's map (input_set_map) from it.
+    void input_set_base_map(const ButtonMap* map, size_t count);
+    // The N64 buttons a map gives one 3DS key (0: none).
+    uint16_t input_map_buttons(const ButtonMap* map, size_t count, u32 key);
+    void input_base_map(const ButtonMap** map, size_t* count);
+    // The Controls page's choice for each mappable key, N64 buttons (0:
+    // nothing). A key whose buttons the game's current map changes from its
+    // base map (a mod mode) presses what that map says instead.
+    void input_set_user_buttons(const uint16_t* n64_per_key);
     // GameDesc::cstick_camera_*: hold 0 turns the camera mode off.
     void input_set_cstick_camera(uint16_t hold, uint16_t lead_ms, uint16_t press_ms, uint16_t period_ms);
     void input_poll();
@@ -150,6 +175,9 @@ namespace recomp3ds {
     // console was cleared); the game thread reads what is held.
     void touch_pad_update(bool shown, bool contact, int x, int y, bool redraw);
     uint16_t touch_pad_held();
+    // The player's two touch buttons (the Controls page), N64 buttons each
+    // (0: not shown): the top of the right-hand column, ahead of a game's.
+    void touch_pad_set_user(uint16_t first, uint16_t second);
     std::string settings_game_mode();
     void settings_set_game_mode(const std::string& mod_id);
     bool settings_debug_capture();      // settings.ini's dbg_capture: a SELECT hold saves a frame capture

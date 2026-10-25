@@ -1377,8 +1377,10 @@ library's keys:
 | key | default | row | read by |
 |---|---|---|---|
 | `separation`, `convergence_tenths`, `hud_depth`, `auto_convergence`, `comfort_target`, `stereo_ghost_contrast`, `stereo_ghost_black_floor` | 25, 60, 50, 1, 0, 100, 0 (the games set their own) | 3D page | the gfx thread each frame |
-| `stick_deadzone`, `cstick_deadzone`, `cstick_up`, `cstick_camera` | 5, 20, 1, 1 (`cstick_camera` only with `GameDesc::cstick_camera_hold`) | Controls | `input_set_*` |
-| `xy_buttons` | 0: X and Y as the game's map has them (C-Up, C-Down); 1: X C-Right, Y C-Left (the map's other keys keep C-Up and C-Down) | Controls | `input_set_xy_left_right` |
+| `stick_deadzone`, `cstick_deadzone`, `cstick_up`, `cstick_down`, `cstick_camera` | 5, 20, 1, 1, 1 (`cstick_camera` only with `GameDesc::cstick_camera_hold`) | Controls | `input_set_*` |
+| `button_a`, `button_b`, `button_x`, `button_y`, `button_l`, `button_r`, `button_zl`, `button_zr`, `button_dup`, `button_ddown`, `button_dleft`, `button_dright` | the N64 button each 3DS button presses, an index into `kN64ChoiceButtons` (0 none, then A, B, Z, START, L, R, the D-pad's four, the C buttons' four); the defaults are the game's `button_map`. ZL and ZR rows on a New 3DS only. A key a mod mode's map (`input_set_map`) gives other buttons than the game's own map follows that map instead | Controls | `input_set_user_buttons` |
+| `brightness_top`, `brightness_bottom` | 0 (the system's level, left alone); 1-5 the system's levels (gsp::Lcd), set again after the HOME Menu and sleep | Game | `GSPLCD_SetBrightness` |
+| `touch_button_1`, `touch_button_2` | 0 (none): the player's touch buttons, any N64 button each, at the top of the touch grid's right column ahead of a game's buttons | Controls | `touch_pad_set_user` |
 | `audio` | 1 | Game | `audio_set_enabled` |
 | `perf_monitor` | 1: the touch screen's game name, frame rate and SELECT hint; 0: none of them (the touch buttons, alerts and the menu stay) | Game | `settings_perf_monitor` |
 | `frame_cap` | 0; the games 2, which an Old 3DS turns into `old3ds_frame_cap` | Game | the gfx thread |
@@ -1437,7 +1439,12 @@ fed from tables compiled into the executable.
   button needed only to start a move goes away before another mod reading
   it held reacts much (Cheats' moon jump, on L). Banjo builds its buttons
   from the mods on and their options; "Mod buttons" remaps the D-pad and ZL
-  instead.
+  instead. All of these share one grid under the status lines: the
+  player's two touch buttons (the Controls page) at the top of the right
+  column, then the buttons that ask for it (`TouchButton::right`; of
+  `touch_pad_set`'s, Right and L), the left column the rest. A game's
+  alternate map for a mod mode (`input_set_map`) overrides the player's
+  Controls rows only for the keys it changes from the game's own map.
 - **`GameDesc.rom_cache_mb` / `rom_block_kb`**: the ROM stream's cache and
   its block, the unit of one card read (2 MB of 128 KB by default). A card
   read has a high fixed cost: about 10 ms on a New 3DS (Dinosaur Planet's

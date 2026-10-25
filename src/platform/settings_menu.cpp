@@ -8,8 +8,9 @@
 //
 // The 3D page holds the stereo rows: the 3D slider sets the strength, these
 // its shape (the owner's desktop settings, same units and defaults). The
-// stick deadzones start the Controls page and C-Stick up follows the
-// game's rows there; the game's own options (GameDesc::menu_options) go on
+// stick deadzones start the Controls page; C-Stick up and down, a row per
+// button (its N64 button, the game's map by default) and the two touch
+// buttons follow the game's rows there; the game's own options (GameDesc::menu_options) go on
 // the pages they name, and GameDesc::menu_defaults can change any row's
 // default. A page with more rows than fit scrolls.
 //
@@ -89,7 +90,7 @@ struct Row {
     void (*on_change_ctx)(void* ctx, int value);
     void* ctx;
 };
-constexpr int kMaxRows = 128;
+constexpr int kMaxRows = 160;
 Row g_rows[kMaxRows];
 int g_row_count = 0;
 
@@ -157,16 +158,53 @@ int g_stick_dz = 5, g_cstick_dz = 20;
 void apply_deadzones(int) { recomp3ds::input_set_deadzones(g_stick_dz, g_cstick_dz); }
 
 // Whether pushing the C-Stick up presses C-Up (in many games first person,
-// easy to hit while turning the camera).
-int g_cstick_up = 1;
+// easy to hit while turning the camera), and down C-Down.
+int g_cstick_up = 1, g_cstick_down = 1;
 const char* const kCstickUpNames[] = { "Off", "C-Up" };
+const char* const kCstickDownNames[] = { "Off", "C-Down" };
 void apply_cstick_up(int v) { recomp3ds::input_set_cstick_up(v != 0); }
+void apply_cstick_down(int v) { recomp3ds::input_set_cstick_down(v != 0); }
 
-// What X and Y press: the game's map (C-Up and C-Down, the default) or
-// C-Right and C-Left (input_hid.cpp; the D-pad keeps C-Up and C-Down).
-int g_xy_buttons = 0;
-const char* const kXyButtonNames[] = { "C-Up/Down", "C-Left/Right" };
-void apply_xy_buttons(int v) { recomp3ds::input_set_xy_left_right(v != 0); }
+// The buttons' N64 buttons (recomp3ds::input_set_user_buttons), one row per
+// 3DS button in input_mappable_key's order, each an index into
+// kN64ChoiceButtons (the defaults: the game's own map, input_base_map). A
+// button may press what another does.
+int g_button_choice[recomp3ds::kMappableKeys] = {};
+void apply_buttons(int) {
+    uint16_t n64[recomp3ds::kMappableKeys];
+    for (int i = 0; i < recomp3ds::kMappableKeys; i++) n64[i] = recomp3ds::kN64ChoiceButtons[g_button_choice[i]];
+    recomp3ds::input_set_user_buttons(n64);
+}
+// The screens' brightness (gsp::Lcd, in the library's CIA template): 0
+// leaves it to the system (the HOME Menu's setting), 1-5 are the system's
+// own levels. Set again after the HOME Menu and sleep, which may put the
+// system's back. From a level back to "System", the system's returns at
+// its next turn with the screens (the HOME Menu, a restart): an Old 3DS
+// can't read the level to put it back here.
+int g_brightness[2] = { 0, 0 };         // top, bottom
+const char* const kBrightnessNames[] = { "System", "1", "2", "3", "4", "5" };
+bool g_lcd_ready = false;
+aptHookCookie g_lcd_cookie;
+void set_brightness() {
+    for (int s = 0; s < 2; s++) {
+        if (g_brightness[s] <= 0) continue;
+        if (!g_lcd_ready) {
+            if (R_FAILED(gspLcdInit())) { fprintf(stderr, "recomp3ds: gsp::Lcd unavailable: brightness stays the system's\n"); return; }
+            g_lcd_ready = true;
+            aptHook(&g_lcd_cookie, [](APT_HookType type, void*) {
+                if (type == APTHOOK_ONRESTORE || type == APTHOOK_ONWAKEUP) set_brightness();
+            }, nullptr);
+        }
+        GSPLCD_SetBrightness(s == 0 ? GSPLCD_SCREEN_TOP : GSPLCD_SCREEN_BOTTOM, (u32)g_brightness[s]);
+    }
+}
+void apply_brightness(int) { set_brightness(); }
+
+// The player's two touch buttons (touch_pad.cpp), none by default.
+int g_touch_choice[2] = { 0, 0 };
+void apply_touch(int) {
+    recomp3ds::touch_pad_set_user(recomp3ds::kN64ChoiceButtons[g_touch_choice[0]], recomp3ds::kN64ChoiceButtons[g_touch_choice[1]]);
+}
 
 // GameDesc::cstick_camera_hold games: the C-Stick as the game's button
 // camera (1, the default) or the plain C buttons (0).
@@ -406,18 +444,30 @@ void load() {
     FILE* f = fopen(g_path, "r");
     if (f == nullptr) return;
     char line[192];
+    // The old "X / Y buttons" row (xy_buttons=1: X C-Right, Y C-Left),
+    // carried into the X and Y rows when the file has no word of them yet.
+    int old_xy = 0;
+    bool saw_x = false, saw_y = false;
     while (fgets(line, sizeof(line), f)) {
         char key[128], text[64];
         int v;
         if (sscanf(line, "game_mode=%63s", text) == 1) { g_game_mode = text; continue; }
         if (sscanf(line, "%127[^=]=%d", key, &v) != 2) continue;
         if (strncmp(key, "mod.", 4) == 0) { g_mod_values[key] = v; continue; }
+        if (strcmp(key, "xy_buttons") == 0) old_xy = v;
+        if (strcmp(key, "button_x") == 0) saw_x = true;
+        if (strcmp(key, "button_y") == 0) saw_y = true;
         for (int i = 0; i < g_row_count; i++) {
             const Row& r = g_rows[i];
             if (!r.no_save && strcmp(key, r.key) == 0) *r.value = v < r.lo ? r.lo : v > r.hi ? r.hi : v;
         }
     }
     fclose(f);
+    if (old_xy == 1) {
+        // A, B, X, Y, ... (input_mappable_key's order): X is 2, Y is 3.
+        if (!saw_x && recomp3ds::kN64ChoiceButtons[g_button_choice[2]] == recomp3ds::N64_CUP) g_button_choice[2] = recomp3ds::n64_choice_of(recomp3ds::N64_CRIGHT);
+        if (!saw_y && recomp3ds::kN64ChoiceButtons[g_button_choice[3]] == recomp3ds::N64_CDOWN) g_button_choice[3] = recomp3ds::n64_choice_of(recomp3ds::N64_CLEFT);
+    }
 }
 
 // Written when the menu closes (settings_menu_toggle), not on every step.
@@ -723,9 +773,40 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
         add_row({ "cstick_camera", "C-Stick", 0, 1, &g_cstick_camera, kCstickCameraNames, false, nullptr, apply_cstick_camera, PageControls, 1, nullptr });
     }
     add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, PageControls, 1, nullptr });
-    add_row({ "xy_buttons", "X / Y buttons", 0, 1, &g_xy_buttons, kXyButtonNames, false, nullptr, apply_xy_buttons, PageControls, 1, nullptr });
+    add_row({ "cstick_down", "C-Stick down", 0, 1, &g_cstick_down, kCstickDownNames, false, nullptr, apply_cstick_down, PageControls, 1, nullptr });
+    {
+        // A row per button, each scrolling through every N64 button; the
+        // defaults are the game's own map. ZL and ZR only on a New 3DS (an
+        // Old 3DS has none: their rows would do nothing).
+        bool new_3ds = false;
+        APT_CheckNew3DS(&new_3ds);
+        const recomp3ds::ButtonMap* base = nullptr;
+        size_t base_count = 0;
+        recomp3ds::input_base_map(&base, &base_count);
+        static const char* const kKeys[recomp3ds::kMappableKeys] = {
+            "button_a", "button_b", "button_x", "button_y", "button_l", "button_r", "button_zl", "button_zr",
+            "button_dup", "button_ddown", "button_dleft", "button_dright",
+        };
+        static const char* const kLabels[recomp3ds::kMappableKeys] = {
+            "A button", "B button", "X button", "Y button", "L button", "R button", "ZL button", "ZR button",
+            "D-pad up", "D-pad down", "D-pad left", "D-pad right",
+        };
+        for (int i = 0; i < recomp3ds::kMappableKeys; i++) {
+            const u32 key = recomp3ds::input_mappable_key(i);
+            g_button_choice[i] = recomp3ds::n64_choice_of(recomp3ds::input_map_buttons(base, base_count, key));
+            const bool shown = new_3ds || (key != KEY_ZL && key != KEY_ZR);
+            add_row({ kKeys[i], kLabels[i], 0, recomp3ds::kN64Choices - 1, &g_button_choice[i], recomp3ds::kN64ChoiceNames, false, nullptr,
+                      apply_buttons, shown ? PageControls : recomp3ds::PageCount, 1, nullptr });
+        }
+        add_row({ "touch_button_1", "Touch button 1", 0, recomp3ds::kN64Choices - 1, &g_touch_choice[0], recomp3ds::kN64ChoiceNames, false, nullptr,
+                  apply_touch, PageControls, 1, nullptr });
+        add_row({ "touch_button_2", "Touch button 2", 0, recomp3ds::kN64Choices - 1, &g_touch_choice[1], recomp3ds::kN64ChoiceNames, false, nullptr,
+                  apply_touch, PageControls, 1, nullptr });
+    }
     add_row({ "audio", "Audio", 0, 1, &g_audio_on, kAudioNames, false, nullptr, apply_audio, PageGame, 1, nullptr });
     g_game_name = desc.render.game_name != nullptr ? desc.render.game_name : "";
+    add_row({ "brightness_top", "Top screen brightness", 0, 5, &g_brightness[0], kBrightnessNames, false, nullptr, apply_brightness, PageGame, 1, nullptr });
+    add_row({ "brightness_bottom", "Bottom screen brightness", 0, 5, &g_brightness[1], kBrightnessNames, false, nullptr, apply_brightness, PageGame, 1, nullptr });
     add_row({ "perf_monitor", "Performance monitor", 0, 1, &g_perf_monitor, kPerfMonitorNames, false, nullptr, apply_perf_monitor, PageGame, 1, nullptr });
     add_row({ "frame_cap", "Frame rate", 0, desc.render.frame_interpolation ? 2 : 1, &st.frame_cap, kFrameCapNames, false, nullptr, nullptr, PageGame, 1, nullptr });
     add_row({ "rom_stream", "ROM stream", 0, 2, &g_rom_stream, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });

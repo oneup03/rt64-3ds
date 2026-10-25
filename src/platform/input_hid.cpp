@@ -1,9 +1,11 @@
 // ultramodern input callbacks on libctru's HID: one N64 controller from the
 // 3DS pad. The buttons follow the game's ButtonMap (GameDesc), or by default:
 //   A=A  B=B  Y=Z  ZL=Z  X=C-up  L=L  R/ZR=R  D-pad=D-pad  START=START
-// The Circle Pad is the stick and the C-Stick (New 3DS) the C buttons.
-// SELECT belongs to the platform (settings menu, frame capture), and the
-// D-pad to the menu while it is open.
+// and the Controls page maps each of A, B, X, Y, L, R, ZL, ZR and the
+// D-pad's directions to an N64 button of the player's choice (defaults:
+// the game's map). The Circle Pad is the stick and the C-Stick (New 3DS)
+// the C buttons. SELECT belongs to the platform (settings menu, frame
+// capture), and the D-pad to the menu while it is open.
 #include <3ds.h>
 #include <atomic>
 #include <cmath>
@@ -27,7 +29,7 @@ circlePosition g_cstick{};
 volatile bool g_blocked = false;
 volatile bool g_cstick_buttons = true;
 volatile bool g_cstick_up = true;       // C-Stick up presses C-Up (settings menu)
-volatile bool g_xy_left_right = false;  // X and Y press C-Right and C-Left, not C-Up and C-Down (settings menu)
+volatile bool g_cstick_down = true;     // C-Stick down presses C-Down (settings menu)
 volatile float g_stick_dz = 0.05f, g_cstick_dz = 0.20f;
 
 // GameDesc::cstick_camera_*: the C-Stick holds these buttons and repeats a C
@@ -56,7 +58,7 @@ uint16_t cstick_camera(const CstickCamera& c, float cx, float cy) {
     }
     else {
         if (cy > CSTICK_BUTTON && g_cstick_up) dir = N64_CUP;
-        else if (cy < -CSTICK_BUTTON) dir = N64_CDOWN;
+        else if (cy < -CSTICK_BUTTON && g_cstick_down) dir = N64_CDOWN;
     }
     if (dir == 0) { g_cam_dir = 0; return 0; }
     const uint64_t now = recomp3ds::wall_ms();
@@ -98,11 +100,121 @@ const ButtonMap kDefaultMap[] = {
 // The menu can switch maps (main thread) while the game thread reads it:
 // pointer and count change together (8 bytes, LDREXD/STREXD).
 struct MapRef { const ButtonMap* map; uint32_t count; };
-std::atomic<MapRef> g_map{ MapRef{ kDefaultMap, sizeof(kDefaultMap) / sizeof(kDefaultMap[0]) } };
+constexpr MapRef kDefaultRef{ kDefaultMap, sizeof(kDefaultMap) / sizeof(kDefaultMap[0]) };
+std::atomic<MapRef> g_map{ kDefaultRef };
+
+// The Controls page's keys, in its order (recomp3ds::kMappableKeys).
+constexpr u32 kMappable[recomp3ds::kMappableKeys] = {
+    KEY_A, KEY_B, KEY_X, KEY_Y, KEY_L, KEY_R, KEY_ZL, KEY_ZR, KEY_DUP, KEY_DDOWN, KEY_DLEFT, KEY_DRIGHT,
+};
+// What the read map (g_map) is made of: the game's base map (as it
+// starts), its current one (a mod mode's, input_set_map), and the player's
+// choices. Changed from any thread (the menu's, the game's mod switches)
+// under the lock; the made maps rotate through a few buffers, so one the
+// game thread may still be reading is not written over by the next change
+// (they come at the menu's pace).
+MapRef g_base = kDefaultRef, g_cur = kDefaultRef;
+uint16_t g_user[recomp3ds::kMappableKeys] = {};
+bool g_user_set = false;
+constexpr size_t kMadeMax = 40;
+ButtonMap g_made[4][kMadeMax];
+unsigned g_made_next = 0;
+LightLock& map_lock() {
+    static LightLock lock = [] { LightLock l; LightLock_Init(&l); return l; }();
+    return lock;
+}
+// Under map_lock: the map the game thread reads.
+void remake_map() {
+    if (!g_user_set) { g_map.store(g_cur); return; }    // before the settings load: the game's map as it is
+    ButtonMap* out = g_made[g_made_next++ & 3];
+    size_t n = 0;
+    u32 mappable = 0;
+    for (int i = 0; i < recomp3ds::kMappableKeys; i++) {
+        const u32 k = kMappable[i];
+        mappable |= k;
+        // A mod mode's map gives this key other buttons than the game's own
+        // map does: the mod's (it repurposes the key); else the player's.
+        const uint16_t base = recomp3ds::input_map_buttons(g_base.map, g_base.count, k);
+        const uint16_t cur = recomp3ds::input_map_buttons(g_cur.map, g_cur.count, k);
+        const uint16_t b = cur != base ? cur : g_user[i];
+        if (b != 0 && n < kMadeMax) out[n++] = ButtonMap{ k, b };
+    }
+    // The log, when it changes: each key's N64 button, '*' where a mod
+    // mode's map decides it.
+    {
+        static const char* const kNames[recomp3ds::kMappableKeys] = { "A", "B", "X", "Y", "L", "R", "ZL", "ZR", "Up", "Down", "Left", "Right" };
+        static char last[256] = "";
+        char line[256];
+        int at = 0;
+        for (int i = 0; i < recomp3ds::kMappableKeys && at < (int)sizeof(line) - 24; i++) {
+            const u32 k = kMappable[i];
+            const uint16_t base = recomp3ds::input_map_buttons(g_base.map, g_base.count, k);
+            const uint16_t cur = recomp3ds::input_map_buttons(g_cur.map, g_cur.count, k);
+            const uint16_t b = cur != base ? cur : g_user[i];
+            at += snprintf(line + at, sizeof(line) - (size_t)at, " %s=%s%s", kNames[i], recomp3ds::kN64ChoiceNames[recomp3ds::n64_choice_of(b)], cur != base ? "*" : "");
+        }
+        if (strcmp(line, last) != 0) {
+            strcpy(last, line);
+            fprintf(stderr, "recomp3ds: buttons:%s\n", line);
+        }
+    }
+    // Everything else in the current map (START) as it is.
+    for (uint32_t i = 0; i < g_cur.count && n < kMadeMax; i++) {
+        const u32 keys = g_cur.map[i].keys & ~mappable;
+        if (keys != 0) out[n++] = ButtonMap{ keys, g_cur.map[i].n64 };
+    }
+    g_map.store(MapRef{ out, uint32_t(n) });
+}
+}
+
+const char* const recomp3ds::kN64ChoiceNames[kN64Choices] = {
+    "None", "A", "B", "Z", "START", "L", "R", "D-Up", "D-Down", "D-Left", "D-Right", "C-Up", "C-Down", "C-Left", "C-Right",
+};
+const uint16_t recomp3ds::kN64ChoiceButtons[kN64Choices] = {
+    0, N64_A, N64_B, N64_Z, N64_START, N64_L, N64_R, N64_DUP, N64_DDOWN, N64_DLEFT, N64_DRIGHT, N64_CUP, N64_CDOWN, N64_CLEFT, N64_CRIGHT,
+};
+int recomp3ds::n64_choice_of(uint16_t n64) {
+    for (int i = 0; i < kN64Choices; i++) if (kN64ChoiceButtons[i] == n64) return i;
+    for (int i = 1; i < kN64Choices; i++) if (n64 & kN64ChoiceButtons[i]) return i;
+    return 0;
+}
+
+u32 recomp3ds::input_mappable_key(int i) { return i >= 0 && i < kMappableKeys ? kMappable[i] : 0; }
+
+uint16_t recomp3ds::input_map_buttons(const ButtonMap* map, size_t count, u32 key) {
+    uint16_t b = 0;
+    for (size_t i = 0; map != nullptr && i < count; i++) if (map[i].keys & key) b |= map[i].n64;
+    return b;
+}
+
+void recomp3ds::input_set_base_map(const ButtonMap* map, size_t count) {
+    LightLock_Lock(&map_lock());
+    g_base = (map != nullptr && count != 0) ? MapRef{ map, uint32_t(count) } : kDefaultRef;
+    remake_map();
+    LightLock_Unlock(&map_lock());
+}
+
+void recomp3ds::input_base_map(const ButtonMap** map, size_t* count) {
+    LightLock_Lock(&map_lock());
+    *map = g_base.map;
+    *count = g_base.count;
+    LightLock_Unlock(&map_lock());
 }
 
 void recomp3ds::input_set_map(const ButtonMap* map, size_t count) {
-    if (map != nullptr && count != 0) g_map.store(MapRef{ map, uint32_t(count) });
+    if (map == nullptr || count == 0) return;
+    LightLock_Lock(&map_lock());
+    g_cur = MapRef{ map, uint32_t(count) };
+    remake_map();
+    LightLock_Unlock(&map_lock());
+}
+
+void recomp3ds::input_set_user_buttons(const uint16_t* n64_per_key) {
+    LightLock_Lock(&map_lock());
+    for (int i = 0; i < kMappableKeys; i++) g_user[i] = n64_per_key[i];
+    g_user_set = true;
+    remake_map();
+    LightLock_Unlock(&map_lock());
 }
 
 void recomp3ds::input_set_cstick_buttons(bool on) { g_cstick_buttons = on; }
@@ -110,7 +222,7 @@ void recomp3ds::input_set_cstick_camera(uint16_t hold, uint16_t lead_ms, uint16_
     g_cam_cfg.store(uint64_t(hold) | (uint64_t(lead_ms) << 16) | (uint64_t(press_ms) << 32) | (uint64_t(period_ms) << 48));
 }
 void recomp3ds::input_set_cstick_up(bool on) { g_cstick_up = on; }
-void recomp3ds::input_set_xy_left_right(bool on) { g_xy_left_right = on; }
+void recomp3ds::input_set_cstick_down(bool on) { g_cstick_down = on; }
 
 // Motion (gyro aiming), through JibbSmart's GamepadMotionHelpers (MIT, as
 // the desktop uses): gyro calibration while the console is still, gravity
@@ -246,18 +358,8 @@ bool recomp3ds::input_get(int controller_num, uint16_t* buttons, float* x, float
     uint16_t b = 0;
     const u32 h = g_held & ~settings_menu_keys();
     const MapRef m = g_map.load();
-    // "X / Y" at C-Left/Right: what the game's map gives X and Y, with X's
-    // C-Up as C-Right and Y's C-Down as C-Left (Y is the left-hand button).
-    // The other keys on those entries (the D-pad's up and down) keep C-Up
-    // and C-Down.
-    const bool lr = g_xy_left_right;
-    const u32 xy = lr ? h & (KEY_X | KEY_Y) : 0;
-    const u32 rest = h & ~xy;
     for (uint32_t i = 0; i < m.count; i++) {
-        const uint16_t n = m.map[i].n64;
-        if (rest & m.map[i].keys) b |= n;
-        if (xy & m.map[i].keys & KEY_X) b |= (n & N64_CUP) ? (uint16_t)((n & ~N64_CUP) | N64_CRIGHT) : n;
-        if (xy & m.map[i].keys & KEY_Y) b |= (n & N64_CDOWN) ? (uint16_t)((n & ~N64_CDOWN) | N64_CLEFT) : n;
+        if (h & m.map[i].keys) b |= m.map[i].n64;
     }
     if (g_cstick_buttons) {
         float cx, cy;
@@ -269,7 +371,7 @@ bool recomp3ds::input_get(int controller_num, uint16_t* buttons, float* x, float
         else {
             g_cam_dir = 0;
             if (cy > CSTICK_BUTTON && g_cstick_up) b |= N64_CUP;
-            if (cy < -CSTICK_BUTTON) b |= N64_CDOWN;
+            if (cy < -CSTICK_BUTTON && g_cstick_down) b |= N64_CDOWN;
             if (cx < -CSTICK_BUTTON) b |= N64_CLEFT;
             if (cx > CSTICK_BUTTON) b |= N64_CRIGHT;
         }

@@ -890,7 +890,9 @@ int recomp3ds::run(const GameDesc& desc) {
     fprintf(stderr, "recomp3ds: %d libultra matrix helpers as host functions (RT64_3DS_GU_NATIVE, with the game's config ignoring them)\n", recomp3ds::gu_native_count());
     recomp3ds::screen_printf("%s\n", desc.render.game_name);
     log_memory("boot");
-    // Before the settings: a loaded setting's on_change may pick another map.
+    // Before the settings: a loaded setting's on_change may pick another map,
+    // and the Controls page's defaults are the game's own.
+    recomp3ds::input_set_base_map(desc.button_map, desc.button_map_count);
     recomp3ds::input_set_map(desc.button_map, desc.button_map_count);
     recomp3ds::input_set_controller_pak(desc.controller_pak);
     recomp3ds::settings_menu_init(g_base_path, desc);
