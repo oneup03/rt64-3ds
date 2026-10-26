@@ -57,9 +57,10 @@ namespace recomp3ds {
     // are the system's).
     constexpr int kMappableKeys = 12;
     // The N64 buttons a Controls row can choose, by index: none, then A, B,
-    // Z, START, L, R, the D-pad's four and the C buttons' four (names up to
-    // 12 characters, as the menu shows them and the touch buttons label).
-    constexpr int kN64Choices = 15;
+    // Z, L, R, the D-pad's four and the C buttons' four (names up to 12
+    // characters, as the menu shows them and the touch buttons label).
+    // Not START: it stays on the 3DS's START, where the game's map has it.
+    constexpr int kN64Choices = 14;
     extern const char* const kN64ChoiceNames[kN64Choices];
     extern const uint16_t kN64ChoiceButtons[kN64Choices];
     int n64_choice_of(uint16_t n64);    // the index of a button set (a set of more than one: its first in this order)

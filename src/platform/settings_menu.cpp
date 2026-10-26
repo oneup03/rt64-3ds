@@ -179,19 +179,42 @@ void apply_buttons(int) {
 // The screens' brightness (gsp::Lcd, in the library's CIA template): 0
 // leaves it to the system (the HOME Menu's setting), 1-5 are the system's
 // own levels. Set again after the HOME Menu and sleep, which may put the
-// system's back. From a level back to "System", the system's returns at
-// its next turn with the screens (the HOME Menu, a restart): an Old 3DS
-// can't read the level to put it back here.
+// system's back. Back to "System" from a level, the screen gets the
+// system's level again: config block 0x00050001's second byte, the
+// brightness the system set (cfg:s, in the CIA template; GSP reads the same
+// block).
 int g_brightness[2] = { 0, 0 };         // top, bottom
+bool g_brightness_ours[2] = { false, false };   // a level of ours is on that screen
 const char* const kBrightnessNames[] = { "System", "1", "2", "3", "4", "5" };
 bool g_lcd_ready = false;
 aptHookCookie g_lcd_cookie;
+// The system's brightness level (1-5), or 0 when it can't be read.
+int system_brightness() {
+    u8 blk[2] = {};
+    if (R_FAILED(cfguInit())) return 0;
+    const Result rc = CFG_GetConfigInfoBlk4(sizeof(blk), 0x00050001, blk);
+    cfguExit();
+    if (R_FAILED(rc) || blk[1] < 1 || blk[1] > 5) {
+        fprintf(stderr, "recomp3ds: the system's brightness unread (rc %08lx, level %u): it returns at the HOME Menu or a restart\n", (unsigned long)rc, (unsigned)blk[1]);
+        return 0;
+    }
+    return blk[1];
+}
 void set_brightness() {
     for (int s = 0; s < 2; s++) {
-        if (g_brightness[s] <= 0) continue;
+        if (g_brightness[s] <= 0) {
+            // "System" after a level of ours: the system's again.
+            if (!g_brightness_ours[s] || !g_lcd_ready) continue;
+            const int level = system_brightness();
+            if (level > 0) GSPLCD_SetBrightness(s == 0 ? GSPLCD_SCREEN_TOP : GSPLCD_SCREEN_BOTTOM, (u32)level);
+            g_brightness_ours[s] = false;
+            continue;
+        }
+        g_brightness_ours[s] = true;
         if (!g_lcd_ready) {
             if (R_FAILED(gspLcdInit())) { fprintf(stderr, "recomp3ds: gsp::Lcd unavailable: brightness stays the system's\n"); return; }
             g_lcd_ready = true;
+            fprintf(stderr, "recomp3ds: brightness: the system's level %d (0: unread)\n", system_brightness());
             aptHook(&g_lcd_cookie, [](APT_HookType type, void*) {
                 if (type == APTHOOK_ONRESTORE || type == APTHOOK_ONWAKEUP) set_brightness();
             }, nullptr);

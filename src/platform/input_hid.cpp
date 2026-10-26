@@ -168,10 +168,10 @@ void remake_map() {
 }
 
 const char* const recomp3ds::kN64ChoiceNames[kN64Choices] = {
-    "None", "A", "B", "Z", "START", "L", "R", "D-Up", "D-Down", "D-Left", "D-Right", "C-Up", "C-Down", "C-Left", "C-Right",
+    "None", "A", "B", "Z", "L", "R", "D-Up", "D-Down", "D-Left", "D-Right", "C-Up", "C-Down", "C-Left", "C-Right",
 };
 const uint16_t recomp3ds::kN64ChoiceButtons[kN64Choices] = {
-    0, N64_A, N64_B, N64_Z, N64_START, N64_L, N64_R, N64_DUP, N64_DDOWN, N64_DLEFT, N64_DRIGHT, N64_CUP, N64_CDOWN, N64_CLEFT, N64_CRIGHT,
+    0, N64_A, N64_B, N64_Z, N64_L, N64_R, N64_DUP, N64_DDOWN, N64_DLEFT, N64_DRIGHT, N64_CUP, N64_CDOWN, N64_CLEFT, N64_CRIGHT,
 };
 int recomp3ds::n64_choice_of(uint16_t n64) {
     for (int i = 0; i < kN64Choices; i++) if (kN64ChoiceButtons[i] == n64) return i;
