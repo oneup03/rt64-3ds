@@ -82,6 +82,41 @@ void swizzle32(uint32_t* dst, const uint32_t* src, int w, int h) {
     }
 }
 
+// Two texels as one, for a texture made at half the size (decode_into, short
+// of memory). RGBA5551: of an opaque and a clear one, the opaque one (no dark
+// fringe round cut-outs); else the channels' mean. RGBA8 and LA8: each byte's.
+inline uint16_t mean5551(uint16_t a, uint16_t b) {
+    if ((a ^ b) & 1) return (a & 1) ? a : b;
+    const uint16_t r = (uint16_t)((((a >> 11) & 31) + ((b >> 11) & 31)) >> 1);
+    const uint16_t g = (uint16_t)((((a >> 6) & 31) + ((b >> 6) & 31)) >> 1);
+    const uint16_t bl = (uint16_t)((((a >> 1) & 31) + ((b >> 1) & 31)) >> 1);
+    return (uint16_t)((r << 11) | (g << 6) | (bl << 1) | (a & 1));
+}
+inline uint16_t mean88(uint16_t a, uint16_t b) {
+    return (uint16_t)(((((a >> 8) + (b >> 8)) >> 1) << 8) | (((a & 0xFF) + (b & 0xFF)) >> 1));
+}
+inline uint32_t mean8888(uint32_t a, uint32_t b) {
+    return ((a >> 1) & 0x7F7F7F7Fu) + ((b >> 1) & 0x7F7F7F7Fu) + (a & b & 0x01010101u);
+}
+
+// A w x h stage halved in place along its longer side; w and h become the
+// new size. Each output texel sits at or before the two it is made from.
+template <typename T, typename Mean>
+void halve_stage(T* s, uint32_t& w, uint32_t& h, Mean mean) {
+    if (w >= h) {
+        const uint32_t nw = w / 2;
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < nw; x++) s[y * nw + x] = mean(s[y * w + 2 * x], s[y * w + 2 * x + 1]);
+        w = nw;
+    }
+    else {
+        const uint32_t nh = h / 2;
+        for (uint32_t y = 0; y < nh; y++)
+            for (uint32_t x = 0; x < w; x++) s[y * w + x] = mean(s[2 * y * w + x], s[(2 * y + 1) * w + x]);
+        h = nh;
+    }
+}
+
 }   // namespace
 
 struct TextureCache::Impl {
@@ -331,22 +366,37 @@ BoundTex TextureCache::decode_into(uint64_t key, uint32_t h, const uint8_t* src,
     }
 
     Entry e;
-    if (!C3D_TexInitWithParams(&e.tex, nullptr, C3D_TexInitParams{ (u16)potw, (u16)poth, (u8)(levels - 1), fmt, GPU_TEX_2D, false })) {
+    // Short of linear memory (an Old 3DS late in a session), the texture at
+    // half the size, then a quarter, before none: a draw without one samples
+    // the white placeholder (Goemon's flat sky, a 640x240 image in 512 KB,
+    // came out white). The coordinates stay in the full size's units
+    // (uscale), so the smaller texture covers the same ground, coarser; its
+    // mipmaps go.
+    uint32_t tw = potw, th = poth, made_levels = levels;
+    bool made = C3D_TexInitWithParams(&e.tex, nullptr, C3D_TexInitParams{ (u16)tw, (u16)th, (u8)(made_levels - 1), fmt, GPU_TEX_2D, false });
+    for (int halving = 0; !made && halving < 2 && tw * th >= 128u * 128u; halving++) {
+        if (wide) halve_stage(impl_->stage32.data(), tw, th, mean8888);
+        else if (la8) halve_stage(impl_->stage16.data(), tw, th, mean88);
+        else halve_stage(impl_->stage16.data(), tw, th, mean5551);
+        made_levels = 1;
+        made = C3D_TexInitWithParams(&e.tex, nullptr, C3D_TexInitParams{ (u16)tw, (u16)th, 0, fmt, GPU_TEX_2D, false });
+    }
+    if (!made || tw != potw || th != poth) {
         // The frame's end frees the unused ones (end_frame); the draw goes untextured meanwhile.
         impl_->alloc_failed = true;
         if (++impl_->failures <= 10 || (impl_->failures & 1023) == 0)
-            fprintf(stderr, "rt64-3ds: C3D_TexInit %ux%u (%u levels) failed (%u so far; %u textures live, %u KB, linear free %lu KB)\n",
+            fprintf(stderr, "rt64-3ds: C3D_TexInit %ux%u (%u levels) failed (%u so far; %u textures live, %u KB, linear free %lu KB)%s\n",
                     (unsigned)potw, (unsigned)poth, (unsigned)levels, (unsigned)impl_->failures, (unsigned)live_, (unsigned)(bytes_ >> 10),
-                    (unsigned long)(linearSpaceFree() >> 10));
-        return b;
+                    (unsigned long)(linearSpaceFree() >> 10), !made ? "" : tw * th * 2 == potw * poth ? ", made at half the size" : ", made at a quarter of the size");
+        if (!made) return b;
     }
-    const uint32_t bytes = C3D_TexCalcTotalSize(e.tex.size, levels - 1);
-    if (wide) swizzle32((uint32_t*)e.tex.data, impl_->stage32.data(), (int)potw, (int)poth);
-    else swizzle16((uint16_t*)e.tex.data, impl_->stage16.data(), (int)potw, (int)poth);
+    const uint32_t bytes = C3D_TexCalcTotalSize(e.tex.size, made_levels - 1);
+    if (wide) swizzle32((uint32_t*)e.tex.data, impl_->stage32.data(), (int)tw, (int)th);
+    else swizzle16((uint16_t*)e.tex.data, impl_->stage16.data(), (int)tw, (int)th);
     // Mipmaps: each level from the game's own (TexDesc::levels; the
     // interpreter checked each is exactly half the one before, so none
     // needs padding), after the base in the texture's memory.
-    for (uint32_t k = 1; k < levels; k++) {
+    for (uint32_t k = 1; k < made_levels; k++) {
         const uint32_t lw = potw >> k, lh = poth >> k;
         decode_level(mips[k - 1], lw);
         void* dst = C3D_TexGetImagePtr(&e.tex, e.tex.data, (int)k, nullptr);
