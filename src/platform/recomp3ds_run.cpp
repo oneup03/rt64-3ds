@@ -368,9 +368,9 @@ void update_gfx_inner() {
     g_main_stage = 5;
     {
         // SELECT (the game has no use for it): a tap opens or closes the
-        // settings menu; held for a second it saves a screenshot (with
-        // dbg_capture=1 in settings.ini, a frame capture for the host
-        // tools instead), and says so on the touch screen.
+        // settings menu; held for a second it saves a screenshot (with the
+        // Game page's Hold SELECT on Debug Capture, dbg_capture=1, a frame
+        // capture for the host tools instead), and says so on the touch screen.
         static u64 select_since = 0;
         static bool fired = false;
         if ((hidKeysHeld() | recomp3ds::autotest_keys()) & KEY_SELECT) {

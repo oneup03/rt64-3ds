@@ -620,7 +620,8 @@ per pair, and with `double_eyes` what the presenter waited instead; compare
 
 Check a frame on the host before blaming the console: set
 `GFX_CAPTURE.TXT` to a frame number to write that frame's RDRAM and task to
-`gfx_task.bin` (or hold SELECT for a second with `dbg_capture=1` in
+`gfx_task.bin` (or hold SELECT for a second with the Game page's Hold SELECT
+on Debug Capture, `dbg_capture=1` in
 `settings.ini`, or `CAPTURE` in a test script). One writer thread writes
 captures (about 11 s for the 16 MB on the console) while the game plays on;
 one asked for meanwhile is refused, and the touch screen says so. Then
@@ -1369,11 +1370,12 @@ library's keys:
 | `audio` | 1 | Game | `audio_set_enabled` |
 | `perf_monitor` | 1: the touch screen's game name, frame rate and SELECT hint; 0: none of them (the touch buttons, alerts and the menu stay) | Game | `settings_perf_monitor` |
 | `frame_cap` | 0; the games 2, which an Old 3DS turns into `old3ds_frame_cap` | Game | the gfx thread |
+| `dbg_capture` | 0: a SELECT hold saves a screenshot; 1: a frame capture (`gfx_task.bin`) | Game (Hold SELECT: Screenshot, Debug Capture) | the SELECT hold in `recomp3ds_run.cpp` |
 | `dbg_old_clock` | 0 | none, New 3DS only | `set_cpu_speed` (1 runs at the Old 3DS clock) |
 | `dbg_cores` | 0 (Auto) | none, read at start | the core layout (1 two cores with the game on core 1, 2 on core 0, 3 on core 0 with the lists read there) |
 | `rom_stream` | 0 (the game's choice: `GameDesc::rom_new3ds` / `rom_old3ds`) | none, read at start | the ROM stream |
 | `log_level` | 1 on a New 3DS, 0 on an Old | none | `log_set_level` |
-| `dbg_rows`, `dbg_capture` | 0, 0 | none | the touch screen's stats rows; SELECT held for a capture |
+| `dbg_rows` | 0 | none | the touch screen's stats rows |
 | `dbg_*` | 0 | none, read at start | the table above |
 | `gpu_double_eyes` | the `RenderDesc` value; off on an Old 3DS | none, read at start | the renderer's init |
 | `audio_engine` | 1 (the DSP synth) for a game with `GameDesc::synth` | none | `dsp_synth_set_enabled` |

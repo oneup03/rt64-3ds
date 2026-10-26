@@ -1,5 +1,6 @@
 // The settings menu on the touch screen. A tap of SELECT opens and closes it
-// (holding SELECT takes a frame capture instead, see recomp3ds_run.cpp).
+// (holding SELECT takes a screenshot or a frame capture instead, the Game
+// page's Hold SELECT row; see recomp3ds_run.cpp).
 // While it is open the D-pad works it and the game does not see the D-pad:
 // up/down chooses a row, left/right changes it (held to repeat); on the tab
 // row at the top left/right changes the page. A tap chooses a tab or a row
@@ -149,9 +150,11 @@ const char* const kFrameCapNames[] = { "Game", "30 fps", "60 interp." };
 // row on no page: loaded and saved, never drawn.
 int g_rom_stream = 0;
 
-// Debugging, settings.ini only: 1 makes a SELECT hold save a frame capture
-// for the host tools (gfx_task.bin, gfx_frame.ppm) instead of a screenshot.
+// The Game page's Hold SELECT row (settings.ini's dbg_capture): what a
+// SELECT hold saves, a screenshot or a frame capture for the host tools
+// (gfx_task.bin, gfx_frame.ppm).
 int g_debug_capture = 0;
+const char* const kSelectHoldNames[] = { "Screenshot", "Debug Capture" };
 recomp3ds::DebugSettings g_dbg;         // the platform's dbg_* keys (recomp3ds::debug_settings)
 
 // Stick deadzones in percent of the travel.
@@ -273,8 +276,13 @@ void draw_row(int slot) {
     else if (r.tenths) snprintf(val, sizeof(val), "%d.%d", *r.value / 10, *r.value % 10);
     else snprintf(val, sizeof(val), "%d%s", *r.value, r.suffix != nullptr ? r.suffix : "");
     const bool sel = slot == g_sel;
+    // A value wider than its column ("Debug Capture") takes the room from
+    // the label's (touches go by the line, not the column).
+    int vw = (int)strlen(val);
+    if (vw < kValueWidth) vw = kValueWidth;
+    const int lw = kLabelWidth - (vw - kValueWidth);
     recomp3ds::screen_printf("\x1b[%d;0H%s%s %-*.*s %-*.*s\x1b[0m", slot_line(slot), sel ? "\x1b[33m" : "", sel ? ">" : " ",
-           kLabelWidth, kLabelWidth, r.label, kValueWidth, kValueWidth, val);
+           lw, lw, r.label, vw, vw, val);
 }
 
 void draw_tabs() {
@@ -848,7 +856,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "perf_monitor", "Performance monitor", 0, 1, &g_perf_monitor, kPerfMonitorNames, false, nullptr, apply_perf_monitor, PageGame, 1, nullptr });
     add_row({ "frame_cap", "Frame rate", 0, desc.render.frame_interpolation ? 2 : 1, &st.frame_cap, kFrameCapNames, false, nullptr, nullptr, PageGame, 1, nullptr });
     add_row({ "rom_stream", "ROM stream", 0, 2, &g_rom_stream, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
-    add_row({ "dbg_capture", "Debug capture", 0, 1, &g_debug_capture, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_capture", "Hold SELECT", 0, 1, &g_debug_capture, kSelectHoldNames, false, nullptr, nullptr, PageGame, 1, nullptr });
     bool is_new_3ds = false;
     APT_CheckNew3DS(&is_new_3ds);
     // RenderDesc::double_eyes, settings.ini only and read at start: the
