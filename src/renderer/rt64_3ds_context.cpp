@@ -2812,9 +2812,14 @@ private:
         last_plan_.stages = -1;
     }
 
-    // Blending: force-blend with memory colour by source alpha.
+    // Blending: force-blend with memory colour by source alpha. Also the
+    // dither alpha compare (G_AC_DITHER), which keeps a pixel when its alpha
+    // beats a random number: a stipple of the alpha's density (Goemon's lists
+    // set it) that the alpha test alone (alpha > 0) drew solid; blending by
+    // alpha is its average, at a blend's cost.
     static bool draw_blends(const rt64_3ds::DrawRecord& d) {
         const uint32_t l = d.othermode_l, cyc = (d.othermode_h >> 20) & 3;
+        if ((l & 3) == 3) return true;
         const bool force_bl = (l & 0x4000) != 0;
         const uint32_t m2 = (cyc == 1) ? ((l >> 20) & 3) : ((l >> 22) & 3);   // second cycle in 2-cycle mode
         const uint32_t b2 = (cyc == 1) ? ((l >> 16) & 3) : ((l >> 18) & 3);
@@ -3013,7 +3018,11 @@ private:
         // screen's left edge to framebuffer y = 400: both axes run backwards.
         // The frame copy holds the eye kFrameRowOffset rows up.
         const u32 fy = frame_viewport_ ? kFrameRowOffset : 0;
-        if (x1 <= x0 || y1 <= y0) C3D_SetScissor(GPU_SCISSOR_NORMAL, 0, 0, 0, 0);
+        // An empty scissor draws nothing, as on the N64 (Goemon's Impact
+        // battles keep the sky's below the letterbox's top: bottom above
+        // top). citro3d stores right - 1 and bottom - 1, so (0, 0, 0, 0)
+        // wrapped to the whole target: one pixel past any target instead.
+        if (x1 <= x0 || y1 <= y0) C3D_SetScissor(GPU_SCISSOR_NORMAL, 1023, 1023, 1024, 1024);
         else C3D_SetScissor(GPU_SCISSOR_NORMAL, (u32)(240 - y1), (u32)(400 - x1) + fy, (u32)(240 - y0), (u32)(400 - x0) + fy);
         prof_[2] += tick() - tp2;
     }

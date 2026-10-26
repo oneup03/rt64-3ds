@@ -290,8 +290,10 @@ __attribute__((always_inline)) inline void shade_vertex(LoadedVertex& v, const V
             if (fneg(dx + 1.0f)) dx = -1.0f; else if (fpos(dx - 1.0f)) dx = 1.0f;
             if (fneg(dy + 1.0f)) dy = -1.0f; else if (fpos(dy - 1.0f)) dy = 1.0f;
             if (s.linear) {
-                dx = acosf(-dx) / 3.14159265f;
-                dy = acosf(-dy) / 3.14159265f;
+                // The same span as the spherical mapping's (0..0.5): RT64
+                // takes both to 0..1024 before the scale.
+                dx = acosf(-dx) * (0.5f / 3.14159265f);
+                dy = acosf(-dy) * (0.5f / 3.14159265f);
             }
             else {
                 dx = (dx + 1.0f) * 0.25f;
@@ -3342,6 +3344,16 @@ struct Interpreter::Impl {
         screen_drawn = false;
         proj_inst = 0;
         inst_break = true;
+        // The look-at directions as the microcode's data holds them: the RSP
+        // loads its DMEM afresh for every task, so a list that sets none
+        // (Goemon's shop armour and Ebisumaru's hammer: texgen with no
+        // gSPLookAt) has F3DEX's, not the last list's. F3DEX 1.21 and 1.23
+        // keep X (0, 127, 0) and Y (127, 0, 0); F3DEX2's data has none.
+        if (gbi == Gbi::F3DEX) {
+            lookat[0][0] = 0.0f; lookat[0][1] = 127.0f; lookat[0][2] = 0.0f;
+            lookat[1][0] = 127.0f; lookat[1][1] = 0.0f; lookat[1][2] = 0.0f;
+            ldir_dirty = true;
+        }
         if (image_tiles) roll_images();
         plain = true;
         plain_cimg = 0;
