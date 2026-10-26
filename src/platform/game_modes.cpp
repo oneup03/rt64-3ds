@@ -99,6 +99,8 @@ void recomp3ds::game_modes_init(const char* base_path, const GameDesc& desc) {
     g_base_path = base_path;
     g_desc = &desc;
     recomp::mods::set_rom_file_handler(use_mode_rom);
+    // Another mod's ROM patch (nmr 0038): the game's own (GameDesc::rom_patch).
+    if (desc.rom_patch != nullptr) recomp::mods::set_rom_patch_handler(desc.rom_patch);
 }
 
 std::string recomp3ds::pick_game_mode(const GameDesc& desc) {
@@ -187,13 +189,23 @@ std::string recomp3ds::pick_game_mode(const GameDesc& desc) {
 
 namespace {
 std::unordered_set<std::string> g_left_out;
+// The choice row's mods not chosen, and what only they need
+// (settings_apply_mods): left out of the session too, so their sections take
+// no RDRAM, but still offered on the Mods page (not mod_left_out).
+std::unordered_set<std::string> g_unchosen;
+
+void exclude_session_mods() {
+    std::unordered_set<std::string> all = g_left_out;
+    all.insert(g_unchosen.begin(), g_unchosen.end());
+    recomp::mods::set_session_excluded_mods(all);
+}
 }
 
 void recomp3ds::game_mode_begin(const GameDesc& desc, const std::string& game_mode) {
     g_left_out.clear();
     if (game_mode.empty()) return;
     for (size_t i = 0; i < desc.mods_not_in_game_modes_count; i++) g_left_out.insert(desc.mods_not_in_game_modes[i]);
-    recomp::mods::set_session_excluded_mods(g_left_out);
+    exclude_session_mods();
     for (const std::string& id : g_left_out) {
         if (recomp::mods::is_mod_enabled(id)) fprintf(stderr, "recomp3ds: %s stays off in game modes\n", id.c_str());
     }
@@ -201,11 +213,17 @@ void recomp3ds::game_mode_begin(const GameDesc& desc, const std::string& game_mo
 
 bool recomp3ds::mod_left_out(const std::string& mod_id) { return g_left_out.contains(mod_id); }
 
+void recomp3ds::exclude_unchosen_mods(const std::unordered_set<std::string>& mod_ids) {
+    g_unchosen = mod_ids;
+    exclude_session_mods();
+}
+
 #else
 
 void recomp3ds::game_modes_init(const char*, const GameDesc&) {}
 std::string recomp3ds::pick_game_mode(const GameDesc&) { return {}; }
 void recomp3ds::game_mode_begin(const GameDesc&, const std::string&) {}
 bool recomp3ds::mod_left_out(const std::string&) { return false; }
+void recomp3ds::exclude_unchosen_mods(const std::unordered_set<std::string>&) {}
 
 #endif

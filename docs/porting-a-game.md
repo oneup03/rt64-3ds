@@ -1413,6 +1413,31 @@ fed from tables compiled into the executable.
   switched on; the runtime's `mods.json` is not used. Mods without `:embed`
   must also be on the SD card in `mods/`: they only run when their file is
   present.
+- **A mod with no code**, only a ROM patch (a translation), is built in with
+  `:embed` alone: nothing to compile, its `patch.bps` kept in the embedded
+  file. A code mod that is not a game mode keeps its `patch.bps` too.
+- **`GameDesc.rom_patch`**: the ROM patch of an enabled mod that is not a
+  game mode goes to the game (nmr 0038: the platform's ROM file stands for a
+  game mode's patch only), which applies it itself. Goemon's translations
+  are against the desktop's decompressed 32 MB ROM, which that port never
+  holds: they only replace bytes in place, inside files, so it keeps the
+  patch and writes each file's changes over the file as the game loads it
+  (Goemon's `platform/3ds/file_patches.cpp`). Unset, the runtime patches the
+  ROM in memory.
+- **`GameDesc.mod_choice_label`** / **`mod_choice_off_name`** /
+  **`mod_choice_ids`** / **`mod_choice_names`**: built-in mods that don't
+  work together (a translation and a mod with its own English scripts), on
+  one row of the Mods page (`mod_choice_off_name`, "Off" unless set, or one
+  of them) instead of a toggle each. The choice is kept as each one's
+  `mod.<id>` and takes effect at the next start (a ROM patch goes in as the
+  mods load; a code mod switched alone at once would miss its start-up
+  hooks); at most one of them is enabled at start. The mods they depend on
+  (their manifests' dependencies) follow the choice with no row of their
+  own: on when a mod chosen (or another mod on) needs them, off otherwise
+  (Banjo's languages and the expansion pak mod they need). The mods not
+  chosen and the dependencies none on needs are left out of the session
+  (beside a game mode's), since a baked mod's sections take RDRAM whether
+  it is on or not (Banjo's expansion pak mod: 2.66 MB of its 3 MB heap).
 - **`GameDesc.on_mod_switched`** / **`on_mod_option_changed`**: told when a
   mod is switched on or off, or one of its options changes, for a game whose
   map leaves out buttons a mod reads. `recomp3ds::touch_pad_set` then offers

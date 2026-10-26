@@ -3,6 +3,7 @@
 #define RECOMP3DS_H
 
 #include <cstdint>
+#include <span>
 #include <string>
 
 #include "librecomp/game.hpp"
@@ -100,6 +101,25 @@ struct GameDesc {
     // original game's maps. The Mods page hides them during a game mode.
     const char* const* mods_not_in_game_modes = nullptr;
     size_t mods_not_in_game_modes_count = 0;
+    // Optional: the ROM patch (patch.bps) of an enabled mod that is not a game
+    // mode (a translation), which the game applies itself, e.g. as it loads
+    // its files (Goemon: the desktop's patches are against a decompressed ROM
+    // twice the size of the one this port reads). Unset, the runtime patches
+    // the ROM in memory. False fails the mods' load.
+    bool (*rom_patch)(const std::string& mod_id, std::span<const uint8_t> patch) = nullptr;
+    // Optional: built-in mods that don't work together, offered on one row of
+    // the Mods page (mod_choice_label: mod_choice_off_name, then
+    // mod_choice_names) in place of a toggle each. The choice takes effect at
+    // the next start (a ROM patch is applied as the mods load), and at most
+    // one of them is on. The mods they depend on (their manifests'
+    // dependencies) follow the choice, with no row of their own: on with a
+    // mod chosen that needs them, off otherwise (Banjo's translations and
+    // the expansion pak mod they need).
+    const char* mod_choice_label = nullptr;
+    const char* mod_choice_off_name = nullptr;  // the row's first value, for none of them ("Off" unless set; "English")
+    const char* const* mod_choice_ids = nullptr;
+    const char* const* mod_choice_names = nullptr;
+    size_t mod_choice_count = 0;
     // Optional: a mod was switched on or off on the Mods page (it takes
     // effect at once), e.g. to give a mod's key a button.
     void (*on_mod_switched)(const char* mod_id, bool on) = nullptr;

@@ -22,6 +22,9 @@
 //                      recomp_baked_game_modes[], the game modes whose .nrm the
 //                      player brings (id, name, version, file), for a picker
 //   static_mods_data.c those .nrm files' bytes
+//
+// A mod with no code, only a ROM patch (a translation), has no mod_<id>.c: it
+// is built in with :embed alone, its patch.bps kept (the platform applies it).
 //   game_hooks.toml    [[patches.hook]] entries for the game's recompilation,
 //   patch_hooks.toml   and for the patches' (functions they replace): a check
 //                      of the function's dispatch slot at its entry
@@ -176,7 +179,9 @@ struct Nrm {
     bool rom_binary = false;    // :rom, embedded without mod_binary.bin (the ROM carries it)
     std::string id, version, display_name;
     bool game_mode = false;     // custom_gamemode: a ROM hack (its ROM made by the player)
+    bool code = true;           // mod_syms.bin and mod_binary.bin (else a ROM patch alone)
     std::vector<uint8_t> manifest, syms, binary;
+    std::vector<uint8_t> patch;     // patch.bps, kept for a mod that is not a game mode
     std::string ident;      // C identifier derived from the id
 };
 
@@ -196,10 +201,13 @@ bool read_nrm(Nrm& n) {
         return false;
     }
     std::vector<uint8_t>& manifest = n.manifest;
-    bool ok = read_zip_file(zip, "mod.json", manifest) && read_zip_file(zip, "mod_syms.bin", n.syms) && read_zip_file(zip, "mod_binary.bin", n.binary);
+    const bool have_manifest = read_zip_file(zip, "mod.json", manifest);
+    const bool have_syms = read_zip_file(zip, "mod_syms.bin", n.syms), have_binary = read_zip_file(zip, "mod_binary.bin", n.binary);
+    const bool have_patch = read_zip_file(zip, "patch.bps", n.patch);
     mz_zip_reader_end(&zip);
-    if (!ok) {
-        fprintf(stderr, "mod_bake: %s lacks mod.json, mod_syms.bin or mod_binary.bin\n", n.path.string().c_str());
+    n.code = have_syms || have_binary;
+    if (!have_manifest || have_syms != have_binary || (!n.code && !have_patch)) {
+        fprintf(stderr, "mod_bake: %s lacks mod.json, mod_syms.bin or mod_binary.bin (or, without code, patch.bps)\n", n.path.string().c_str());
         return false;
     }
     try {
@@ -222,8 +230,10 @@ bool read_nrm(Nrm& n) {
 // A game mode keeps an empty patch.bps, so the runtime still takes it for
 // one with a ROM patch; the platform supplies the patched ROM, made on a PC
 // (rt64-3ds game_modes.cpp, tools/make_game_mod_rom.py), and the patch is
-// never read. A :rom mod leaves its binary out: the platform streams it from
-// the ROM (rom_mods.cpp), and its hash is still the one baked here.
+// never read. Another mod's patch.bps stays (the platform applies it as the
+// game loads its files). A :rom mod leaves its binary out: the platform
+// streams it from the ROM (rom_mods.cpp), and its hash is still the one baked
+// here.
 std::vector<uint8_t> stripped_nrm(const Nrm& n) {
     mz_zip_archive zip{};
     std::vector<uint8_t> out;
@@ -234,9 +244,10 @@ std::vector<uint8_t> stripped_nrm(const Nrm& n) {
     const std::string manifest = j.dump(4);
     if (!mz_zip_writer_init_heap(&zip, 0, 0)) return out;
     bool ok = mz_zip_writer_add_mem(&zip, "mod.json", manifest.data(), manifest.size(), MZ_BEST_COMPRESSION) &&
-              mz_zip_writer_add_mem(&zip, "mod_syms.bin", n.syms.data(), n.syms.size(), MZ_BEST_COMPRESSION) &&
-              (n.rom_binary || mz_zip_writer_add_mem(&zip, "mod_binary.bin", n.binary.data(), n.binary.size(), MZ_BEST_COMPRESSION)) &&
-              (!n.game_mode || mz_zip_writer_add_mem(&zip, "patch.bps", "", 0, MZ_NO_COMPRESSION));
+              (!n.code || mz_zip_writer_add_mem(&zip, "mod_syms.bin", n.syms.data(), n.syms.size(), MZ_BEST_COMPRESSION)) &&
+              (!n.code || n.rom_binary || mz_zip_writer_add_mem(&zip, "mod_binary.bin", n.binary.data(), n.binary.size(), MZ_BEST_COMPRESSION)) &&
+              (n.game_mode ? mz_zip_writer_add_mem(&zip, "patch.bps", "", 0, MZ_NO_COMPRESSION)
+                           : n.patch.empty() || mz_zip_writer_add_mem(&zip, "patch.bps", n.patch.data(), n.patch.size(), MZ_BEST_COMPRESSION));
     void* buf = nullptr;
     size_t size = 0;
     if (ok && mz_zip_writer_finalize_heap_archive(&zip, &buf, &size)) {
@@ -399,6 +410,13 @@ int bake(int argc, char** argv) {
         n.path = arg;
         if (!read_nrm(n)) return 1;
         if (!ids.insert(n.ident).second) { fprintf(stderr, "mod_bake: mod %s given twice\n", n.id.c_str()); return 1; }
+        if (!n.code) {
+            // A ROM patch alone: nothing to compile, only the file to build in.
+            if (!n.embed || n.rom_binary) { fprintf(stderr, "mod_bake: %s has no code: build it in with :embed\n", n.id.c_str()); return 1; }
+            printf("mod_bake: %s %s: no code, a ROM patch of %zu bytes (embedded)\n", n.id.c_str(), n.version.c_str(), n.patch.size());
+            mods.push_back(std::move(n));
+            continue;
+        }
 
         N64Recomp::Context mod;
         if (!load_mod(n.syms, n.binary, ref, mod)) { fprintf(stderr, "mod_bake: in %s\n", n.path.string().c_str()); return 1; }
@@ -463,13 +481,13 @@ int bake(int argc, char** argv) {
           << "extern const uint32_t recomp_static_dispatch_count;\n"
           << "extern unsigned char recomp_static_dispatch_active[];\n";
         for (const auto& n : mods) {
-            o << "extern const recomp_static_mod static_mod_" << n.ident << ";\n";
+            if (n.code) o << "extern const recomp_static_mod static_mod_" << n.ident << ";\n";
             if (n.embed) o << "extern const unsigned char static_mod_nrm_" << n.ident << "[];\nextern const size_t static_mod_nrm_" << n.ident << "_size;\n";
         }
         o << "}\n\n// The baked mods, before recomp::start.\nvoid recomp_register_static_mods() {\n"
           << "    recomp::mods::register_static_dispatch(recomp_static_dispatch_entries, recomp_static_dispatch_count, recomp_static_dispatch_active);\n";
         for (const auto& n : mods) {
-            o << "    recomp::mods::register_static_mod(&static_mod_" << n.ident << ");\n";
+            if (n.code) o << "    recomp::mods::register_static_mod(&static_mod_" << n.ident << ");\n";
             if (n.embed) {
                 o << "    recomp::mods::register_embedded_mod(\"" << n.id << "\", std::span<const uint8_t>{ static_mod_nrm_" << n.ident
                   << ", static_mod_nrm_" << n.ident << "_size });\n";

@@ -1,0 +1,68 @@
+From 19565c207fad3339deb73e35c317a3f51fe523e3 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Sun, 25 Oct 2026 14:34:27 -0500
+Subject: [PATCH] Send a ROM patch that is not a game mode's to the host's
+ patch handler
+
+The host's ROM file handler (a game mode's ROM, made beforehand on a PC)
+took every mod's ROM patch, so a mod that only patches a few bytes of the
+game (Goemon's German translation: 167 KB of text in 44 files) asked the
+host for a ROM file that no one makes. The handler now stands for game
+modes only; another mod's patch is read and goes to the patch handler, or
+into the ROM in memory when the host sets none.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/include/librecomp/mods.hpp | 13 ++++++++-----
+ librecomp/src/mods.cpp               |  6 ++++--
+ 2 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index 675f07c..4625fea 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -682,16 +682,19 @@ namespace recomp {
+         CodeModLoadError validate_api_version(uint32_t api_version, std::string& error_param);
+ 
+         void initialize_mods();
+-        // A game mode's ROM patch (patch.bps) is applied to the ROM in memory,
++        // A mod's ROM patch (patch.bps) is applied to the ROM in memory,
+         // unless the host takes it over: one that cannot hold the patched ROM
+         // (the 3DS; ROM hacks make 64 MB ROMs) applies it itself, e.g. to a
+         // file it then streams the ROM from. Returning false fails the load.
+         using RomPatchHandler = bool (*)(const std::string& mod_id, std::span<const uint8_t> patch);
+         void set_rom_patch_handler(RomPatchHandler handler);
+-        // Or the host supplies the patched ROM itself, made beforehand: the
+-        // patch is never read (13-14 MB a game mode, more than an Old 3DS
+-        // has room for beside RDRAM). It gets the mod's file, to check the
+-        // ROM was made from its patch; returning false fails the load.
++        // Or, for a game mode, the host supplies the patched ROM itself, made
++        // beforehand: the patch is never read (13-14 MB a game mode, more
++        // than an Old 3DS has room for beside RDRAM). It gets the mod's file,
++        // to check the ROM was made from its patch; returning false fails the
++        // load. Another mod's patch still goes to the patch handler (a
++        // translation's few changed bytes, which the host can apply as the
++        // game loads its files).
+         using RomFileHandler = bool (*)(const std::string& mod_id, const std::filesystem::path& mod_path);
+         void set_rom_file_handler(RomFileHandler handler);
+         // Whether initialize_mods creates the mods folder (yes by default). A
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
+index 2a9dad8..350b6fd 100644
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -1890,8 +1890,10 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+         return ret;
+     }
+ 
+-    // Apply a ROM patch if one was found.
+-    if (rom_patch_mod_index != (size_t)-1 && rom_file_handler != nullptr) {
++    // Apply a ROM patch if one was found. The host's ROM file stands for a
++    // game mode's patch only; another mod's patch is read and goes to the
++    // patch handler (or into the ROM in memory).
++    if (rom_patch_mod_index != (size_t)-1 && rom_file_handler != nullptr && opened_mods[rom_patch_mod_index].manifest.custom_gamemode) {
+         auto& mod = opened_mods[rom_patch_mod_index];
+         if (!rom_file_handler(mod.manifest.mod_id, mod.manifest.mod_root_path)) {
+             ret.emplace_back(mod.manifest.mod_id, ModLoadError::FailedToLoadPatch, std::string{});
+-- 
+2.56.0
+

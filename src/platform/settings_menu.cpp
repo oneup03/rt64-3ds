@@ -32,6 +32,7 @@
 #include <map>
 #include <deque>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "rt64_3ds.h"
@@ -369,6 +370,33 @@ bool mod_required(const std::string& id) {
     for (const std::string& r : g_required_mods) if (r == id) return true;
     return false;
 }
+// GameDesc::mod_choice_*: built-in mods that don't work together, on one row.
+std::string g_mod_choice_label, g_mod_choice_off;
+std::vector<std::string> g_mod_choice_ids, g_mod_choice_names;
+int in_mod_choice(const std::string& id) {
+    for (size_t i = 0; i < g_mod_choice_ids.size(); i++) if (g_mod_choice_ids[i] == id) return (int)i;
+    return -1;
+}
+#ifdef RECOMP_STATIC_MODS
+// Whether mod `id` is a dependency of the choice's mod `which` (of any of
+// them for which < 0), by their manifests: such a mod follows the choice.
+bool choice_dependency(const std::vector<recomp::mods::ModDetails>& mods, const std::string& id, int which) {
+    for (const recomp::mods::ModDetails& d : mods) {
+        const int c = in_mod_choice(d.mod_id);
+        if (c < 0 || (which >= 0 && c != which)) continue;
+        for (const recomp::mods::Dependency& dep : d.dependencies) if (dep.mod_id == id) return true;
+    }
+    return false;
+}
+#endif
+// The one of them settings.ini has on (the first, should it have several), or -1.
+int saved_mod_choice() {
+    for (size_t i = 0; i < g_mod_choice_ids.size(); i++) {
+        const auto on = g_mod_values.find("mod." + g_mod_choice_ids[i]);
+        if (on != g_mod_values.end() && on->second != 0) return (int)i;
+    }
+    return -1;
+}
 LightLock g_file_lock;
 
 // What settings.ini holds now, as text (the main thread's values).
@@ -685,10 +713,28 @@ void add_mod_rows() {
         add_row({ row.mod_id.c_str(), row.label.c_str(), lo, hi, &row.value, names, false, nullptr, nullptr, recomp3ds::PageMods, 1, nullptr,
                   true, apply_mod_row, &row });
     };
+    // Not in a game mode that leaves all its mods out, as their toggles.
+    const bool choice_shown = std::any_of(g_mod_choice_ids.begin(), g_mod_choice_ids.end(), [](const std::string& id) { return !recomp3ds::mod_left_out(id); });
+    if (choice_shown) {
+        // The mods that don't work together: none ("Off") or one of them,
+        // kept as each one's on/off key and applied at the next start (a ROM
+        // patch goes in as the mods load; switching a code mod alone at once
+        // would leave its start-up hooks unrun).
+        static int choice = 0;
+        static std::vector<const char*> names;
+        names.assign(1, g_mod_choice_off.c_str());
+        for (const std::string& s : g_mod_choice_names) names.push_back(s.c_str());
+        choice = saved_mod_choice() + 1;
+        add_row({ "mod_choice", g_mod_choice_label.c_str(), 0, (int)g_mod_choice_ids.size(), &choice, names.data(), false, nullptr, nullptr,
+                  recomp3ds::PageMods, 1, nullptr, true, [](void*, int v) {
+                      for (size_t i = 0; i < g_mod_choice_ids.size(); i++) g_mod_values["mod." + g_mod_choice_ids[i]] = v == (int)i + 1 ? 1 : 0;
+                      changed();
+                  }, nullptr });
+    }
     for (const recomp::mods::ModDetails& d : mods) {
         if (d.custom_gamemode) continue;    // chosen at start, not toggled
         if (recomp3ds::mod_left_out(d.mod_id)) continue;   // not with this game mode
-        if (!mod_required(d.mod_id)) {
+        if (!mod_required(d.mod_id) && in_mod_choice(d.mod_id) < 0 && !choice_dependency(mods, d.mod_id, -1)) {
             ModRow toggle;
             toggle.mod_id = d.mod_id;
             toggle.key = "mod." + d.mod_id;
@@ -744,11 +790,39 @@ void add_mod_rows() {}
 // built-in code mod as settings.ini has it, off unless saved on.
 void recomp3ds::settings_apply_mods() {
     std::vector<std::string> missing = g_required_mods;
-    for (const recomp::mods::ModDetails& d : recomp::mods::get_all_mod_details(g_mod_game_id)) {
+    const int chosen = saved_mod_choice();
+    const std::vector<recomp::mods::ModDetails> mods = recomp::mods::get_all_mod_details(g_mod_game_id);
+    // A mod's own state: required, or as settings.ini has it; of the choice's
+    // mods, the one chosen alone.
+    auto own_state = [&](const recomp::mods::ModDetails& d) {
+        const int c = in_mod_choice(d.mod_id);
+        if (c >= 0) return c == chosen;
+        const auto on = g_mod_values.find("mod." + d.mod_id);
+        return mod_required(d.mod_id) || (on != g_mod_values.end() && on->second != 0);
+    };
+    // What the choice's mods depend on follows the choice: on when the mod
+    // chosen (or another mod on) needs it.
+    auto follows_choice = [&](const std::string& id) { return !mod_required(id) && in_mod_choice(id) < 0 && choice_dependency(mods, id, -1); };
+    // The choice's mods not chosen and what none on needs are left out of the
+    // session: a baked mod's sections take RDRAM whether it is on or not
+    // (Banjo's expansion pak mod: 2.66 MB of a 3 MB recomp heap).
+    std::unordered_set<std::string> unchosen;
+    for (const recomp::mods::ModDetails& d : mods) {
         if (d.custom_gamemode) continue;
         missing.erase(std::remove(missing.begin(), missing.end(), d.mod_id), missing.end());
-        const auto on = g_mod_values.find("mod." + d.mod_id);
-        recomp::mods::enable_mod(d.mod_id, mod_required(d.mod_id) || (on != g_mod_values.end() && on->second != 0));
+        bool enable = false;
+        if (follows_choice(d.mod_id)) {
+            enable = chosen >= 0 && choice_dependency(mods, d.mod_id, chosen);
+            for (const recomp::mods::ModDetails& o : mods) {
+                if (o.custom_gamemode || in_mod_choice(o.mod_id) >= 0 || follows_choice(o.mod_id) || !own_state(o)) continue;
+                for (const recomp::mods::Dependency& dep : o.dependencies) enable = enable || dep.mod_id == d.mod_id;
+            }
+        }
+        else {
+            enable = own_state(d);
+        }
+        if (!enable && (in_mod_choice(d.mod_id) >= 0 || follows_choice(d.mod_id))) unchosen.insert(d.mod_id);
+        recomp::mods::enable_mod(d.mod_id, enable);
         const recomp::config::ConfigSchema& schema = recomp::mods::get_mod_config_schema(d.mod_id);
         for (const recomp::config::ConfigOption& o : schema.options) {
             const auto saved = g_mod_values.find("mod." + d.mod_id + "." + o.id);
@@ -757,6 +831,7 @@ void recomp3ds::settings_apply_mods() {
             if (!std::holds_alternative<std::monostate>(value)) recomp::mods::set_mod_config_value(d.mod_id, o.id, value);
         }
     }
+    recomp3ds::exclude_unchosen_mods(unchosen);
     // A required mod whose file is not on the card (GameDesc::required_mods).
     for (const std::string& id : missing) {
         char msg[512];
@@ -863,6 +938,14 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     // game's choice unless the file says otherwise.
     g_required_mods.assign(desc.required_mods, desc.required_mods + desc.required_mod_count);
     g_required_mods_hint = desc.required_mods_hint != nullptr ? desc.required_mods_hint : "";
+    g_mod_choice_label = desc.mod_choice_label != nullptr ? desc.mod_choice_label : "Mod";
+    g_mod_choice_off = desc.mod_choice_off_name != nullptr ? desc.mod_choice_off_name : "Off";
+    g_mod_choice_ids.clear();
+    g_mod_choice_names.clear();
+    for (size_t i = 0; i < desc.mod_choice_count; i++) {
+        g_mod_choice_ids.push_back(desc.mod_choice_ids[i]);
+        g_mod_choice_names.push_back(desc.mod_choice_names != nullptr ? desc.mod_choice_names[i] : desc.mod_choice_ids[i]);
+    }
     // The in-betweens' own eye targets serve "60 interp." alone, which an Old
     // 3DS does not run by default (GameDesc::old3ds_frame_cap): there they
     // would hold 1125 KB of VRAM (room for textures) and a 512 KB command

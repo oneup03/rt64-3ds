@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 extern "C" {
 #include <3ds/types.h>
 #include <3ds/svc.h>
@@ -103,6 +104,10 @@ namespace recomp3ds {
     // mod_bake :rom): the runtime streams it from that file.
     void rom_mods_install(const char* rom_path);
     bool mod_left_out(const std::string& mod_id);
+    // Before the mods load (settings_apply_mods): the choice row's mods not
+    // chosen and what only they need, left out of this session beside the
+    // game mode's, so their sections take no RDRAM.
+    void exclude_unchosen_mods(const std::unordered_set<std::string>& mod_ids);
     bool rom_stream_active();
     // Since the last call: the card reads and their bytes, and the game's
     // waits in the stream (calls over 50 us), their time and the longest.
