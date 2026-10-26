@@ -1361,7 +1361,7 @@ library's keys:
 | key | default | row | read by |
 |---|---|---|---|
 | `separation`, `convergence_tenths`, `hud_depth`, `auto_convergence`, `comfort_target`, `stereo_ghost_contrast`, `stereo_ghost_black_floor` | 25, 60, 50, 1, 0, 100, 0 (the games set their own) | 3D page | the gfx thread each frame |
-| `stick_deadzone`, `cstick_deadzone`, `cstick_up`, `cstick_down`, `cstick_camera` | 5, 20, 1, 1, 1 (`cstick_camera` only with `GameDesc::cstick_camera_hold`) | Controls | `input_set_*` |
+| `stick_deadzone`, `cstick_deadzone`, `cstick_up`, `cstick_down`, `cstick_camera` | 5, 20, 1, 1, 1 (`cstick_camera` only with `GameDesc::cstick_camera_hold`; with `cstick_camera_analog_x` its left and right press nothing and the game reads them, `recomp3ds::cstick_camera_analog()`: Goemon's analog camera) | Controls | `input_set_*` |
 | `button_a`, `button_b`, `button_x`, `button_y`, `button_l`, `button_r`, `button_zl`, `button_zr`, `button_dup`, `button_ddown`, `button_dleft`, `button_dright` | the N64 button each 3DS button presses, an index into `kN64ChoiceButtons` (0 none, then A, B, Z, L, R, the D-pad's four, the C buttons' four; START stays on START); the defaults are the game's `button_map`. ZL and ZR rows on a New 3DS only. A key a mod mode's map (`input_set_map`) gives other buttons than the game's own map follows that map instead | Controls | `input_set_user_buttons` |
 | `crosshair` | 0: the crosshair (the reticle classify_frame finds) at the depth under it; 1: at the HUD's depth (`hud_depth`) | 3D | `Settings::crosshair_hud` |
 | (Reset controls) | not saved: a first press arms it, a second puts every Controls row back to its default (the game's, before `settings.ini`) | Controls | |

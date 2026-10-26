@@ -79,6 +79,8 @@ namespace recomp3ds {
     void input_set_user_buttons(const uint16_t* n64_per_key);
     // GameDesc::cstick_camera_*: hold 0 turns the camera mode off.
     void input_set_cstick_camera(uint16_t hold, uint16_t lead_ms, uint16_t press_ms, uint16_t period_ms);
+    // GameDesc::cstick_camera_analog_x.
+    void input_set_cstick_camera_analog_x(bool on);
     void input_poll();
     void input_motion_update();         // main thread, after hidScanInput
     bool input_get(int controller_num, uint16_t* buttons, float* x, float* y);

@@ -889,6 +889,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     // follows the game's camera settings.
     if (desc.cstick_camera_hold != 0) {
         g_cam_desc = &desc;
+        recomp3ds::input_set_cstick_camera_analog_x(desc.cstick_camera_analog_x);
         add_row({ "cstick_camera", "C-Stick", 0, 1, &g_cstick_camera, kCstickCameraNames, false, nullptr, apply_cstick_camera, PageControls, 1, nullptr });
     }
     add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, PageControls, 1, nullptr });

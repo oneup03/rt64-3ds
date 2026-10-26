@@ -37,6 +37,7 @@ volatile float g_stick_dz = 0.05f, g_cstick_dz = 0.20f;
 // on the game thread (input_get).
 struct CstickCamera { uint16_t hold, lead_ms, press_ms, period_ms; };
 std::atomic<uint64_t> g_cam_cfg{ 0 };
+std::atomic<bool> g_cam_analog_x{ false };   // GameDesc::cstick_camera_analog_x
 uint16_t g_cam_dir = 0;          // the C button being pulsed (0: stick centred)
 uint64_t g_cam_held_since = 0;   // ms: when the hold buttons went down
 uint64_t g_cam_dir_since = 0;    // ms: when this direction's presses start
@@ -53,7 +54,9 @@ CstickCamera cam_cfg() {
 uint16_t cstick_camera(const CstickCamera& c, float cx, float cy) {
     uint16_t dir = 0;
     if (fabsf(cx) >= fabsf(cy)) {
-        if (cx < -CSTICK_BUTTON) dir = N64_CLEFT;
+        // Left and right turn the game's analog camera instead (cstick_camera_analog_x).
+        if (g_cam_analog_x.load(std::memory_order_relaxed)) {}
+        else if (cx < -CSTICK_BUTTON) dir = N64_CLEFT;
         else if (cx > CSTICK_BUTTON) dir = N64_CRIGHT;
     }
     else {
@@ -221,6 +224,8 @@ void recomp3ds::input_set_cstick_buttons(bool on) { g_cstick_buttons = on; }
 void recomp3ds::input_set_cstick_camera(uint16_t hold, uint16_t lead_ms, uint16_t press_ms, uint16_t period_ms) {
     g_cam_cfg.store(uint64_t(hold) | (uint64_t(lead_ms) << 16) | (uint64_t(press_ms) << 32) | (uint64_t(period_ms) << 48));
 }
+void recomp3ds::input_set_cstick_camera_analog_x(bool on) { g_cam_analog_x = on; }
+bool recomp3ds::cstick_camera_analog() { return g_cam_analog_x.load() && cam_cfg().hold != 0; }
 void recomp3ds::input_set_cstick_up(bool on) { g_cstick_up = on; }
 void recomp3ds::input_set_cstick_down(bool on) { g_cstick_down = on; }
 

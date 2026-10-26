@@ -205,6 +205,12 @@ struct GameDesc {
     uint16_t cstick_camera_lead_ms = 70;
     uint16_t cstick_camera_press_ms = 100;
     uint16_t cstick_camera_period_ms = 267;
+    // With the camera mode on, the C-Stick's left and right press nothing:
+    // the game turns its camera from the stick itself (its patches reading
+    // the C-Stick through input_get_right_stick, while cstick_camera_analog()
+    // says so); up and down still hold and press as above (Goemon: an analog
+    // camera turn, the game's own R + C-Up/Down zoom).
+    bool cstick_camera_analog_x = false;
     // Optional: called once the audio is up (ndsp, and the DSP synthesizer
     // when the game has one) with the first ndsp channel the platform leaves
     // free (23 - SynthDesc::reserve_channels + 1; 24 when none is), for a
@@ -241,6 +247,10 @@ const char* base_path();
 // Whether the C-Stick also presses the C buttons (on by default). A game
 // that reads the C-Stick as an analog camera turns it off.
 void input_set_cstick_buttons(bool on);
+// GameDesc::cstick_camera_analog_x: whether the Controls page's C-Stick row
+// is on Camera, so the game turns its camera from the C-Stick's left and
+// right itself. Any thread.
+bool cstick_camera_analog();
 // N64 buttons (N64_DUP ... N64_L) to offer on the touch screen while the
 // settings menu is closed, for mods that read buttons the game's own map
 // leaves out; 0 hides them. Any thread.
