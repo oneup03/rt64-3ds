@@ -47,15 +47,46 @@ unsigned g_mask = 0;
 // game may still make one: a capture's writer, a game thread later on).
 constexpr unsigned kThreadsSpare = 3;
 
+// A thread that has not finished within the wait keeps its handle: it is
+// joined at the next stop, or carries on if the monitors are back first
+// (start_threads leaves its core alone).
 void stop_threads() {
     g_running = false;
     for (int c = 0; c < kCores; c++) {
         if (g_mon[c].thread != nullptr) {
-            if (R_SUCCEEDED(threadJoin(g_mon[c].thread, 200 * 1000000ull))) threadFree(g_mon[c].thread);
+            if (R_SUCCEEDED(threadJoin(g_mon[c].thread, 200 * 1000000ull))) {
+                threadFree(g_mon[c].thread);
+                g_mon[c].thread = nullptr;
+            }
             else fprintf(stderr, "loadmon: core %d's idle thread did not finish (left to the exit)\n", c);
-            g_mon[c].thread = nullptr;
         }
     }
+}
+
+// The Performance monitor row (loadmon_want): the idle threads run only
+// while it is on. Each takes its core whenever nothing else of the
+// application wants it, so on an Old 3DS the application always has a
+// thread asking for its whole time limit on core 1, where the system
+// modules (fs, nwm, hid) run.
+bool g_wanted = true;
+bool g_released = false;      // loadmon_resume has run (the game has made its threads)
+
+void start_threads() {
+    unsigned used = 0, limit = 0;
+    const bool known = recomp3ds::thread_budget(&used, &limit);
+    g_running = true;
+    int started = 0;
+    for (int c = 0; c < kCores; c++) {
+        if (!((g_mask >> c) & 1) || g_mon[c].calibration == 0) continue;
+        if (g_mon[c].thread != nullptr) { started++; continue; }   // one that had not finished: running again
+        if (known && used + 1 + kThreadsSpare > limit) break;
+        g_mon[c].count = 0;
+        g_mon[c].last = 0;
+        g_mon[c].peek_tick = 0;
+        g_mon[c].thread = threadCreate(idle_thread, &g_mon[c], 4096, 0x3F, c, false);
+        if (g_mon[c].thread != nullptr) { started++; used++; }
+    }
+    fprintf(stderr, "loadmon: %d core monitors running (threads %u of %u in use)\n", started, used, limit);
 }
 
 }   // namespace
@@ -89,20 +120,20 @@ void recomp3ds::loadmon_start(unsigned core_mask) {
 }
 
 void recomp3ds::loadmon_resume() {
-    unsigned used = 0, limit = 0;
-    const bool known = recomp3ds::thread_budget(&used, &limit);
-    g_running = true;
-    int started = 0;
-    for (int c = 0; c < kCores; c++) {
-        if (!((g_mask >> c) & 1) || g_mon[c].calibration == 0) continue;
-        if (known && used + 1 + kThreadsSpare > limit) break;
-        g_mon[c].count = 0;
-        g_mon[c].last = 0;
-        g_mon[c].peek_tick = 0;
-        g_mon[c].thread = threadCreate(idle_thread, &g_mon[c], 4096, 0x3F, c, false);
-        if (g_mon[c].thread != nullptr) { started++; used++; }
+    g_released = true;
+    if (g_wanted) start_threads();
+    else fprintf(stderr, "loadmon: no core monitors (Performance monitor off)\n");
+}
+
+void recomp3ds::loadmon_want(bool on) {
+    if (on == g_wanted) return;
+    g_wanted = on;
+    if (!g_released) return;      // loadmon_resume starts them, or not
+    if (on) start_threads();
+    else {
+        stop_threads();
+        fprintf(stderr, "loadmon: core monitors stopped (Performance monitor off)\n");
     }
-    fprintf(stderr, "loadmon: %d core monitors running (threads %u of %u in use)\n", started, used, limit);
 }
 
 // A core's idle count now and the idle thread's rate with the core to

@@ -1368,7 +1368,7 @@ library's keys:
 | `brightness_top`, `brightness_bottom` | 0 (the system's level, left alone); 1-5 the system's levels (gsp::Lcd), set again after the HOME Menu and sleep | Game | `GSPLCD_SetBrightness` |
 | `touch_button_1`, `touch_button_2` | 0 (none): the player's touch buttons, any N64 button each, at the top of the touch grid's right column ahead of a game's buttons | Controls | `touch_pad_set_user` |
 | `audio` | 1 | Game | `audio_set_enabled` |
-| `perf_monitor` | 1: the touch screen's game name, frame rate and SELECT hint; 0: none of them (the touch buttons, alerts and the menu stay) | Game | `settings_perf_monitor` |
+| `perf_monitor` | 1: the touch screen's game name, frame rate and SELECT hint; 0: none of them (the touch buttons, alerts and the menu stay), and no load monitor idle threads (`loadmon_want`; kept for `dbg_profile` 2 or 3), so the stats lines read the cores' loads as -1 | Game | `settings_perf_monitor` |
 | `frame_cap` | 0; the games 2, which an Old 3DS turns into `old3ds_frame_cap` | Game | the gfx thread |
 | `dbg_capture` | 0: a SELECT hold saves a screenshot; 1: a frame capture (`gfx_task.bin`) | Game (Hold SELECT: Screenshot, Debug Capture) | the SELECT hold in `recomp3ds_run.cpp` |
 | `dbg_old_clock` | 0 | none, New 3DS only | `set_cpu_speed` (1 runs at the Old 3DS clock) |

@@ -316,6 +316,9 @@ int g_perf_monitor = 1;
 const char* const kPerfMonitorNames[] = { "Off", "On" };
 const char* g_game_name = "";
 void apply_perf_monitor(int v) {
+    // The load monitor's idle threads too (loadmon.cpp), kept for the
+    // game profile (dbg_profile 2 or 3), which reads them.
+    recomp3ds::loadmon_want(v != 0 || (rt64_3ds::settings().dbg_profile & 2) != 0);
     // The name on row 1 (printed at boot); the stats line on row 2 is the
     // stats loop's (recomp3ds_run.cpp), blanked here and left so while off.
     if (v != 0) recomp3ds::screen_printf("\x1b[1;0H%-40.40s", g_game_name);

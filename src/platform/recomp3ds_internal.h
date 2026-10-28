@@ -203,6 +203,10 @@ namespace recomp3ds {
     // threads find slots at boot (an application has 32); this brings them
     // back, as many as leave kThreadsSpare slots free.
     void loadmon_resume();
+    // Whether the idle threads run, from the Performance monitor row (and
+    // the game profile, which reads them); before loadmon_resume it only
+    // decides whether that starts them.
+    void loadmon_want(bool on);
     // The process's threads in use and its limit; false if unreadable.
     bool thread_budget(unsigned* used, unsigned* limit);
 
