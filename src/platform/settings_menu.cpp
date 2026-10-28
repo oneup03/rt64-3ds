@@ -11,7 +11,9 @@
 // its shape (the owner's desktop settings, same units and defaults). The
 // stick deadzones start the Controls page; C-Stick up and down, a row per
 // button (its N64 button, the game's map by default) and the two touch
-// buttons follow the game's rows there; the game's own options (GameDesc::menu_options) go on
+// buttons follow the game's rows there (an Old 3DS, with no C-Stick, ZL or
+// ZR, has their rows in settings.ini only, and a game's
+// MenuOption::new3ds_only rows); the game's own options (GameDesc::menu_options) go on
 // the pages they name, and GameDesc::menu_defaults can change any row's
 // default. A page with more rows than fit scrolls.
 //
@@ -545,8 +547,8 @@ void step(int slot, int d) {
 
 // "Reset controls" (the Controls page's last row): a first press of left
 // or right arms it, a second puts every Controls row back to its default
-// (the game's, before settings.ini), the ZL and ZR rows an Old 3DS hides
-// included. Choosing another row disarms it.
+// (the game's, before settings.ini), the ZL, ZR and C-Stick rows an Old 3DS
+// hides included. Choosing another row disarms it.
 int g_reset_value = 0;
 const char* const kResetNames[] = { "Press >", "Again: reset" };
 void reset_controls(void*, int) {
@@ -554,7 +556,8 @@ void reset_controls(void*, int) {
     // Stepped off "Again" (either way): reset.
     for (int i = 0; i < g_row_count; i++) {
         Row& r = g_rows[i];
-        const bool controls = r.page == recomp3ds::PageControls || strncmp(r.key, "button_", 7) == 0;
+        const bool controls = r.page == recomp3ds::PageControls || strncmp(r.key, "button_", 7) == 0 ||
+                              strncmp(r.key, "cstick_", 7) == 0;
         if (!controls || r.no_save || *r.value == r.def) continue;
         *r.value = r.def;
         fprintf(stderr, "settings: %s=%d (reset)\n", r.key, r.def);
@@ -882,27 +885,31 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     // The desktop's ghost reduction: 100% contrast and a 0% floor are off.
     add_row({ "stereo_ghost_contrast", "Ghost reduction: contrast", 50, 100, &st.ghost_contrast, nullptr, false, "%", nullptr, Page3D, 1, nullptr });
     add_row({ "stereo_ghost_black_floor", "Ghost black floor", 0, 20, &st.ghost_black_floor, nullptr, false, "%", nullptr, Page3D, 1, nullptr });
+    bool is_new_3ds = false;
+    APT_CheckNew3DS(&is_new_3ds);
+    // The C-Stick's rows (and a game's MenuOption::new3ds_only rows) only on
+    // a New 3DS: an Old 3DS has no C-Stick, they would do nothing.
+    const int cstick_page = is_new_3ds ? PageControls : recomp3ds::PageCount;
     add_row({ "stick_deadzone", "Circle Pad deadzone", 0, 50, &g_stick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
-    add_row({ "cstick_deadzone", "C-Stick deadzone", 0, 50, &g_cstick_dz, nullptr, false, "%", apply_deadzones, PageControls, 1, nullptr });
+    add_row({ "cstick_deadzone", "C-Stick deadzone", 0, 50, &g_cstick_dz, nullptr, false, "%", apply_deadzones, cstick_page, 1, nullptr });
     for (size_t i = 0; i < desc.menu_option_count; i++) {
         const MenuOption& o = desc.menu_options[i];
-        add_row({ o.key, o.label, o.lo, o.hi, o.value, o.names, false, o.suffix, o.on_change, o.page, o.step > 0 ? o.step : 1, o.zero_text });
+        const int page = o.new3ds_only && !is_new_3ds ? recomp3ds::PageCount : o.page;
+        add_row({ o.key, o.label, o.lo, o.hi, o.value, o.names, false, o.suffix, o.on_change, page, o.step > 0 ? o.step : 1, o.zero_text });
     }
     // After the game's rows: where C-Up is a camera (DK64's first person) it
     // follows the game's camera settings.
     if (desc.cstick_camera_hold != 0) {
         g_cam_desc = &desc;
         recomp3ds::input_set_cstick_camera_analog_x(desc.cstick_camera_analog_x);
-        add_row({ "cstick_camera", "C-Stick", 0, 1, &g_cstick_camera, kCstickCameraNames, false, nullptr, apply_cstick_camera, PageControls, 1, nullptr });
+        add_row({ "cstick_camera", "C-Stick", 0, 1, &g_cstick_camera, kCstickCameraNames, false, nullptr, apply_cstick_camera, cstick_page, 1, nullptr });
     }
-    add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, PageControls, 1, nullptr });
-    add_row({ "cstick_down", "C-Stick down", 0, 1, &g_cstick_down, kCstickDownNames, false, nullptr, apply_cstick_down, PageControls, 1, nullptr });
+    add_row({ "cstick_up", "C-Stick up", 0, 1, &g_cstick_up, kCstickUpNames, false, nullptr, apply_cstick_up, cstick_page, 1, nullptr });
+    add_row({ "cstick_down", "C-Stick down", 0, 1, &g_cstick_down, kCstickDownNames, false, nullptr, apply_cstick_down, cstick_page, 1, nullptr });
     {
         // A row per button, each scrolling through every N64 button; the
         // defaults are the game's own map. ZL and ZR only on a New 3DS (an
         // Old 3DS has none: their rows would do nothing).
-        bool new_3ds = false;
-        APT_CheckNew3DS(&new_3ds);
         const recomp3ds::ButtonMap* base = nullptr;
         size_t base_count = 0;
         recomp3ds::input_base_map(&base, &base_count);
@@ -917,7 +924,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
         for (int i = 0; i < recomp3ds::kMappableKeys; i++) {
             const u32 key = recomp3ds::input_mappable_key(i);
             g_button_choice[i] = recomp3ds::n64_choice_of(recomp3ds::input_map_buttons(base, base_count, key));
-            const bool shown = new_3ds || (key != KEY_ZL && key != KEY_ZR);
+            const bool shown = is_new_3ds || (key != KEY_ZL && key != KEY_ZR);
             add_row({ kKeys[i], kLabels[i], 0, recomp3ds::kN64Choices - 1, &g_button_choice[i], recomp3ds::kN64ChoiceNames, false, nullptr,
                       apply_buttons, shown ? PageControls : recomp3ds::PageCount, 1, nullptr });
         }
@@ -936,8 +943,6 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "frame_cap", "Frame rate", 0, desc.render.frame_interpolation ? 2 : 1, &st.frame_cap, kFrameCapNames, false, nullptr, nullptr, PageGame, 1, nullptr });
     add_row({ "rom_stream", "ROM stream", 0, 2, &g_rom_stream, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "dbg_capture", "Hold SELECT", 0, 1, &g_debug_capture, kSelectHoldNames, false, nullptr, nullptr, PageGame, 1, nullptr });
-    bool is_new_3ds = false;
-    APT_CheckNew3DS(&is_new_3ds);
     // RenderDesc::double_eyes, settings.ini only and read at start: the
     // game's choice unless the file says otherwise.
     g_required_mods.assign(desc.required_mods, desc.required_mods + desc.required_mod_count);

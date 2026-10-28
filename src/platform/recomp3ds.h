@@ -54,6 +54,9 @@ struct MenuOption {
     int step = 1;
     const char* suffix = nullptr;       // after the number ("%")
     const char* zero_text = nullptr;    // shown for 0 instead of the number ("Off")
+    // Hidden on an Old 3DS, settings.ini only there: a row for the C-Stick
+    // (an analog camera), which an Old 3DS has none of.
+    bool new3ds_only = false;
 };
 
 // A game's starting value for a menu row by its key, the library's own rows
