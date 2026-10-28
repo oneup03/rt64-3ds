@@ -59,7 +59,17 @@ a port. Three games are the reference, each in its repository's
      an Old 3DS, 64MB unless the game asks for more: a larger mode leaves
      the system less and the console reboots when the title closes; the
      `.3dsx` gets the Homebrew Launcher's mode instead). 80MB is the most
-     that works: 96MB crashed the HOME Menu at launch on an Old 3DS. DK64
+     known to work: 96MB crashed the HOME Menu at launch on an Old 3DS
+     (2026-10-21, wireless on), leaving the system region (the HOME Menu
+     and applets) 12 MB, against 44 at 64MB and 28 at 80MB. A title in
+     96MB is to keep the wireless and the background network services off
+     for as long as it runs: `NWMEXT_ControlWirelessEnabled(false)` unless
+     the shared page's `network_state` is already 7 (off), and
+     `NDMU_SuspendDaemons(NDM_DAEMON_MASK_ALL)` with
+     `NDMU_SuspendScheduler(1)` (StreetPass, SpotPass, eShop, friends),
+     both put back on `APTHOOK_ONEXIT`; the template lists `nwm::EXT` and
+     `ndm:u`. Not in rt64-3ds yet and untested on a console: DK64's 96MB
+     test CIA of 2026-10-28 does it from test rows. DK64
      and Banjo ask for 80MB to hold their ROMs there (DK64 with 12 MB of
      RDRAM), `CpuSpeed 804MHz` + `EnableL2Cache`,
      `StackSize 0x80000`, `AffinityMask 3` / `CanAccessCore2` and the
