@@ -88,7 +88,10 @@ a port. Three games are the reference, each in its repository's
      no HOME Menu). `add_cia` asks for 80MB by default, as DK64, Banjo and
      Goemon do, to hold their ROMs (DK64 with 12 MB of
      RDRAM), `CpuSpeed 804MHz` + `EnableL2Cache`,
-     `StackSize 0x80000`, `AffinityMask 3` / `CanAccessCore2` and the
+     `StackSize 0x10000` (libctru's `initSystem` moves the main thread
+     onto `__stacksize__`, 512 KB from the heap, so the exheader's stack
+     only carries the start; at 0x80000 it held 448 KB for nothing),
+     `AffinityMask 3` / `CanAccessCore2` and the
      services `dsp::DSP`, `ptm:sysm`, `nwm::UDS`, `soc:U`. The New 3DS clock
      comes from `osSetSpeedupEnable(true)` at start, CIA and `.3dsx` alike.
      The banner sound must be the project's own: a recording of the game's

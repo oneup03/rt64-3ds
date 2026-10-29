@@ -35,7 +35,9 @@ namespace recomp { uint32_t heap_rdram_address() __attribute__((weak)); }
 #include "game_profile.h"
 
 // libctru's default main stack is 32 KB; the runtime's start path and the
-// C++ library want more.
+// C++ library want more. libctru's initSystem takes it from the heap and
+// moves the main thread onto it, so the exheader's StackSize (the CIA
+// template's 0x10000) only carries the start.
 extern "C" { u32 __stacksize__ = 512 * 1024; }
 
 namespace {

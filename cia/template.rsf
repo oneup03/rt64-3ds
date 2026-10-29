@@ -263,7 +263,7 @@ AccessControlInfo:
 SystemControlInfo:
   SaveDataSize: 0KB # Change if the app uses savedata
   RemasterVersion: 0
-  StackSize: 0x80000   # 512 KB, same as __stacksize__ in src/platform/recomp3ds_run.cpp
+  StackSize: 0x10000   # 64 KB: libctru's initSystem moves the main thread onto __stacksize__ (512 KB, src/platform/recomp3ds_run.cpp) taken from the heap, so this stack only carries the start and libctru's own exit (recomp3ds_run.cpp's finish_exit never comes back to it); 0x80000 held 448 KB of the application's memory for nothing (found by the LEGO Island 2 port)
 
   # Modules that run services listed above should be included below
   # Maximum 48 dependencies
