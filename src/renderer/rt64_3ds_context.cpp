@@ -3576,9 +3576,11 @@ public:
         if (sf.aim) {
             aim_z_ = sample_aim_depth(sf);
             // Zero at the convergence distance, the full separation at
-            // infinity (also when nothing was sampled: open sky), negative
-            // nearer; clamped harder behind the screen than in front.
-            const float ratio = aim_z_ > 0.0f ? sf.conv / aim_z_ : 0.0f;
+            // infinity, negative nearer; clamped harder behind the screen
+            // than in front. Open sky or nothing drawn keeps the last finite
+            // depth (sample_aim_depth); with none yet this aim, the screen's
+            // plane.
+            const float ratio = aim_z_ > 0.0f ? sf.conv / aim_z_ : 1.0f;
             const float off = sf.sep * (1.0f - ratio);
             const float limit = off > 0.0f ? 0.10f : 0.30f;
             sf.aim_ndc = off < -limit ? -limit : off > limit ? limit : off;
@@ -3602,7 +3604,10 @@ public:
     // is visible. An empty patch is cleared depth, the far plane: an infinity
     // candidate whose position is known exactly (-s). With nothing consistent
     // the previous answer holds (a guess only when there is none), and the
-    // result is smoothed in z behind a 1% relative deadband.
+    // result is smoothed in z behind a 1% relative deadband. Infinity winning
+    // (open sky) holds the last finite depth as well, as does a frame with no
+    // world drawn: the crosshair stays where it was rather than jumping
+    // behind everything (the owner's choice, 2026-10-28).
     //
     // The prediction uses the separation and convergence that frame was
     // drawn with. Depth needs no viewport correction here (the desktop's
@@ -3610,7 +3615,7 @@ public:
     // 2 z' - 1 is exactly the projection's ndc.z.
     float sample_aim_depth(const rt64_3ds::StereoFrame& sf) {
         (void)sf;
-        if (!prev_cam_world_) { aim_have_prev_ = false; return -1.0f; }
+        if (!prev_cam_world_) return aim_have_prev_ ? aim_ema_ : -1.0f;
         constexpr int kCandidates = 13, kPatch = 5, kMinSamples = 2;
         const float s_px = prev_sep_ * 200.0f, conv = prev_conv_;
         const bool shifted = s_px > 0.5f && conv > 0.0f;
@@ -3648,13 +3653,7 @@ public:
             }
         }
         if (aim_inv < 0.0f && !aim_have_prev_) aim_inv = best_inv;
-        if (aim_inv < 0.0f) return aim_have_prev_ ? aim_ema_ : -1.0f;   // hold
-        if (aim_inv <= 0.0f) {
-            // Infinity: nothing finite to ease toward.
-            aim_have_prev_ = false;
-            aim_ema_ = -1.0f;
-            return -1.0f;
-        }
+        if (aim_inv <= 0.0f) return aim_have_prev_ ? aim_ema_ : -1.0f;   // nothing, or infinity: hold
         const float z = 1.0f / aim_inv;
         if (!aim_have_prev_) aim_ema_ = z;
         else if (std::fabs(z - aim_ema_) / aim_ema_ > 0.01f) aim_ema_ += (z - aim_ema_) * 0.25f;
