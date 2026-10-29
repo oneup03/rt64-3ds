@@ -9,6 +9,7 @@
 extern "C" {
 #include <3ds/types.h>
 #include <3ds/svc.h>
+#include <3ds/console.h>
 }
 
 #include "ultramodern/input.hpp"
@@ -120,8 +121,20 @@ namespace recomp3ds {
     // right after consoleInit, and screen_printf writes to it. stdout goes to
     // the log with stderr (log_init), so the runtime's diagnostic printf
     // lines ("Opening mod ...") don't stay on the screen.
-    void screen_init();
+    void screen_init(PrintConsole* console);
     void screen_printf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+    // The touch screen to the renderer for the game's HUD (hud: Settings::
+    // hud_on_bottom with the settings menu closed), the console's text drawn
+    // over it from a copy; or back to the console, once the renderer's last
+    // copy to the screen is done (the main loop, each pass).
+    void screen_bottom_update(bool hud);
+    // The console back on the touch screen now (waiting up to timeout_ms for
+    // the renderer's last copy): the HOME prompt and the fatal message, with
+    // the renderer held or gone.
+    void screen_take_console(uint32_t timeout_ms);
+    // A pixel of what the console shows or would show (RGB565): the touch
+    // pad's fill colours, made see-through over a HUD.
+    uint16_t screen_pixel(int x, int y);
     // What the console drew since the last call, out of the cache to the
     // framebuffer the display reads (the main loop, each pass).
     void screen_flush();
@@ -185,7 +198,9 @@ namespace recomp3ds {
     // The touch-screen buttons (touch_pad.cpp): update from the main thread
     // with the touch point (shown: the settings menu is closed; redraw: the
     // console was cleared); the game thread reads what is held.
-    void touch_pad_update(bool shown, bool contact, int x, int y, bool redraw);
+    // over_hud: the game's HUD is on the touch screen (GameDesc::touch_area_hud).
+    void touch_pad_update(bool shown, bool over_hud, bool contact, int x, int y, bool redraw);
+    void touch_pad_set_hud_area(int col, int row, int cols, int rows);
     uint16_t touch_pad_held();
     // The player's two touch buttons (the Controls page), N64 buttons each
     // (0: not shown): the top of the right-hand column, ahead of a game's.

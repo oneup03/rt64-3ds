@@ -214,6 +214,13 @@ struct GameDesc {
     // says so); up and down still hold and press as above (Goemon: an analog
     // camera turn, the game's own R + C-Up/Down zoom).
     bool cstick_camera_analog_x = false;
+    // With the HUD on the touch screen (RenderDesc::hud_on_bottom_supported):
+    // the console cells (8 x 8 px, 40 x 30) the touch buttons keep to, clear
+    // of the game's HUD there. Buttons that don't fit it (taller than two
+    // cells each, labels whole) take the usual rows over the HUD instead,
+    // their fills see-through. None (no columns): always the latter.
+    struct TouchArea { uint8_t col = 0, row = 0, cols = 0, rows = 0; };
+    TouchArea touch_area_hud;
     // Optional: called once the audio is up (ndsp, and the DSP synthesizer
     // when the game has one) with the first ndsp channel the platform leaves
     // free (23 - SynthDesc::reserve_channels + 1; 24 when none is), for a
@@ -261,6 +268,11 @@ void input_set_cstick_buttons(bool on);
 // is on Camera, so the game turns its camera from the C-Stick's left and
 // right itself. Any thread.
 bool cstick_camera_analog();
+// The game's HUD is on the touch screen (RenderDesc::hud_on_bottom_supported
+// and the Game page's HUD row): its marked spans are drawn there, so a HUD
+// that hides itself can stay up (the game's patches ask through the recomp
+// API). The answer can change while the game runs.
+bool hud_on_bottom();
 // N64 buttons (N64_DUP ... N64_L) to offer on the touch screen while the
 // settings menu is closed, for mods that read buttons the game's own map
 // leaves out; 0 hides them. Any thread.

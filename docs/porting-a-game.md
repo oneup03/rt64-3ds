@@ -1394,8 +1394,9 @@ library's keys:
 | `brightness_top`, `brightness_bottom` | 0 (the system's level, left alone); 1-5 the system's levels (gsp::Lcd), set again after the HOME Menu and sleep | Game | `GSPLCD_SetBrightness` |
 | `touch_button_1`, `touch_button_2` | 0 (none): the player's touch buttons, any N64 button each, at the top of the touch grid's right column ahead of a game's buttons | Controls | `touch_pad_set_user` |
 | `audio` | 1 | Game | `audio_set_enabled` |
-| `perf_monitor` | 1: the touch screen's game name, frame rate and SELECT hint; 0: none of them (the touch buttons, alerts and the menu stay), and no load monitor idle threads (`loadmon_want`; kept for `dbg_profile` 2 or 3), so the stats lines read the cores' loads as -1 | Game | `settings_perf_monitor` |
+| `perf_monitor` | 1 (0 for a game with `RenderDesc::hud_on_bottom_supported`, whose HUD the text would cover): the touch screen's game name, frame rate and SELECT hint; 0: none of them (the touch buttons, alerts and the menu stay), and no load monitor idle threads (`loadmon_want`; kept for `dbg_profile` 2 or 3), so the stats lines read the cores' loads as -1 | Game | `settings_perf_monitor` |
 | `frame_cap` | 0; the games 2, which an Old 3DS turns into `old3ds_frame_cap` | Game | the gfx thread |
+| `hud_on_bottom` | 1: the game's marked HUD on the touch screen; 0: on the top screen. With `RenderDesc::hud_on_bottom_supported` only | Game (HUD: Top screen, Touch screen) | `screen_bottom_update`, `recomp3ds::hud_on_bottom` |
 | `log_level` | 1 on a New 3DS, 0 on an Old | Game (Log level: Warnings, Summary, Full) | `log_set_level` |
 | `dbg_capture` | 0: a SELECT hold saves a screenshot; 1: a frame capture (`gfx_task.bin`) | Game (Hold SELECT: Screenshot, Debug Capture) | the SELECT hold in `recomp3ds_run.cpp` |
 | `dbg_old_clock` | 0 | none, New 3DS only | `set_cpu_speed` (1 runs at the Old 3DS clock) |
@@ -1415,6 +1416,55 @@ the C-Stick, and its speed (DK64's Analog speed). DK64's Camera row also
 stops at Better Free there, its last choice, Analog, being the C-Stick's
 (main lowers the row's `hi` before `recomp3ds::run`; a saved Analog loads
 as Better Free).
+
+## The HUD on the touch screen
+
+A game can draw its HUD on the touch screen, leaving the top screen to the
+scene (`RenderDesc::hud_on_bottom_supported`; the Game page's HUD row, on
+the touch screen by default). The game decides what goes there: its
+patches mark spans of the display list with `include/rt64_3ds_gbi.h`, under
+the game's 3DS define (the desktop never sees them):
+
+```c
+#include "rt64_3ds_gbi.h"
+gEX3DSBottomScreen(gfx++, dx, dy);     // what follows on the touch screen, moved by dx, dy
+...                                    // the HUD's draws, sub-lists included
+gEX3DSTopScreen(gfx++);                // back to the top screen (a list's end does it too)
+```
+
+- Inside a span the interpreter places draws at the game's own
+  coordinates: EX origins, `gEXSetRectAlign`, `gEXSetViewportAlign` and
+  scissor origins are left out, and nothing is stretched. The touch screen
+  shows the game's frame centred at the largest whole scale that fits
+  (1:1 for 320x240, 292x216 with borders), moved by the span's dx, dy:
+  one span for a whole HUD, or one per piece to place the pieces apart.
+  Spans are many per list if need be.
+- Those draws (`DrawRecord::screen`) leave the eyes and every top-screen
+  decision (reticle, auto-convergence, the world camera, depth). The
+  renderer draws them once per game frame (not on the in-betweens) into a
+  320x240 target with a depth buffer of its own, the console's text over
+  them (black see-through), and copies that into the touch screen's
+  framebuffer; a frame whose touch-screen draws and text are unchanged is
+  skipped (redrawn every 30 frames anyway). 300 KB of VRAM, a 256 KB
+  texture for the text.
+- The console (status lines, touch buttons, alerts) writes a copy of its
+  framebuffer while the renderer has the screen (`screen_bottom_update`,
+  log.cpp). The settings menu, the HOME prompt and a fatal error take the
+  screen back once the renderer's last copy is done (150 ms); closing the
+  menu hands it over again.
+- The touch buttons keep to the game's safe area while the HUD is down
+  (`GameDesc::touch_area_hud`, in console cells: Goemon's right of its
+  map, which stays on the left), in one column or two, at least two cells tall with whole
+  labels. More buttons than that take the usual rows over the HUD, their
+  fills half see-through (the colours sampled from the painted buttons,
+  `rt64_3ds::set_bottom_console_see_through`); a game with no safe area
+  always does.
+- With the row on the top screen the markers are skipped: the spans draw
+  where they always did. `recomp3ds::hud_on_bottom()` tells the game's
+  patches (through its recomp API) which it is, for a HUD that hides
+  itself and could stay up on the touch screen.
+- `tools/dl_test`: `DL_BOTTOM=1` honours the markers, `DL_RENDER_BOTTOM`
+  draws the touch screen (`DL_RENDER` then the top screen without them).
 
 ## Mods
 

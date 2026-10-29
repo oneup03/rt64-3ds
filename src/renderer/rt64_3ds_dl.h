@@ -80,6 +80,11 @@ public:
     // RenderDesc::aim_texture_hashes (or dbg_aim_tex_log): hash the texels of
     // every candidate reticle rectangle into DrawRecord::tex_hash.
     void set_aim_hash(bool on);
+    // The game's touch-screen spans (include/rt64_3ds_gbi.h) honoured: their
+    // draws get DrawRecord::screen 1, placed in the game's coordinates
+    // (RenderDesc::hud_on_bottom_supported with the HUD row on the bottom).
+    // Off, the markers are skipped and those draws stay on the top screen.
+    void set_bottom_hud(bool on);
     void set_split_untagged_ortho(bool on);
     // Always take G_BRANCH_Z (the near model), as the recomp frontends do.
     void set_force_branch_z(bool on);

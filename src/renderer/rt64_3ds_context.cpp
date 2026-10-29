@@ -5,6 +5,7 @@
 #include <3ds.h>
 #include <citro3d.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cerrno>
 #include <cstdarg>
@@ -86,6 +87,16 @@ void apt_hook(APT_HookType type, void*) {
 
 bool gpu_away() { return g_suspended || g_sleeping; }
 volatile bool g_paused = false;
+// The touch screen (rt64_3ds::set_bottom_screen): the renderer draws the
+// game's touch-screen spans there, with the console's text from
+// g_bottom_console over them; the tick of the last copy it queued there.
+std::atomic<bool> g_bottom_on{ false };
+const uint16_t* volatile g_bottom_console = nullptr;
+std::atomic<bool> g_bottom_console_changed{ false };
+std::atomic<uint32_t> g_bottom_see_through{ 0 };    // set_bottom_console_see_through: first | second << 16
+std::atomic<uint32_t> g_bottom_last_copy_ms{ 0 };   // 0: none yet
+
+uint32_t now_ms() { return (uint32_t)(svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000)); }
 volatile bool g_capture_request = false;
 volatile int g_seq_request = 0;         // rt64_3ds::request_frame_sequence
 volatile bool g_pair_request = false;   // rt64_3ds::request_capture_pair
@@ -463,6 +474,8 @@ public:
         last_dl_tick_ = submitted;
         // Frame interpolation (RenderDesc::frame_interpolation, Settings::
         // frame_cap 2): the interpreter records each list's transforms.
+        // The game's touch-screen spans, while the touch screen is the renderer's.
+        interp_.set_bottom_hud(g_bottom_on.load(std::memory_order_relaxed));
         const bool interp_mode = rt64_3ds::render_desc().frame_interpolation && rt64_3ds::settings().frame_cap == 2;
         if (interp_mode != interp_mode_) {
             interp_.set_interpolation(interp_mode);
@@ -1240,6 +1253,7 @@ private:
         else fprintf(stderr, "rt64-3ds: no right-eye target (VRAM): stereo off\n");
         cur_eye_[0] = last_eye_[0] = top_;
         cur_eye_[1] = last_eye_[1] = top_r_;
+        if (rt64_3ds::render_desc().hud_on_bottom_supported) init_bottom();
         fprintf(stderr, "rt64-3ds: eye targets: %s colour, %s depth (VRAM left %u KB)\n", color16_ ? "RGB565" : "RGBA8",
                 depth16_ ? "16-bit" : "24-bit + stencil", (unsigned)(vramSpaceFree() / 1024));
         // The game frame's depth, copied by the GPU after its left eye's draws
@@ -1388,6 +1402,7 @@ private:
         // its height (DK64's 320x240: x -40..360). Everything arrives in N64
         // screen pixels with y growing downward: bottom edge = h, top = 0.
         Mtx_OrthoTilt(&proj_, -geo_.x0, (float)geo_.w + geo_.x0, (float)geo_.h, 0.0f, 0.0f, 1.0f, true);
+        bottom_geometry();
         C3D_DepthMap(true, -1.0f, 0.0f);
         C3D_CullFace(GPU_CULL_NONE);
         start_reader();
@@ -1727,7 +1742,7 @@ private:
         };
         auto replayable = [&](size_t i) {
             const rt64_3ds::DrawRecord& d = frame_.draws[i];
-            return d.count >= 3 && d.first + d.count <= n && (int)i >= draw_lo_ && (int)i <= draw_hi_;
+            return d.count >= 3 && d.first + d.count <= n && (int)i >= draw_lo_ && (int)i <= draw_hi_ && d.screen == 0;
         };
         if (!split) {
             for (size_t i = 0; i < frame_.draws.size(); i++) {
@@ -1818,6 +1833,7 @@ private:
             if (tl_split != 0) { acc_left_ += tl_split - tl0; acc_right_ += tl1 - tl_split; }
             else acc_left_ += tl1 - tl0;
         }
+        if (!inbetween && !offscreen_frame) bottom_pass(vb, n);
         if (vi_blanked_ && black_ != nullptr && !offscreen_frame) {
             // The frame is drawn (the game may store it for an effect) but
             // the screen gets the black target, as the VI would show.
@@ -1956,7 +1972,7 @@ private:
             // RDP writes nothing there; neither does the write-back now.
             bool wrote_depth = false;
             for (const rt64_3ds::DrawRecord& d : frame_.draws) {
-                if (d.kind == rt64_3ds::DrawRecord::Tris && (d.othermode_l & 0x20) != 0 && d.rtt < 0 && d.count > 0) { wrote_depth = true; break; }
+                if (d.kind == rt64_3ds::DrawRecord::Tris && (d.othermode_l & 0x20) != 0 && d.rtt < 0 && d.screen == 0 && d.count > 0) { wrote_depth = true; break; }
             }
             prev_depth_image_ = (wrote_depth && frame_.color_width == (uint32_t)geo_.w) ? frame_.depth_image : 0;
             prev_depth_w_ = geo_.w;
@@ -2046,6 +2062,7 @@ private:
             const DeferredOp& op = dops_[i];
             if (op.fill != nullptr) C3D_RenderTargetClear(op.fill, op.bits, op.color, 0);
             else if (op.copy_dst != nullptr) copy_depth(op.copy_src, op.copy_dst, op.copy_bytes);
+            else if (op.show_dst != nullptr) show_bottom(op.show_src, op.show_dst);
             else GX_ProcessCommandList(op.list, op.words * 4, 0);
         }
         C3D_FrameEnd(GX_CMDLIST_FLUSH);       // the recording was flushed as it ended (end_deferred)
@@ -2727,7 +2744,7 @@ private:
         if (frame_.frame_sample_last >= 0) return -1;     // frames copying themselves draw in runs: as they are
         for (size_t i = 0; i < frame_.draws.size(); i++) {
             const rt64_3ds::DrawRecord& d = frame_.draws[i];
-            if (d.rtt >= 0) continue;                     // an off-screen image's: another target
+            if (d.rtt >= 0 || d.screen != 0) continue;    // an off-screen image's or the touch screen's: another target
             if ((int)i < draw_lo_ || (int)i > draw_hi_) return -1;
             if (d.kind != rt64_3ds::DrawRecord::FillRect || ((d.othermode_h >> 20) & 3) != 3 || d.count != 6 || draw_blends(d)) return -1;
             if (d.first + d.count > frame_.verts.size()) return -1;
@@ -3004,6 +3021,18 @@ private:
         if (d.rtt >= 0) {
             // An off-screen image: the texture is its own clip.
             C3D_SetScissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
+            prof_[2] += tick() - tp2;
+            return;
+        }
+        if (cur_target_ == kBottomTarget) {
+            // The touch screen (bottom_pass): the game's frame centred at
+            // bottom_scale_, its framebuffer 240x320, rotated as the eyes'.
+            int x0 = (int)lroundf(((float)d.scissor[0] + bottom_ox_) * bottom_scale_), y0 = (int)lroundf(((float)d.scissor[1] + bottom_oy_) * bottom_scale_);
+            int x1 = (int)lroundf(((float)d.scissor[2] + bottom_ox_) * bottom_scale_), y1 = (int)lroundf(((float)d.scissor[3] + bottom_oy_) * bottom_scale_);
+            if (no_scissor) { x0 = 0; y0 = 0; x1 = 320; y1 = 240; }
+            x0 = std::max(x0, 0); y0 = std::max(y0, 0); x1 = std::min(x1, 320); y1 = std::min(y1, 240);
+            if (x1 <= x0 || y1 <= y0) C3D_SetScissor(GPU_SCISSOR_NORMAL, 1023, 1023, 1024, 1024);
+            else C3D_SetScissor(GPU_SCISSOR_NORMAL, (u32)(240 - y1), (u32)(320 - x1), (u32)(240 - y0), (u32)(320 - x0));
             prof_[2] += tick() - tp2;
             return;
         }
@@ -3708,7 +3737,7 @@ public:
         if (desc.stretch_tint_quads) {
             tint_.assign(frame_.draws.size(), 0);
             for (size_t i = 0; i < frame_.draws.size(); i++) {
-                if (rt64_3ds::stretch_tint_quad(frame_.draws[i], frame_.verts.data(), geo_)) tint_[i] = 1;
+                if (frame_.draws[i].screen == 0 && rt64_3ds::stretch_tint_quad(frame_.draws[i], frame_.verts.data(), geo_)) tint_[i] = 1;
             }
         }
         if (!sf.on) return;
@@ -3721,6 +3750,11 @@ public:
         float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
         for (size_t i = 0; i < frame_.draws.size(); i++) {
             const rt64_3ds::DrawRecord& d = frame_.draws[i];
+            if (d.screen != 0) {
+                // The touch screen's: no part in the eyes' depth or the reticle.
+                classes_[i] = (uint8_t)rt64_3ds::StereoClass::Hud;
+                continue;
+            }
             rt64_3ds::StereoClass cls = rt64_3ds::classify_draw(d, desc);
             if (hud_cam_is_world_ && d.kind == rt64_3ds::DrawRecord::Tris && d.perspective && d.proj_id == desc.hud_camera_id &&
                 (!desc.primary_world_instance || d.proj_inst == primary_inst_)) {
@@ -3810,6 +3844,7 @@ public:
         grid_rows_ = std::min((geo_.h + grid_by_ - 1) / grid_by_, kGridRowsMax);
         for (float& z : depth_grid_) z = 1.0f;
         Mtx_OrthoTilt(&proj_, -geo_.x0, (float)geo_.w + geo_.x0, (float)geo_.h, 0.0f, 0.0f, 1.0f, true);
+        bottom_geometry();
         fprintf(stderr, "rt64-3ds: game frame %dx%d, x%.3f, %.1f-unit margins, depth grid %dx%d of %dx%d px\n",
                 geo_.w, geo_.h, geo_.scale, geo_.x0, grid_cols_, grid_rows_, grid_bx_, grid_by_);
     }
@@ -4018,6 +4053,8 @@ public:
         const void* copy_src = nullptr;         // a copy: copy_bytes from copy_src to copy_dst (copy_depth)
         void* copy_dst = nullptr;
         u32 copy_bytes = 0;
+        const void* show_src = nullptr;         // the touch screen's image to its framebuffer (show_bottom)
+        void* show_dst = nullptr;
     };
     static constexpr int kMaxDeferredOps = 30;  // citro3d's GX queue takes 32 a frame
     u32* dbuf_ = nullptr;                       // the game frame's command buffer (linear)
@@ -4162,6 +4199,166 @@ public:
         const u32 dim = GX_BUFFER_DIM(240 * 8 * 2 / 16, 0);    // no gaps: any line length will do
         GX_TextureCopy((u32*)src, dim, (u32*)dst, dim, bytes, kTextureCopyMode);
     }
+    // ---- The touch screen (RenderDesc::hud_on_bottom_supported, while the
+    // platform gives it to the renderer: set_bottom_screen). The game's
+    // touch-screen spans (DrawRecord::screen) are drawn there once per game
+    // frame, its frame centred at the largest whole scale that fits (1 for
+    // 320x240 and Banjo's 292x216), the console's text (set_bottom_console)
+    // over them, and copied to the screen's framebuffer: the console's own,
+    // single-buffered. Skipped while it would draw what it drew.
+    static constexpr int kBottomTarget = -5;
+    C3D_RenderTarget* bottom_ = nullptr;
+    C3D_Mtx bproj_{};
+    float bottom_scale_ = 1.0f, bottom_ox_ = 0.0f, bottom_oy_ = 0.0f;
+    C3D_Tex con_tex_{};             // the console's text, 512x256 RGBA4, black see-through
+    bool con_tex_ok_ = false;
+    bool bottom_shown_ = false;     // the last game frame drew it
+    uint32_t bottom_hash_ = 0;
+    int bottom_same_ = 0;           // game frames it was skipped for since
+    void init_bottom() {
+        bottom_ = C3D_RenderTargetCreate(240, 320, GPU_RB_RGB565, GPU_RB_DEPTH16);
+        con_tex_ok_ = C3D_TexInit(&con_tex_, 512, 256, GPU_RGBA4);
+        if (con_tex_ok_) {
+            memset(con_tex_.data, 0, 512 * 256 * 2);
+            flush_dcache(con_tex_.data, 512 * 256 * 2);
+            C3D_TexSetFilter(&con_tex_, GPU_NEAREST, GPU_NEAREST);
+        }
+        fprintf(stderr, "rt64-3ds: touch-screen target %s, console texture %s (VRAM left %u KB)\n", bottom_ != nullptr ? "ready" : "FAILED",
+                con_tex_ok_ ? "ready" : "FAILED", (unsigned)(vramSpaceFree() / 1024));
+    }
+    void bottom_geometry() {
+        const float k = std::min(320.0f / (float)geo_.w, 240.0f / (float)geo_.h);
+        bottom_scale_ = k >= 1.0f ? std::floor(k) : k;
+        bottom_ox_ = (320.0f / bottom_scale_ - (float)geo_.w) * 0.5f;
+        bottom_oy_ = (240.0f / bottom_scale_ - (float)geo_.h) * 0.5f;
+        Mtx_OrthoTilt(&bproj_, -bottom_ox_, (float)geo_.w + bottom_ox_, (float)geo_.h + bottom_oy_, -bottom_oy_, 0.0f, 1.0f, true);
+    }
+    // What a bottom draw looks like, for the skip: its state, textures (by
+    // address, not texels: a texture that changes in place is caught by the
+    // redraw every 30 frames) and vertices.
+    static uint32_t hash_words(uint32_t h, const void* p, size_t bytes) {
+        const uint32_t* w = (const uint32_t*)p;
+        for (size_t i = 0; i < bytes / 4; i++) h = (h ^ w[i]) * 16777619u;
+        return h;
+    }
+    uint32_t hash_draw(uint32_t h, const rt64_3ds::DrawRecord& d) const {
+        uint32_t k[16] = { (uint32_t)d.kind, d.cc_w0, d.cc_w1, d.othermode_h, d.othermode_l, d.geometry_mode, 0, 0, 0, 0, d.prim_lod_frac, 0, 0, d.count, 0, 0 };
+        memcpy(&k[6], d.prim, 4); memcpy(&k[7], d.env, 4); memcpy(&k[8], d.blend, 4); memcpy(&k[9], d.fog, 4);
+        memcpy(&k[11], d.scissor, 8);
+        h = hash_words(h, k, sizeof(k));
+        h = hash_words(h, d.uv1, sizeof(d.uv1));
+        for (const rt64_3ds::TexDesc& t : d.tex) {
+            if (!t.valid) { h = (h ^ 0xFFFFFFFFu) * 16777619u; continue; }
+            const uint32_t tk[6] = { t.addr, t.pitch | ((uint32_t)t.fmt << 16) | ((uint32_t)t.siz << 24), (uint32_t)t.width | ((uint32_t)t.height << 16),
+                                     t.tlut_hash, (uint32_t)t.masks | ((uint32_t)t.maskt << 8) | ((uint32_t)t.cms << 16) | ((uint32_t)t.cmt << 24),
+                                     (uint32_t)t.palette | ((uint32_t)(uint8_t)t.rtt << 8) | ((uint32_t)t.snapshot << 16) | ((uint32_t)t.frame << 17) };
+            h = hash_words(h, tk, sizeof(tk));
+        }
+        return hash_words(h, frame_.verts.data() + d.first, (size_t)d.count * sizeof(GpuVertex));
+    }
+    // The console's framebuffer (240 px columns, bottom row first, RGB565)
+    // into con_tex_ (rows flipped, as the texture cache's), black clear and
+    // the see-through colours half so.
+    void convert_console() {
+        const uint16_t* fb = g_bottom_console;
+        if (fb == nullptr || !con_tex_ok_) return;
+        const uint32_t st = g_bottom_see_through.load(std::memory_order_relaxed);
+        const uint16_t see0 = (uint16_t)st, see1 = (uint16_t)(st >> 16);
+        uint16_t* dst = (uint16_t*)con_tex_.data;
+        constexpr int kTilesX = 512 / 8;
+        for (int x = 0; x < 320; x++) {
+            const uint16_t* col = fb + x * 240;
+            const unsigned mx = (x & 1) | ((x & 2) << 1) | ((x & 4) << 2);
+            uint16_t* tiles = dst + (x >> 3) * 64;
+            for (int y = 0; y < 240; y++) {
+                const uint16_t p = col[239 - y];
+                const int yd = 255 - y;
+                const unsigned my = ((yd & 1) << 1) | ((yd & 2) << 2) | ((yd & 4) << 3);
+                const uint16_t alpha = (p == see0 || p == see1) ? 0x8 : 0xF;
+                tiles[(yd >> 3) * kTilesX * 64 + (my | mx)] =
+                    p == 0 ? 0 : (uint16_t)(((p >> 12) << 12) | (((p >> 7) & 0xF) << 8) | (((p >> 1) & 0xF) << 4) | alpha);
+            }
+        }
+        flush_dcache(dst, 512 * 256 * 2);
+    }
+    void draw_console(GpuVertex* q, uint32_t first) {
+        const float l = -bottom_ox_, r = (float)geo_.w + bottom_ox_, t = -bottom_oy_, b = (float)geo_.h + bottom_oy_;
+        const float xs[6] = { l, r, r, l, r, l }, ys[6] = { t, t, b, t, b, b };
+        const float us[6] = { 0.0f, 320.0f, 320.0f, 0.0f, 320.0f, 0.0f }, vs[6] = { 0.0f, 0.0f, 240.0f, 0.0f, 240.0f, 240.0f };
+        for (int i = 0; i < 6; i++) q[i] = GpuVertex{ xs[i], ys[i], 0.0f, 1.0f, us[i], vs[i], 255, 255, 255, 255 };
+        flush_dcache(q, 6 * sizeof(GpuVertex));
+        for (int i = 0; i < 6; i++) {
+            C3D_TexEnv* env = C3D_GetTexEnv(i);
+            C3D_TexEnvInit(env);
+            if (i == 0) C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_TEXTURE0, GPU_TEXTURE0);
+            else C3D_TexEnvSrc(env, C3D_Both, GPU_PREVIOUS, GPU_PREVIOUS, GPU_PREVIOUS);
+            C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+        }
+        C3D_TexBind(0, &con_tex_);
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uvscale_, 1.0f / 512.0f, 1.0f / 256.0f, 0.0f, 0.0f);
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
+        C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+        C3D_AlphaTest(false, GPU_ALWAYS, 0);
+        C3D_SetScissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
+        C3D_DrawArrays(GPU_TRIANGLES, first, 6);
+    }
+    // The touch screen's image into its framebuffer (on the GX queue after
+    // its draws).
+    static void show_bottom(const void* src, void* dst) {
+        constexpr u32 kFlags = GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
+                               GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGB565) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB565) |
+                               GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO);
+        GX_DisplayTransfer((u32*)src, GX_BUFFER_DIM(240, 320), (u32*)dst, GX_BUFFER_DIM(240, 320), kFlags);
+    }
+    // After a game frame's eyes (vb: its vertices, n of them; the six after
+    // them the ghost quad's, the six after those the console's).
+    void bottom_pass(GpuVertex* vb, size_t n) {
+        if (bottom_ == nullptr || !g_bottom_on.load(std::memory_order_relaxed)) {
+            bottom_shown_ = false;
+            return;
+        }
+        uint32_t h = 2166136261u;
+        for (const rt64_3ds::DrawRecord& d : frame_.draws) {
+            if (d.screen != 0 && d.count >= 3 && d.first + d.count <= n) h = hash_draw(h, d);
+        }
+        const bool con = g_bottom_console_changed.exchange(false);
+        if (con) convert_console();
+        if (bottom_shown_ && !con && h == bottom_hash_ && ++bottom_same_ < 30) return;
+        bottom_shown_ = true;
+        bottom_hash_ = h;
+        bottom_same_ = 0;
+        clear_target(bottom_, C3D_CLEAR_ALL, 0);
+        draw_on(bottom_);
+        cur_target_ = kBottomTarget;
+        frame_viewport_ = false;
+        forget_draw_state();
+        C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &bproj_);
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, 0.0f, 0.0f, 0.0f, 0.0f);
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, u_eye_, 1.0f, 0.0f, 0.0f, 0.0f);
+        last_sa_ = last_sb_ = 0.0f;
+        set_cull(GPU_CULL_NONE);
+        for (size_t i = 0; i < frame_.draws.size(); i++) {
+            const rt64_3ds::DrawRecord& d = frame_.draws[i];
+            if (d.screen == 0 || d.count < 3 || d.first + d.count > n) continue;
+            apply_state(d, i, nullptr);
+            C3D_DrawArrays(GPU_TRIANGLES, d.first, d.count);
+        }
+        if (con_tex_ok_ && g_bottom_console != nullptr && n + 12 <= kVboVerts) draw_console(vb + n + 6, (uint32_t)(n + 6));
+        forget_draw_state();
+        // To the screen, after the draws on the GX queue (or the deferred frame's).
+        close_segment();
+        void* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+        if (deferring_) {
+            DeferredOp op{ nullptr, 0, nullptr, C3D_CLEAR_ALL, 0 };
+            op.show_src = bottom_->frameBuf.colorBuf;
+            op.show_dst = fb;
+            push_op(op);
+        }
+        else show_bottom(bottom_->frameBuf.colorBuf, fb);
+        const uint32_t ms = now_ms();
+        g_bottom_last_copy_ms.store(ms != 0 ? ms : 1);
+    }
+
     void queue_depth_copy() {
         const void* src = cur_eye_[0]->frameBuf.depthBuf;
         if (deferring_) {
@@ -4416,6 +4613,20 @@ void rt64_3ds::dump_progress() {
 void rt64_3ds::set_debug_gfx_delay_ms(int ms) { g_debug_gfx_delay_ms = ms; }
 void rt64_3ds::set_quitting() { g_quitting = true; }
 void rt64_3ds::set_paused(bool paused) { g_paused = paused; }
+void rt64_3ds::set_bottom_screen(bool on) { g_bottom_on.store(on); }
+void rt64_3ds::set_bottom_console(const uint16_t* console) {
+    g_bottom_console = console;
+    g_bottom_console_changed.store(true);
+}
+void rt64_3ds::note_bottom_console_changed() { g_bottom_console_changed.store(true, std::memory_order_relaxed); }
+void rt64_3ds::set_bottom_console_see_through(uint16_t first, uint16_t second) {
+    const uint32_t v = (uint32_t)first | ((uint32_t)second << 16);
+    if (g_bottom_see_through.exchange(v) != v) g_bottom_console_changed.store(true);
+}
+uint32_t rt64_3ds::bottom_idle_ms() {
+    const uint32_t t = g_bottom_last_copy_ms.load();
+    return t == 0 ? UINT32_MAX : now_ms() - t;
+}
 void rt64_3ds::request_capture() { g_capture_request = true; }
 void rt64_3ds::request_frame_sequence(int count) { g_seq_request = count; }
 void rt64_3ds::request_capture_pair() { g_pair_request = true; }

@@ -347,6 +347,7 @@ void old3ds_quiet_end() {
     recomp3ds::log_flush();
     recomp3ds::stall_watch_stop();             // its reports would write over the message
     park_main_thread();                        // the pad is read here now, and the screen left alone
+    recomp3ds::screen_take_console(300);       // from the renderer's touch-screen HUD
     recomp3ds::screen_printf("\x1b[31m\n%s\x1b[0m\nPress START to exit.\n", line);
     for (int i = 0; i < 600; i++) {
         hidScanInput();
@@ -403,6 +404,7 @@ bool home_prompt() {
     recomp3ds::stall_watch_pause(true);    // the main thread and the frames stop here by design
     recomp3ds::input_set_blocked(true);
     recomp3ds::audio_set_paused(true);
+    recomp3ds::screen_take_console(300);   // the main loop gives it back to a touch-screen HUD after
     draw_home_prompt(true);
     u32 prev = prompt_keys();          // held on entry: not a press
     bool quit = false;
@@ -994,8 +996,8 @@ int recomp3ds::run(const GameDesc& desc) {
     atexit(on_exit_called);
 
     gfxInitDefault();
-    consoleInit(GFX_BOTTOM, nullptr);          // status text on the touch screen (screen_printf)
-    recomp3ds::screen_init();
+    // Status text on the touch screen (screen_printf).
+    recomp3ds::screen_init(consoleInit(GFX_BOTTOM, nullptr));
     if (__3dslink_host.s_addr != 0) {
         link3dsStdio();
     }

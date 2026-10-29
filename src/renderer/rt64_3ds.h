@@ -68,6 +68,9 @@ struct RenderDesc {
     struct FrameSize { uint16_t w, h; };
     const FrameSize* frame_sizes = nullptr;
     size_t frame_size_count = 0;
+    // The game marks its HUD for the touch screen (include/rt64_3ds_gbi.h):
+    // the Game page's HUD row (Settings::hud_on_bottom) puts those draws
+    // there or leaves them on the top screen.
     bool hud_on_bottom_supported = false;
     const uint32_t* snapshot_buffers = nullptr;   // RDRAM addresses the game copies frames into
     size_t snapshot_count = 0;
@@ -365,7 +368,7 @@ struct Settings {
     int crosshair_hud = 0;
     bool auto_convergence = true;
     int comfort_target = 0;           // auto-convergence pop-out budget, thousandths of width (-20..30)
-    bool hud_on_bottom = true;
+    bool hud_on_bottom = true;        // the HUD row (with RenderDesc::hud_on_bottom_supported): the touch screen
     bool show_fps = true;
     // Ghost reduction, the desktop's anti-crosstalk range compression (only
     // while 3D is on): contrast squeezes each eye towards mid-grey, the black
@@ -451,6 +454,24 @@ void set_quitting();
 // game waits on its current one (a modal prompt). The top screen keeps the
 // last frame.
 void set_paused(bool paused);
+
+// The touch screen (RenderDesc::hud_on_bottom_supported). On: the renderer
+// draws the game's touch-screen spans there each game frame (the lists read
+// from then on keep them off the eyes), over black, with the console's text
+// over them, and copies the image into the screen's framebuffer. Off: it
+// stops; the console may write the framebuffer again once bottom_idle_ms()
+// says the last copy is done (a copy queued in a frame reaches the screen
+// within that frame's GPU work).
+void set_bottom_screen(bool on);
+// The console's framebuffer (240 px per column, RGB565, as libctru's
+// console writes it), drawn with black see-through; changes reach the
+// screen once note_bottom_console_changed says so.
+void set_bottom_console(const uint16_t* console);
+void note_bottom_console_changed();
+// Two of the console's colours drawn half see-through (0: none): the touch
+// buttons' fills, idle and held, when the grid lies over the HUD.
+void set_bottom_console_see_through(uint16_t first, uint16_t second);
+uint32_t bottom_idle_ms();      // since the last copy to the touch screen was queued (UINT32_MAX: none)
 
 // Save the next frame for the host tools: its gfx task and RDRAM
 // (gfx_task.bin) and what it rendered (gfx_frame.ppm), in the game's folder.

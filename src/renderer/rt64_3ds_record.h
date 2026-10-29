@@ -136,6 +136,9 @@ struct DrawRecord {
     // v1 = v0 * uv1[1] + uv1[3] (the two tiles' shifts and origins differ).
     float uv1[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
     int8_t rtt = -1;                    // drawn into FrameRecord::rtts[rtt] instead of the screen
+    // 1: drawn on the touch screen instead of the top screen's eyes (a span
+    // the game marked, include/rt64_3ds_gbi.h), in the game's coordinates.
+    uint8_t screen = 0;
     uint32_t proj_id = 0;               // projection group id in force (gEXMatrixGroup), for stereo
     bool perspective = true;
     bool mv_auto = false;               // the modelview group is untagged (G_EX_ID_AUTO): reticle candidates

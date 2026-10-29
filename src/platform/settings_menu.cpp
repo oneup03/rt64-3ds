@@ -127,6 +127,12 @@ int g_debug_rows = 0;
 int g_log_level = 1;
 const char* const kLogLevelNames[] = { "Warnings", "Summary", "Full" };
 void apply_log_level(int v) { recomp3ds::log_set_level(v); }
+// The game's HUD on the touch screen (RenderDesc::hud_on_bottom_supported:
+// the game marks it) or on the top screen (rt64_3ds::Settings::hud_on_bottom).
+bool g_hud_supported = false;
+int g_hud_bottom = 1;
+const char* const kHudNames[] = { "Top screen", "Touch screen" };
+void apply_hud_bottom(int v) { rt64_3ds::settings().hud_on_bottom = v != 0; }
 
 // Audio on or off: off skips the audio microcode, which the CPU runs here,
 // for speed (an Old 3DS).
@@ -941,8 +947,16 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     g_game_name = desc.render.game_name != nullptr ? desc.render.game_name : "";
     add_row({ "brightness_top", "Top screen brightness", 0, 5, &g_brightness[0], kBrightnessNames, false, nullptr, apply_brightness, PageGame, 1, nullptr });
     add_row({ "brightness_bottom", "Bottom screen brightness", 0, 5, &g_brightness[1], kBrightnessNames, false, nullptr, apply_brightness, PageGame, 1, nullptr });
+    // With the HUD on the touch screen, its text is over the HUD: off by default.
+    g_hud_supported = desc.render.hud_on_bottom_supported;
+    recomp3ds::touch_pad_set_hud_area(desc.touch_area_hud.col, desc.touch_area_hud.row, desc.touch_area_hud.cols, desc.touch_area_hud.rows);
+    if (g_hud_supported) g_perf_monitor = 0;
     add_row({ "perf_monitor", "Performance monitor", 0, 1, &g_perf_monitor, kPerfMonitorNames, false, nullptr, apply_perf_monitor, PageGame, 1, nullptr });
     add_row({ "frame_cap", "Frame rate", 0, desc.render.frame_interpolation ? 2 : 1, &st.frame_cap, kFrameCapNames, false, nullptr, nullptr, PageGame, 1, nullptr });
+    if (g_hud_supported) {
+        g_hud_bottom = st.hud_on_bottom ? 1 : 0;
+        add_row({ "hud_on_bottom", "HUD", 0, 1, &g_hud_bottom, kHudNames, false, nullptr, apply_hud_bottom, PageGame, 1, nullptr });
+    }
     add_row({ "rom_stream", "ROM stream", 0, 2, &g_rom_stream, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     g_log_level = is_new_3ds ? 1 : 0;
     add_row({ "log_level", "Log level", 0, 2, &g_log_level, kLogLevelNames, false, nullptr, apply_log_level, PageGame, 1, nullptr });
@@ -1021,6 +1035,7 @@ int recomp3ds::settings_rom_stream() { return g_rom_stream; }
 int recomp3ds::settings_cores() { return g_cores; }
 bool recomp3ds::settings_debug_rows() { return g_debug_rows != 0; }
 bool recomp3ds::settings_perf_monitor() { return g_perf_monitor != 0; }
+bool recomp3ds::hud_on_bottom() { return g_hud_supported && g_hud_bottom != 0; }
 bool recomp3ds::settings_debug_capture() { return g_debug_capture != 0; }
 const recomp3ds::DebugSettings& recomp3ds::debug_settings() { return g_dbg; }
 
@@ -1046,6 +1061,8 @@ void recomp3ds::settings_menu_update() {
     hidScanInput();
     const u32 keys = hidKeysHeld() | autotest_keys();
     const u64 now = svcGetSystemTick();
+    // The touch screen: the game's HUD there while the menu is closed.
+    recomp3ds::screen_bottom_update(g_hud_supported && g_hud_bottom != 0 && !g_open);
     if (g_redraw) {
         draw();
         g_redraw = false;
@@ -1120,10 +1137,10 @@ void recomp3ds::settings_menu_update() {
             tx = tp.px; ty = tp.py;
             contact = true;
         }
-        touch_pad_update(true, contact, tx, ty, g_pad_redraw);
+        touch_pad_update(true, g_hud_supported && g_hud_bottom != 0, contact, tx, ty, g_pad_redraw);
         g_pad_redraw = false;
     }
-    if (g_open) touch_pad_update(false, false, 0, 0, false);
+    if (g_open) touch_pad_update(false, false, false, 0, 0, false);
     prev = keys;
 }
 

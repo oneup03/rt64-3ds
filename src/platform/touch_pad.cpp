@@ -7,19 +7,30 @@
 // - or N64 buttons a game's own controls leave out while some mod reads
 //   them (touch_pad_set: the D-pad and L, DK64's Tag Anywhere).
 // A touch holds the button under it (one at a time: the panel reads a
-// single point).
+// single point). With a game's HUD on the touch screen the grid keeps to
+// the game's safe area (GameDesc::touch_area_hud) while the buttons fit
+// there, else it takes the usual rows over the HUD, its fills see-through.
 #include <3ds.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 
 #include "recomp3ds.h"
 #include "recomp3ds_internal.h"
+#include "rt64_3ds.h"
 
 namespace {
 
 // In console cells (8 x 8 pixels, 0-based): the rows between the status
 // lines (rows 0-3) and the HOME prompt (22-25).
 constexpr int kFirstRow = 5, kLastRow = 19;
+
+// Where the grid goes, in cells.
+struct Area { int col, row, cols, rows; };
+constexpr Area kUsualArea{ 0, kFirstRow, 40, kLastRow - kFirstRow + 1 };
+Area g_hud_area{ 0, 0, 0, 0 };          // GameDesc::touch_area_hud (none: no columns)
+// The safe area's buttons are at least this tall (cells), for a finger.
+constexpr int kHudMinHeight = 2;
 
 // touch_pad_set's buttons, as grid buttons: the D-pad's directions, Right
 // and L in the right-hand column (DK64's Tag Anywhere: Left and Right side
@@ -70,6 +81,9 @@ u64 g_active_since = 0;
 int g_drawn_active = -2;
 bool g_drawn = false;           // the grid on screen is the live one
 bool g_area_used = false;       // something of ours is on screen (to clear)
+bool g_live_hud = false;        // the grid was laid out for a HUD on the touch screen
+bool g_see_through = false;     // ... over it: its fills see-through (rt64_3ds::set_bottom_console_see_through)
+uint16_t g_fill[2] = { 0, 0 };  // the fills' colours as the console paints them (sampled), idle and held
 
 // Made on first use, from whichever thread gets there first (C++'s guarded
 // static initialisation).
@@ -91,31 +105,36 @@ void paint(int col, int row, int w, int h, const char* label, bool held) {
 }
 
 void clear_area() {
-    for (int r = kFirstRow; r <= kLastRow; r++) recomp3ds::screen_printf("\x1b[%d;1H%40s", r + 1, "");
+    const int first = g_hud_area.cols > 0 ? std::min(kFirstRow, g_hud_area.row) : kFirstRow;
+    const int last = g_hud_area.cols > 0 ? std::max(kLastRow, g_hud_area.row + g_hud_area.rows - 1) : kLastRow;
+    for (int r = first; r <= last; r++) recomp3ds::screen_printf("\x1b[%d;1H%40s", r + 1, "");
 }
 
 // One column of full-width buttons up to four, else two columns, and two
 // whenever a button wants the right one (the right hand's, which the face
 // buttons leave free). The right column holds the player's buttons first,
 // then those that want it, as far as a column goes; the left the rest, and
-// what the left can't hold goes on under the right's. As tall as the rows
-// between the status lines and the HOME prompt allow, with a row between
-// buttons.
-void lay_out(LabelButton* b, size_t n) {
-    if (n == 0) return;
+// what the left can't hold goes on under the right's. As tall as the area's
+// rows allow (up to five), with a row between buttons. `cols` 0 chooses as
+// above. False when the buttons would be less than min_h tall or a label
+// wider than its button (laid out anyway).
+bool lay_out(LabelButton* b, size_t n, const Area& area, int min_h, int cols = 0) {
+    if (n == 0) return true;
     size_t users = 0, rights = 0;
     for (size_t i = 0; i < n; i++) {
         if (b[i].user) users++;
         else if (b[i].right) rights++;
     }
-    const int cols = (n <= 4 && users + rights == 0) ? 1 : 2;
+    if (cols == 0) cols = (n <= 4 && users + rights == 0) ? 1 : 2;
     int per_col = (int)((n + (size_t)cols - 1) / (size_t)cols);
     if ((int)users > per_col) per_col = (int)users;
-    const int rows = kLastRow - kFirstRow + 1;
-    int h = (rows - (per_col - 1)) / per_col;
+    int h = (area.rows - (per_col - 1)) / per_col;
+    bool fits = h >= min_h;
     if (h > 5) h = 5;
     if (h < 1) h = 1;
-    const int w = cols == 1 ? 38 : 19;
+    // Two columns of (cols - 2) / 2 with a gap of two, or one inset by a cell.
+    const int w = cols == 1 ? area.cols - 2 : (area.cols - 2) / 2;
+    for (size_t i = 0; i < n; i++) fits = fits && (int)__builtin_strlen(b[i].label) <= w;
     int slot[kLiveMax][2];      // column, row of each button
     int next[2] = { 0, 0 };
     // The right column: the player's buttons, then those that want it.
@@ -135,11 +154,28 @@ void lay_out(LabelButton* b, size_t n) {
         else { slot[i][0] = 1; slot[i][1] = next[1]++; }
     }
     for (size_t i = 0; i < n; i++) {
-        b[i].col = cols == 1 ? 1 : (slot[i][0] == 0 ? 0 : 21);     // two columns: 0-18 and 21-39
-        b[i].row = kFirstRow + slot[i][1] * (h + 1);
+        b[i].col = cols == 1 ? area.col + 1 : (slot[i][0] == 0 ? area.col : area.col + area.cols - w);   // the usual two: 0-18 and 21-39
+        b[i].row = area.row + slot[i][1] * (h + 1);
         b[i].w = w;
         b[i].h = h;
     }
+    return fits;
+}
+
+// The grid for where it goes now: the usual rows, or with a HUD on the
+// touch screen the safe area (one column or two, whichever fits), else the
+// usual rows over the HUD, see-through.
+void place_live(bool over_hud) {
+    g_see_through = false;
+    if (over_hud && g_live_count > 0) {
+        if (g_hud_area.cols > 0 && (lay_out(g_live, g_live_count, g_hud_area, kHudMinHeight) ||
+                                    lay_out(g_live, g_live_count, g_hud_area, kHudMinHeight, 1) ||
+                                    lay_out(g_live, g_live_count, g_hud_area, kHudMinHeight, 2))) {
+            return;
+        }
+        g_see_through = true;
+    }
+    lay_out(g_live, g_live_count, kUsualArea, 1);
 }
 
 // The grid from its three sources (main thread).
@@ -170,7 +206,6 @@ void make_live(uint16_t offered, uint32_t user) {
         g_live_press_ms = 100;
     }
     LightLock_Unlock(&set_lock());
-    lay_out(g_live, g_live_count);
 }
 
 void draw_live(int held_index) {
@@ -178,7 +213,12 @@ void draw_live(int held_index) {
     for (size_t i = 0; i < g_live_count; i++) {
         const LabelButton& b = g_live[i];
         paint(b.col, b.row, b.w, b.h, b.label, (int)i == held_index);
+        // The fill as painted (a button's top-left pixel: no label there),
+        // once of each kind, for the see-through grid.
+        uint16_t& fill = g_fill[(int)i == held_index ? 1 : 0];
+        if (fill == 0) fill = recomp3ds::screen_pixel(b.col * 8, b.row * 8);
     }
+    rt64_3ds::set_bottom_console_see_through(g_see_through ? g_fill[0] : 0, g_see_through ? g_fill[1] : 0);
 }
 
 // The touch: returns the N64 buttons to send now.
@@ -240,12 +280,18 @@ uint16_t recomp3ds::touch_pad_held() {
     return g_held.load(std::memory_order_relaxed);
 }
 
-void recomp3ds::touch_pad_update(bool shown, bool contact, int x, int y, bool redraw) {
+void recomp3ds::touch_pad_set_hud_area(int col, int row, int cols, int rows) {
+    g_hud_area = Area{ col, row, cols, rows };
+}
+
+void recomp3ds::touch_pad_update(bool shown, bool over_hud, bool contact, int x, int y, bool redraw) {
     const uint32_t version = g_version.load();
     const uint16_t offered = g_offered.load();
     const uint32_t user = g_user.load();
-    if (version != g_live_version || offered != g_live_offered || user != g_live_user) {
+    if (version != g_live_version || offered != g_live_offered || user != g_live_user || (shown && over_hud != g_live_hud)) {
         make_live(offered, user);
+        if (shown) g_live_hud = over_hud;
+        place_live(g_live_hud);
         g_live_version = version;
         g_live_offered = offered;
         g_live_user = user;
@@ -266,6 +312,8 @@ void recomp3ds::touch_pad_update(bool shown, bool contact, int x, int y, bool re
         // alone (a message the runtime printed there).
         if (g_area_used) clear_area();
         g_area_used = false;
+        if (g_see_through) rt64_3ds::set_bottom_console_see_through(0, 0);
+        g_see_through = false;
         g_drawn = true;
         return;
     }

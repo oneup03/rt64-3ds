@@ -5,6 +5,7 @@
 // (DK64's 320x240: N64 x = 0 at column 40).
 #include "refrender.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -66,14 +67,26 @@ struct Target {
 class Renderer {
 public:
     Renderer(const uint8_t* rdram, const FrameRecord& f, RefOptions opt) : rdram_(rdram), f_(f), opt_(opt) {
-        screen_.init(400, 240, true);
+        out_w_ = opt_.bottom ? 320 : 400;
+        if (opt_.bottom) {
+            // The renderer's bottom_geometry: a whole scale that fits, centred.
+            rt64_3ds::ScreenGeometry& g = opt_.geo;
+            const float k = std::min(320.0f / (float)g.w, 240.0f / (float)g.h);
+            g.scale = k >= 1.0f ? std::floor(k) : k;
+            g.x0 = (320.0f / g.scale - (float)g.w) * 0.5f;
+            g.wide_w = 320.0f / g.scale;
+            bottom_oy_ = (240.0f / g.scale - (float)g.h) * 0.5f;
+        }
+        screen_.init(out_w_, 240, true);
     }
+    int width() const { return out_w_; }
 
     void run() {
         for (size_t i = 0; i < f_.draws.size(); i++) {
             if (opt_.only_draw >= 0 && (int)i != opt_.only_draw) continue;
             if (opt_.max_draw >= 0 && (int)i > opt_.max_draw) break;
             const DrawRecord& d = f_.draws[i];
+            if (d.screen != (opt_.bottom ? 1 : 0)) continue;
             cur_ = &screen_;
             if (opt_.model_images && d.rtt >= 0 && d.rtt < rt64_3ds::kMaxRtt) {
                 const rt64_3ds::RttImage& img = f_.rtts[d.rtt];
@@ -95,6 +108,9 @@ private:
     Target screen_;
     Target images_[rt64_3ds::kMaxRtt];
     Target* cur_ = &screen_;
+    int out_w_ = 400;
+    float bottom_oy_ = 0.0f;        // the touch screen's frame offset down (ScreenGeometry has none)
+    float out_y(float y) const { return opt_.geo.screen_y(y + bottom_oy_); }
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, Tex> texcache_;
 
     const Tex* texture(const TexDesc& d) {
@@ -135,7 +151,7 @@ private:
             // The snapshot layout: u = 240 - screen y, v = 512 - screen x.
             int sx = (int)floorf(512.0f - v), sy = (int)floorf(240.0f - u);
             if (sx < 0) sx = 0; if (sx > 399) sx = 399; if (sy < 0) sy = 0; if (sy > 239) sy = 239;
-            uint32_t p = screen_.color[(size_t)sy * 400 + sx];
+            uint32_t p = screen_.color[(size_t)sy * out_w_ + sx];
             return { (int)(p >> 24), (int)((p >> 16) & 0xFF), (int)((p >> 8) & 0xFF), 255 };   // full coverage
         }
         if (opt_.model_images && d.rtt >= 0 && d.rtt < rt64_3ds::kMaxRtt) {
@@ -238,10 +254,10 @@ private:
         const Tex* t0 = texture(d.tex[0]);
         const Tex* t1 = texture(d.tex[1]);
         const rt64_3ds::ScreenGeometry& g = opt_.geo;
-        int sx0 = (int)lroundf(g.screen_x((float)d.scissor[0])), sy0 = (int)lroundf(g.screen_y((float)d.scissor[1]));
-        int sx1 = (int)lroundf(g.screen_x((float)d.scissor[2])), sy1 = (int)lroundf(g.screen_y((float)d.scissor[3]));
-        if (d.scissor[0] <= 0 && d.scissor[2] >= g.w) { sx0 = 0; sx1 = 400; }
-        if (sx0 < 0) sx0 = 0; if (sy0 < 0) sy0 = 0; if (sx1 > 400) sx1 = 400; if (sy1 > 240) sy1 = 240;
+        int sx0 = (int)lroundf(g.screen_x((float)d.scissor[0])), sy0 = (int)lroundf(out_y((float)d.scissor[1]));
+        int sx1 = (int)lroundf(g.screen_x((float)d.scissor[2])), sy1 = (int)lroundf(out_y((float)d.scissor[3]));
+        if (!opt_.bottom && d.scissor[0] <= 0 && d.scissor[2] >= g.w) { sx0 = 0; sx1 = 400; }
+        if (sx0 < 0) sx0 = 0; if (sy0 < 0) sy0 = 0; if (sx1 > out_w_) sx1 = out_w_; if (sy1 > 240) sy1 = 240;
         if (!cur_->screen) { sx0 = 0; sy0 = 0; sx1 = cur_->w; sy1 = cur_->h; }   // an image is its own clip
         uint32_t l = d.othermode_l;
         bool is_rect = d.kind != DrawRecord::Tris;
@@ -266,7 +282,7 @@ private:
         for (int i = 0; i < 3; i++) {
             IW[i] = 1.0f / vs[i]->w;
             X[i] = cur_->screen ? opt_.geo.screen_x(vs[i]->x * IW[i]) : vs[i]->x * IW[i];
-            Y[i] = cur_->screen ? opt_.geo.screen_y(vs[i]->y * IW[i]) : vs[i]->y * IW[i];
+            Y[i] = cur_->screen ? out_y(vs[i]->y * IW[i]) : vs[i]->y * IW[i];
         }
         float area = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
         if (fabsf(area) < 1e-6f) return;
@@ -329,7 +345,7 @@ bool ref_render(const uint8_t* rdram, const rt64_3ds::FrameRecord& frame, const 
     r.run();
     FILE* f = fopen(ppm_path, "wb");
     if (!f) return false;
-    fprintf(f, "P6\n400 240\n255\n");
+    fprintf(f, "P6\n%d 240\n255\n", r.width());
     for (uint32_t p : r.color()) { uint8_t px[3] = { (uint8_t)(p >> 24), (uint8_t)(p >> 16), (uint8_t)(p >> 8) }; fwrite(px, 1, 3, f); }
     fclose(f);
     return true;

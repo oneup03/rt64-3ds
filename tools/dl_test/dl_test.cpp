@@ -87,6 +87,10 @@ int main(int argc, char** argv) {
     // console's dbg_aim_tex_log prints them (for RenderDesc::aim_texture_hashes).
     const bool aim_hash = getenv("DL_AIM_HASH") != nullptr;
     if (aim_hash) interp.set_aim_hash(true);
+    // DL_BOTTOM: the game's touch-screen spans honoured (the HUD row on the
+    // touch screen); DL_RENDER then draws the top screen without them and
+    // DL_RENDER_BOTTOM the touch screen.
+    if (getenv("DL_BOTTOM") != nullptr || getenv("DL_RENDER_BOTTOM") != nullptr) interp.set_bottom_hud(true);
     // RenderDesc::merge_image_tiles (Goemon's sky). The rows of an image
     // texture come from the list before, so the task is run once first, as
     // the console runs the frame before it, and its frame presented
@@ -469,6 +473,7 @@ int main(int argc, char** argv) {
                     (int)d.tex[0].snapshot, d.tex[0].pitch, (int)d.tex[0].block, d.tex[0].cms, d.tex[0].cmt, d.tex[0].masks, d.tex[0].maskt, minx, maxx, miny, maxy);
             // Only when set, so dumps of games that never use them don't change.
             if (d.tex[0].frame || d.tex[1].frame) fprintf(o, "  frame %d/%d\n", (int)d.tex[0].frame, (int)d.tex[1].frame);
+            if (d.screen != 0) fprintf(o, "  touch screen, scissor %d %d %d %d\n", d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
             if (d.tex[0].wrap_rows || d.tex[1].wrap_rows) fprintf(o, "  wrap rows %u/%u\n", d.tex[0].wrap_rows, d.tex[1].wrap_rows);
             if (d.proj_inst) fprintf(o, "  projection instance %u\n", d.proj_inst);
             if (d.tex[0].levels > 1) {
@@ -530,6 +535,14 @@ int main(int argc, char** argv) {
         // with DL_FRAME_COPY); otherwise everything lands on the screen.
         o.model_images = getenv("DL_REF_RTT") != nullptr || getenv("DL_FRAME_COPY") != nullptr;
         printf("reference render -> %s: %s\n", out, ref_render(rdram.data(), frame, o, out) ? "ok" : "failed");
+    }
+    if (const char* out = getenv("DL_RENDER_BOTTOM")) {
+        RefOptions o;
+        o.geo = geo;
+        o.bottom = true;
+        size_t n = 0;
+        for (const auto& d : frame.draws) n += d.screen != 0;
+        printf("touch screen render (%zu draws) -> %s: %s\n", n, out, ref_render(rdram.data(), frame, o, out) ? "ok" : "failed");
     }
     // DL_COPY_CHECK: every texture (and mip level) decoded from a copy of
     // its texel_span, as the texture cache's deferred decoding does, against

@@ -18,6 +18,9 @@ struct RefOptions {
     bool model_images = false;
     // Where the game's frame sits on the 400x240 output (DK64's 320x240 by default).
     rt64_3ds::ScreenGeometry geo = rt64_3ds::ScreenGeometry::make(320, 240);
+    // The touch screen instead (DrawRecord::screen 1): its draws alone on a
+    // 320x240 output, the frame centred at a whole scale as the renderer has it.
+    bool bottom = false;
 };
 
 bool ref_render(const uint8_t* rdram, const rt64_3ds::FrameRecord& frame, const RefOptions& opt, const char* ppm_path);

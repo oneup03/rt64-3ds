@@ -157,7 +157,7 @@ bool hud_camera_is_world(const DrawRecord* draws, size_t count, const RenderDesc
     uint32_t hud_cam = 0, world = 0;
     for (size_t i = 0; i < count; i++) {
         const DrawRecord& d = draws[i];
-        if (d.kind != DrawRecord::Tris || !d.perspective || d.rtt >= 0) continue;
+        if (d.kind != DrawRecord::Tris || !d.perspective || d.rtt >= 0 || d.screen != 0) continue;
         if (!(d.scissor[0] <= 0 && d.scissor[2] >= frame_w)) continue;      // full width
         if (d.proj_id == desc.hud_camera_id) hud_cam++;
         else if (classify_draw(d, desc) == StereoClass::World) world++;
@@ -178,7 +178,7 @@ uint32_t primary_world_instance(const DrawRecord* draws, size_t count, const Ren
     uint32_t world_tris = 0;
     for (size_t i = 0; i < count; i++) {
         const DrawRecord& d = draws[i];
-        if (d.kind != DrawRecord::Tris || !d.perspective || d.rtt >= 0) continue;
+        if (d.kind != DrawRecord::Tris || !d.perspective || d.rtt >= 0 || d.screen != 0) continue;
         const bool hud = desc.hud_camera_id != 0 && d.proj_id == desc.hud_camera_id;
         const bool world = !hud && classify_draw(d, desc) == StereoClass::World;
         if (world) world_tris += d.count / 3;

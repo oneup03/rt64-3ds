@@ -12,6 +12,7 @@
 #include <3ds.h>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unistd.h>
 #include <sys/reent.h>
@@ -172,6 +173,38 @@ const devoptab_t* g_screen = nullptr;
 LightLock g_screen_lock;
 volatile bool g_screen_dirty = false;   // the console drew since screen_flush
 
+// Who has the touch screen (screen_bottom_update): the console, writing its
+// framebuffer, or the renderer, drawing the game's HUD there with the
+// console's text over it; the console then writes g_shadow, a copy of its
+// framebuffer the renderer reads (rt64_3ds::set_bottom_console).
+PrintConsole* g_console = nullptr;
+uint16_t* g_shadow = nullptr;
+bool g_on_shadow = false;               // the console writes g_shadow
+bool g_releasing = false;               // the renderer was told to stop; waiting for its last copy
+uint32_t g_release_ms = 0;
+constexpr uint32_t kReleaseMs = 150;    // a copy queued before the stop is on the screen by then
+
+uint32_t tick_ms() { return (uint32_t)(svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000)); }
+
+uint16_t* bottom_fb(size_t* bytes) {
+    u16 w = 0, h = 0;
+    u8* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &w, &h);
+    *bytes = (size_t)w * h * 2;         // RGB565, as consoleInit sets it
+    return (uint16_t*)fb;
+}
+
+// The console back on its framebuffer, with what it wrote meanwhile.
+void console_to_fb() {
+    size_t bytes = 0;
+    uint16_t* fb = bottom_fb(&bytes);
+    LightLock_Lock(&g_screen_lock);
+    memcpy(fb, g_shadow, bytes);
+    g_console->frameBuffer = fb;
+    LightLock_Unlock(&g_screen_lock);
+    svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)fb, bytes);
+    g_on_shadow = g_releasing = false;
+}
+
 const devoptab_t g_errtab = {
     .name = "recomp3ds_stderr",
     .structSize = 0,
@@ -196,9 +229,56 @@ void recomp3ds::log_init(const char* base_path) {
     }
 }
 
-void recomp3ds::screen_init() {
+void recomp3ds::screen_init(PrintConsole* console) {
     LightLock_Init(&g_screen_lock);
     g_screen = devoptab_list[STD_OUT];
+    g_console = console;
+}
+
+void recomp3ds::screen_bottom_update(bool hud) {
+    if (g_console == nullptr) return;
+    if (hud) {
+        if (!g_on_shadow) {
+            size_t bytes = 0;
+            uint16_t* fb = bottom_fb(&bytes);
+            if (g_shadow == nullptr) g_shadow = (uint16_t*)malloc(bytes);
+            if (g_shadow == nullptr) return;
+            LightLock_Lock(&g_screen_lock);
+            memcpy(g_shadow, fb, bytes);
+            g_console->frameBuffer = g_shadow;
+            LightLock_Unlock(&g_screen_lock);
+            g_on_shadow = true;
+            rt64_3ds::set_bottom_console(g_shadow);
+        }
+        g_releasing = false;
+        rt64_3ds::set_bottom_screen(true);
+        return;
+    }
+    if (!g_on_shadow) return;
+    if (!g_releasing) {
+        rt64_3ds::set_bottom_screen(false);
+        g_releasing = true;
+        g_release_ms = tick_ms();
+        return;
+    }
+    // No copy queued since the stop, and the last one long enough ago.
+    if (tick_ms() - g_release_ms >= kReleaseMs && rt64_3ds::bottom_idle_ms() >= kReleaseMs) console_to_fb();
+}
+
+uint16_t recomp3ds::screen_pixel(int x, int y) {
+    if (g_console == nullptr || x < 0 || x >= 320 || y < 0 || y >= 240) return 0;
+    return g_console->frameBuffer[x * 240 + (239 - y)];
+}
+
+void recomp3ds::screen_take_console(uint32_t timeout_ms) {
+    if (g_console == nullptr || !g_on_shadow) return;
+    rt64_3ds::set_bottom_screen(false);
+    if (!g_releasing) { g_releasing = true; g_release_ms = tick_ms(); }
+    const uint32_t t0 = tick_ms();
+    while (!(tick_ms() - g_release_ms >= kReleaseMs && rt64_3ds::bottom_idle_ms() >= kReleaseMs) && tick_ms() - t0 < timeout_ms) {
+        svcSleepThread(10 * 1000000ll);
+    }
+    console_to_fb();
 }
 
 // One call's text reaches the console whole (escape sequences included),
@@ -215,6 +295,7 @@ void recomp3ds::screen_printf(const char* fmt, ...) {
     g_screen->write_r(_REENT, nullptr, buf, (size_t)n);
     g_screen_dirty = true;
     LightLock_Unlock(&g_screen_lock);
+    if (g_on_shadow) rt64_3ds::note_bottom_console_changed();
 }
 
 // A line of its own at the bottom of the touch screen, in red (empty: clear
@@ -227,6 +308,7 @@ void recomp3ds::screen_alert(const char* text, int row) {
     const int n = snprintf(buf, sizeof(buf), "\x1b[%d;0H\x1b[31m%-39.39s\x1b[0m", row, text);
     g_screen->write_r(_REENT, nullptr, buf, (size_t)n);
     LightLock_Unlock(&g_screen_lock);
+    if (g_on_shadow) rt64_3ds::note_bottom_console_changed();
     u16 w = 0, h = 0;
     u8* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &w, &h);
     if (fb != nullptr) svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)fb, (u32)w * h * gspGetBytesPerPixel(gfxGetScreenFormat(GFX_BOTTOM)));
@@ -246,6 +328,7 @@ uint32_t recomp3ds::log_write_stuck_ms() {
 void recomp3ds::screen_flush() {
     if (!g_screen_dirty) return;
     g_screen_dirty = false;
+    if (g_on_shadow) return;            // the renderer reads the copy
     u16 w = 0, h = 0;
     u8* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &w, &h);
     if (fb == nullptr) return;

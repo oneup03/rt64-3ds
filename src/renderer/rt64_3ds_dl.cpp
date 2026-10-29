@@ -114,6 +114,10 @@ enum : uint32_t {
     EX_SETTEXCOORDWRAPPOINT = 0x32, EX_SETRECTASPECT = 0x33,
 };
 constexpr uint32_t kHookMagic = 0x525464;
+// A game's touch-screen span markers (include/rt64_3ds_gbi.h): G_SPNOOP with
+// this in its 24 bits, w1's top nibble 1 (bottom, with dx and dy as two
+// signed 12-bit fields) or 2 (top).
+constexpr uint32_t kScreenMagic = 0x523344;
 
 struct Tile {
     uint8_t fmt = 0, siz = 0, palette = 0, cms = 0, cmt = 0, masks = 0, maskt = 0, shifts = 0, shiftt = 0;
@@ -765,7 +769,8 @@ struct Interpreter::Impl {
     // backend's projection scales them to the screen.
     ScreenGeometry geo = ScreenGeometry::make(320, 240);
     int screen_w = 320, screen_h = 240;
-    struct Viewport { float scale[3], trans[3]; float trans_stretch = 160.0f; };
+    // trans_raw: the x translate as the game loaded it (touch-screen spans).
+    struct Viewport { float scale[3], trans[3]; float trans_stretch = 160.0f; float trans_raw = 160.0f; };
     Viewport vp{ { 160, -120, 511 }, { 160, 120, 511 }, 160.0f };
     Viewport vp_stack[8]{};
     int vp_depth = 0;
@@ -839,6 +844,12 @@ struct Interpreter::Impl {
     }
     bool split_untagged_ortho = false;
     bool aim_hash = false;             // Interpreter::set_aim_hash
+    // Interpreter::set_bottom_hud, and the span being read: the draws in it
+    // go to the touch screen (DrawRecord::screen), moved by bottom_dx/dy, at
+    // the game's coordinates (no origins, alignments or stretching).
+    bool bottom_allowed = false;
+    bool bottom_span = false;
+    float bottom_dx = 0.0f, bottom_dy = 0.0f;
     // FNV-1a over the image's bytes (its rows, in whole words) and, with the
     // TLUT on, the palette entries it indexes: RenderDesc::aim_texture_hashes.
     // Not texel_span's slack past the last row: what follows a texture can
@@ -1556,9 +1567,12 @@ struct Interpreter::Impl {
         // Model -> clip -> screen in one matrix: the viewport is a scale and
         // translate of x/w and y/w (y negated: screen y grows downward) and
         // z' = (z + w) / 2, all linear in homogeneous coordinates.
-        const bool stretch = proj_stretch() && cur_rtt < 0;   // an off-screen image is drawn 1:1
+        const bool stretch = proj_stretch() && cur_rtt < 0 && !bottom_span;   // an off-screen image is drawn 1:1
         const float sx = stretch ? vp.scale[0] * stretch_k() : vp.scale[0], sy = -vp.scale[1];
-        const float tx = stretch ? stretch_x(vp.trans_stretch) : vp.trans[0], ty = vp.trans[1];
+        // A touch-screen span: the viewport as the game loaded it (no
+        // gEXSetViewportAlign), moved with the span.
+        const float tx = bottom_span ? vp.trans_raw + bottom_dx : stretch ? stretch_x(vp.trans_stretch) : vp.trans[0];
+        const float ty = bottom_span ? vp.trans[1] + bottom_dy : vp.trans[1];
         float m[4][4];
         for (int i = 0; i < 4; i++) {
             const float cx = mvp.m[i][0], cy = mvp.m[i][1], cz = mvp.m[i][2], cw = mvp.m[i][3];
@@ -1856,7 +1870,8 @@ struct Interpreter::Impl {
         r.geometry_mode = geometry_mode;
         memcpy(r.prim, prim, 4); memcpy(r.env, env, 4); memcpy(r.blend, blend, 4); memcpy(r.fog, fog, 4);
         r.prim_lod_frac = prim_lod_frac;
-        effective_scissor(r.scissor, r.kind == DrawRecord::Tris && proj_stretch());
+        draw_scissor(r.scissor, r.kind == DrawRecord::Tris);
+        r.screen = bottom_span ? 1 : 0;
         r.proj_id = proj_id;
         r.rtt = (int8_t)cur_rtt;
         r.perspective = is_perspective(proj);
@@ -2124,7 +2139,7 @@ struct Interpreter::Impl {
                a.geometry_mode == b.geometry_mode && memcmp(a.prim, b.prim, 4) == 0 && memcmp(a.env, b.env, 4) == 0 &&
                memcmp(a.blend, b.blend, 4) == 0 && memcmp(a.fog, b.fog, 4) == 0 && a.prim_lod_frac == b.prim_lod_frac &&
                memcmp(a.scissor, b.scissor, sizeof(a.scissor)) == 0 && a.proj_id == b.proj_id && a.perspective == b.perspective && a.rtt == b.rtt &&
-               memcmp(a.uv1, b.uv1, sizeof(a.uv1)) == 0 && a.depth_a == b.depth_a && a.depth_b == b.depth_b &&
+               a.screen == b.screen && memcmp(a.uv1, b.uv1, sizeof(a.uv1)) == 0 && a.depth_a == b.depth_a && a.depth_b == b.depth_b &&
                same_tex(a.tex[0], b.tex[0]) && same_tex(a.tex[1], b.tex[1]);
     }
 
@@ -2149,8 +2164,9 @@ struct Interpreter::Impl {
         if (a.mv_auto != (mv_groups[mv_group_depth] == kIdAuto)) return false;
         if (a.depth_a != cur_depth_a || a.depth_b != cur_depth_b) return false;
         if (!same_bits<4>(a.prim, prim) || !same_bits<4>(a.env, env) || !same_bits<4>(a.blend, blend) || !same_bits<4>(a.fog, fog)) return false;
+        if (a.screen != (bottom_span ? 1 : 0)) return false;
         int16_t sc[4];
-        effective_scissor(sc, proj_stretch());
+        draw_scissor(sc, true);
         if (!same_bits<sizeof(sc)>(a.scissor, sc)) return false;
         if (a.perspective != is_perspective(proj)) return false;
         // uv1 places TEXEL1 alone (merge_image_tiles: the sky's column loads
@@ -2179,6 +2195,13 @@ struct Interpreter::Impl {
     // on the wide screen's right edge. Without the origin's place those
     // rectangles landed a frame's width to the left.
     void emit_rect(float ulx, float uly, float lrx, float lry, bool textured, int tile, float s, float t, float dsdx, float dtdy, bool flip) {
+        if (bottom_span) {
+            // The touch screen: the game's coordinates, no origin or
+            // alignment (emit_rect_aligned moves it with the span).
+            static const float kNone[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            emit_rect_aligned(ulx, uly, lrx, lry, textured, tile, s, t, dsdx, dtdy, flip, 0.0f, 0.0f, kNone, false);
+            return;
+        }
         const float align[4] = { rect_align[0] + origin_place(rect_lorigin), rect_align[1], rect_align[2] + origin_place(rect_rorigin), rect_align[3] };
         emit_rect_aligned(ulx, uly, lrx, lry, textured, tile, s, t, dsdx, dtdy, flip, origin_shift(rect_lorigin), origin_shift(rect_rorigin), align,
                           rect_lorigin == 0x800 && rect_rorigin == 0x800);
@@ -2268,7 +2291,7 @@ struct Interpreter::Impl {
         // hashed here, while RDRAM still holds them (nothing reads RDRAM
         // after "parsed"): a textured rectangle of 8..64 px, roughly square,
         // sampling ordinary texture memory.
-        if (aim_hash && textured && r.tex[0].valid && !r.tex[0].snapshot && !r.tex[0].frame && r.tex[0].rtt < 0 &&
+        if (aim_hash && !bottom_span && textured && r.tex[0].valid && !r.tex[0].snapshot && !r.tex[0].frame && r.tex[0].rtt < 0 &&
             w >= 8.0f && h >= 8.0f && w <= 64.0f && h <= 64.0f && w <= h * 1.6f && h <= w * 1.6f) {
             r.tex_hash = hash_texture(r.tex[0]);
         }
@@ -2309,8 +2332,9 @@ struct Interpreter::Impl {
         // frame copy, spans the full width with plain origins (full-screen
         // fills and tints), or is tagged STRETCH, unless it is tagged ADJUST.
         const bool stretch = ((textured && (r.tex[0].snapshot || r.tex[0].frame)) || (plain_origins && ulx <= 0.0f && lrx >= (float)screen_w) ||
-                              rect_aspect == kAspectStretch || cover) && rect_aspect != kAspectAdjust && cur_rtt < 0;
+                              rect_aspect == kAspectStretch || cover) && rect_aspect != kAspectAdjust && cur_rtt < 0 && !bottom_span;
         const float ulx_n64 = ulx, lrx_n64 = lrx;     // before any stretch (merge_rect_slices)
+        if (bottom_span) { ulx += bottom_dx; lrx += bottom_dx; uly += bottom_dy; lry += bottom_dy; }
         if (stretch) {
             ulx = stretch_x(ulx);
             lrx = stretch_x(lrx);
@@ -2650,6 +2674,7 @@ struct Interpreter::Impl {
         if (vp_origin < 0x800) x += (float)vp_origin * (float)screen_w * 4.0f / 1024.0f;
         vp.trans[0] = (x + (float)vp_align_x) / 4.0f + (float)origin_shift(vp_origin);
         vp.trans_stretch = (x + (float)vp_align_x) / 4.0f;
+        vp.trans_raw = raw_vtrans_x / 4.0f;
     }
 
     // Widescreen, as RT64 does it: its native mapping spreads the N64's
@@ -2668,6 +2693,17 @@ struct Interpreter::Impl {
         if (stretch && scissor[0] >= 0 && scissor[2] <= screen_w) {
             out[0] = (int16_t)stretch_x((float)scissor[0]);
             out[2] = (int16_t)stretch_x((float)scissor[2]);
+        }
+    }
+    // A draw's scissor: on the touch screen (a bottom span) the game's own,
+    // held within its frame (an origin-relative one reaches the wide
+    // screen's edges) and moved with the span.
+    void draw_scissor(int16_t* out, bool tris) const {
+        if (!bottom_span) { effective_scissor(out, tris && proj_stretch()); return; }
+        const int lim[4] = { 0, 0, screen_w, screen_h };
+        for (int i = 0; i < 4; i++) {
+            const int v = std::min(std::max((int)scissor[i], lim[i & 1]), lim[2 + (i & 1)]);
+            out[i] = (int16_t)(v + (int)((i & 1) ? bottom_dy : bottom_dx));
         }
     }
 
@@ -2826,6 +2862,17 @@ struct Interpreter::Impl {
                             next = seg(w1 & 0x0FFFFFFF);
                         }
                         else if (hop == 4) next = seg(w1 & 0x0FFFFFFF);
+                    }
+                    else if ((w0 & 0xFFFFFF) == kScreenMagic && bottom_allowed) {
+                        const uint32_t sop = w1 >> 28;
+                        const bool bottom = sop == 1;
+                        if (bottom || sop == 2) {
+                            if (bottom != bottom_span) state_seq++;     // a new record either side
+                            bottom_span = bottom;
+                            // Two signed 12-bit fields.
+                            bottom_dx = bottom ? (float)((int32_t)(w1 << 8) >> 20) : 0.0f;
+                            bottom_dy = bottom ? (float)((int32_t)(w1 << 20) >> 20) : 0.0f;
+                        }
                     }
                     break;
                 case G_EXTENDED: {
@@ -3314,7 +3361,7 @@ struct Interpreter::Impl {
                a.othermode_l == b.othermode_l && a.geometry_mode == b.geometry_mode && same_bits<4>(a.prim, b.prim) && same_bits<4>(a.env, b.env) &&
                same_bits<4>(a.blend, b.blend) && same_bits<4>(a.fog, b.fog) && a.prim_lod_frac == b.prim_lod_frac &&
                same_bits<sizeof(a.scissor)>(a.scissor, b.scissor) && a.proj_id == b.proj_id && a.perspective == b.perspective && a.rtt == b.rtt &&
-               same_tex(a.tex[0], b.tex[0]);
+               a.screen == b.screen && same_tex(a.tex[0], b.tex[0]);
     }
 
     void begin_list(FrameRecord& o) {
@@ -3339,6 +3386,7 @@ struct Interpreter::Impl {
         for (int i = 0; i < kMaxRtt; i++) o.rtts[i] = rtt_images[i];
         for (auto& L : loads) L.valid = false;
         rect_slices.clear();
+        bottom_span = false;
         list_seq++;
         screen_cimg = cur_rtt < 0 ? cimg : 0;
         screen_drawn = false;
@@ -3812,6 +3860,7 @@ void Interpreter::set_world_proj_ids(const uint32_t* ids, int count) {
 }
 void Interpreter::set_split_untagged_ortho(bool on) { impl_->split_untagged_ortho = on; }
 void Interpreter::set_aim_hash(bool on) { impl_->aim_hash = on; }
+void Interpreter::set_bottom_hud(bool on) { impl_->bottom_allowed = on; }
 void Interpreter::set_force_branch_z(bool on) { impl_->force_branch_z = on; }
 void Interpreter::set_cull_dl(bool on) { impl_->cull_dl = on; }
 void Interpreter::set_screen_cull(float slack) { g_screen_cull_slack = slack; }
