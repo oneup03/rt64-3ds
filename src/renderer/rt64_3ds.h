@@ -317,6 +317,10 @@ struct RenderDesc {
     // first_person_scene().
     const uint64_t* aim_texture_hashes = nullptr;
     size_t aim_texture_count = 0;
+    // The 3D page's Crosshair row (Settings::crosshair_hud): off for a game
+    // with no reticle the renderer places (Goemon), whose row would do
+    // nothing.
+    bool crosshair_row = true;
 };
 
 void set_render_desc(const RenderDesc& desc);

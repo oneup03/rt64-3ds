@@ -121,10 +121,11 @@ const char* const kCoresNames[] = { "Auto", "2, game on 1", "2, game on 0" };
 int g_cores = 0;
 // settings.ini only: the touch screen's game-thread shares and audio rows.
 int g_debug_rows = 0;
-// settings.ini only: how much goes to log.txt (log.cpp): the summary (1),
-// on an Old 3DS (core 0 full) boot, warnings and exit only (0), unless a
-// game or the file asks otherwise.
+// The Game page's Log level, how much goes to log.txt (log.cpp): the summary
+// (1), on an Old 3DS (core 0 full) boot, warnings and exit only (0), unless a
+// game or the file asks otherwise; 2 the stats line every second.
 int g_log_level = 1;
+const char* const kLogLevelNames[] = { "Warnings", "Summary", "Full" };
 void apply_log_level(int v) { recomp3ds::log_set_level(v); }
 
 // Audio on or off: off skips the audio microcode, which the CPU runs here,
@@ -879,7 +880,8 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "convergence_tenths", "Convergence", 1, 200, &g_conv_tenths, nullptr, true, nullptr, apply_conv, Page3D, 1, nullptr });
     add_row({ "hud_depth", "HUD depth", 0, 100, &st.hud_depth, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
     // The crosshair at the depth under it (dynamic) or the HUD's (rt64_3ds::Settings::crosshair_hud).
-    add_row({ "crosshair", "Crosshair", 0, 1, &st.crosshair_hud, kCrosshairNames, false, nullptr, nullptr, Page3D, 1, nullptr });
+    add_row({ "crosshair", "Crosshair", 0, 1, &st.crosshair_hud, kCrosshairNames, false, nullptr, nullptr,
+              desc.render.crosshair_row ? Page3D : recomp3ds::PageCount, 1, nullptr });
     add_row({ "auto_convergence", "Auto convergence", 0, 1, &g_auto, kOffOn, false, nullptr, apply_auto, Page3D, 1, nullptr });
     add_row({ "comfort_target", "Comfort target", -20, 30, &st.comfort_target, nullptr, false, nullptr, nullptr, Page3D, 1, nullptr });
     // The desktop's ghost reduction: 100% contrast and a 0% floor are off.
@@ -942,6 +944,8 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "perf_monitor", "Performance monitor", 0, 1, &g_perf_monitor, kPerfMonitorNames, false, nullptr, apply_perf_monitor, PageGame, 1, nullptr });
     add_row({ "frame_cap", "Frame rate", 0, desc.render.frame_interpolation ? 2 : 1, &st.frame_cap, kFrameCapNames, false, nullptr, nullptr, PageGame, 1, nullptr });
     add_row({ "rom_stream", "ROM stream", 0, 2, &g_rom_stream, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    g_log_level = is_new_3ds ? 1 : 0;
+    add_row({ "log_level", "Log level", 0, 2, &g_log_level, kLogLevelNames, false, nullptr, apply_log_level, PageGame, 1, nullptr });
     add_row({ "dbg_capture", "Hold SELECT", 0, 1, &g_debug_capture, kSelectHoldNames, false, nullptr, nullptr, PageGame, 1, nullptr });
     // RenderDesc::double_eyes, settings.ini only and read at start: the
     // game's choice unless the file says otherwise.
@@ -986,8 +990,6 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     if (is_new_3ds) add_row({ "dbg_old_clock", "Old 3DS clock", 0, 1, &g_dbg_old_clock, nullptr, false, nullptr, apply_old_clock, recomp3ds::PageCount, 1, nullptr });
     add_row({ "dbg_cores", "Cores (at restart)", 0, 2, &g_cores, kCoresNames, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "dbg_rows", "Debug rows", 0, 1, &g_debug_rows, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
-    g_log_level = is_new_3ds ? 1 : 0;
-    add_row({ "log_level", "Log level", 0, 2, &g_log_level, nullptr, false, nullptr, apply_log_level, recomp3ds::PageCount, 1, nullptr });
     if (desc.synth.flavor != recomp3ds::SynthFlavor::None) {
         // settings.ini only (audio_engine=0 runs the audio task as before).
         add_row({ "audio_engine", "Audio engine", 0, 1, &g_audio_engine, kAudioEngineNames, false, nullptr, apply_audio_engine, recomp3ds::PageCount, 1, nullptr });

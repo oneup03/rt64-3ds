@@ -939,7 +939,7 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   screen shows frames and each core's load. settings.ini's `dbg_rows=1`
   adds the thread shares and the audio rows. loadmon's calibrations follow
   the clock chosen: 268 and 804 MHz, exactly 1:3.
-- **Logging.** settings.ini's `log_level` (log.cpp) has three levels:
+- **Logging.** The Game page's Log level (`log_level`, log.cpp) has three levels:
   - 2: everything (for tests).
   - 1, the New 3DS default: no renderer reports or late-frame lines, and
     the stats and synth lines only every 10 s.
@@ -1389,18 +1389,18 @@ library's keys:
 | `separation`, `convergence_tenths`, `hud_depth`, `auto_convergence`, `comfort_target`, `stereo_ghost_contrast`, `stereo_ghost_black_floor` | 25, 60, 50, 1, 0, 100, 0 (the games set their own) | 3D page | the gfx thread each frame |
 | `stick_deadzone`, `cstick_deadzone`, `cstick_up`, `cstick_down`, `cstick_camera` | 5, 20, 1, 1, 1 (`cstick_camera` only with `GameDesc::cstick_camera_hold`; with `cstick_camera_analog_x` its left and right press nothing and the game reads them, `recomp3ds::cstick_camera_analog()`: Goemon's analog camera). The C-Stick's rows on a New 3DS only: an Old 3DS has no C-Stick, settings.ini only there | Controls | `input_set_*` |
 | `button_a`, `button_b`, `button_x`, `button_y`, `button_l`, `button_r`, `button_zl`, `button_zr`, `button_dup`, `button_ddown`, `button_dleft`, `button_dright` | the N64 button each 3DS button presses, an index into `kN64ChoiceButtons` (0 none, then A, B, Z, L, R, the D-pad's four, the C buttons' four; START stays on START); the defaults are the game's `button_map`. ZL and ZR rows on a New 3DS only. A key a mod mode's map (`input_set_map`) gives other buttons than the game's own map follows that map instead | Controls | `input_set_user_buttons` |
-| `crosshair` | 0: the crosshair (the reticle classify_frame finds) at the depth under it, holding the last finite depth over open sky or nothing drawn (the screen's plane before the first); 1: at the HUD's depth (`hud_depth`) | 3D | `Settings::crosshair_hud` |
+| `crosshair` | 0: the crosshair (the reticle classify_frame finds) at the depth under it, holding the last finite depth over open sky or nothing drawn (the screen's plane before the first); 1: at the HUD's depth (`hud_depth`) | 3D (not with `RenderDesc::crosshair_row` off: Goemon) | `Settings::crosshair_hud` |
 | (Reset controls) | not saved: a first press arms it, a second puts every Controls row back to its default (the game's, before `settings.ini`) | Controls | |
 | `brightness_top`, `brightness_bottom` | 0 (the system's level, left alone); 1-5 the system's levels (gsp::Lcd), set again after the HOME Menu and sleep | Game | `GSPLCD_SetBrightness` |
 | `touch_button_1`, `touch_button_2` | 0 (none): the player's touch buttons, any N64 button each, at the top of the touch grid's right column ahead of a game's buttons | Controls | `touch_pad_set_user` |
 | `audio` | 1 | Game | `audio_set_enabled` |
 | `perf_monitor` | 1: the touch screen's game name, frame rate and SELECT hint; 0: none of them (the touch buttons, alerts and the menu stay), and no load monitor idle threads (`loadmon_want`; kept for `dbg_profile` 2 or 3), so the stats lines read the cores' loads as -1 | Game | `settings_perf_monitor` |
 | `frame_cap` | 0; the games 2, which an Old 3DS turns into `old3ds_frame_cap` | Game | the gfx thread |
+| `log_level` | 1 on a New 3DS, 0 on an Old | Game (Log level: Warnings, Summary, Full) | `log_set_level` |
 | `dbg_capture` | 0: a SELECT hold saves a screenshot; 1: a frame capture (`gfx_task.bin`) | Game (Hold SELECT: Screenshot, Debug Capture) | the SELECT hold in `recomp3ds_run.cpp` |
 | `dbg_old_clock` | 0 | none, New 3DS only | `set_cpu_speed` (1 runs at the Old 3DS clock) |
 | `dbg_cores` | 0 (Auto) | none, read at start | the core layout (1 two cores with the game on core 1, 2 on core 0, 3 on core 0 with the lists read there) |
 | `rom_stream` | 0 (the game's choice: `GameDesc::rom_new3ds` / `rom_old3ds`) | none, read at start | the ROM stream |
-| `log_level` | 1 on a New 3DS, 0 on an Old | none | `log_set_level` |
 | `dbg_rows` | 0 | none | the touch screen's stats rows |
 | `dbg_*` | 0 | none, read at start | the table above |
 | `gpu_double_eyes` | the `RenderDesc` value; off on an Old 3DS | none, read at start | the renderer's init |
