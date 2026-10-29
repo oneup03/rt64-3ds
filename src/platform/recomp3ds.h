@@ -235,6 +235,13 @@ struct GameDesc {
     // left) lowers it; the log's "heap in use" says what the game really
     // takes.
     int rom_room_mb = 24;
+    // Core 1's share an Old 3DS asks for (through PM above APT's 80; the
+    // CIA's MaxCpu allows up to 89, the kernel's most). The system's modules
+    // (the card, the pad, NS) share the rest of that core with the game's
+    // threads there: at 89 they starved (15 s card writes, a slow pad, a
+    // HOME button that never answered), 85 is the owner's choice
+    // (2026-10-28).
+    int old3ds_core1_limit = 85;
 };
 
 // Brings up the console, registers the game and runs the runtime. Returns the

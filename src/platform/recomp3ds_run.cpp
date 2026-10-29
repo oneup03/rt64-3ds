@@ -3,6 +3,7 @@
 #include <3ds.h>
 #include <opendsp.h>
 #include <malloc.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -197,6 +198,104 @@ void park_main_thread() {
     for (int i = 0; i < 40 && !g_main_parked; i++) svcSleepThread(10000000ll);   // it wakes every ~16 ms
 }
 
+// An Old 3DS in the 96 MB layout: a game's hidden 96 MB CIA (add_cia's
+// HIDDEN), which tools/launcher96 started through an NS restart with no HOME
+// Menu behind it (the HOME Menu cannot run in 96 MB: the layout leaves the
+// system 12 MB and its first heap is 13 MB, its crash at start on
+// 2026-10-28). Nothing may start the HOME Menu then: HOME opens the quit
+// prompt as ever, POWER does too (apt_main_loop), and the exit restarts the
+// console into the HOME Menu (finish_exit).
+bool g_no_home_menu = false;
+bool g_power_pressed = false;
+bool take_power_press() {
+    const bool pressed = g_power_pressed;
+    g_power_pressed = false;
+    return pressed;
+}
+
+// The exit with no HOME Menu behind the game: NS restarts the console into
+// it, in the system's default layout (NSS:RebootSystemClean). PTM tells the
+// processes, waits up to 4 s for them and restarts the console, which ends
+// this one; should that not come within 10 s, the exit goes on as ever.
+void restart_into_home_menu() {
+    fprintf(stderr, "recomp3ds: restarting the console into the HOME Menu\n");
+    recomp3ds::screen_printf("\nRestarting into the HOME Menu...\n");
+    gfxFlushBuffers();
+    recomp3ds::log_flush();
+    Result rc = nsInit();
+    if (R_SUCCEEDED(rc)) {
+        rc = NS_RebootSystem();
+        nsExit();
+    }
+    if (R_FAILED(rc)) {
+        fprintf(stderr, "recomp3ds: NS refused the restart (%08lx): a hardware reset\n", (unsigned long)rc);
+        rc = APT_HardwareResetAsync();
+    }
+    if (R_SUCCEEDED(rc)) {
+        for (int i = 0; i < 100; i++) svcSleepThread(100000000ll);
+        fprintf(stderr, "recomp3ds: no restart after 10 s\n");
+    }
+    else fprintf(stderr, "recomp3ds: no restart (%08lx)\n", (unsigned long)rc);
+    recomp3ds::log_flush();
+}
+
+void old3ds_check_layout() {
+    const u32 layout = osGetApplicationMemType();
+    bool home_menu = true;
+    const Result rc = APT_IsRegistered(APPID_HOMEMENU, &home_menu);
+    // 96 MB: no HOME Menu can be running. 80 or 72 MB: one may (the
+    // HOME Menu starts a title that asks for them), so APT says.
+    g_no_home_menu = layout == 2 || ((layout == 3 || layout == 4) && R_SUCCEEDED(rc) && !home_menu);
+    if (g_no_home_menu) aptSetHomeAllowed(false);       // a HOME press before the frames start: the quit prompt
+    fprintf(stderr, "recomp3ds: Old 3DS: layout %lu (app region %lu KB); HOME Menu %s (APT %s, %08lx)\n",
+            (unsigned long)layout, (unsigned long)(osGetMemRegionSize(MEMREGION_APPLICATION) / 1024),
+            g_no_home_menu ? "not running: HOME and POWER open the quit prompt, quitting restarts the console" : "running",
+            home_menu ? "registered" : "not registered", (unsigned long)rc);
+}
+
+// An Old 3DS: the wireless off and the background network services
+// (StreetPass, SpotPass, eShop, friends) paused while the game runs, both
+// put back as it quits (the owner's rule for every game, 2026-10-28). Their
+// work runs on core 1 beside the game. The wireless is left alone when it
+// is off already (the shared page's network_state 7).
+bool g_wireless_turned_off = false, g_net_paused = false;
+void old3ds_quiet_start() {
+    const unsigned state = OS_SharedConfig->network_state;
+    Result rc = 0;
+    if (state != 7) {
+        rc = nwmExtInit();
+        if (R_SUCCEEDED(rc)) {
+            rc = NWMEXT_ControlWirelessEnabled(false);
+            nwmExtExit();
+        }
+        g_wireless_turned_off = R_SUCCEEDED(rc);
+    }
+    Result net = ndmuInit();
+    Result sched = -1;
+    if (R_SUCCEEDED(net)) {
+        net = NDMU_SuspendDaemons(NDM_DAEMON_MASK_ALL);
+        sched = NDMU_SuspendScheduler(1);
+        g_net_paused = R_SUCCEEDED(net);
+        if (!g_net_paused) ndmuExit();
+    }
+    fprintf(stderr, "recomp3ds: Old 3DS: wireless %s (network state %u, %08lx); background network services %s (%08lx, scheduler %08lx)\n",
+            state == 7 ? "already off" : g_wireless_turned_off ? "off" : "left on", state, (unsigned long)rc,
+            g_net_paused ? "paused" : "left running", (unsigned long)net, (unsigned long)sched);
+}
+void old3ds_quiet_end() {
+    if (g_net_paused) {
+        NDMU_ResumeDaemons(NDM_DAEMON_MASK_ALL);
+        NDMU_ResumeScheduler();
+        ndmuExit();
+        g_net_paused = false;
+    }
+    if (g_wireless_turned_off && R_SUCCEEDED(nwmExtInit())) {
+        NWMEXT_ControlWirelessEnabled(true);
+        nwmExtExit();
+        g_wireless_turned_off = false;
+    }
+}
+
 [[noreturn]] void finish_exit() {
     static volatile u32 once = 0;
     if (__atomic_exchange_n(&once, 1u, __ATOMIC_SEQ_CST) != 0) {
@@ -215,6 +314,8 @@ void park_main_thread() {
     recomp3ds::loadmon_stop();
     recomp3ds::dsp_synth_shutdown();
     recomp3ds::audio_shutdown();
+    old3ds_quiet_end();
+    if (g_no_home_menu) restart_into_home_menu();
     gfxExit();
     osSetSpeedupEnable(false);             // hand the system back at the clock it had
     __appExit();
@@ -283,7 +384,8 @@ void draw_home_prompt(bool show) {
     if (show) {
         recomp3ds::screen_printf("\x1b[%d;0H----------------------------------------", kRow);
         recomp3ds::screen_printf("\x1b[%d;0H  Quit %-33s", kRow + 1, g_desc != nullptr ? g_desc->render.game_name : "the game");
-        recomp3ds::screen_printf("\x1b[%d;0H  A: quit   B: resume%19s", kRow + 2, "");
+        // With no HOME Menu behind the game, quitting restarts the console.
+        recomp3ds::screen_printf("\x1b[%d;0H  %-38s", kRow + 2, g_no_home_menu ? "A: quit and restart   B: resume" : "A: quit   B: resume");
         recomp3ds::screen_printf("\x1b[%d;0H----------------------------------------", kRow + 3);
     }
     else {
@@ -305,18 +407,18 @@ bool home_prompt() {
     u32 prev = prompt_keys();          // held on entry: not a press
     bool quit = false;
     for (;;) {
-        if (!aptMainLoop()) { quit = true; break; }
+        if (!recomp3ds::apt_main_loop()) { quit = true; break; }
         const u32 keys = prompt_keys();
         const u32 down = keys & ~prev;
         prev = keys;
-        if (aptCheckHomePressRejected() || recomp3ds::autotest_take_home()) break;
+        if (aptCheckHomePressRejected() || take_power_press() || recomp3ds::autotest_take_home()) break;
         if (down & KEY_A) { quit = true; break; }
         if (down & KEY_B) break;
         svcSleepThread(16 * 1000000ll);
     }
     if (!quit) {
         while ((prompt_keys() & KEY_B) != 0) {
-            if (!aptMainLoop()) { quit = true; break; }
+            if (!recomp3ds::apt_main_loop()) { quit = true; break; }
             svcSleepThread(16 * 1000000ll);
         }
     }
@@ -362,7 +464,7 @@ void update_gfx_inner() {
         aptSetHomeAllowed(false);
         g_home_trapped = true;
     }
-    if (!g_exit_requested && (aptCheckHomePressRejected() || recomp3ds::autotest_take_home())) {
+    if (!g_exit_requested && (aptCheckHomePressRejected() || take_power_press() || recomp3ds::autotest_take_home())) {
         if (home_prompt()) g_exit_requested = true;
     }
     g_main_stage = 5;
@@ -658,7 +760,7 @@ void update_gfx_inner() {
         }
     }
     g_main_stage = 8;
-    if (!aptMainLoop() || g_exit_requested) {
+    if (!recomp3ds::apt_main_loop() || g_exit_requested) {
         static bool quitting = false;
         if (!quitting) {
             quitting = true;
@@ -856,6 +958,23 @@ const char* recomp3ds::base_path() { return g_base_path; }
 
 void recomp3ds::request_exit() { g_exit_requested = true; }
 
+// libctru's aptMainLoop jumps to the HOME Menu on POWER (for its power-off
+// menu), whatever aptSetHomeAllowed says. With no HOME Menu behind the game
+// that would start it, so then a jump request is a POWER press for the quit
+// prompt (update_gfx_inner), counted once while it stands.
+bool recomp3ds::apt_main_loop() {
+    if (!g_no_home_menu) return aptMainLoop();
+    aptHandleSleep();
+    static bool standing = false;
+    const bool jump = aptShouldJumpToHome();
+    if (jump && !standing) {
+        fprintf(stderr, "recomp3ds: POWER (no HOME Menu): the quit prompt\n");
+        g_power_pressed = true;
+    }
+    standing = jump;
+    return !aptShouldClose();
+}
+
 // newlib's abort and assert, replaced: see fatal().
 extern "C" void abort(void) {
     fatal("abort() was called");
@@ -890,6 +1009,10 @@ int recomp3ds::run(const GameDesc& desc) {
     fprintf(stderr, "recomp3ds: %d libultra matrix helpers as host functions (RT64_3DS_GU_NATIVE, with the game's config ignoring them)\n", recomp3ds::gu_native_count());
     recomp3ds::screen_printf("%s\n", desc.render.game_name);
     log_memory("boot");
+    if (!is_new_3ds) {
+        old3ds_check_layout();
+        old3ds_quiet_start();
+    }
     // Before the settings: a loaded setting's on_change may pick another map,
     // and the Controls page's defaults are the game's own.
     recomp3ds::input_set_base_map(desc.button_map, desc.button_map_count);
@@ -1039,7 +1162,7 @@ int recomp3ds::run(const GameDesc& desc) {
         if (desc.rom_hint != nullptr) recomp3ds::screen_printf("\n%s\n", desc.rom_hint);
         recomp3ds::screen_printf("\nPress START to exit.\n");
         fprintf(stderr, "recomp3ds: %s at %s\n", present ? "the wrong ROM (its hash)" : "no ROM", rom_path);
-        while (aptMainLoop()) {
+        while (recomp3ds::apt_main_loop()) {
             hidScanInput();
             if (hidKeysDown() & KEY_START) break;
             gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
@@ -1072,15 +1195,40 @@ int recomp3ds::run(const GameDesc& desc) {
         {
             // PM refuses a limit above the exheader's MaxCpu (low 7 bits):
             // take the highest it accepts. More than 80 is accepted and
-            // ignored (a New 3DS, as a CIA and as a .3dsx).
+            // ignored (a New 3DS, as a CIA and as a .3dsx). The kernel
+            // reads 1-89 as a percentage (90 and up as other things); an
+            // Old 3DS asks for GameDesc::old3ds_core1_limit first.
             u32 limit = 0;
             Result rc = -1;
+            const u32 first = is_new_3ds ? 80u : (u32)std::clamp(desc.old3ds_core1_limit, 20, 89);
             static const u32 kTry[] = { 80, 70, 60, 50, 40, 30, 25, 20 };
+            rc = APT_SetAppCpuTimeLimit(first);
+            const Result first_rc = rc;
             for (u32 pct : kTry) {
-                rc = APT_SetAppCpuTimeLimit(pct);
                 if (R_SUCCEEDED(rc)) break;
+                if (pct < first) rc = APT_SetAppCpuTimeLimit(pct);
             }
             APT_GetAppCpuTimeLimit(&limit);
+            if (first > 80) {
+                // APT refuses more than 80 (e0e01bf4), whatever the
+                // exheader's MaxCpu says; PM, which checks MaxCpu, gives it
+                // (an Old 3DS, 2026-10-28: 89 took core 1 from 75% of core
+                // 0's rate to 84.5%, and starved the system's modules).
+                Result pm_rc = -1, pm_get = -1;
+                s64 pm_limit = -1;
+                if (limit < first && R_SUCCEEDED(pm_rc = pmAppInit())) {
+                    pm_rc = PMAPP_SetAppResourceLimit(first);
+                    pm_get = PMAPP_GetAppResourceLimit(&pm_limit);
+                    pmAppExit();
+                    if (R_SUCCEEDED(pm_rc)) rc = 0;
+                }
+                u32 apt_after = 0;
+                APT_GetAppCpuTimeLimit(&apt_after);
+                fprintf(stderr, "recomp3ds: core 1: asked APT for %lu%% (%08lx), APT says %lu%%; PM %08lx, PM says %lld%% (%08lx), APT then %lu%%\n",
+                        (unsigned long)first, (unsigned long)first_rc, (unsigned long)limit, (unsigned long)pm_rc,
+                        (long long)pm_limit, (unsigned long)pm_get, (unsigned long)apt_after);
+                if (pm_limit > (s64)limit) limit = (u32)pm_limit;
+            }
             Thread probe = R_SUCCEEDED(rc) ? threadCreate([](void*) {}, nullptr, 4096, 0x30, 1, false) : nullptr;
             if (probe != nullptr) {
                 threadJoin(probe, UINT64_MAX);

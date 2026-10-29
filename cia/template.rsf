@@ -4,15 +4,18 @@
 #
 # Why a CIA at all: an installable title the HOME Menu starts, with the
 # memory mode its exheader asks for (SystemModeExt 124MB on a New 3DS,
-# SystemMode on an Old: 64MB unless the game asks add_cia for more; an Old
-# 3DS reboots after closing a title that ran in a larger mode). The New 3DS clock + L2 cache come from
+# SystemMode on an Old: add_cia's OLD3DS_MODE, 80MB by default; an Old
+# 3DS reboots after closing a title that ran in a mode larger than 64MB). The New 3DS clock + L2 cache come from
 # osSetSpeedupEnable(true) at start (recomp3ds_run.cpp), for the CIA and the
 # .3dsx alike: neither launch path applies CpuSpeed/EnableL2Cache by itself
 # (measured on Luma3DS, 2026-09-28). Based on the standard homebrew template
 # (Steveice10/buildtools). The lines that matter: SystemModeExt / SystemMode,
 # CpuSpeed / EnableL2Cache, StackSize, AffinityMask / MaxCpu / CanAccessCore2
 # (threads on cores 1 and 2), and the service list (dsp::DSP for ndsp,
-# ptm:sysm for the clock, nwm::UDS and soc:U for networking).
+# ptm:sysm for the clock, nwm::UDS and soc:U for networking, ns:s for the
+# restart into the HOME Menu as a 96 MB game quits, nwm::EXT and ndm:u for
+# the wireless and the background services an Old 3DS turns off, pm:app
+# for core 1's share above APT's 80%).
 BasicInfo:
   Title                   : "@TITLE@"
   ProductCode             : "@PRODUCT@"
@@ -84,7 +87,7 @@ AccessControlInfo:
   IdealProcessor                : 0
   AffinityMask                  : 3 # cores 0 and 1 (the audio task may run on core 1)
   Priority                      : 16
-  MaxCpu                        : 0xD0 # bit 7 kept from the default 0x9E; low bits = the most core 1 time APT may grant (80%, the most it gives an application: 90 is accepted and ignored)
+  MaxCpu                        : 0xD9 # bit 7 kept from the default 0x9E; low bits = the most core 1 time APT may grant (89%, the kernel's most: 90 and up are not percentages to it; an Old 3DS asks for GameDesc::old3ds_core1_limit, 85 by default)
   HandleTableSize               : 0x200
   DisableDebug                  : false
   EnableForceDebug              : false
@@ -247,6 +250,8 @@ AccessControlInfo:
    - news:s
    - nwm::EXT
    - nwm::UDS
+   - ns:s
+   - pm:app
    - ptm:sysm
    - ptm:u
    - pxi:dev

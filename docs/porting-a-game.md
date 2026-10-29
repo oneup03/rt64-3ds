@@ -56,21 +56,37 @@ a port. Three games are the reference, each in its repository's
      template's `@TITLE@`, `@PRODUCT@`, `@UNIQUEID@` and `@OLD3DS_MODE@` and
      runs makerom and bannertool; no game keeps an RSF of its own. The
      template asks for `SystemModeExt 124MB` (`SystemMode` `OLD3DS_MODE` on
-     an Old 3DS, 64MB unless the game asks for more: a larger mode leaves
-     the system less and the console reboots when the title closes; the
+     an Old 3DS, 80MB unless the game asks otherwise: a mode larger than
+     64MB leaves the system less and the console reboots when the title
+     closes; the
      `.3dsx` gets the Homebrew Launcher's mode instead). 80MB is the most
-     known to work: 96MB crashed the HOME Menu at launch on an Old 3DS
-     (2026-10-21, wireless on), leaving the system region (the HOME Menu
-     and applets) 12 MB, against 44 at 64MB and 28 at 80MB. A title in
-     96MB is to keep the wireless and the background network services off
-     for as long as it runs: `NWMEXT_ControlWirelessEnabled(false)` unless
-     the shared page's `network_state` is already 7 (off), and
-     `NDMU_SuspendDaemons(NDM_DAEMON_MASK_ALL)` with
-     `NDMU_SuspendScheduler(1)` (StreetPass, SpotPass, eShop, friends),
-     both put back on `APTHOOK_ONEXIT`; the template lists `nwm::EXT` and
-     `ndm:u`. Not in rt64-3ds yet and untested on a console: DK64's 96MB
-     test CIA of 2026-10-28 does it from test rows. DK64
-     and Banjo ask for 80MB to hold their ROMs there (DK64 with 12 MB of
+     the HOME Menu can start a title in. In 96MB it crashes at its own
+     start, before the title runs: the mode leaves the system region (the
+     HOME Menu and applets) 12 MB, against 44 at 64MB and 28 at 80MB, and
+     the HOME Menu's first heap is 13 MB (Luma's dump, 2026-10-28: a NULL
+     buffer of 0xD00000 bytes; switching wireless and the background
+     services off cannot help). A title restarting itself into 96MB from
+     64MB does not work either: NS starts it, but in the layout its
+     exheader asks for. So 96MB is a second CIA: `add_cia(.. OLD3DS_MODE
+     96MB HIDDEN NAME <name>-o3ds96 UNIQUEID <its own> PRODUCT "<code>-96")`
+     leaves it off the HOME Menu, and `tools/launcher96` (a `.3dsx` for the
+     Homebrew Launcher) lists the installed `-96` titles and has NS restart
+     the console into the chosen one with that layout (`NS_RebootToTitle`,
+     APPMEMTYPE 2, as Luma3DS's autoboot does). No HOME Menu runs behind
+     it: the platform sees the layout at start, HOME and POWER open the
+     quit prompt (`apt_main_loop` never jumps to the HOME Menu, which would
+     start it), and quitting restarts the console into the HOME Menu
+     (`ns:s`). On every Old 3DS start the platform also turns the wireless
+     off and pauses the background network services (StreetPass, SpotPass,
+     eShop, friends), putting both back as it quits (the owner's rule), and
+     asks for `GameDesc::old3ds_core1_limit` of core 1: 85 by default, 89 at
+     most (`MaxCpu 0xD9`). APT refuses more than 80 (`E0E01BF4`), so the
+     platform asks PM (`pm:app`). At 89 the system's modules on that core
+     starved (15 s card writes, a slow pad, a HOME button that never
+     answered); 85 with 80MB is the owner's choice. The 96MB CIA is a last
+     resort no game ships (it worked on a console: layout 2, a 72 MB heap,
+     no HOME Menu). `add_cia` asks for 80MB by default, as DK64, Banjo and
+     Goemon do, to hold their ROMs (DK64 with 12 MB of
      RDRAM), `CpuSpeed 804MHz` + `EnableL2Cache`,
      `StackSize 0x80000`, `AffinityMask 3` / `CanAccessCore2` and the
      services `dsp::DSP`, `ptm:sysm`, `nwm::UDS`, `soc:U`. The New 3DS clock

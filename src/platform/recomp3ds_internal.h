@@ -153,6 +153,10 @@ namespace recomp3ds {
     u32  autotest_keys();               // the scripted keys autotest_tick last returned
     bool autotest_touch(int* x, int* y);
     bool autotest_take_home();          // a scripted HOME press since the last call
+    // aptMainLoop, except with no HOME Menu behind the game (an Old 3DS's
+    // 96 MB layout, from tools/launcher96): nothing jumps to it, and POWER
+    // opens the quit prompt instead (recomp3ds_run.cpp).
+    bool apt_main_loop();
     void input_set_blocked(bool blocked);
     // The settings menu on the touch screen (settings_menu.cpp).
     struct GameDesc;
