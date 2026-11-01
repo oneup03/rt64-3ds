@@ -33,18 +33,11 @@ volatile bool g_paused = false;         // audio_set_paused: the HOME prompt is 
 volatile uint32_t g_submitted = 0, g_dropped = 0, g_underruns = 0;
 volatile uint32_t g_added = 0;          // frames handed to the channel since init (the AI clock)
 volatile uint32_t g_low_water = 0xFFFFFFFFu;
-
-// libctru numbers a channel's buffers 1 to 65535 and then from 1 again, and
-// OpenDSP (1.2.2) plays the lowest number it holds next: at the wrap the
-// last buffers numbered before it stayed in its five-slot queue for good,
-// later buffers beyond the slots left were dropped while libctru counted
-// them played, and the stream (and the game's music, which keeps pace with
-// it) ran about a quarter fast from 18 minutes in. So the channel is
-// renumbered before its numbers wrap (renumber()).
-constexpr u16 kRenumberAt = 0xFF00;
-u16 g_last_seq = 0;                     // the number libctru gave the last buffer queued
-volatile uint32_t g_renumbering = 0;    // odd while renumber() runs
-volatile uint32_t g_held_played = 0;    // audio_frames_played while it does
+// libctru numbers a channel's buffers 1 to 65535 and then from 1 again,
+// about 18 minutes into the stream. OpenDSP before a15c861 (Cellenseres/
+// OpenDSP#1) lost buffers there and the stream ran a quarter fast after it:
+// logged, so a log shows whether the rates held across it.
+u16 g_last_seq = 0;
 
 // AUDIO_WAV.TXT beside the executable ("<start s> <length s>"): the game's
 // output from <start> seconds of audio in, for <length> seconds, to
@@ -91,44 +84,6 @@ void wav_record(const int16_t* src, size_t frames) {
     fwrite(g_wav, 4, g_wav_frames, f);
     fclose(f);
     fprintf(stderr, "recomp3ds: audio.wav written (%zu frames at %lu Hz)\n", g_wav_frames, (unsigned long)rate);
-}
-
-// Clears the channel (libctru numbers from 1 again, and the next buffer it
-// sends carries the partial reset that empties OpenDSP's queue) and queues
-// again what had yet to play, from where the DSP is, oldest first. The
-// played count holds still meanwhile, so the DSP synthesizer's clock (which
-// never steps back) does not jump ahead by the queue cleared.
-void renumber() {
-    int order[kNumBufs], count = 0, playing = -1;
-    const u32 pos = ndspChnGetSamplePos(kChannel);
-    for (int k = 0; k < kNumBufs; k++) {
-        const int i = (g_next + k) % kNumBufs;
-        if (g_bufs[i].status == NDSP_WBUF_PLAYING) playing = i;
-        if (g_bufs[i].status == NDSP_WBUF_QUEUED || g_bufs[i].status == NDSP_WBUF_PLAYING) order[count++] = i;
-    }
-    g_held_played = g_added - (uint32_t)recomp3ds::audio_frames_queued();
-    __sync_synchronize();
-    g_renumbering = g_renumbering + 1;
-    __sync_synchronize();
-    ndspChnWaveBufClear(kChannel);
-    ndspChnSetInterp(kChannel, NDSP_INTERP_LINEAR);
-    ndspChnSetRate(kChannel, (float)g_rate);
-    ndspChnSetFormat(kChannel, NDSP_FORMAT_STEREO_PCM16);
-    for (int k = 0; k < count; k++) {
-        ndspWaveBuf* wb = &g_bufs[order[k]];
-        if (order[k] == playing) {
-            // The one playing: the rest of it.
-            if (pos >= wb->nsamples) continue;
-            wb->data_pcm16 += pos * 2;
-            wb->nsamples -= pos;
-        }
-        ndspChnWaveBufAdd(kChannel, wb);
-        g_last_seq = wb->sequence_id;
-    }
-    __sync_synchronize();
-    g_renumbering = g_renumbering + 1;
-    fprintf(stderr, "recomp3ds: audio stream renumbered (%d buffers queued again, %lu frames into the first)\n", count,
-            (unsigned long)pos);
 }
 
 }   // namespace
@@ -231,9 +186,6 @@ void recomp3ds::audio_queue_samples(int16_t* samples, size_t sample_count) {
         ndspChnSetRate(kChannel, (float)g_rate);
         ndspChnSetFormat(kChannel, NDSP_FORMAT_STEREO_PCM16);
     }
-    // After the check above: the cleared channel reads as stopped until
-    // ndsp's next frame.
-    if (g_opendsp && g_last_seq >= kRenumberAt) renumber();
     g_started = true;
     g_submitted = g_submitted + (uint32_t)frames;
     while (done < frames) {
@@ -272,6 +224,7 @@ void recomp3ds::audio_queue_samples(int16_t* samples, size_t sample_count) {
         wb->nsamples = (u32)n;
         wb->looping = false;
         ndspChnWaveBufAdd(kChannel, wb);
+        if (wb->sequence_id < g_last_seq) fprintf(stderr, "recomp3ds: audio stream buffer ids wrapped\n");
         g_last_seq = wb->sequence_id;
         // After the add: a reader that sees the new count sees the buffer
         // queued, so the played count (added minus queued) never runs ahead.
@@ -306,15 +259,9 @@ size_t recomp3ds::audio_frames_queued() {
 uint32_t recomp3ds::audio_frames_added() { return g_added; }
 
 uint32_t recomp3ds::audio_frames_played() {
-    // During renumber() (or across it) the count before it.
-    const uint32_t renumbering = g_renumbering;
-    if (renumbering & 1) return g_held_played;
-    __sync_synchronize();
     const uint32_t added = g_added;
     __sync_synchronize();
-    const uint32_t played = added - (uint32_t)audio_frames_queued();
-    __sync_synchronize();
-    return g_renumbering == renumbering ? played : g_held_played;
+    return added - (uint32_t)audio_frames_queued();
 }
 
 uint32_t recomp3ds::audio_rate() { return g_rate; }

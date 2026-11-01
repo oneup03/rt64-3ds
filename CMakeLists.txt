@@ -104,7 +104,8 @@ target_include_directories(rt64_3ds PUBLIC src/renderer)
 target_link_libraries(rt64_3ds PUBLIC ultramodern librecomp citro3d ctru m)
 target_compile_features(rt64_3ds PUBLIC cxx_std_20)
 
-# OpenDSP (third_party/OpenDSP, a submodule at v1.2.2): open DSP firmware
+# OpenDSP (third_party/OpenDSP, a submodule at upstream main a15c861, past
+# v1.2.2 for its buffer-id wrap fix): open DSP firmware
 # that libctru's ndsp runs on, so no dumped dspfirm.cdc is needed, and whose
 # aux buses run a reverb and a delay on the DSP (dsp_reverb.cpp). Its
 # library's sources are built here (its own Makefile builds in-tree); the
@@ -134,6 +135,10 @@ foreach(patch_file ${OPENDSP_PATCHES})
 endforeach()
 file(GLOB OPENDSP_SOURCES "${OPENDSP_SRC}/library/source/*.c" "${OPENDSP_SRC}/library/source/aac/*.c")
 add_library(opendsp STATIC ${OPENDSP_SOURCES} "${OPENDSP_DIR}/library/source/firmware.s")
+# The images firmware.s embeds (.incbin): not in the assembler's dependency
+# output, so a submodule bump that changes them alone rebuilt nothing.
+set_source_files_properties("${OPENDSP_DIR}/library/source/firmware.s" PROPERTIES OBJECT_DEPENDS
+    "${OPENDSP_DIR}/firmware/opendsp.cdc;${OPENDSP_DIR}/firmware/aac_tables.bin;${OPENDSP_DIR}/firmware/mp3_tables.bin")
 target_include_directories(opendsp PUBLIC "${OPENDSP_DIR}/library/include"
                            PRIVATE "${OPENDSP_SRC}/library/source" "${OPENDSP_DIR}/firmware")
 target_compile_options(opendsp PRIVATE $<$<COMPILE_LANGUAGE:C>:-std=gnu11 -O2 -w>
