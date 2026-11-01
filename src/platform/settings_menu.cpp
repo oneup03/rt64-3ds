@@ -1058,8 +1058,8 @@ void recomp3ds::settings_menu_update() {
     static u64 next_repeat = 0;
     static int ticks = 0;
     // The game scans the pad only while it polls it (not during loads).
-    hidScanInput();
-    const u32 keys = hidKeysHeld() | autotest_keys();
+    const PadScan scan = input_scan_main();
+    const u32 keys = scan.held | autotest_keys();
     const u64 now = svcGetSystemTick();
     // The touch screen: the game's HUD there while the menu is closed.
     recomp3ds::screen_bottom_update(g_hud_supported && g_hud_bottom != 0 && !g_open);
@@ -1074,10 +1074,16 @@ void recomp3ds::settings_menu_update() {
         draw_hint();
     }
     if (g_open) {
-        const u32 pad = keys & (KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT);
+        // L+Down is Luma3DS's Rosalina combo on its way (SELECT completes
+        // it), not a move: the D-pad does nothing while both are held, and
+        // a Down still held once L is let go repeats only after the usual
+        // delay.
+        const bool rosalina = (keys & (KEY_L | KEY_DDOWN)) == (KEY_L | KEY_DDOWN);
+        const u32 pad = rosalina ? 0 : keys & (KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT);
         const u32 down = pad & ~prev;
         bool fire = false;
         u32 act = 0;
+        if (rosalina) next_repeat = now + SYSCLOCK_ARM11 * 2 / 5;
         if (down != 0) { fire = true; act = down; next_repeat = now + SYSCLOCK_ARM11 * 2 / 5; }
         else if (pad != 0 && now >= next_repeat) { fire = true; act = pad; next_repeat = now + SYSCLOCK_ARM11 / 12; }
         if (fire) {
@@ -1103,10 +1109,8 @@ void recomp3ds::settings_menu_update() {
         int tx = 0, ty = 0;
         bool contact = false;
         if (autotest_touch(&tx, &ty)) contact = true;
-        else if (hidKeysHeld() & KEY_TOUCH) {
-            touchPosition tp;
-            hidTouchRead(&tp);
-            tx = tp.px; ty = tp.py;
+        else if (scan.touching) {
+            tx = scan.touch_x; ty = scan.touch_y;
             contact = true;
         }
         if (contact) { lift_frames = 0; contact_frames++; }
@@ -1131,10 +1135,8 @@ void recomp3ds::settings_menu_update() {
         // The touch pad's buttons while the menu is closed.
         int tx = 0, ty = 0;
         bool contact = autotest_touch(&tx, &ty);
-        if (!contact && (hidKeysHeld() & KEY_TOUCH)) {
-            touchPosition tp;
-            hidTouchRead(&tp);
-            tx = tp.px; ty = tp.py;
+        if (!contact && scan.touching) {
+            tx = scan.touch_x; ty = scan.touch_y;
             contact = true;
         }
         touch_pad_update(true, g_hud_supported && g_hud_bottom != 0, contact, tx, ty, g_pad_redraw);

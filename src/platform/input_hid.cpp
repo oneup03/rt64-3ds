@@ -27,6 +27,16 @@ u32 g_held = 0;
 circlePosition g_cpad{};
 circlePosition g_cstick{};
 volatile bool g_blocked = false;
+u32 g_main_held = 0;                    // the main thread's last scan (input_scan_main)
+// libctru's hidScanInput keeps what it reads (keys, touch, both sticks, the
+// motion sensors) in plain globals, and the game thread (input_poll) and
+// the main thread (input_scan_main) both scan: unguarded, one scan's
+// hidKeysHeld could see the other's half-written state (presses lost,
+// releases invented). Every scan and read of that state takes this lock.
+struct HidLock {
+    LightLock lock;
+    HidLock() { LightLock_Init(&lock); }
+} g_hid;
 volatile bool g_cstick_buttons = true;
 volatile bool g_cstick_up = true;       // C-Stick up presses C-Up (settings menu)
 volatile bool g_cstick_down = true;     // C-Stick down presses C-Down (settings menu)
@@ -273,7 +283,7 @@ void recomp3ds::input_set_gyro(bool on) {
     g_gyro_on = on;
 }
 
-// After hidScanInput, on the main thread.
+// After input_scan_main, on the main thread.
 void recomp3ds::input_motion_update() {
     if (!g_gyro_on) return;
     const u64 now = svcGetSystemTick();
@@ -282,8 +292,10 @@ void recomp3ds::input_motion_update() {
     if (dt <= 0.0f || dt > 0.25f) return;       // the first sample, or after a pause
     angularRate r;
     accelVector a;
+    LightLock_Lock(&g_hid.lock);
     hidGyroRead(&r);
     hidAccelRead(&a);
+    LightLock_Unlock(&g_hid.lock);
     const float k = 1.0f / g_gyro_coef;
     g_motion.ProcessMotion(-(float)r.x * k, (float)r.z * k, -(float)r.y * k,
                            (float)a.x / 512.0f, -(float)a.y / 512.0f, (float)a.z / 512.0f, dt);
@@ -340,11 +352,14 @@ void recomp3ds::input_poll() {
         g_cstick = circlePosition{};
         return;
     }
+    LightLock_Lock(&g_hid.lock);
     hidScanInput();
-    u32 scripted = recomp3ds::autotest_tick();
-    g_held = hidKeysHeld() | scripted;
+    const u32 hw = hidKeysHeld();
     hidCircleRead(&g_cpad);
     hidCstickRead(&g_cstick);
+    LightLock_Unlock(&g_hid.lock);
+    u32 scripted = recomp3ds::autotest_tick();
+    g_held = hw | scripted;
     // Scripted stick directions (AUTOTEST STICK_*, CSTICK_*): full deflection.
     if (scripted & (KEY_CPAD_UP | KEY_CPAD_DOWN | KEY_CPAD_LEFT | KEY_CPAD_RIGHT)) {
         g_cpad.dx = (scripted & KEY_CPAD_RIGHT) ? CPAD_MAX : ((scripted & KEY_CPAD_LEFT) ? -CPAD_MAX : 0);
@@ -392,7 +407,24 @@ void recomp3ds::input_get_right_stick(float* x, float* y) {
 }
 
 u32 recomp3ds::input_raw_held() {
-    return g_held;
+    return g_main_held;
+}
+
+recomp3ds::PadScan recomp3ds::input_scan_main() {
+    PadScan p{};
+    LightLock_Lock(&g_hid.lock);
+    hidScanInput();
+    p.held = hidKeysHeld();
+    if (p.held & KEY_TOUCH) {
+        touchPosition tp;
+        hidTouchRead(&tp);
+        p.touching = true;
+        p.touch_x = tp.px;
+        p.touch_y = tp.py;
+    }
+    LightLock_Unlock(&g_hid.lock);
+    g_main_held = p.held;
+    return p;
 }
 
 void recomp3ds::input_set_rumble(int controller_num, bool rumble) {

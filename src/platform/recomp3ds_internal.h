@@ -83,10 +83,16 @@ namespace recomp3ds {
     // GameDesc::cstick_camera_analog_x.
     void input_set_cstick_camera_analog_x(bool on);
     void input_poll();
-    void input_motion_update();         // main thread, after hidScanInput
+    void input_motion_update();         // main thread, after input_scan_main
     bool input_get(int controller_num, uint16_t* buttons, float* x, float* y);
     void input_get_right_stick(float* x, float* y);
-    u32  input_raw_held();
+    // The pad scanned from the main thread (settings menu, prompts) under
+    // the lock input_poll's scan takes: the keys held and the touch point.
+    // Callers find their own presses (hidKeysDown is the last scan's,
+    // whichever thread made it).
+    struct PadScan { u32 held; bool touching; int touch_x, touch_y; };
+    PadScan input_scan_main();
+    u32  input_raw_held();              // the keys input_scan_main last found held
     void input_set_rumble(int controller_num, bool rumble);
     ultramodern::input::connected_device_info_t input_device_info(int controller_num);
     void input_set_controller_pak(ultramodern::input::Pak pak);   // GameDesc::controller_pak

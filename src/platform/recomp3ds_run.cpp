@@ -136,6 +136,7 @@ int g_helper_core = 0;                  // the DSP synthesizer's decoding thread
 unsigned g_watch_cores = 1;             // the cores loadmon watches (bit n: core n)
 bool g_core3 = false;                   // a New 3DS lets the application run threads on core 3
 bool g_core1_granted = false;           // the system gives the application time on core 1
+u32 g_core1_limit = 0;                  // the share of core 1 run() got, percent (the Rosalina throttle goes back to it)
 volatile int g_main_stage = 0;          // recomp3ds::main_stage
 
 // Thread placement: game code on core 0, renderer on core 2 (on an Old 3DS
@@ -351,9 +352,11 @@ void old3ds_quiet_end() {
     park_main_thread();                        // the pad is read here now, and the screen left alone
     recomp3ds::screen_take_console(300);       // from the renderer's touch-screen HUD
     recomp3ds::screen_printf("\x1b[31m\n%s\x1b[0m\nPress START to exit.\n", line);
+    u32 prev = KEY_START;              // held on entry: not a press
     for (int i = 0; i < 600; i++) {
-        hidScanInput();
-        if (hidKeysDown() & KEY_START) break;
+        const u32 held = recomp3ds::input_scan_main().held;
+        if (held & ~prev & KEY_START) break;
+        prev = held;
         svcSleepThread(50000000ll);
     }
     // The renderer stops before the GPU is shut down (as the quit's forced
@@ -367,6 +370,51 @@ void on_new_failed() { fatal("out of memory (operator new failed)"); }
 void on_terminate() { fatal("std::terminate (an uncaught exception or a failed new)"); }
 void on_exit_called() { fatal("exit() was called (an error exit; the message before it in the log says why)"); }
 
+// Core 1's share for the application: APT takes up to 80%, PM (which
+// checks the exheader's MaxCpu) more (run()).
+Result set_core1_limit(u32 pct) {
+    Result rc = pct <= 80 ? APT_SetAppCpuTimeLimit(pct) : -1;
+    if (R_FAILED(rc) && R_SUCCEEDED(rc = pmAppInit())) {
+        rc = PMAPP_SetAppResourceLimit(pct);
+        pmAppExit();
+    }
+    return rc;
+}
+
+// Luma3DS's Rosalina menu (L+Down+SELECT) runs on core 1, the system core,
+// where the application has up to 80% (more on an Old 3DS: run()). While
+// L+Down is held, before SELECT completes the combo (once the menu is open
+// the application is frozen and can no longer react), the application's
+// share drops to 30%, and goes back a quarter second after they are let
+// go. Called with the keys held each time the main thread scans the pad;
+// returns whether L+Down is held.
+bool update_rosalina_throttle(u32 held) {
+    constexpr u32 kRosalinaLimit = 30;
+    static bool throttled = false;
+    static u64 released = 0;
+    const bool combo = (held & (KEY_L | KEY_DDOWN)) == (KEY_L | KEY_DDOWN);
+    if (g_core1_limit <= kRosalinaLimit) return combo;
+    if (combo) {
+        released = 0;
+        if (!throttled) {
+            const Result rc = set_core1_limit(kRosalinaLimit);
+            throttled = true;
+            fprintf(stderr, "recomp3ds: L+Down (Rosalina): core 1 limit %lu%% (%08lx)\n", (unsigned long)kRosalinaLimit, (unsigned long)rc);
+        }
+    }
+    else if (throttled) {
+        const u64 now = svcGetSystemTick();
+        if (released == 0) released = now;
+        else if (now - released > SYSCLOCK_ARM11 / 4) {
+            const Result rc = set_core1_limit(g_core1_limit);
+            throttled = false;
+            released = 0;
+            fprintf(stderr, "recomp3ds: core 1 limit back to %lu%% (%08lx)\n", (unsigned long)g_core1_limit, (unsigned long)rc);
+        }
+    }
+    return combo;
+}
+
 // HOME: a quit prompt on the touch screen instead of the HOME Menu (as in
 // the Sonic R port). A quits; B (or HOME again) resumes. The HOME Menu is
 // not offered: coming back from it froze the GPU queue on the console.
@@ -375,11 +423,10 @@ void on_exit_called() { fatal("exit() was called (an error exit; the message bef
 // sound paused where it is (audio_set_paused); the top screen keeps the last
 // frame. It returns only once B is released, so that press does not reach
 // the game.
-bool g_home_trapped = false;
-
 u32 prompt_keys() {
-    hidScanInput();
-    return hidKeysHeld() | recomp3ds::autotest_tick();
+    const u32 held = recomp3ds::input_scan_main().held | recomp3ds::autotest_tick();
+    update_rosalina_throttle(held);
+    return held;
 }
 
 void draw_home_prompt(bool show) {
@@ -396,6 +443,7 @@ void draw_home_prompt(bool show) {
     }
     // The console writes through the CPU cache; with the game (and so the
     // renderer's frame flushes) paused, flush them to the screen here.
+    recomp3ds::screen_flush();
     gfxFlushBuffers();
 }
 
@@ -431,13 +479,43 @@ bool home_prompt() {
     recomp3ds::settings_menu_redraw();
     recomp3ds::input_set_blocked(false);
     // Quitting keeps the sound paused and the game's audio thread held for
-    // good (audio_queue_samples); it releases the renderer itself.
+    // good (audio_queue_samples), and the game held (quick_quit).
     if (!quit) {
         recomp3ds::audio_set_paused(false);
         rt64_3ds::set_paused(false);
     }
     fprintf(stderr, "recomp3ds: HOME prompt closed (%s)\n", quit ? "quit" : "resume");
     return quit;
+}
+
+// The quit (the HOME prompt's, or the system closing the application),
+// without the runtime's own shutdown (recomp::start joining the game's
+// threads, which can hang): the game is held at its next display list and
+// its sound stopped; ultramodern::quit ends the runtime's save thread, which
+// writes what the game last saved first and is waited for (no save is lost
+// and nothing is on the card when finish_exit closes it); the GPU finishes
+// what it was given; then the process ends from here. Should the save or
+// the GPU hang, the exit goes ahead after 3 s anyway.
+[[noreturn]] void quick_quit() {
+    fprintf(stderr, "recomp3ds: quitting\n");
+    recomp3ds::game_profile_report(true);
+    rt64_3ds::set_paused(true);
+    recomp3ds::audio_set_paused(true);
+    threadCreate([](void*) {
+        svcSleepThread(3000000000ll);
+        fprintf(stderr, "recomp3ds: exit forced after 3 s\n");
+        rt64_3ds::set_quitting();
+        svcSleepThread(300000000ll);      // the renderer finishes its frame and goes idle
+        finish_exit();
+    }, nullptr, 16 * 1024, 0x20, -2, true);
+    const u64 t0 = svcGetSystemTick();
+    ultramodern::quit();
+    ultramodern::join_saving_thread();
+    const u64 t1 = svcGetSystemTick();
+    rt64_3ds::wait_idle_for_exit();
+    fprintf(stderr, "recomp3ds: save thread done in %lu ms, GPU idle %lu ms later\n",
+            (unsigned long)((t1 - t0) * 1000 / SYSCLOCK_ARM11), (unsigned long)((svcGetSystemTick() - t1) * 1000 / SYSCLOCK_ARM11));
+    finish_exit();
 }
 
 // Called by the runtime's main loop (which sleeps 1 ms between calls) on
@@ -463,11 +541,8 @@ void update_gfx_inner() {
     g_main_stage = 3;
     recomp3ds::input_motion_update();
     g_main_stage = 4;
-    // HOME opens the quit prompt (above) rather than the HOME Menu.
-    if (!g_home_trapped) {
-        aptSetHomeAllowed(false);
-        g_home_trapped = true;
-    }
+    // HOME opens the quit prompt (above) rather than the HOME Menu (run()
+    // disallowed it from the start).
     if (!g_exit_requested && (aptCheckHomePressRejected() || take_power_press() || recomp3ds::autotest_take_home())) {
         if (home_prompt()) g_exit_requested = true;
     }
@@ -479,7 +554,14 @@ void update_gfx_inner() {
         // capture for the host tools instead), and says so on the touch screen.
         static u64 select_since = 0;
         static bool fired = false;
-        if ((hidKeysHeld() | recomp3ds::autotest_keys()) & KEY_SELECT) {
+        const u32 held = recomp3ds::input_raw_held() | recomp3ds::autotest_keys();   // settings_menu_update's scan
+        if (update_rosalina_throttle(held)) {
+            // L+Down: Rosalina's combo on its way. Its SELECT neither opens
+            // the settings menu nor takes a screenshot.
+            select_since = 0;
+            fired = true;
+        }
+        else if (held & KEY_SELECT) {
             const u64 now = svcGetSystemTick();
             if (select_since == 0) select_since = now;
             else if (!fired && now - select_since > SYSCLOCK_ARM11) {
@@ -764,26 +846,7 @@ void update_gfx_inner() {
         }
     }
     g_main_stage = 8;
-    if (!recomp3ds::apt_main_loop() || g_exit_requested) {
-        static bool quitting = false;
-        if (!quitting) {
-            quitting = true;
-            fprintf(stderr, "recomp3ds: quitting\n");
-            recomp3ds::game_profile_report(true);
-            rt64_3ds::set_quitting();      // no more frames: the renderer's thread can leave its loop
-            ultramodern::quit();
-            // The runtime joins its own threads and recomp::start returns
-            // (run() then finishes the exit). Should a join ever hang, leave
-            // anyway rather than keep the HOME Menu on "closing".
-            threadCreate([](void*) {
-                svcSleepThread(3000000000ll);
-                fprintf(stderr, "recomp3ds: exit forced after 3 s\n");
-                rt64_3ds::set_quitting();
-                svcSleepThread(300000000ll);      // the renderer finishes its frame and goes idle
-                finish_exit();
-            }, nullptr, 16 * 1024, 0x20, -2, true);
-        }
-    }
+    if (!recomp3ds::apt_main_loop() || g_exit_requested) quick_quit();
 }
 
 // The runtime shows a message box just before it quits, so everything logged
@@ -993,6 +1056,14 @@ extern "C" void __assert_func(const char* file, int line, const char* func, cons
 int recomp3ds::run(const GameDesc& desc) {
     g_desc = &desc;
     svcGetThreadId(&g_main_thread_id, CUR_THREAD_HANDLE);
+    // The main thread (the pad, APT, the prompts, the Rosalina throttle)
+    // above the game's threads (0x30), with the VI and timer threads,
+    // however it was started: level with the game on its core it waited
+    // for the game to block.
+    svcSetThreadPriority(CUR_THREAD_HANDLE, 0x28);
+    // HOME opens the quit prompt from the start, the loading included
+    // (update_gfx_inner; the HOME Menu is never offered).
+    aptSetHomeAllowed(false);
     std::set_new_handler(on_new_failed);
     std::set_terminate(on_terminate);
     atexit(on_exit_called);
@@ -1238,6 +1309,7 @@ int recomp3ds::run(const GameDesc& desc) {
                 threadJoin(probe, UINT64_MAX);
                 threadFree(probe);
                 g_core1_granted = true;
+                g_core1_limit = limit;
                 g_watch_cores |= 0x2;
                 if (core2) g_sp_core = 1;               // the audio task beside the renderer's core
                 else if (game_on_0) g_gfx_core = g_sp_core = 1;   // two cores: the rest on core 1

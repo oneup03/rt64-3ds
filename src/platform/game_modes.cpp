@@ -172,8 +172,7 @@ std::string recomp3ds::pick_game_mode(const GameDesc& desc) {
     draw();
     u32 prev = 0;
     while (recomp3ds::apt_main_loop()) {
-        hidScanInput();
-        const u32 held = hidKeysHeld() | recomp3ds::autotest_tick();
+        const u32 held = recomp3ds::input_scan_main().held | recomp3ds::autotest_tick();
         const u32 down = held & ~prev;
         prev = held;
         if (down & KEY_A) break;
