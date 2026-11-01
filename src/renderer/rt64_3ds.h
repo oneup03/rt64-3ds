@@ -58,6 +58,21 @@ struct RenderDesc {
     // The game's frame, in N64 pixels (its framebuffer's size: DK64 320x240,
     // Banjo 292x216). It is placed as RT64 places it: see ScreenGeometry.
     uint32_t vi_width = 320, vi_height = 240;
+    // Follow the VI (a game that switches between 240p and 480i with no
+    // frame size of its own per VI width, as Star Wars Episode I: Racer
+    // does): the frame's width is the VI's visible scanout (H_START's span
+    // times X_SCALE, in framebuffer pixels), its height vi_height, or
+    // vi_interlaced_height while the VI interlaces (serrate) a framebuffer
+    // whose stride is two of its lines (each field every other line of a
+    // frame twice as tall: shown as vi_height, only its top half was on the
+    // screen). Off (the default): vi_width x vi_height; frame_sizes win.
+    bool follow_vi = false;
+    uint32_t vi_interlaced_height = 0;
+    // The frame's display aspect (width / height, 4:3 = 1.3333): a frame of
+    // any size is shown that wide at the screen's height (a 320x480 frame
+    // as wide as a 320x240 one), its margins in its own units. 0 (the
+    // default): square pixels.
+    float display_aspect = 0.0f;
     // A game whose frame size changes while it runs (Dinosaur Planet: 320x240
     // in play, 640x480 for its title and menus, 384x192 once): the sizes it
     // uses. Each display list is then placed by the VI's width when it is
@@ -93,6 +108,12 @@ struct RenderDesc {
     // in-betweens) ends there, and the object's draws and vertex transforms
     // are skipped. DK64 tests up to 40 objects a frame; Banjo never uses it.
     bool cull_dl = true;
+    // The microcode does not clip at the near plane: what lies between the
+    // eye and the near plane is drawn at the near plane's depth (a .NoN
+    // microcode; RT64 turns the GPU's depth clip off). The renderer finds
+    // that in the microcode's name (its data segment's "RSP Gfx ucode
+    // F3DEX.NoN ..."), as RT64 does; this forces it.
+    bool no_near_clip = false;
     // Draw colour images the game renders off screen (neither a presented
     // framebuffer nor the depth buffer) into GPU textures, and sample those
     // where the game loads textures from them: Banjo's jiggy transition and
@@ -328,7 +349,7 @@ struct RenderDesc {
 
 void set_render_desc(const RenderDesc& desc);
 const RenderDesc& render_desc();
-// ScreenGeometry::make of render_desc()'s vi_width x vi_height.
+// ScreenGeometry::make of render_desc()'s vi_width x vi_height (and display_aspect).
 ScreenGeometry screen_geometry();
 
 // The folder the renderer's one-shot input files (GFX_CAPTURE.TXT) and captures live in:
@@ -449,6 +470,10 @@ void set_debug_gfx_delay_ms(int ms);
 
 // The process is about to end: stop submitting GPU work.
 void set_quitting();
+// The same, then wait (on the calling thread) for the frame in flight and
+// the GPU work already queued, under the lock the APT hooks take: the exit
+// can then shut the GPU down at once (the platform's quick quit).
+void wait_idle_for_exit();
 
 // Hold the game: the renderer takes no display list while paused, so the
 // game waits on its current one (a modal prompt). The top screen keeps the

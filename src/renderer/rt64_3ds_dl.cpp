@@ -176,6 +176,18 @@ inline Mtx depth_camera(const Mtx& p) {
     return c;
 }
 
+// The same for the depth buffer when the draws' depth goes through the
+// viewport's range (DrawRecord::vp_za, vp_zb: a depth of za * z' + zb): the
+// camera whose z'/w reads that depth back. za 1, zb 0 (the standard
+// viewport) leave it as it is.
+inline Mtx depth_camera(const Mtx& p, float za, float zb) {
+    Mtx c = depth_camera(p);
+    if (za == 1.0f && zb == 0.0f) return c;
+    c.m[2][2] = za * c.m[2][2] - (za + 2.0f * zb - 1.0f);
+    c.m[3][2] = za * c.m[3][2];
+    return c;
+}
+
 constexpr int kMaxDlDepth = 18;
 
 // 1 for opcodes that may change the state a draw snapshots.
@@ -208,6 +220,13 @@ struct TexOpTable {
 constexpr TexOpTable kTexOpTable{};
 constexpr int kMaxMtxStack = 32;
 constexpr int kMaxVerts = 64;
+// Once a run: vertices or triangles left out (InterpreterStats' *_lost).
+inline void warn_lost() {
+    static bool warned = false;
+    if (warned) return;
+    warned = true;
+    fputs("rt64-3ds: WARNING: vertices or triangles left out of a frame (\"lost\" in the frame line): more vertices than the slots, or a full vertex buffer\n", stderr);
+}
 
 // A loaded vertex, already in N64 screen homogeneous space (the RSP applies
 // the viewport at load time): x/w, y/w are pixels (y down), z/w in [0, 1];
@@ -321,14 +340,21 @@ struct TriSink {
     uint32_t* count;
     uint32_t* tris;                 // triangles output
     uint32_t* clipped;              // ... clipped
+    uint32_t* lost;                 // ... dropped for a full vertex buffer (nullptr: not counted)
     int screen_w, screen_h;
+    bool no_near_clip;              // Interpreter::set_no_near_clip
 };
 
 // The PICA rasterises in fixed point over a limited range: a triangle
 // with a corner far off screen (or behind the eye) is dropped on the
 // console, where emulators draw it. Such triangles are clipped here to a
 // guard band around the screen and to the near plane (z' >= 0), in
-// homogeneous screen space, then drawn as a fan.
+// homogeneous screen space, then drawn as a fan. A .NoN microcode
+// (no_near_clip) clips at the eye (w > 0) instead, and what lies between
+// the eye and the near plane is drawn at the near plane's depth, as the
+// RDP's depth clamp has it (RT64 turns the GPU's depth clip off for them):
+// the PICA has no depth clamp, so the polygon is split at z' = 0 and the
+// part before it flattened.
 constexpr float kGuard = 1024.0f;   // pixels beyond the screen centre, each axis
 // The screen cull (Interpreter::set_screen_cull, dl_test DL_SCREEN_CULL=
 // <slack>): a triangle whose three vertices lie beyond the same edge of the
@@ -368,6 +394,7 @@ inline Vtx3ds lerp_vtx(const Vtx3ds& p, const Vtx3ds& q, float t) {
 }
 void clip_tri(const TriSink& s, const Vtx3ds* tri) {
     const int screen_w = s.screen_w, screen_h = s.screen_h;
+    const bool no_near = s.no_near_clip;
     {
         // Wholly outside one plane: nothing is left (what the clipping
         // below finds, without the clipping). Skies and models behind
@@ -376,7 +403,7 @@ void clip_tri(const TriSink& s, const Vtx3ds* tri) {
         // cut the triangle, i.e. on the vertices the loop would see.
         const float cx = (float)screen_w * 0.5f, cy = (float)screen_h * 0.5f;
         int out0 = 0;
-        for (int i = 0; i < 3; i++) out0 += (tri[i].z - 1e-5f * tri[i].w) < 0.0f;
+        for (int i = 0; i < 3; i++) out0 += (no_near ? tri[i].w - 1e-5f : tri[i].z - 1e-5f * tri[i].w) < 0.0f;
         if (out0 == 3) return;
         if (out0 == 0) {
             for (int plane = 1; plane < 5; plane++) {
@@ -398,13 +425,14 @@ void clip_tri(const TriSink& s, const Vtx3ds* tri) {
     for (int i = 0; i < 3; i++) buf_a[i] = tri[i];
     Vtx3ds* in = buf_a;
     Vtx3ds* outp = buf_b;
-    // Planes as f(v) >= 0: near (z' >= 0), then the four guard band edges.
+    // Planes as f(v) >= 0: near (z' >= 0, or the eye's w > 0 with
+    // no_near_clip), then the four guard band edges.
     for (int plane = 0; plane < 5 && n >= 3; plane++) {
         const float cx = (float)screen_w * 0.5f, cy = (float)screen_h * 0.5f;
-        auto f = [plane, cx, cy](const Vtx3ds& v) {
+        auto f = [plane, cx, cy, no_near](const Vtx3ds& v) {
             const float g = kGuard * v.w;
             switch (plane) {
-                case 0: return v.z - 1e-5f * v.w;
+                case 0: return no_near ? v.w - 1e-5f : v.z - 1e-5f * v.w;
                 case 1: return g - (v.x - cx * v.w);
                 case 2: return g + (v.x - cx * v.w);
                 case 3: return g - (v.y - cy * v.w);
@@ -423,11 +451,47 @@ void clip_tri(const TriSink& s, const Vtx3ds* tri) {
         Vtx3ds* t = in; in = outp; outp = t;
     }
     if (n < 3) return;
+    // no_near_clip: the part before the near plane (z' < 0) is cut off as a
+    // polygon of its own, at the near depth; the part behind it is kept, no
+    // nearer than that.
+    constexpr float kNearZ = 1e-4f;
+    Vtx3ds before[12];
+    int nb = 0;
+    if (no_near) {
+        bool neg = false, pos = false;
+        for (int i = 0; i < n; i++) { neg |= in[i].z < 0.0f; pos |= in[i].z > 0.0f; }
+        if (neg && !pos) {
+            for (int i = 0; i < n; i++) { before[i] = in[i]; before[i].z = kNearZ * in[i].w; }
+            nb = n;
+            n = 0;
+        }
+        else if (neg) {
+            int m = 0;
+            for (int i = 0; i < n; i++) {
+                const Vtx3ds& p = in[i];
+                const Vtx3ds& q = in[(i + 1) % n];
+                if (p.z <= 0.0f && nb < 11) before[nb++] = p;
+                if (p.z >= 0.0f && m < 11) outp[m++] = p;
+                if ((p.z < 0.0f) != (q.z < 0.0f) && p.z != 0.0f && q.z != 0.0f) {
+                    const Vtx3ds x = lerp_vtx(p, q, p.z / (p.z - q.z));
+                    if (nb < 11) before[nb++] = x;
+                    if (m < 11) outp[m++] = x;
+                }
+            }
+            for (int i = 0; i < nb; i++) before[i].z = kNearZ * before[i].w;
+            for (int i = 0; i < m; i++) if (outp[i].z < kNearZ * outp[i].w) outp[i].z = kNearZ * outp[i].w;
+            n = m;
+            Vtx3ds* t = in; in = outp; outp = t;
+        }
+    }
+    const uint32_t total = (uint32_t)((n >= 3 ? n - 2 : 0) + (nb >= 3 ? nb - 2 : 0)) * 3;
+    if (total == 0) return;
+    Vtx3ds* o = s.verts->append(total);
+    if (o == nullptr) { if (s.lost != nullptr) (*s.lost)++; return; }
     (*s.clipped)++;
-    Vtx3ds* o = s.verts->append((uint32_t)(n - 2) * 3);
-    if (o == nullptr) return;
     for (int i = 1; i + 1 < n; i++) { *o++ = in[0]; *o++ = in[i]; *o++ = in[i + 1]; }
-    *s.count += (uint32_t)(n - 2) * 3;
+    for (int i = 1; i + 1 < nb; i++) { *o++ = before[0]; *o++ = before[i]; *o++ = before[i + 1]; }
+    *s.count += total;
 }
 
 // The eyes' reach for the face cull (Interpreter::set_eye_cull): while the
@@ -496,7 +560,7 @@ inline void output_tri(const TriSink& s, const LoadedVertex& a, const LoadedVert
         return;
     }
     Vtx3ds* o = s.verts->append(3);
-    if (o == nullptr) return;
+    if (o == nullptr) { if (s.lost != nullptr) (*s.lost)++; return; }
     o[0] = tri[0]; o[1] = tri[1]; o[2] = tri[2];
     *s.count += 3;
 }
@@ -512,6 +576,7 @@ struct Interpreter::Interp {
     bool recording = false;         // run(): record into now()
     bool applying = false;          // run_inbetween(): draw with now()'s interpolated transforms
     bool diverged = false;          // run_inbetween() did not follow run()
+    bool forced_mtx = false;        // run(): the list forced a matrix (G_MV_MATRIX), which no transform pairs
     float weight = 1.0f;
     interp::FrameLog& now() { return logs[cur]; }
     interp::FrameLog& before() { return logs[cur ^ 1]; }
@@ -624,16 +689,17 @@ struct Interpreter::Defer {
     void* notify_arg = nullptr;
     static constexpr uint32_t kPublishEvery = 128;   // triangles
     // drain's.
-    uint32_t done_tris = 0, started_runs = 0, out_tris = 0, out_clipped = 0;
+    uint32_t done_tris = 0, started_runs = 0, out_tris = 0, out_clipped = 0, out_lost = 0;
     int screen_w = 320, screen_h = 240;
+    bool no_near_clip = false;      // Interpreter::set_no_near_clip, for its TriSink
     bool pending = false;           // run() left triangles for finish_triangles
     bool vertices = true;           // the vertices' transforms too (set_defer_triangles)
 
     // A list's start (run, before it publishes anything; drain's side was
     // put back by the last finish).
-    void begin(int sw, int sh) {
+    void begin(int sw, int sh, bool nnc) {
         used = nctxs = nshades = nruns = ntris = last_pub = 0;
-        screen_w = sw; screen_h = sh;
+        screen_w = sw; screen_h = sh; no_near_clip = nnc;
     }
     void publish() {
         last_pub = ntris;
@@ -715,7 +781,7 @@ struct Interpreter::Defer {
             if (started_runs == 0) continue;
             Run& R = runs[started_runs - 1];
             const Tri& T = tris[done_tris];
-            output_tri(TriSink{ &out, &R.out_count, &out_tris, &out_clipped, screen_w, screen_h },
+            output_tri(TriSink{ &out, &R.out_count, &out_tris, &out_clipped, &out_lost, screen_w, screen_h, no_near_clip },
                        resolve(T.v[0]), resolve(T.v[1]), resolve(T.v[2]), R.cull, R.ss, R.st, R.uls, R.ult, R.zprim,
                        [](float&, float&) {});
         }
@@ -728,6 +794,7 @@ struct Interpreter::Defer {
         const uint32_t base = f.verts.size();
         Vtx3ds* dst = n != 0 ? f.verts.append(n) : nullptr;
         if (dst != nullptr) memcpy(dst, out.data(), n * sizeof(Vtx3ds));
+        else if (n != 0) st.tris_lost_vbo += n / 3;     // the frame's vertex buffer is full
         uint32_t cur = ~0u;
         DrawRecord* r = nullptr;
         for (uint32_t k = 0; k < started_runs; k++) {
@@ -741,7 +808,8 @@ struct Interpreter::Defer {
         }
         st.tris += out_tris;
         st.clipped += out_clipped;
-        done_tris = started_runs = out_tris = out_clipped = 0;
+        st.tris_lost_vbo += out_lost;
+        done_tris = started_runs = out_tris = out_clipped = out_lost = 0;
         out.clear();
         __atomic_store_n(&pub_runs, 0u, __ATOMIC_RELAXED);
         __atomic_store_n(&pub_tris, 0u, __ATOMIC_RELEASE);
@@ -772,6 +840,26 @@ struct Interpreter::Impl {
     // trans_raw: the x translate as the game loaded it (touch-screen spans).
     struct Viewport { float scale[3], trans[3]; float trans_stretch = 160.0f; float trans_raw = 160.0f; };
     Viewport vp{ { 160, -120, 511 }, { 160, 120, 511 }, 160.0f };
+    // The viewport's depth range: the RSP's screen z is z/w * scale[2] +
+    // trans[2] (the standard viewport's G_MAXZ / 2 each: 0..1022), and a
+    // triangle's depth goes to the depth buffer as that over 1022 (RT64
+    // maps it the same way, through the GPU viewport's depth range): za * z'
+    // + zb, z' = (z/w + 1) / 2 as the vertices keep it (clipping and fog
+    // read that). The context applies it per draw (DrawRecord::vp_za, vp_zb)
+    // with the PICA's depth map. A range past 0..1022 is cut to it.
+    float vp_za = 1.0f, vp_zb = 0.0f;
+    void update_vp_depth() {
+        float za = 1.0f, zb = 0.0f;
+        if (vp.scale[2] > 0.0f) {
+            zb = std::max(0.0f, (vp.trans[2] - vp.scale[2]) / 1022.0f);
+            za = std::min(vp.scale[2] / 511.0f, 1.0f - zb);
+            if (!(za > 0.0f)) { za = 1.0f; zb = 0.0f; }
+        }
+        if (za != vp_za || zb != vp_zb) {
+            vp_za = za; vp_zb = zb;
+            state_seq++;               // a new record for the triangles from here (same_as_last compares it)
+        }
+    }
     Viewport vp_stack[8]{};
     int vp_depth = 0;
     int16_t vp_align_x = 0, vp_align_y = 0;
@@ -874,6 +962,7 @@ struct Interpreter::Impl {
     }
     bool force_branch_z = true;        // RenderDesc::force_lod_branch, or gEXForceBranch
     bool cull_dl = true;               // RenderDesc::cull_dl: gSPCullDisplayList ends a list (cull_dl_test)
+    bool no_near_clip = false;         // set_no_near_clip: a .NoN microcode (clip_tri)
     bool fix_rect_lr = false;          // RenderDesc::fix_rect_lr
     int scissor_slack = 0;             // RenderDesc::scissor_edge_slack
     bool merge_rect_slices = false;    // RenderDesc::merge_rect_slices
@@ -926,7 +1015,7 @@ struct Interpreter::Impl {
                 if (x > x_hi * w) f |= kPosX;
                 if (y < y_lo * w) f |= kNegY;
                 if (y > y_hi * w) f |= kPosY;
-                if (z < 0.0f) f |= kNear;   // z' = (z + w) / 2: before the near plane
+                if (z < 0.0f && !no_near_clip) f |= kNear;   // z' = (z + w) / 2: before the near plane (drawn by .NoN)
             }
             all &= f;
         }
@@ -967,6 +1056,9 @@ struct Interpreter::Impl {
     uint16_t prim_depth_z = 0;       // gDPSetPrimDepth (G_ZS_PRIM draws take it as their depth)
     // The primitive depth as z' (0 near .. 1 far): the RDP's 15-bit screen z.
     float prim_z() const { return (float)(prim_depth_z > 0x7FFF ? 0x7FFF : prim_depth_z) / 32767.0f; }
+    // A triangle's (G_ZS_PRIM): the RDP's primitive depth is past the
+    // viewport already, which the draw's depth map applies again.
+    float prim_z_tri() const { return vp_za == 1.0f && vp_zb == 0.0f ? prim_z() : (prim_z() - vp_zb) / vp_za; }
     uint16_t tlut[256]{};
     // Bumped by every LOADTLUT that changes an entry. Not a hash of the
     // load: the same palette loaded into another slot (Banjo's two eyes,
@@ -1262,7 +1354,7 @@ struct Interpreter::Impl {
             if (hud_camera_id != 0 && proj_id == hud_camera_id && r.perspective) {
                 FrameRecord::InstanceCam c;
                 c.inst = proj_inst;
-                const Mtx cam = depth_camera(proj);
+                const Mtx cam = depth_camera(proj, vp_za, vp_zb);
                 memcpy(c.m, &cam, sizeof(c.m));
                 out->inst_cams.push_back(c);
             }
@@ -1584,7 +1676,11 @@ struct Interpreter::Impl {
         const float fm = (float)fog_mul, fo = (float)fog_off;
         const int32_t amb0 = ambient[0] << 16, amb1 = ambient[1] << 16, amb2 = ambient[2] << 16;
         int lo = v0 < 0 ? -v0 : 0, hi = n;
-        if (v0 + hi > kMaxVerts) hi = kMaxVerts - v0;
+        if (v0 + hi > kMaxVerts) {
+            warn_lost();
+            stats->verts_lost_load += (uint32_t)(v0 + hi - kMaxVerts);
+            hi = kMaxVerts - v0;
+        }
         // Frame interpolation: the transform's vertices are recorded (when
         // its group interpolates vertices or texcoords), or moved between the
         // previous frame's and these.
@@ -1876,6 +1972,7 @@ struct Interpreter::Impl {
         r.rtt = (int8_t)cur_rtt;
         r.perspective = is_perspective(proj);
         r.depth_a = cur_depth_a; r.depth_b = cur_depth_b;
+        if (r.kind == DrawRecord::Tris) { r.vp_za = vp_za; r.vp_zb = vp_zb; }   // rectangles: no viewport
         r.mv_auto = mv_groups[mv_group_depth] == kIdAuto;
         r.mv_seq = mv_seq;
         r.dbg_vtx = last_vtx_addr;
@@ -1916,7 +2013,11 @@ struct Interpreter::Impl {
         if (cimg != plain_cimg || cur_rtt >= 0) note_target(false);
         if (skim) return;
         if (offscreen_target() && cur_rtt < 0) return;
-        if (i0 >= kMaxVerts || i1 >= kMaxVerts || i2 >= kMaxVerts) return;
+        if (i0 >= kMaxVerts || i1 >= kMaxVerts || i2 >= kMaxVerts) {
+            warn_lost();
+            stats->tris_lost_index++;
+            return;
+        }
         if (ip != nullptr) interp_tiles();
         // RenderDesc::merge_image_tiles: the triangle samples a texture of its
         // tile's whole image when its coordinates stay inside the tile.
@@ -2005,7 +2106,7 @@ struct Interpreter::Impl {
                 s.uv_first = (uint32_t)ip->tri_uv.size();
                 s.ss = shift_scale(tl.shifts); s.st = shift_scale(tl.shiftt);
                 s.uls = (float)(tl.uls >> 2); s.ult = (float)(tl.ult >> 2);
-                s.zprim = (othermode_l & G_ZS_PRIM) != 0 ? prim_z() : -1.0f;
+                s.zprim = (othermode_l & G_ZS_PRIM) != 0 ? prim_z_tri() : -1.0f;
                 s.tile = tile_cur;
                 s.cull = cull_bits();
                 s.plain = plain;
@@ -2034,9 +2135,9 @@ struct Interpreter::Impl {
         const float uls = (float)(tl.uls >> 2) + tile_du[0], ult = (float)(tl.ult >> 2) + tile_dv[0];
         const float ss = shift_scale(tl.shifts), st = shift_scale(tl.shiftt);
         const bool snap = r->tex[0].snapshot;
-        output_tri(TriSink{ &out->verts, &r->count, &stats->tris, &stats->clipped, screen_w, screen_h },
+        output_tri(TriSink{ &out->verts, &r->count, &stats->tris, &stats->clipped, &stats->tris_lost_vbo, screen_w, screen_h, no_near_clip },
                    a, b, c, cull_bits(), ss, st, uls, ult,
-                   (othermode_l & G_ZS_PRIM) != 0 ? prim_z() : -1.0f, [&](float& u, float& v) {
+                   (othermode_l & G_ZS_PRIM) != 0 ? prim_z_tri() : -1.0f, [&](float& u, float& v) {
             if (img) { u += img_du; v += img_dv; }
             else if (snap) snapshot_uv(r->tex[0], u, v, u, v, proj_stretch());
             else if (r->tex[0].frame) frame_uv(r->tex[0], u, v, u, v, proj_stretch() && cur_rtt < 0);
@@ -2057,7 +2158,7 @@ struct Interpreter::Impl {
             const Tile& tl = tiles[texture.tile & 7];
             D.runs[D.nruns++] = { draw, D.ntris, shift_scale(tl.shifts), shift_scale(tl.shiftt),
                                   (float)(tl.uls >> 2) + tile_du[0], (float)(tl.ult >> 2) + tile_dv[0],
-                                  (othermode_l & G_ZS_PRIM) != 0 ? prim_z() : -1.0f, cull_bits(), 0, 0 };
+                                  (othermode_l & G_ZS_PRIM) != 0 ? prim_z_tri() : -1.0f, cull_bits(), 0, 0 };
         }
         Interpreter::Defer::Tri& T = D.tris[D.ntris++];
         T.v[0] = dslot[i0]; T.v[1] = dslot[i1]; T.v[2] = dslot[i2];
@@ -2084,7 +2185,7 @@ struct Interpreter::Impl {
     // (The guard band and clipping: in_guard_band and clip_tri.)
     bool inside_guard_band(const Vtx3ds& v) const { return in_guard_band(v, screen_w, screen_h); }
     void emit_clipped(DrawRecord& r, const Vtx3ds* tri) {
-        clip_tri(TriSink{ &out->verts, &r.count, &stats->tris, &stats->clipped, screen_w, screen_h }, tri);
+        clip_tri(TriSink{ &out->verts, &r.count, &stats->tris, &stats->clipped, &stats->tris_lost_vbo, screen_w, screen_h, no_near_clip }, tri);
     }
 
     // Texel coordinates relative to a tile that reads the stored frame ->
@@ -2163,6 +2264,7 @@ struct Interpreter::Impl {
             a.geometry_mode != geometry_mode || a.prim_lod_frac != prim_lod_frac || a.proj_id != proj_id || a.rtt != cur_rtt) return false;
         if (a.mv_auto != (mv_groups[mv_group_depth] == kIdAuto)) return false;
         if (a.depth_a != cur_depth_a || a.depth_b != cur_depth_b) return false;
+        if (a.vp_za != vp_za || a.vp_zb != vp_zb) return false;
         if (!same_bits<4>(a.prim, prim) || !same_bits<4>(a.env, env) || !same_bits<4>(a.blend, blend) || !same_bits<4>(a.fog, fog)) return false;
         if (a.screen != (bottom_span ? 1 : 0)) return false;
         int16_t sc[4];
@@ -2524,7 +2626,7 @@ struct Interpreter::Impl {
                 if (vp_depth < 8) { vp_stack[vp_depth++] = vp; }
                 return 0;
             case EX_POPVIEWPORT:
-                if (vp_depth > 0) { vp = vp_stack[--vp_depth]; inst_dirty = true; }
+                if (vp_depth > 0) { vp = vp_stack[--vp_depth]; inst_dirty = true; update_vp_depth(); }
                 return 0;
             case EX_PUSHSCISSOR:
                 if (scissor_depth < 8) { memcpy(scissor_stack[scissor_depth++], scissor, sizeof(scissor)); }
@@ -2663,6 +2765,7 @@ struct Interpreter::Impl {
         raw_vtrans_x = (float)r16(addr + 8);
         vp.trans[1] = r16(addr + 10) / 4.0f;
         vp.trans[2] = r16(addr + 12);
+        update_vp_depth();
         apply_viewport_align();
     }
     void apply_viewport_align() {
@@ -2717,7 +2820,7 @@ struct Interpreter::Impl {
             inst_dirty = true;
             if (is_perspective(proj)) {
                 bool world = is_world_proj(proj_id);
-                const Mtx cam = depth_camera(proj);
+                const Mtx cam = depth_camera(proj, vp_za, vp_zb);
                 if (!out->has_cam || (world && !out->cam_is_world)) {
                     out->has_cam = true;
                     out->cam_is_world = world;
@@ -3009,6 +3112,14 @@ struct Interpreter::Impl {
                     uint32_t addr = seg(w1);
                     if (index == 8) {            // G_MV_VIEWPORT
                         load_viewport(addr);
+                    }
+                    else if (index == 14) {      // G_MV_MATRIX (gSPForceMatrix): the combined matrix as given
+                        load_mtx(mvp, addr);
+                        mvp_dirty = false;       // until the next matrix load or pop, as the RSP has it
+                        if (ip != nullptr) {
+                            if (ip->recording) ip->forced_mtx = true;
+                            if (ip->applying) ip->diverged = true;
+                        }
                     }
                     else if (index == 10) {      // G_MV_LIGHT
                         ldir_dirty = true;
@@ -3467,6 +3578,7 @@ bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
         ip->now().clear();
         ip->recording = true;
         ip->applying = false;
+        ip->forced_mtx = false;
         ip->ctxs.clear();
         ip->lv.clear();
         ip->tris.clear();
@@ -3484,7 +3596,7 @@ bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
         // renderer's drain is running already and the last finish put
         // drain's side back.)
         if (dfr_->pending) { FrameRecord scrap; dfr_->finish(scrap, stats_); dfr_->pending = false; }
-        dfr_->begin(impl_->screen_w, impl_->screen_h);
+        dfr_->begin(impl_->screen_w, impl_->screen_h, impl_->no_near_clip);
         impl_->dfr = dfr_;
         for (int i = 0; i < kMaxVerts; i++) impl_->new_slot(i) = impl_->vtx[i];
         impl_->defer_open = -1;
@@ -3507,7 +3619,7 @@ bool Interpreter::run(uint32_t data_ptr, FrameRecord& out) {
     else impl_->unify_world_depth(out);
     if (ip != nullptr) {
         ip->recording = false;
-        ip->now().valid = fullsync;
+        ip->now().valid = fullsync && !ip->forced_mtx;   // no in-betweens for a forced matrix
         if (!ip->draw_remap.empty()) {
             for (Interp::TriState& s : ip->tri_states) if (s.draw < ip->draw_remap.size()) s.draw = ip->draw_remap[s.draw];
         }
@@ -3590,6 +3702,7 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
         size_t d0, d1, ti0;
         float back;
         int screen_w, screen_h;
+        bool no_near_clip;
         uint32_t emitted, clipped, clip_tris;
         static void run(void* arg) {
             Range& r = *static_cast<Range*>(arg);
@@ -3677,7 +3790,7 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
                     r.emitted++;
                     if (!in_guard_band(tri[0], r.screen_w, r.screen_h) || !in_guard_band(tri[1], r.screen_w, r.screen_h) ||
                         !in_guard_band(tri[2], r.screen_w, r.screen_h)) {
-                        clip_tri(TriSink{ &out, &d.count, &r.clip_tris, &r.clipped, r.screen_w, r.screen_h }, tri);
+                        clip_tri(TriSink{ &out, &d.count, &r.clip_tris, &r.clipped, nullptr, r.screen_w, r.screen_h, r.no_near_clip }, tri);
                         continue;
                     }
                     Vtx3ds* dst = out.append(3);
@@ -3692,7 +3805,7 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
     // microseconds of work on the console).
     constexpr size_t kSplitMinTris = 512;
     const size_t nd = o.draws.size(), nt = ip->tris.size();
-    Range a{ ip, &L, &P, &real, &o, &o.verts, &ip->cache[0], 0, nd, 0, back, impl_->screen_w, impl_->screen_h, 0, 0, 0 };
+    Range a{ ip, &L, &P, &real, &o, &o.verts, &ip->cache[0], 0, nd, 0, back, impl_->screen_w, impl_->screen_h, impl_->no_near_clip, 0, 0, 0 };
     // With a helper and enough triangles: the records from the one holding
     // the middle triangle (the triangles are in record order) go to it.
     size_t split = nd;
@@ -3863,6 +3976,7 @@ void Interpreter::set_aim_hash(bool on) { impl_->aim_hash = on; }
 void Interpreter::set_bottom_hud(bool on) { impl_->bottom_allowed = on; }
 void Interpreter::set_force_branch_z(bool on) { impl_->force_branch_z = on; }
 void Interpreter::set_cull_dl(bool on) { impl_->cull_dl = on; }
+void Interpreter::set_no_near_clip(bool on) { impl_->no_near_clip = on; }
 void Interpreter::set_screen_cull(float slack) { g_screen_cull_slack = slack; }
 void Interpreter::set_eye_cull(float m) { g_eye_cull = m > 0.0f ? m : 0.0f; }
 void Interpreter::set_gbi(Gbi gbi) {
@@ -3902,6 +4016,7 @@ void Interpreter::set_screen(const ScreenGeometry& geo) {
     memcpy(impl_->scissor, full, sizeof(full));
     const float cx = (float)geo.w * 0.5f, cy = (float)geo.h * 0.5f;
     impl_->vp = Impl::Viewport{ { cx, -cy, 511 }, { cx, cy, 511 }, cx };
+    impl_->update_vp_depth();
     impl_->inst_dirty = true;
 }
 

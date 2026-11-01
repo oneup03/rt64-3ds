@@ -48,6 +48,8 @@ int main(int argc, char** argv) {
     if (getenv("DL_LOD_BRANCH")) interp.set_force_branch_z(false);
     // DL_CULLDL=0: gSPCullDisplayList ignored (RenderDesc::cull_dl off), for A/B.
     if (const char* e = getenv("DL_CULLDL")) interp.set_cull_dl(atoi(e) != 0);
+    // DL_NO_NEAR: as a .NoN microcode (Interpreter::set_no_near_clip).
+    if (getenv("DL_NO_NEAR")) interp.set_no_near_clip(true);
     // DL_SCREEN_CULL=<slack>: the screen cull (0.10 an Old 3DS's, 0.25 a New 3DS's; the console adds the eyes' shift).
     if (const char* e = getenv("DL_SCREEN_CULL")) interp.set_screen_cull((float)atof(e));
     // DL_EYE_CULL=<m>: the face cull's reach for the eyes (the console's separation * 200 * convergence).

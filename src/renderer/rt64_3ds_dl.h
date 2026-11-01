@@ -23,6 +23,10 @@ struct InterpreterStats {
     uint32_t rects_merged = 0;     // rectangles stretched as slices of a full-width row (merge_rect_slices)
     uint32_t branch_z_taken = 0, branch_z_not = 0, cull_dl = 0;   // level-of-detail branches, cull tests
     uint32_t cull_dl_culled = 0;   // ... of cull_dl, tests that ended their list (set_cull_dl)
+    // What a frame lost (none expected): vertices a load put past the
+    // vertex slots, triangles naming a slot past them, triangles a full
+    // vertex buffer dropped.
+    uint32_t verts_lost_load = 0, tris_lost_index = 0, tris_lost_vbo = 0;
     uint32_t refresh_rate = 0;     // the game's intended frame rate (gEXSetRefreshRate), 0 = not given
     uint32_t image_tris = 0;       // triangles sampled from a whole image (merge_image_tiles)
     uint32_t image_fallbacks = 0;  // ... and those of such tiles that kept their tile (coordinates outside it)
@@ -91,6 +95,9 @@ public:
     // gSPCullDisplayList honoured (RenderDesc::cull_dl): a list whose tested
     // vertices all lie off one side of the visible area ends there.
     void set_cull_dl(bool on);
+    // A .NoN microcode: no clipping at the near plane, what lies before it
+    // drawn at its depth (clip_tri).
+    void set_no_near_clip(bool on);
     // The screen cull: triangles wholly beyond one edge of the visible area
     // (the frame and the wide screen's margins), by more than slack * the
     // frame's size, are dropped before the vertex buffer and left out of

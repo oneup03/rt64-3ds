@@ -73,6 +73,7 @@ public:
             rt64_3ds::ScreenGeometry& g = opt_.geo;
             const float k = std::min(320.0f / (float)g.w, 240.0f / (float)g.h);
             g.scale = k >= 1.0f ? std::floor(k) : k;
+            g.scale_x = g.scale;
             g.x0 = (320.0f / g.scale - (float)g.w) * 0.5f;
             g.wide_w = 320.0f / g.scale;
             bottom_oy_ = (240.0f / g.scale - (float)g.h) * 0.5f;
@@ -300,6 +301,7 @@ private:
                 float iw = w0 * IW[0] + w1 * IW[1] + w2 * IW[2];
                 float p0 = w0 * IW[0] / iw, p1 = w1 * IW[1] / iw, p2 = w2 * IW[2] / iw;   // perspective-correct weights
                 float z = (w0 * a.z * IW[0] + w1 * b.z * IW[1] + w2 * c.z * IW[2]);       // z'/w is affine in screen space
+                z = z * d.vp_za + d.vp_zb;                                                     // the viewport's depth range
                 int idx = py * cur_->w + px;
                 if (zcmp) {
                     if (zmode == 3) { if (z > cur_->depth[idx] + 0.002f) continue; }

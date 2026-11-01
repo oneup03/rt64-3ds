@@ -30,6 +30,7 @@ extern "C" void C3Di_UpdateContext(void);
 // citro3d's own frame split (internal, exported): closes the commands
 // recorded since the last split, with the framebuffer flush a draw needs.
 extern "C" bool C3Di_SplitFrame(u32** pBuf, u32* pSize);
+extern "C" void C3Di_RenderQueueWaitDone(void);   // citro3d (internal, exported): waits out every frame queued
 
 namespace {
 
@@ -62,27 +63,41 @@ volatile bool g_quitting = false;
 
 // While the HOME Menu (or sleep) has the GPU, libctru has released the GPU
 // rights: anything submitted then never completes and the gfx thread hangs
-// in citro3d's queue wait (which also kept "Close" from ever finishing). The
-// APT hook, on the main thread before the rights go, waits out the frame in
-// flight under g_gpu_lock and raises the flags; send_dl then holds the game
-// until the rights are back. The hook is registered after C3D_Init so it runs
-// ahead of citro3d's own, which then drains the queue.
+// in citro3d's queue wait (which also kept "Close" from ever finishing).
+// Two APT hooks, on the main thread, one each side of citro3d's own
+// (libctru runs the newest hook first; citro3d's drains its queue on
+// suspend and takes it back, its state marked dirty, on restore, and does
+// nothing for sleep):
+// - apt_pre_hook, registered after C3D_Init, runs before citro3d's: on
+//   suspend and on sleep it waits out the frame in flight under g_gpu_lock,
+//   raises the flag (send_dl then holds the game until the rights are back)
+//   and waits out what is queued itself (citro3d does not on sleep).
+// - apt_post_hook, registered before C3D_Init, runs after citro3d's: on
+//   restore and wake-up the flags drop only once citro3d has its queue
+//   back, so the gfx thread cannot submit in between; the next frame then
+//   sets the vertex attribute layout again (replay_and_present: it is set
+//   once at start, and citro3d marks it dirty on restore but not on
+//   wake-up).
 LightLock g_gpu_lock;
+volatile bool g_gpu_lock_ready = false;   // g_gpu_lock set up (wait_idle_for_exit may come before the renderer)
 volatile bool g_suspended = false, g_sleeping = false;
-aptHookCookie g_apt_cookie;
+volatile bool g_attr_dirty = false;       // back from the HOME Menu or sleep: replay_and_present sets the attribute layout
+aptHookCookie g_apt_pre_cookie, g_apt_post_cookie;
 
-void apt_hook(APT_HookType type, void*) {
-    switch (type) {
-        case APTHOOK_ONSUSPEND:
-        case APTHOOK_ONSLEEP:
-            LightLock_Lock(&g_gpu_lock);
-            if (type == APTHOOK_ONSUSPEND) g_suspended = true; else g_sleeping = true;
-            LightLock_Unlock(&g_gpu_lock);
-            break;
-        case APTHOOK_ONRESTORE: g_suspended = false; break;
-        case APTHOOK_ONWAKEUP:  g_sleeping = false; break;
-        default: break;
-    }
+void apt_pre_hook(APT_HookType type, void*) {
+    if (type != APTHOOK_ONSUSPEND && type != APTHOOK_ONSLEEP) return;
+    LightLock_Lock(&g_gpu_lock);
+    if (type == APTHOOK_ONSUSPEND) g_suspended = true; else g_sleeping = true;
+    C3Di_RenderQueueWaitDone();
+    LightLock_Unlock(&g_gpu_lock);
+}
+
+void apt_post_hook(APT_HookType type, void*) {
+    if (type != APTHOOK_ONRESTORE && type != APTHOOK_ONWAKEUP) return;
+    LightLock_Lock(&g_gpu_lock);
+    g_attr_dirty = true;
+    if (type == APTHOOK_ONRESTORE) g_suspended = false; else g_sleeping = false;
+    LightLock_Unlock(&g_gpu_lock);
 }
 
 bool gpu_away() { return g_suspended || g_sleeping; }
@@ -429,8 +444,9 @@ public:
         stop_builder();
         stop_presenter();
         ok_ = false;
-        aptUnhook(&g_apt_cookie);
+        aptUnhook(&g_apt_pre_cookie);
         C3D_Fini();
+        aptUnhook(&g_apt_post_cookie);
         fprintf(stderr, "rt64-3ds: renderer shut down\n");
     }
     uint32_t get_display_framerate() const override { return 60; }
@@ -512,7 +528,7 @@ public:
         if (screen_cull_base_ >= 0.0f) {
             const rt64_3ds::Settings& st = rt64_3ds::settings();
             const float sep_px = (float)st.sep_slider * 0.002f * slider_ * st.slider_gain * rt64_3ds::kPxPerNdc;
-            const float eyes = geo_.scale > 0.0f && geo_.w > 0 ? 2.0f * sep_px / (geo_.scale * (float)geo_.w) : 0.0f;
+            const float eyes = geo_.scale_x > 0.0f && geo_.w > 0 ? 2.0f * sep_px / (geo_.scale_x * (float)geo_.w) : 0.0f;
             interp_.set_screen_cull(std::max(screen_cull_base_, eyes));
         }
         else interp_.set_screen_cull(-1.0f);
@@ -856,10 +872,11 @@ public:
                         (float)prof_[0] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[1] * 1000.0f / SYSCLOCK_ARM11 / fpw,
                         (float)prof_[2] * 1000.0f / SYSCLOCK_ARM11 / fpw, (float)prof_[4] * 1000.0f / SYSCLOCK_ARM11 / fpw,
                         (float)prof_[3] * 1000.0f / SYSCLOCK_ARM11 / fpw);
-                fprintf(stderr, "rt64-3ds: frame %u: %u draws %u verts, interp %.1f ms replay %.1f ms (gpu wait %.1f, end %.1f, depth %.1f), tex live %u (%u KB, %u in VRAM, %u mipmapped) %u uploads/frame, linear free %u KB, unknown ops %u ex %u, tev fallbacks %d, cimg %06x w%u, snapshots %u, lod branches %u/%u, culldl %u/%u\n",
+                fprintf(stderr, "rt64-3ds: frame %u: %u draws %u verts, interp %.1f ms replay %.1f ms (gpu wait %.1f, end %.1f, depth %.1f), tex live %u (%u KB, %u in VRAM, %u mipmapped) %u uploads/frame, linear free %u KB, unknown ops %u ex %u, tev fallbacks %d, cimg %06x w%u, snapshots %u, lod branches %u/%u, culldl %u/%u, lost %u vtx %u tri %u vbo\n",
                         frames_, (unsigned)last_draws_, (unsigned)last_verts_, g_stats.gfx_ms, g_stats.replay_ms, wait_ms_, end_ms_, depth_ms_, textures_.live(), textures_.bytes() / 1024, textures_.vram_bytes() / 1024, textures_.mipmapped(), last_uploads_,
                         (unsigned)(linearSpaceFree() / 1024), is.unknown, is.ex_unknown, g_stats.combiner_fallbacks, frame_.color_image, frame_.color_width, snapshots_,
-                        is.branch_z_taken, is.branch_z_taken + is.branch_z_not, is.cull_dl_culled, is.cull_dl);
+                        is.branch_z_taken, is.branch_z_taken + is.branch_z_not, is.cull_dl_culled, is.cull_dl,
+                        is.verts_lost_load, is.tris_lost_index, is.tris_lost_vbo);
                 {
                     // GPU time per frame drawn and per eye (C3D_GetDrawingTime),
                     // game frames and in-betweens apart; on the console these
@@ -1032,6 +1049,41 @@ public:
         return false;
     }
 
+    // The microcode's name, from its data segment ("RSP Gfx ucode F3DEX.NoN
+    // fifo 2.08 Yoshitaka Yasumoto 1999 Nintendo."): logged, and a .NoN
+    // one (or RenderDesc::no_near_clip) does not clip at the near plane.
+    // Looked at once per microcode.
+    uint32_t ucode_data_seen_ = 0;
+    void note_ucode(const OSTask* task) {
+        const uint32_t data = (uint32_t)task->t.ucode_data & 0x1FFFFFFFu;
+        if (data == ucode_data_seen_) return;
+        ucode_data_seen_ = data;
+        const uint32_t size = std::min<uint32_t>((uint32_t)task->t.ucode_data_size, 0x1000u);
+        char name[72] = "";
+        if (data != 0 && data + size <= rt64_3ds::kRdramBytes) {
+            auto byte = [&](uint32_t a) { return (char)rdram_[(data + a) ^ 3]; };
+            static const char kTag[] = "RSP Gfx ucode ";
+            for (uint32_t i = 0; i + sizeof(kTag) - 1 < size && name[0] == '\0'; i++) {
+                uint32_t k = 0;
+                while (kTag[k] != '\0' && byte(i + k) == kTag[k]) k++;
+                if (kTag[k] != '\0') continue;
+                size_t n = 0;
+                for (uint32_t a = i + k; a < size && n + 1 < sizeof(name); a++) {
+                    const char c = byte(a);
+                    if (c < 0x20 || c > 0x7E) break;
+                    name[n++] = c;
+                }
+                name[n] = '\0';
+                while (n > 0 && name[n - 1] == ' ') name[--n] = '\0';
+            }
+        }
+        const bool non = strstr(name, ".NoN") != nullptr;
+        const bool no_near = non || rt64_3ds::render_desc().no_near_clip;
+        interp_.set_no_near_clip(no_near);
+        fprintf(stderr, "rt64-3ds: microcode \"%s\" (data %08lx): %s\n", name[0] ? name : "(no name found)", (unsigned long)data,
+                no_near ? (non ? "no near clip (.NoN)" : "no near clip (RenderDesc::no_near_clip)") : "clips at the near plane");
+    }
+
     // A list's read (send_dl): the interpreter's run over it and its
     // textures' decoding, up to "parsed" (tell_parsed), after which the game
     // may change anything the list points at.
@@ -1043,6 +1095,7 @@ public:
         frame_.verts.set_storage((rt64_3ds::Vtx3ds*)vbo_[vbo_idx_], kVboVerts);
         g_progress.phase = 1;
         maybe_capture(task);
+        note_ucode(task);
         // In first person the reticle's quads must stay one per record.
         interp_.set_split_untagged_ortho(rt64_3ds::first_person_scene());
         maybe_switch_frame_size();
@@ -1201,12 +1254,16 @@ public:
 
 private:
     void init() {
+        LightLock_Init(&g_gpu_lock);
+        g_gpu_lock_ready = true;
+        aptHook(&g_apt_post_cookie, apt_post_hook, nullptr);   // before citro3d's: runs after it
         if (!C3D_Init(C3D_DEFAULT_CMDBUF_SIZE * 2)) {
+            aptUnhook(&g_apt_post_cookie);
+            g_gpu_lock_ready = false;
             fprintf(stderr, "rt64-3ds: C3D_Init failed\n");
             return;
         }
-        LightLock_Init(&g_gpu_lock);
-        aptHook(&g_apt_cookie, apt_hook, nullptr);
+        aptHook(&g_apt_pre_cookie, apt_pre_hook, nullptr);     // after citro3d's: runs before it
         textures_.set_compact_intensity(rt64_3ds::render_desc().intensity_textures16);
         // Textures in VRAM (TextureCache::set_vram).
         {
@@ -1589,6 +1646,10 @@ private:
         }
         cur_target_ = offscreen_frame ? -2 : -1;
         frame_viewport_ = false;
+        if (g_attr_dirty) {
+            g_attr_dirty = false;               // apt_post_hook
+            C3D_SetAttrInfo(C3D_GetAttrInfo());
+        }
         C3D_BindProgram(&prog_);
         C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &proj_);
         C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -2973,12 +3034,16 @@ private:
         uint32_t l = d.othermode_l;
         // Decals sit on coplanar surfaces: moved toward the viewer (reversed
         // depth: nearer is larger) by 0.0004 of depth, or by RT64's window
-        // for this decal (RenderDesc::decal_window), set per draw.
+        // for this decal (RenderDesc::decal_window), set per draw. The
+        // viewport's depth range (DrawRecord::vp_za, vp_zb) goes in the same
+        // map: the depth is 1 - (za * z' + zb), and clip z / w is z' - 1 here.
         {
             const float zoff = ((l >> 10) & 3) == 3 ? (rt64_3ds::render_desc().decal_window ? decal_window_of(d) : 0.0004f) : 0.0f;
-            if (zoff != last_zoff_) {
-                C3D_DepthMap(true, -1.0f, zoff);
-                last_zoff_ = zoff;
+            const float zscale = -d.vp_za, zoffset = 1.0f - d.vp_za - d.vp_zb + zoff;
+            if (zoffset != last_zoff_ || zscale != last_zscale_) {
+                C3D_DepthMap(true, zscale, zoffset);
+                last_zoff_ = zoffset;
+                last_zscale_ = zscale;
             }
         }
         // Everything below reads exactly these fields (and the target, whose
@@ -3568,7 +3633,7 @@ public:
             sf.conv = held_sf_.conv > 0.0f ? held_sf_.conv : (float)st.convergence_hundredths * 0.2f;
             sf.world_empty = sf.on && held_sf_.world_empty;
             if (sf.on && st.hud_depth != 50) rt64_3ds::set_hud_terms(sf, st.hud_depth, slider_, st.slider_gain);
-            if (rt64_3ds::render_desc().snap_hud_shift) sf.px_scale = geo_.scale;
+            if (rt64_3ds::render_desc().snap_hud_shift) sf.px_scale = geo_.scale_x;
             sf.reticle = sf.on && held_sf_.reticle;
             sf.aim = sf.on && held_sf_.aim;
             sf.aim_ndc = held_sf_.aim_ndc;
@@ -3594,7 +3659,7 @@ public:
             sf.world_empty = !any;
         }
         if (sf.on && st.hud_depth != 50) rt64_3ds::set_hud_terms(sf, st.hud_depth, slider_, st.slider_gain);
-        if (rt64_3ds::render_desc().snap_hud_shift) sf.px_scale = geo_.scale;
+        if (rt64_3ds::render_desc().snap_hud_shift) sf.px_scale = geo_.scale_x;
         sf.reticle = sf.on && rt64_3ds::first_person_scene();
         // The depth under the reticle: DK64's quad while first person is on,
         // or a rectangle matching RenderDesc::aim_texture_hashes drawn last
@@ -3845,23 +3910,48 @@ public:
         for (float& z : depth_grid_) z = 1.0f;
         Mtx_OrthoTilt(&proj_, -geo_.x0, (float)geo_.w + geo_.x0, (float)geo_.h, 0.0f, 0.0f, 1.0f, true);
         bottom_geometry();
-        fprintf(stderr, "rt64-3ds: game frame %dx%d, x%.3f, %.1f-unit margins, depth grid %dx%d of %dx%d px\n",
-                geo_.w, geo_.h, geo_.scale, geo_.x0, grid_cols_, grid_rows_, grid_bx_, grid_by_);
+        fprintf(stderr, "rt64-3ds: game frame %dx%d, x%.3f (across x%.3f), %.1f-unit margins, depth grid %dx%d of %dx%d px\n",
+                geo_.w, geo_.h, geo_.scale, geo_.scale_x, geo_.x0, grid_cols_, grid_rows_, grid_bx_, grid_by_);
+    }
+    // RenderDesc::follow_vi, before a list is read: the frame's size from
+    // the VI's scanout. The width is the framebuffer pixels across its
+    // active line ((h_end - h_start) output pixels at X_SCALE's 2.10
+    // framebuffer pixels each); the height vi_height, or
+    // vi_interlaced_height while the VI interlaces (serrate) a framebuffer
+    // whose stride is two of its lines. A VI that shows nothing usable
+    // (osViBlack, no mode set yet) keeps the size. The interpreter reads
+    // the list at it; the replay places the frame as the list recorded
+    // (apply_frame_geometry).
+    void follow_the_vi(const rt64_3ds::RenderDesc& desc, const ultramodern::renderer::ViRegs& vi) {
+        const uint32_t stride = vi.VI_WIDTH_REG & 0xFFF;
+        const uint32_t h_lo = (vi.VI_H_START_REG >> 16) & 0x3FF, h_hi = vi.VI_H_START_REG & 0x3FF;
+        const uint32_t x_scale = vi.VI_X_SCALE_REG & 0xFFF;
+        if (stride < 8 || h_lo >= h_hi || x_scale == 0) return;
+        const int visible = (int)(((h_hi - h_lo) * x_scale + 512) >> 10);
+        if (visible < 64 || visible > 800) return;
+        const bool interlaced = desc.vi_interlaced_height != 0 && (vi.VI_STATUS_REG & 0x40) != 0 && stride == (uint32_t)visible * 2;
+        const int h = interlaced ? (int)desc.vi_interlaced_height : (int)desc.vi_height;
+        if (visible == read_geo_.w && h == read_geo_.h) return;
+        read_geo_ = rt64_3ds::ScreenGeometry::make(visible, h, desc.display_aspect);
+        interp_.set_screen(read_geo_);
+        fprintf(stderr, "rt64-3ds: VI scanout: stride %u, h %u..%u, x_scale 0x%03X, status %08X: lists read at %dx%d from here\n",
+                (unsigned)stride, (unsigned)h_lo, (unsigned)h_hi, (unsigned)x_scale, (unsigned)vi.VI_STATUS_REG, read_geo_.w, read_geo_.h);
     }
     // Before a list is read (RenderDesc::frame_sizes): the VI's width names
     // the frame size it is drawn at; the interpreter reads the list in it.
     void maybe_switch_frame_size() {
         const rt64_3ds::RenderDesc& desc = rt64_3ds::render_desc();
-        if (desc.frame_size_count == 0) return;
+        if (desc.frame_size_count == 0 && !desc.follow_vi) return;
         const ultramodern::renderer::ViRegs* vi = ultramodern::renderer::get_vi_regs();
         if (vi == nullptr) return;
         interp_.note_vi_origin(vi->VI_ORIGIN_REG);
+        if (desc.frame_size_count == 0) { follow_the_vi(desc, *vi); return; }
         const uint32_t width = vi->VI_WIDTH_REG & 0xFFF;
         for (size_t i = 0; i < desc.frame_size_count; i++) {
             const rt64_3ds::RenderDesc::FrameSize& fs = desc.frame_sizes[i];
             if (fs.w != width) continue;
             if (fs.w == read_geo_.w && fs.h == read_geo_.h) return;
-            read_geo_ = rt64_3ds::ScreenGeometry::make(fs.w, fs.h);
+            read_geo_ = rt64_3ds::ScreenGeometry::make(fs.w, fs.h, desc.display_aspect);
             interp_.set_screen(read_geo_);
             fprintf(stderr, "rt64-3ds: VI width %u: lists read at %dx%d from here\n", width, read_geo_.w, read_geo_.h);
             return;
@@ -3879,7 +3969,7 @@ public:
     void apply_frame_geometry() {
         frame_resized_ = false;
         if (frame_.frame_w == 0 || (frame_.frame_w == geo_.w && frame_.frame_h == geo_.h)) return;
-        apply_geometry(rt64_3ds::ScreenGeometry::make(frame_.frame_w, frame_.frame_h));
+        apply_geometry(rt64_3ds::ScreenGeometry::make(frame_.frame_w, frame_.frame_h, rt64_3ds::render_desc().display_aspect));
         frame_resized_ = true;
     }
     int draw_lo_ = 0, draw_hi_ = 1 << 30;       // dbg_draw_first / _last
@@ -4383,7 +4473,7 @@ public:
         last_cull_ = (int)mode;
     }
     // The depth offset in force (apply_state): -1 not known.
-    float last_zoff_ = -1.0f;
+    float last_zoff_ = -1.0f, last_zscale_ = -1.0f;
     // RenderDesc::decal_window: RT64's decal test (RasterPS.hlsl) passes
     // where the surface's depth is within max(CoplanarDepthTolerance at the
     // decal's depth, the decal's depth change per pixel). The PICA has one
@@ -4612,6 +4702,13 @@ void rt64_3ds::dump_progress() {
 
 void rt64_3ds::set_debug_gfx_delay_ms(int ms) { g_debug_gfx_delay_ms = ms; }
 void rt64_3ds::set_quitting() { g_quitting = true; }
+void rt64_3ds::wait_idle_for_exit() {
+    g_quitting = true;
+    if (!g_gpu_lock_ready) return;
+    LightLock_Lock(&g_gpu_lock);
+    C3Di_RenderQueueWaitDone();
+    LightLock_Unlock(&g_gpu_lock);
+}
 void rt64_3ds::set_paused(bool paused) { g_paused = paused; }
 void rt64_3ds::set_bottom_screen(bool on) { g_bottom_on.store(on); }
 void rt64_3ds::set_bottom_console(const uint16_t* console) {

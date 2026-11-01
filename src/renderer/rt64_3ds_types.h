@@ -34,22 +34,27 @@ constexpr uint32_t kRdramMask = rdram_pot(kRdramBytes) - 1;
 // widen their projection to the screen's 5:3 through
 // recomp_get_target_aspect_ratio, and anchor HUD to the edges with gEX
 // origins). DK64's 320x240 gives scale 1 and 40-pixel margins; Banjo's
-// 292x216 scale 10/9 and 34-unit margins.
+// 292x216 scale 10/9 and 34-unit margins. A display aspect (RenderDesc::
+// display_aspect) shows the frame that wide whatever its pixels: a 320x480
+// frame at 4:3 has scale 1/2 down and 1 across.
 struct ScreenGeometry {
     int w = 320, h = 240;          // the N64 frame, N64 pixels
-    float scale = 1.0f;            // screen pixels per N64 pixel
+    float scale = 1.0f;            // screen pixels per N64 pixel (down; across too with square pixels)
+    float scale_x = 1.0f;          // ... across
     float x0 = 40.0f;              // N64 units from the screen's left edge to N64 x = 0
     float wide_w = 400.0f;         // N64 units across the whole screen: w + 2 * x0
-    static ScreenGeometry make(int w, int h) {
+    static ScreenGeometry make(int w, int h, float aspect = 0.0f) {
         ScreenGeometry g;
         g.w = w > 0 ? w : 320;
         g.h = h > 0 ? h : 240;
         g.scale = 240.0f / (float)g.h;
-        g.wide_w = 400.0f / g.scale;
+        const float shown_w = aspect * 240.0f < 400.0f ? aspect * 240.0f : 400.0f;
+        g.scale_x = aspect > 0.0f ? shown_w / (float)g.w : g.scale;
+        g.wide_w = 400.0f / g.scale_x;
         g.x0 = (g.wide_w - (float)g.w) * 0.5f;
         return g;
     }
-    float screen_x(float n64_x) const { return (n64_x + x0) * scale; }
+    float screen_x(float n64_x) const { return (n64_x + x0) * scale_x; }
     float screen_y(float n64_y) const { return n64_y * scale; }
 };
 

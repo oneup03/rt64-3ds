@@ -153,6 +153,10 @@ struct DrawRecord {
     // as depth_camera has them); 0, 0 when the option is off or the
     // projection is not a perspective.
     float depth_a = 0.0f, depth_b = 0.0f;
+    // The viewport's depth range (Interpreter's vp_za, vp_zb): the depth
+    // buffer gets vp_za * z' + vp_zb (the context's depth map). 1, 0 for
+    // the standard viewport and for rectangles.
+    float vp_za = 1.0f, vp_zb = 0.0f;
     // A rectangle sampling a texture of a whole image (RenderDesc::
     // merge_image_tiles): its neighbours alike merge into its record.
     bool image_rect = false;
