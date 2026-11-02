@@ -33,6 +33,10 @@ struct Entry {
     uint32_t potw = 0, poth = 0, bytes = 0;
     uint32_t last_frame = 0, checked_frame = 0;
     uint32_t content = 0;
+    // Every word of each eighth of the rows, hashed (TextureCache::get's
+    // band_hash), and the eighth a recheck hashes next.
+    uint32_t bands[8] = {};
+    uint8_t next_band = 0;
     bool vram = false;          // tex.data is in VRAM
     bool vram_pending = false;  // a copy to VRAM waits for upload_pending
 };
@@ -150,6 +154,7 @@ struct TextureCache::Impl {
     struct Waiting {
         uint64_t key;
         uint32_t content, levels, rdram_addr;
+        uint32_t bands[8];
         bool pal;
         TexDesc d;
         TexDesc mips[7];
@@ -236,6 +241,21 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut, const TexDesc
         }
         return h;
     };
+    // Every word of one eighth of the rows. A recheck hashes the sample and
+    // one eighth, in turn: a change the sample misses is found within eight
+    // rechecks (~0.5 s), at an eighth of the texture's bytes each. The sample
+    // alone kept a stale texture for good where every word it reads is the
+    // same before and after (an Impact battle's sky of black space, decoded
+    // while its tiles' memory held something else).
+    auto band_hash = [&](uint32_t k) {
+        uint32_t h = 2166136261u;
+        for (uint32_t y = k * rows_read / 8, end = (k + 1) * rows_read / 8; y < end; y++) {
+            const uint32_t first = (d.addr + y * d.pitch) & ~3u;
+            const uint32_t last = (d.addr + y * d.pitch + row_bytes - 1) & ~3u;
+            for (uint32_t a = first; a <= last; a += 4) { h ^= rw(rdram_, a); h *= 16777619u; }
+        }
+        return h;
+    };
 
     auto it = impl_->map.find(key);
     if (it != impl_->map.end()) {
@@ -244,8 +264,9 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut, const TexDesc
         // rewrites in place is noticed within ~130 ms at a quarter of the cost.
         if (e.checked_frame != impl_->frame && ((impl_->frame + (uint32_t)(key >> 12)) & 3) == 0) {
             e.checked_frame = impl_->frame;
-            uint32_t h = content_hash();
-            if (h != e.content) {
+            const uint32_t band = e.next_band;
+            e.next_band = (uint8_t)((band + 1) & 7);
+            if (content_hash() != e.content || band_hash(band) != e.bands[band]) {
                 // Rewritten in place: retire the old texture and decode again.
                 impl_->retired[impl_->frame % 3].push_back(e.tex);
                 if (e.vram) vram_bytes_ -= e.bytes;
@@ -266,8 +287,10 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut, const TexDesc
         }
     }
     const uint32_t h = content_hash();
+    uint32_t bands[8];
+    for (uint32_t k = 0; k < 8; k++) bands[k] = band_hash(k);
     if (!defer_) {
-        b = decode_into(key, h, rdram_, d, tlut, mips, levels, d.addr);
+        b = decode_into(key, h, bands, rdram_, d, tlut, mips, levels, d.addr);
         keep(b);
         return b;
     }
@@ -295,6 +318,7 @@ BoundTex TextureCache::get(const TexDesc& d, const uint16_t* tlut, const TexDesc
     };
     w.key = key;
     w.content = h;
+    memcpy(w.bands, bands, sizeof(w.bands));
     w.levels = levels;
     w.rdram_addr = d.addr;
     w.d = d;
@@ -325,14 +349,14 @@ size_t TextureCache::decode_pending(std::vector<BoundTex>& out) {
     out.resize(n);
     for (size_t i = 0; i < n; i++) {
         const Impl::Waiting& w = impl_->waiting[i];
-        out[i] = decode_into(w.key, w.content, impl_->copies.data(), w.d, w.pal ? w.tlut : nullptr, w.levels > 1 ? w.mips : nullptr, w.levels, w.rdram_addr);
+        out[i] = decode_into(w.key, w.content, w.bands, impl_->copies.data(), w.d, w.pal ? w.tlut : nullptr, w.levels > 1 ? w.mips : nullptr, w.levels, w.rdram_addr);
     }
     impl_->waiting.clear();
     impl_->copies.clear();
     return n;
 }
 
-BoundTex TextureCache::decode_into(uint64_t key, uint32_t h, const uint8_t* src, const TexDesc& d, const uint16_t* tlut,
+BoundTex TextureCache::decode_into(uint64_t key, uint32_t h, const uint32_t* bands, const uint8_t* src, const TexDesc& d, const uint16_t* tlut,
                                    const TexDesc* mips, uint32_t levels, uint32_t rdram_addr) {
     BoundTex b;
     uint32_t potw = pot(d.width), poth = pot(d.height);
@@ -407,6 +431,7 @@ BoundTex TextureCache::decode_into(uint64_t key, uint32_t h, const uint8_t* src,
     // the GSP module on core 1, which waits for that core).
     svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)e.tex.data, bytes);
     e.potw = potw; e.poth = poth; e.bytes = bytes; e.last_frame = impl_->frame; e.checked_frame = impl_->frame; e.content = h;
+    memcpy(e.bands, bands, sizeof(e.bands));
     auto ins = impl_->map.emplace(key, e);
     if (ins.second) {
         uploads_++;

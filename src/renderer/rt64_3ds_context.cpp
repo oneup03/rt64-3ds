@@ -47,10 +47,10 @@ inline void flush_dcache(const void* p, size_t bytes) {
 
 #define g_stats rt64_3ds::mutable_stats()
 
-// Frame read-back (rt64_3ds::read_back_frame): while the game is in first
-// person, each finished left eye is converted by the GPU (a display
-// transfer: untiled, RGBA8 to RGB5A1, the N64's RGBA16 bit layout) into one
-// of two linear buffers in turn; the game thread reads the last complete one
+// Frame read-back (rt64_3ds::read_back_frame): while frames are kept (first
+// person, or rt64_3ds::keep_frames' lease), each finished left eye is
+// converted by the GPU (a display transfer: untiled, RGBA8 to RGB5A1, the
+// N64's RGBA16 bit layout) into one of two linear buffers in turn; the game thread reads the last complete one
 // under g_readback_lock, which also keeps the GPU from refilling it
 // meanwhile. Linear layout as the screen's: pixel (x, y) at x * 240 + 239 - y.
 u16* g_readback[2] = { nullptr, nullptr };
@@ -1543,8 +1543,10 @@ private:
         // mode) keeps a frame begun as ever.
         // record_only_ (send_dl, with the builder): recorded on its own
         // whatever comes up meanwhile (it was checked before the build began).
+        // Frames kept for read-back are copied at a frame's start, which a
+        // deferred frame leaves to the presenter: not deferred meanwhile.
         const bool defer = record_only_ || (double_eyes_ && pair_ && kind == Present::Paced && handoff && !debug_frame && !fb_capture_pending_ &&
-                                            !g_shot_request && !frame_.snapshot_request && !vi_blanked_);
+                                            !g_shot_request && !frame_.snapshot_request && !vi_blanked_ && !rt64_3ds::keeping_frames());
         if (inb_pending_ && !defer) flush_pending_inbetween();
         const int set = (double_eyes_ && inbetween) ? 1 : 0;
         cur_eye_[0] = set != 0 ? inb_l_ : top_;
@@ -2679,7 +2681,7 @@ private:
     // and C3D_FrameBegin for the transfer.
     int readback_next_ = 0;
     bool start_readback() {
-        if (!rt64_3ds::first_person_scene() || g_readback[0] == nullptr || frames_ < 2) {
+        if (!rt64_3ds::keeping_frames() || g_readback[0] == nullptr || frames_ < 2) {
             if (g_readback_ready >= 0) {
                 LightLock_Lock(&g_readback_lock);
                 g_readback_ready = -1;
@@ -3263,7 +3265,7 @@ public:
             }
         }
         if (g_readback_ready >= 0) {
-            // In first person: the read-back buffer as a picture too, to check
+            // Frames kept: the read-back buffer as a picture too, to check
             // its layout against the frame (gfx_readback.ppm, 400x240).
             if (FILE* f = rt64_3ds::data_fopen("gfx_readback.ppm", "wb")) {
                 fprintf(f, "P6\n400 240\n255\n");

@@ -86,8 +86,8 @@ private:
     void to_vram(uint64_t key, struct Entry& e);
     void sweep_vram();
     // Decodes `d` (its texels read from `src`, laid out as RDRAM) into a new
-    // entry under `key`.
-    BoundTex decode_into(uint64_t key, uint32_t content, const uint8_t* src, const TexDesc& d, const uint16_t* tlut,
+    // entry under `key`, with its content and band hashes (8).
+    BoundTex decode_into(uint64_t key, uint32_t content, const uint32_t* bands, const uint8_t* src, const TexDesc& d, const uint16_t* tlut,
                          const TexDesc* mips, uint32_t levels, uint32_t rdram_addr);
     bool defer_ = false;
     bool compact_ = false;

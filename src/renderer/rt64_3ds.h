@@ -429,12 +429,19 @@ bool first_person_scene();
 
 // Copy a region of the last finished frame (the left eye) into the game's
 // RGBA16 framebuffer in RDRAM, for game code that reads pixels (DK64's fairy
-// camera). The rectangle is in N64 pixels (the 4:3 area; the wide screen
-// adds 40 px either side); fb_width is the framebuffer's width in pixels.
-// Returns immediately; false when no frame is available - frames are kept
-// only while first_person_scene() is set, where the games that need this
-// take their pictures.
+// camera, Goemon's sepia photos in the ending). The rectangle is in N64
+// pixels (the 4:3 area; the wide screen adds 40 px either side); fb_width is
+// the framebuffer's width in pixels. Returns immediately; false when no
+// frame is available - frames are kept only while keeping_frames(), from
+// before the game takes its picture.
 bool read_back_frame(uint8_t* rdram, uint32_t fb_addr, uint32_t fb_width, int x, int y, int w, int h);
+// Keep finished frames for read_back_frame for the next `ms` milliseconds
+// (a lease the game renews while a picture may come: Goemon's ending and
+// credits). Each frame kept costs a display transfer and the frame's start
+// waits for the GPU (no frame recorded while the one before still draws).
+void keep_frames(int ms);
+// In first person or within keep_frames' lease.
+bool keeping_frames();
 
 // Live progress of the gfx thread, for a watchdog on another thread: which
 // frame and draw it is on. `dump_progress` writes the current draw's state

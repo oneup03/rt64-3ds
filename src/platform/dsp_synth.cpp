@@ -205,6 +205,7 @@ volatile uint32_t g_st_starts = 0, g_st_events = 0, g_st_ticks = 0, g_st_starved
 volatile uint32_t g_st_decode = 0, g_st_apply = 0;      // ticks decoding samples, applying events
 volatile uint32_t g_st_remaps = 0;
 volatile uint32_t g_st_skipped = 0;     // frames built without their commands
+volatile uint32_t g_st_unplayable = 0;  // starts whose wave read_wave refused
 uint32_t g_frames_base = 0;     // g_dsp_frames at the last stats line
 
 // The AI stream's samples a DSP frame plays.
@@ -763,7 +764,21 @@ extern "C" void recomp3ds_synth_hook(uint8_t* rdram, void* ctx_, int which) {
         case RECOMP3DS_SYNTH_START_VOICE:
         case RECOMP3DS_SYNTH_START_VOICE_PARAMS: {
             Wave wave;
-            if (!read_wave(rdram, arg(0), wave)) return;
+            if (!read_wave(rdram, arg(0), wave)) {
+                // Silent, where the microcode would have played something:
+                // the first few logged with what the wave holds.
+                g_st_unplayable = g_st_unplayable + 1;
+                static int said = 0;
+                const uint32_t w = arg(0);
+                if (said < 8 && is_ptr(w)) {
+                    said++;
+                    const uint32_t book = rw(rdram, w + 16);
+                    fprintf(stderr, "dsp-synth: a wave it can't play: %08lx type %u, %lu bytes, book %08lx (order %ld, %ld predictors)\n",
+                            (unsigned long)w, (unsigned)rb(rdram, w + 8), (unsigned long)rw(rdram, w + 4), (unsigned long)book,
+                            is_ptr(book) ? (long)(int32_t)rw(rdram, book) : -1l, is_ptr(book) ? (long)(int32_t)rw(rdram, book + 4) : -1l);
+                }
+                return;
+            }
             if (took_over(pv, voice) && delay > 64) {
                 // A stolen voice: the allocation faded what it played over
                 // the delay less 64 samples (no call of ours saw that), and
@@ -919,6 +934,8 @@ recomp3ds::DspSynthStats recomp3ds::dsp_synth_take_stats() {
     s.remaps = g_st_remaps;
     s.lists_skipped = g_st_skipped;
     g_st_skipped = 0;
+    s.unplayable = g_st_unplayable;
+    g_st_unplayable = 0;
     uint32_t reverb_ticks = 0;
     recomp3ds::dsp_reverb_take_stats(&reverb_ticks, &s.reverb_gaps);
     s.reverb_us = (uint32_t)((uint64_t)reverb_ticks * 1000000ull / SYSCLOCK_ARM11);
