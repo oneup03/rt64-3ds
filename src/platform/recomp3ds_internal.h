@@ -40,6 +40,9 @@ namespace recomp3ds {
     // Audio off: the audio task is skipped (no microcode work, which the
     // CPU does here) and silence is queued in place of its output.
     void audio_set_enabled(bool on);
+    // The Audio row's High priority: the game's code is interrupted for its
+    // audio thread while the audio runs short (recomp3ds_run.cpp's preempt_gate).
+    void audio_set_high_priority(bool on);
     void audio_set_paused(bool paused);     // the HOME prompt (audio_ndsp.cpp)
     bool audio_enabled();
     // Since the previous call: frames the game queued, frames dropped because
@@ -193,6 +196,7 @@ namespace recomp3ds {
     struct DebugSettings {
         int slow_gfx_ms = 0, slow_audio_ms = 0;   // pad every display list / audio task by that much (the emulator mimicking a slower console)
         int audio_rsp = 0;                        // the recompiled audio microcode instead of the interpreter
+        int preempt_audio_ms = 25;                // High priority audio: events preempt the game's code while the audio holds less (1000: at every event)
     };
     const DebugSettings& debug_settings();
     // The core the DSP synthesizer's thread runs on (core 1 when the system

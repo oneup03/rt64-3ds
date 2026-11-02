@@ -1,0 +1,159 @@
+From 58695c636580045ee553ec0226423e3d16eb6fa7 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Mon, 2 Nov 2026 17:29:09 -0600
+Subject: [PATCH] Optional: no trace hooks in simple leaf functions
+ (trace_skip_simple_leaves)
+
+With trace_mode, a function that makes no call (jal, jalr, a linking
+branch), jumps nowhere outside itself, never branches backwards and has
+no jump table or hook gets no TRACE_ENTRY or TRACE_RETURN: it runs a
+bounded few instructions, and a hook that checks for preemption would be
+much of its code. [input]'s trace_skip_simple_leaves, off by default.
+Banjo's 3DS build leaves 1,736 of its 8,352 functions without hooks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/recompiler/context.h |  7 +++++++
+ src/cgenerator.cpp           |  3 +--
+ src/config.cpp               |  4 ++++
+ src/config.h                 |  1 +
+ src/main.cpp                 |  1 +
+ src/recompilation.cpp        | 37 +++++++++++++++++++++++++++++++++++-
+ 6 files changed, 50 insertions(+), 3 deletions(-)
+
+diff --git a/include/recompiler/context.h b/include/recompiler/context.h
+index e7b4431..c03d82f 100644
+--- a/include/recompiler/context.h
++++ b/include/recompiler/context.h
+@@ -270,6 +270,9 @@ namespace N64Recomp {
+ 
+         // Causes functions to print their name to the console the first time they're called.
+         bool trace_mode;
++        // With trace_mode: no TRACE_ENTRY or TRACE_RETURN in a simple leaf
++        // function (traces_function), which runs a bounded few instructions.
++        bool trace_skip_simple_leaves = false;
+ 
+         // Imports sections and function symbols from a provided context into this context's reference sections and reference functions.
+         bool import_reference_context(const Context& reference_context);
+@@ -592,6 +595,10 @@ namespace N64Recomp {
+     class Generator;
+     bool recompile_function(const Context& context, size_t function_index, std::ostream& output_file, std::span<std::vector<uint32_t>> static_funcs, bool tag_reference_relocs);
+     bool recompile_function_custom(Generator& generator, const Context& context, size_t function_index, std::ostream& output_file, std::span<std::vector<uint32_t>> static_funcs_out, bool tag_reference_relocs);
++    // Whether a function gets trace_mode's TRACE_ENTRY and TRACE_RETURN: with
++    // trace_skip_simple_leaves, not when it makes no call, never branches
++    // backwards, has no jump table and no hook.
++    bool traces_function(const Context& context, size_t function_index);
+ 
+     enum class ModSymbolsError {
+         Good,
+diff --git a/src/cgenerator.cpp b/src/cgenerator.cpp
+index 6d312a9..6cd094f 100644
+--- a/src/cgenerator.cpp
++++ b/src/cgenerator.cpp
+@@ -478,8 +478,7 @@ void N64Recomp::CGenerator::emit_switch_error(uint32_t instr_vram, uint32_t jtbl
+ }
+ 
+ void N64Recomp::CGenerator::emit_return(const Context& context, size_t func_index) const {
+-    (void)func_index;
+-    if (context.trace_mode) {
++    if (N64Recomp::traces_function(context, func_index)) {
+         fmt::print(output_file, "TRACE_RETURN()\n    ");
+     }
+     fmt::print(output_file, "return;\n");
+diff --git a/src/config.cpp b/src/config.cpp
+index 1066aff..77d823c 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -476,6 +476,10 @@ N64Recomp::Config::Config(const char* path) {
+             trace_mode = false;
+         }
+ 
++        // Leave trace mode's hooks out of simple leaf functions (optional)
++        std::optional<bool> trace_skip_simple_leaves_opt = input_data["trace_skip_simple_leaves"].value<bool>();
++        trace_skip_simple_leaves = trace_skip_simple_leaves_opt.value_or(false);
++
+         // Function reference symbols file (optional)
+         std::optional<std::string> func_reference_syms_file_opt = input_data["func_reference_syms_file"].value<std::string>();
+         if (func_reference_syms_file_opt.has_value()) {
+diff --git a/src/config.h b/src/config.h
+index 7d6db23..8682ae6 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -45,6 +45,7 @@ namespace N64Recomp {
+         bool unpaired_lo16_warnings;
+         bool use_mdebug;
+         bool trace_mode;
++        bool trace_skip_simple_leaves;
+         bool allow_exports;
+         bool strict_patch_mode;
+         std::filesystem::path elf_path;
+diff --git a/src/main.cpp b/src/main.cpp
+index e06c7b5..df3ed3b 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -526,6 +526,7 @@ int main(int argc, char** argv) {
+ 
+     // Propogate the trace mode parameter.
+     context.trace_mode = config.trace_mode;
++    context.trace_skip_simple_leaves = config.trace_skip_simple_leaves;
+ 
+     // Apply any single-instruction patches.
+     for (const N64Recomp::InstructionPatch& patch : config.instruction_patches) {
+diff --git a/src/recompilation.cpp b/src/recompilation.cpp
+index c228433..e388b97 100644
+--- a/src/recompilation.cpp
++++ b/src/recompilation.cpp
+@@ -759,6 +759,41 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+     return true;
+ }
+ 
++bool N64Recomp::traces_function(const Context& context, size_t func_index) {
++    if (!context.trace_mode) {
++        return false;
++    }
++    if (!context.trace_skip_simple_leaves) {
++        return true;
++    }
++    const Function& func = context.functions[func_index];
++    if (func.stubbed || !func.function_hooks.empty()) {
++        return true;
++    }
++    // A call (jal, jalr, a linking branch), a tail call (a jump out of the
++    // function), a loop (a branch to itself or back) or a jr that isn't a
++    // return (a jump table) keeps the trace.
++    const uint32_t vram_end = func.vram + (uint32_t)func.words.size() * 4;
++    uint32_t vram = func.vram;
++    for (uint32_t word : func.words) {
++        rabbitizer::InstructionCpu instr(byteswap(word), vram);
++        if (instr.doesLink()) {
++            return true;
++        }
++        if (instr.getUniqueId() == rabbitizer::InstrId::UniqueId::cpu_jr && instr.GetO32_rs() != rabbitizer::Registers::Cpu::GprO32::GPR_O32_ra) {
++            return true;
++        }
++        if (instr.isBranch() || instr.getUniqueId() == rabbitizer::InstrId::UniqueId::cpu_j) {
++            const uint32_t target = (uint32_t)instr.getBranchVramGeneric();
++            if (target <= vram || target >= vram_end) {
++                return true;
++            }
++        }
++        vram += 4;
++    }
++    return false;
++}
++
+ template <typename GeneratorType>
+ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context& context, size_t func_index, std::ostream& output_file, std::span<std::vector<uint32_t>> static_funcs_out, bool tag_reference_relocs) {
+     const N64Recomp::Function& func = context.functions[func_index];
+@@ -767,7 +802,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
+ 
+     generator.emit_function_start(func.name, func_index);
+ 
+-    if (context.trace_mode) {
++    if (N64Recomp::traces_function(context, func_index)) {
+         fmt::print(output_file,
+             "    TRACE_ENTRY()\n",
+             func.name);
+-- 
+2.56.0
+

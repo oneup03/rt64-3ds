@@ -167,8 +167,12 @@ add_library(recomp_3ds STATIC
     src/platform/stall_watch.cpp
     src/platform/log.cpp
     src/platform/autotest.cpp
+    src/platform/preempt_check.cpp
 )
 target_include_directories(recomp_3ds PUBLIC src/platform)
+# rt64_3ds_preempt.h's stub, called from the game's code (linked after this
+# library): kept whether or not anything linked before it asks for it.
+target_link_options(recomp_3ds INTERFACE "LINKER:--undefined=rt64_3ds_preempt_stub")
 # The linear heap's size at start (recomp3ds_run.cpp __system_allocateHeaps):
 # 32 MB with plenty of memory and 16 otherwise by default; a game sets
 # RT64_3DS_LINEAR_HEAP_MB to choose (Dinosaur Planet: 16, for its 64 MB ROM

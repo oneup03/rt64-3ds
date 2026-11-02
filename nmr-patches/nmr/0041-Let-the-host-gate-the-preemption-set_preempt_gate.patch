@@ -1,0 +1,70 @@
+From 39d31523889e6ea801b5b95d6118771c73686093 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Mon, 2 Nov 2026 17:29:29 -0600
+Subject: [PATCH] Let the host gate the preemption (set_preempt_gate)
+
+Each preemption cost Banjo about 0.4 ms of frame time on an Old 3DS, and
+at every external event (~270 a second in its attract demos) 11% of its
+frame rate. A host's gate, asked on the host thread as it queues an
+event, can leave the flag down: the event then waits for the game's next
+message or idle wait, as without preemption. rt64-3ds preempts only for
+the audio, and only while it runs short. With no gate every event
+preempts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ultramodern/include/ultramodern/ultramodern.hpp |  7 +++++++
+ ultramodern/src/mesgqueue.cpp                   | 15 ++++++++++++---
+ 2 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index 226eca9..d3ca7cf 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -138,6 +138,13 @@ extern "C" void ultramodern_preempt(uint8_t* rdram);
+ // otherwise it is the global itself.
+ extern "C" uint32_t* ultramodern_preempt_flag;
+ #define ULTRAMODERN_PREEMPT_FLAG_OFFSET 32
++// A host's say over the preemption, asked on the host thread each time it
++// queues an external event: false leaves the flag down, and the event waits
++// for the game's next message or idle wait as it would without preemption
++// (rt64-3ds preempts only while the game's audio is running short). With no
++// gate every event preempts. Set before the game's threads start.
++using preempt_gate_t = bool();
++void set_preempt_gate(preempt_gate_t* gate);
+ // The game's interrupt mask (osSetIntMask), per thread: with every interrupt
+ // masked (OS_IM_NONE) the thread is in a critical section and is not
+ // preempted. Returns the previous mask.
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
+index b3271f8..10dc8a7 100644
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
+@@ -35,13 +35,22 @@ void ultramodern::set_message_queue_control(const ultramodern::MessageQueueContr
+ extern "C" volatile uint32_t ultramodern_dbg_counts[8] = {};
+ #define DBG_COUNT(i) (ultramodern_dbg_counts[i] = ultramodern_dbg_counts[i] + 1)
+ 
+-// Raised after every external message is queued (see ultramodern.hpp); the
+-// running game thread's next preemption check delivers the queue. Cleared
+-// before the queue is drained, so a message queued meanwhile raises it again.
++// Raised after every external message is queued, unless the host's gate
++// says otherwise (see ultramodern.hpp); the running game thread's next
++// preemption check delivers the queue. Cleared before the queue is drained,
++// so a message queued meanwhile raises it again.
+ extern "C" uint32_t ultramodern_preempt_pending = 0;
+ extern "C" uint32_t* ultramodern_preempt_flag = &ultramodern_preempt_pending;
++static ultramodern::preempt_gate_t* preempt_gate = nullptr;
++
++void ultramodern::set_preempt_gate(preempt_gate_t* gate) {
++    preempt_gate = gate;
++}
+ 
+ static inline void raise_preempt() {
++    if (preempt_gate != nullptr && !preempt_gate()) {
++        return;
++    }
+     __atomic_store_n(&ultramodern_preempt_pending, 1u, __ATOMIC_RELEASE);
+     __atomic_store_n(ultramodern_preempt_flag, 1u, __ATOMIC_RELEASE);
+ }
+-- 
+2.56.0
+

@@ -1,0 +1,116 @@
+From 3b3ecb3f127ea9f0c99eafdb67fa50f7fdd804f1 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Mon, 2 Nov 2026 17:29:28 -0600
+Subject: [PATCH] A copy of the preemption flag below RDRAM, on the 3DS
+
+ultramodern_preempt_flag points at a copy of ultramodern_preempt_pending,
+raised and cleared with it, that recompiled code can read from the rdram
+pointer it already holds: no address to load from the function's literal
+pool first. librecomp's 3DS allocation keeps a page below RDRAM for it,
+the copy ULTRAMODERN_PREEMPT_FLAG_OFFSET (32) bytes down, on a cache line
+of its own. Elsewhere the pointer is the global itself.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ librecomp/src/recomp.cpp                        | 15 ++++++++++-----
+ ultramodern/include/ultramodern/ultramodern.hpp |  9 +++++++++
+ ultramodern/src/mesgqueue.cpp                   | 11 +++++++++--
+ 3 files changed, 28 insertions(+), 7 deletions(-)
+
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 1f3abae..155e5b5 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -1089,13 +1089,17 @@ void recomp::start(const recomp::Configuration& cfg) {
+     // No virtual memory tricks on the 3DS: one zero-filled block the size of
+     // the (reduced) RDRAM region. Wild accesses corrupt instead of faulting.
+     // Page-aligned, because malloc only guarantees 8 bytes and the recomp heap
+-    // (o1heap) needs its arena, an offset into RDRAM, aligned to 16.
++    // (o1heap) needs its arena, an offset into RDRAM, aligned to 16. A page
++    // below it holds the preemption flag's copy (ultramodern.hpp), on a cache
++    // line of its own.
+     static_assert(allocation_size == mem_size, "the 3DS commits the whole RDRAM region");
+     static_assert(mem_size % 0x1000 == 0, "aligned_alloc needs a multiple of the alignment");
+-    rdram = reinterpret_cast<uint8_t*>(std::aligned_alloc(0x1000, mem_size));
+-    alloc_failed = (rdram == nullptr);
++    uint8_t* rdram_block = reinterpret_cast<uint8_t*>(std::aligned_alloc(0x1000, mem_size + 0x1000));
++    alloc_failed = (rdram_block == nullptr);
++    rdram = alloc_failed ? nullptr : rdram_block + 0x1000;
+     if (!alloc_failed) {
+-        std::memset(rdram, 0, mem_size);
++        std::memset(rdram_block, 0, mem_size + 0x1000);
++        ultramodern::ultramodern_preempt_flag = reinterpret_cast<uint32_t*>(rdram - ULTRAMODERN_PREEMPT_FLAG_OFFSET);
+     }
+ #else
+     rdram = (uint8_t*)mmap(NULL, allocation_size, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+@@ -1153,7 +1157,8 @@ void recomp::start(const recomp::Configuration& cfg) {
+     // VirtualFree returns zero on failure.
+     free_failed = (VirtualFree(rdram, 0, MEM_RELEASE) == 0);
+ #elif defined(__3DS__)
+-    std::free(rdram);
++    ultramodern::ultramodern_preempt_flag = &ultramodern::ultramodern_preempt_pending;
++    std::free(rdram - 0x1000);
+     free_failed = false;
+ #else
+     // munmap returns -1 on failure.
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index 590d1b4..226eca9 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -129,6 +129,15 @@ uint32_t pending_audio_bytes();
+ // to a woken higher-priority thread, as the interrupt would have.
+ extern "C" uint32_t ultramodern_preempt_pending;
+ extern "C" void ultramodern_preempt(uint8_t* rdram);
++// The flag's copy that recompiled code can read from the rdram pointer it
++// already holds, with no address to load first (the global's comes from the
++// function's literal pool): raised and cleared with
++// ultramodern_preempt_pending. A host that
++// keeps a cache line below RDRAM for it points this at
++// rdram - ULTRAMODERN_PREEMPT_FLAG_OFFSET (librecomp does on the 3DS);
++// otherwise it is the global itself.
++extern "C" uint32_t* ultramodern_preempt_flag;
++#define ULTRAMODERN_PREEMPT_FLAG_OFFSET 32
+ // The game's interrupt mask (osSetIntMask), per thread: with every interrupt
+ // masked (OS_IM_NONE) the thread is in a critical section and is not
+ // preempted. Returns the previous mask.
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
+index 3659f88..b3271f8 100644
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
+@@ -39,17 +39,23 @@ extern "C" volatile uint32_t ultramodern_dbg_counts[8] = {};
+ // running game thread's next preemption check delivers the queue. Cleared
+ // before the queue is drained, so a message queued meanwhile raises it again.
+ extern "C" uint32_t ultramodern_preempt_pending = 0;
++extern "C" uint32_t* ultramodern_preempt_flag = &ultramodern_preempt_pending;
++
++static inline void raise_preempt() {
++    __atomic_store_n(&ultramodern_preempt_pending, 1u, __ATOMIC_RELEASE);
++    __atomic_store_n(ultramodern_preempt_flag, 1u, __ATOMIC_RELEASE);
++}
+ 
+ void ultramodern::enqueue_external_message_src(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, EventMessageSource src) {
+     DBG_COUNT(0);
+     external_messages.enqueue({mq, msg, jam, requeue_enabled[static_cast<int>(src)]});
+-    __atomic_store_n(&ultramodern_preempt_pending, 1u, __ATOMIC_RELEASE);
++    raise_preempt();
+ }
+ 
+ void ultramodern::enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked) {
+     DBG_COUNT(0);
+     external_messages.enqueue({mq, msg, jam, requeue_if_blocked});
+-    __atomic_store_n(&ultramodern_preempt_pending, 1u, __ATOMIC_RELEASE);
++    raise_preempt();
+ }
+ 
+ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
+@@ -86,6 +92,7 @@ extern "C" void ultramodern_preempt(uint8_t* rdram) {
+         return;
+     }
+     __atomic_store_n(&ultramodern_preempt_pending, 0u, __ATOMIC_ACQ_REL);
++    __atomic_store_n(ultramodern_preempt_flag, 0u, __ATOMIC_ACQ_REL);
+     dequeue_external_messages(PASS_RDRAM1);
+     ultramodern::check_running_queue(PASS_RDRAM1);
+ }
+-- 
+2.56.0
+

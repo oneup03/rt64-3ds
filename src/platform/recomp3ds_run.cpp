@@ -58,6 +58,30 @@ uint8_t* g_rdram = nullptr;
 // and audio task by that much, to reproduce console timing in the emulator.
 int g_slow_audio_ms = 0;
 
+// The runtime's preemption gate (ultramodern.hpp's set_preempt_gate). The
+// preemption is there for the audio thread, which a long stretch of game
+// logic otherwise holds back until the DSP runs dry and the music slows; at
+// every event it cost Banjo 11% of its frame rate on an Old 3DS
+// (2026-11-02). So only with the Audio row's High priority, and then only
+// while the audio the DSP holds, with the buffers of audio tasks still to
+// run, comes to less than dbg_preempt_audio_ms (settings.ini; 1000 at every
+// event): in Banjo's demos on an Old 3DS that preempted at 119 of 270 events
+// a second and cost 4.5%. Counted for the stats line.
+bool g_audio_high_priority = false;
+int g_preempt_audio_ms = 25;
+volatile uint32_t g_preempts_raised = 0, g_preempts_held = 0;
+
+bool preempt_gate() {
+    bool raise = false;
+    if (g_audio_high_priority) {
+        const size_t ahead = recomp3ds::audio_frames_queued() + ultramodern::pending_audio_bytes() / 4;
+        raise = g_preempt_audio_ms >= 1000 || ahead < (size_t)recomp3ds::audio_rate() * (size_t)g_preempt_audio_ms / 1000;
+    }
+    if (raise) g_preempts_raised = g_preempts_raised + 1;
+    else g_preempts_held = g_preempts_held + 1;
+    return raise;
+}
+
 RspExitReason timed_ucode(uint8_t* rdram, uint32_t ucode_addr) {
     g_rdram = rdram;
     if (recomp3ds::audio_hle_capturing()) {
@@ -162,6 +186,7 @@ void (*g_game_on_init)(uint8_t* rdram, recomp_context* ctx) = nullptr;
 }   // namespace
 
 int recomp3ds::helper_core() { return g_helper_core; }
+void recomp3ds::audio_set_high_priority(bool on) { g_audio_high_priority = on; }
 int recomp3ds::main_stage() { return g_main_stage; }
 const char* recomp3ds::main_stage_name(int stage) {
     static const char* const kNames[] = { "sleep", "pad", "flush", "motion", "home", "select", "report", "watchdog", "apt" };
@@ -777,10 +802,21 @@ void update_gfx_inner() {
                      (unsigned long)(d.peak_allocated / 1024), (unsigned long)d.oom_count);
         }
 
+        // The preemption gate's answers a second: events that preempted the
+        // game's code, and events it held back (the audio had enough).
+        char preempt_stats[48];
+        {
+            const uint32_t raised = g_preempts_raised, held = g_preempts_held;
+            g_preempts_raised = g_preempts_raised - raised;
+            g_preempts_held = g_preempts_held - held;
+            const u64 span = interval != 0 ? interval : 1;
+            snprintf(preempt_stats, sizeof(preempt_stats), " preempt %lu/s held %lu/s", (unsigned long)((u64)raised * SYSCLOCK_ARM11 / span),
+                     (unsigned long)((u64)held * SYSCLOCK_ARM11 / span));
+        }
         if (log_stats) fprintf(stderr, "stats: %d dl/s%s (late %d, max gap %.0f ms) core0 %d%% core1 %d%%%s%s ucode %u ms/s in %u tasks audio %zu frames queued, in %lu/s at %lu Hz, underruns %lu dropped %lu low water %lu heap %lu KB%s%s%s%s%s%s%s\n",
                 st.dl_per_sec, want_fps, st.late_frames, st.max_gap_ms, busy0, busy1, core2, core3, ucode_ms, ucode_tasks, recomp3ds::audio_frames_queued(),
                 (unsigned long)ac.submitted, (unsigned long)ac.rate, (unsigned long)ac.underruns, (unsigned long)ac.dropped, (unsigned long)(ac.low_water == 0xFFFFFFFFu ? 0u : ac.low_water),
-                (unsigned long)(mallinfo().arena / 1024), rheap, hle_stats, hle_ms.c_str(), "", rom_stats, game_stats, thread_stats.c_str());
+                (unsigned long)(mallinfo().arena / 1024), rheap, hle_stats, hle_ms.c_str(), preempt_stats, rom_stats, game_stats, thread_stats.c_str());
         // On a line of its own: the log cuts lines at 512 characters.
         if (log_stats && dsp_stats[0] != '\0') fprintf(stderr, "%s\n", dsp_stats + 1);
         // dbg_profile 2 or 3: the game's hottest functions, every 10 s whatever the log level.
@@ -1103,6 +1139,10 @@ int recomp3ds::run(const GameDesc& desc) {
             rt64_3ds::set_debug_gfx_delay_ms(dbg.slow_gfx_ms);
             fprintf(stderr, "recomp3ds: dbg_slow: +%d ms per display list, +%d ms per audio task\n", dbg.slow_gfx_ms, dbg.slow_audio_ms);
         }
+        g_preempt_audio_ms = dbg.preempt_audio_ms;
+        ultramodern::set_preempt_gate(&preempt_gate);
+        fprintf(stderr, "recomp3ds: audio %s priority (preempting under %d ms when high)\n", g_audio_high_priority ? "high" : "low or off",
+                g_preempt_audio_ms);
     }
     {
         // The ROM in memory, or read from the SD card as the game needs it:

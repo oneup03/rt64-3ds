@@ -134,11 +134,19 @@ int g_hud_bottom = 1;
 const char* const kHudNames[] = { "Top screen", "Touch screen" };
 void apply_hud_bottom(int v) { rt64_3ds::settings().hud_on_bottom = v != 0; }
 
-// Audio on or off: off skips the audio microcode, which the CPU runs here,
-// for speed (an Old 3DS).
-int g_audio_on = 1;
-const char* const kAudioNames[] = { "Off", "On" };
-void apply_audio(int v) { recomp3ds::audio_set_enabled(v != 0); }
+// Audio: Off skips the audio microcode, which the CPU runs here, and the DSP
+// synthesizer's voices, for speed (an Old 3DS). High priority interrupts the
+// game's code for its audio thread while the audio runs short (the runtime's
+// preemption, recomp3ds_run.cpp's preempt_gate), which keeps the music at
+// its tempo; Low priority never does, which on an Old 3DS is worth 4.5% of
+// the frame rate in Banjo (each interruption costs ~0.4 ms there) for music
+// up to 1.4% slow. Low by default on an Old 3DS, High on a New 3DS.
+int g_audio_mode = 2;
+const char* const kAudioNames[] = { "Off", "Low priority", "High priority" };
+void apply_audio(int v) {
+    recomp3ds::audio_set_enabled(v != 0);
+    recomp3ds::audio_set_high_priority(v == 2);
+}
 // Where the game's voices are made (GameDesc::synth): the DSP (dsp_synth.h),
 // or with settings.ini's audio_engine=0 the audio task (its microcode,
 // interpreted on the CPU). Not in the menu.
@@ -520,6 +528,8 @@ void load() {
         int v;
         if (sscanf(line, "game_mode=%63s", text) == 1) { g_game_mode = text; continue; }
         if (sscanf(line, "%127[^=]=%d", key, &v) != 2) continue;
+        // The Audio row before its priorities (audio_mode): only its Off carries over.
+        if (strcmp(key, "audio") == 0) { if (v == 0) g_audio_mode = 0; continue; }
         if (strncmp(key, "mod.", 4) == 0) { g_mod_values[key] = v; continue; }
         for (int i = 0; i < g_row_count; i++) {
             const Row& r = g_rows[i];
@@ -943,7 +953,8 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
         add_row({ "reset_controls", "Reset controls", 0, 1, &g_reset_value, kResetNames, false, nullptr, nullptr, PageControls, 1, nullptr,
                   true, reset_controls, nullptr });
     }
-    add_row({ "audio", "Audio", 0, 1, &g_audio_on, kAudioNames, false, nullptr, apply_audio, PageGame, 1, nullptr });
+    g_audio_mode = is_new_3ds ? 2 : 1;
+    add_row({ "audio_mode", "Audio", 0, 2, &g_audio_mode, kAudioNames, false, nullptr, apply_audio, PageGame, 1, nullptr });
     g_game_name = desc.render.game_name != nullptr ? desc.render.game_name : "";
     add_row({ "brightness_top", "Top screen brightness", 0, 5, &g_brightness[0], kBrightnessNames, false, nullptr, apply_brightness, PageGame, 1, nullptr });
     add_row({ "brightness_bottom", "Bottom screen brightness", 0, 5, &g_brightness[1], kBrightnessNames, false, nullptr, apply_brightness, PageGame, 1, nullptr });
@@ -999,6 +1010,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     add_row({ "dbg_slow_gfx_ms", "Pad each list (ms)", 0, 5000, &g_dbg.slow_gfx_ms, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "dbg_slow_audio_ms", "Pad each audio task (ms)", 0, 5000, &g_dbg.slow_audio_ms, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     add_row({ "dbg_audio_rsp", "Recompiled audio ucode", 0, 1, &g_dbg.audio_rsp, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
+    add_row({ "dbg_preempt_audio_ms", "High priority audio under (ms)", 0, 1000, &g_dbg.preempt_audio_ms, nullptr, false, nullptr, nullptr, recomp3ds::PageCount, 1, nullptr });
     // Testing an Old 3DS on a New 3DS (settings.ini only): the Old clock, and
     // the two-core layouts an Old 3DS has (read at start).
     if (is_new_3ds) add_row({ "dbg_old_clock", "Old 3DS clock", 0, 1, &g_dbg_old_clock, nullptr, false, nullptr, apply_old_clock, recomp3ds::PageCount, 1, nullptr });

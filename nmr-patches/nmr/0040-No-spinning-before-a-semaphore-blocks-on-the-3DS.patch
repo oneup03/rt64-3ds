@@ -1,0 +1,62 @@
+From 02f0c6f527f6755af2f26554626b7287507dc330 Mon Sep 17 00:00:00 2001
+From: oneup03 <oneup03@gmail.com>
+Date: Mon, 2 Nov 2026 17:29:29 -0600
+Subject: [PATCH] No spinning before a semaphore blocks, on the 3DS
+
+moodycamel's LightweightSemaphore spins up to 10,000 times before it
+blocks. The 3DS kernel never time-slices: a game thread that woke the next
+one on its own core (all of them run on one core at one priority) holds it
+off for every spin of its own wait, and the game's idle wait for an
+external message spins the same way. Each game-thread switch cost about
+0.36 ms on an Old 3DS; with no spinning, 0.06 ms. In Banjo's attract demos
+with the preemption check on, the frame rate went from 17.1 to 20.2 lists
+a second and core 0 from 92% to 84% busy.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../concurrentqueue/lightweightsemaphore.h    | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/thirdparty/concurrentqueue/lightweightsemaphore.h b/thirdparty/concurrentqueue/lightweightsemaphore.h
+index 2d2b810..df6c33b 100644
+--- a/thirdparty/concurrentqueue/lightweightsemaphore.h
++++ b/thirdparty/concurrentqueue/lightweightsemaphore.h
+@@ -390,10 +390,25 @@ private:
+ 	details::Semaphore m_sema;
+ 	int m_maxSpins;
+ 
++	// No spinning on the 3DS: its kernel never time-slices, so a thread that
++	// woke another on its own core (a game thread handing over to the next,
++	// all of them on one core at one priority) holds it off for every spin.
++	// The default 10000 spins cost each game-thread switch ~0.3 ms on an Old
++	// 3DS, which made the preemption check's extra switches cost Banjo 17% of
++	// its frame rate (2026-11-02).
++	int max_spins() const
++	{
++#if defined(__3DS__)
++		return 0;
++#else
++		return m_maxSpins;
++#endif
++	}
++
+ 	bool waitWithPartialSpinning(std::int64_t timeout_usecs = -1)
+ 	{
+ 		ssize_t oldCount;
+-		int spin = m_maxSpins;
++		int spin = max_spins();
+ 		while (--spin >= 0)
+ 		{
+ 			oldCount = m_count.load(std::memory_order_relaxed);
+@@ -438,7 +453,7 @@ private:
+ 	{
+ 		assert(max > 0);
+ 		ssize_t oldCount;
+-		int spin = m_maxSpins;
++		int spin = max_spins();
+ 		while (--spin >= 0)
+ 		{
+ 			oldCount = m_count.load(std::memory_order_relaxed);
+-- 
+2.56.0
+

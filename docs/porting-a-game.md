@@ -997,15 +997,36 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   message call, handed over as few as 12,700 of 22,050 samples a second,
   so the music slowed and its notes came up to 2.4 s late. The check is a
   load and a branch per call (about 200 KB more code in DK64).
+  Each switch between game threads cost 0.36 ms on an Old 3DS while
+  moodycamel's semaphore spun 10,000 times before it blocked (the woken
+  thread on the same core waits out the spin); nmr 0040 drops the spin on
+  the 3DS (0.06 ms). The preemptions themselves still cost: on an Old 3DS
+  each one took about 0.4 ms of Banjo's frame time, and at every event
+  (~270 a second in its demos) 11% of its frame rate. So the platform
+  gates them (`ultramodern::set_preempt_gate`, nmr 0041; `preempt_gate` in
+  recomp3ds_run.cpp): only with the Audio row's High priority, the New 3DS
+  default, and then
+  only while the audio queued for the DSP (with the asynchronous tasks'
+  buffers) holds less than `dbg_preempt_audio_ms` (25). There Banjo's
+  demos preempted at 119 events a second and kept the music at tempo, 4.5%
+  slower than none. Low priority, the Old 3DS default, never preempts:
+  the checks stay in the code and cost next to nothing, and the music can
+  run a little slow (1.4% in those demos). Banjo's check reads the flag
+  from a cache line below RDRAM (`include/rt64_3ds_preempt.h`, nmr 0039)
+  and is left out of simple leaf functions (N64Recomp's
+  `trace_skip_simple_leaves`, n64recomp 0007): 187 KB of code, with no
+  frame rate to tell it from the plain test. The other games read
+  `ultramodern_preempt_pending`, which the gate holds down as well.
 - **Profiling the game's code.** `dbg_profile=2` in settings.ini (3 with the
   renderer's read profile) samples which recompiled function the game's core is in, a thousand times
   a second from the renderer's core, and logs the top functions every 10 s
   and at exit (`game-profile:` lines, with the share of the time the game's
   core was idle: the game waiting). It needs the game's `trace.h` to keep
-  `recomp3ds_trace_func` (DK64's and Banjo's do: set at `TRACE_ENTRY`, the
-  caller's put back at `TRACE_RETURN`, so a sample names the function
-  executing, a self-time profile). The macros' cost, a load and two stores
-  a call, is paid whether the profile runs or not. The patches want
+  `recomp3ds_trace_func` (DK64's does, and Banjo's in a build with CMake's
+  `BK_GAME_PROFILE=ON`: set at `TRACE_ENTRY`, the caller's put back at
+  `TRACE_RETURN`, so a sample names the function executing, a self-time
+  profile). The macros' cost, a load and two stores a call, is paid
+  whether the profile runs or not, hence Banjo's switch (8% more code). The patches want
   `trace_mode` too (DK64's and Banjo's Makefiles recompile a copy of
   patches.toml with it): a patched function without it has no preemption
   check, and its time is booked to its nearest traced caller (Banjo's
@@ -1377,6 +1398,7 @@ the early-drawn, eye-replay, depth-copy, build-split and CULLDL A/Bs, and the
 | `dbg_cores` | The two-core layouts an Old 3DS has, on a New 3DS: 1 the game on core 1, 2 on core 0, 3 on core 0 with the lists read there too (read at start). |
 | `dbg_slow_gfx_ms`, `dbg_slow_audio_ms` | Pads every display list and audio task by that much, to mimic a slower console in the emulator. |
 | `dbg_audio_rsp` | Runs the recompiled audio microcode instead of the interpreter. |
+| `dbg_preempt_audio_ms` | High priority audio's threshold (default 25): an event preempts the game's code while the audio queued holds less than this many ms; 1000 preempts at every event. The stats line's `preempt N/s held M/s` counts the gate's answers. |
 
 The menu writes every row it knows to `settings.ini`, the hidden ones
 included, so after a game's first run the file pins every default: a changed
@@ -1396,7 +1418,7 @@ library's keys:
 | (Reset controls) | not saved: a first press arms it, a second puts every Controls row back to its default (the game's, before `settings.ini`) | Controls | |
 | `brightness_top`, `brightness_bottom` | 0 (the system's level, left alone); 1-5 the system's levels (gsp::Lcd), set again after the HOME Menu and sleep | Game | `GSPLCD_SetBrightness` |
 | `touch_button_1`, `touch_button_2` | 0 (none): the player's touch buttons, any N64 button each, at the top of the touch grid's right column ahead of a game's buttons | Controls | `touch_pad_set_user` |
-| `audio` | 1 | Game | `audio_set_enabled` |
+| `audio_mode` | 1 (Low priority) on an Old 3DS, 2 (High priority) on a New 3DS; 0 is Off. An older settings.ini's `audio=0` stays Off | Game | `audio_set_enabled`, `audio_set_high_priority` (the preemption gate: see "Preemption") |
 | `perf_monitor` | 1 (0 for a game with `RenderDesc::hud_on_bottom_supported`, whose HUD the text would cover): the touch screen's game name, frame rate and SELECT hint; 0: none of them (the touch buttons, alerts and the menu stay), and no load monitor idle threads (`loadmon_want`; kept for `dbg_profile` 2 or 3), so the stats lines read the cores' loads as -1 | Game | `settings_perf_monitor` |
 | `frame_cap` | 0; the games 2, which an Old 3DS turns into `old3ds_frame_cap` | Game | the gfx thread |
 | `hud_on_bottom` | 1: the game's marked HUD on the touch screen; 0: on the top screen. With `RenderDesc::hud_on_bottom_supported` only | Game (HUD: Top screen, Touch screen) | `screen_bottom_update`, `recomp3ds::hud_on_bottom` |
