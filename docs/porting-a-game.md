@@ -1011,7 +1011,11 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   demos preempted at 119 events a second and kept the music at tempo, 4.5%
   slower than none. Low priority, the Old 3DS default, never preempts:
   the checks stay in the code and cost next to nothing, and the music can
-  run a little slow (1.4% in those demos). Banjo's check reads the flag
+  run a little slow (1.4% in those demos). DK64 keeps High on an Old 3DS
+  too (`GameDesc::menu_defaults`, `{ "audio_mode", 2, Old3dsOnly }`), as
+  its audio thread starved there without the preemption (the 12,700
+  samples above); Azahar runs the Old clock too fast to show the
+  difference. Banjo's check reads the flag
   from a cache line below RDRAM (`include/rt64_3ds_preempt.h`, nmr 0039)
   and is left out of simple leaf functions (N64Recomp's
   `trace_skip_simple_leaves`, n64recomp 0007): 187 KB of code, with no
@@ -1022,11 +1026,12 @@ Old 3DS clock). It still has 3 cores and 124 MB, so it flatters a real Old 3DS.
   a second from the renderer's core, and logs the top functions every 10 s
   and at exit (`game-profile:` lines, with the share of the time the game's
   core was idle: the game waiting). It needs the game's `trace.h` to keep
-  `recomp3ds_trace_func` (DK64's does, and Banjo's in a build with CMake's
-  `BK_GAME_PROFILE=ON`: set at `TRACE_ENTRY`, the caller's put back at
-  `TRACE_RETURN`, so a sample names the function executing, a self-time
-  profile). The macros' cost, a load and two stores a call, is paid
-  whether the profile runs or not, hence Banjo's switch (8% more code). The patches want
+  `recomp3ds_trace_func` (Banjo's in a build with CMake's
+  `BK_GAME_PROFILE=ON`, DK64's with `DK64_GAME_PROFILE=ON`: set at
+  `TRACE_ENTRY`, the caller's put back at `TRACE_RETURN`, so a sample names
+  the function executing, a self-time profile). The macros' cost, a load
+  and two stores a call, is paid whether the profile runs or not, hence the
+  switch (8% more code in Banjo, 255 KB in DK64). The patches want
   `trace_mode` too (DK64's and Banjo's Makefiles recompile a copy of
   patches.toml with it): a patched function without it has no preemption
   check, and its time is booked to its nearest traced caller (Banjo's
