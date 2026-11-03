@@ -160,8 +160,9 @@ struct DrawRecord {
     // A rectangle sampling a texture of a whole image (RenderDesc::
     // merge_image_tiles): its neighbours alike merge into its record.
     bool image_rect = false;
-    // RenderDesc::aim_texture_hashes: the hash of a candidate reticle
-    // rectangle's texels (8..64 px, roughly square), computed in the read
+    // RenderDesc::aim_texture_hashes: the hash of a candidate reticle's
+    // texels (a rectangle of 8..64 px, roughly square, or orthographic
+    // triangles with a texture of 8..64 texels a side), computed in the read
     // while RDRAM still holds them; 0 when not a candidate.
     uint64_t tex_hash = 0;
     uint32_t dbg_vtx = 0;               // RDRAM address of the last vertex load (debug)

@@ -931,7 +931,41 @@ struct Interpreter::Impl {
         return c;
     }
     bool split_untagged_ortho = false;
-    bool aim_hash = false;             // Interpreter::set_aim_hash
+    // Interpreter::set_aim_hash: on, its shapes (RenderDesc::
+    // aim_texture_shapes) and every candidate's (the log).
+    bool aim_hash = false;
+    const TexShape* aim_shapes = nullptr;
+    size_t aim_shape_count = 0;
+    bool aim_all = false;
+    // Whether a candidate's texture is hashed: one of the shapes, or with
+    // none, a rectangle's.
+    bool aim_shape(const TexDesc& t, bool tris) const {
+        if (aim_all) return true;
+        if (aim_shape_count == 0) return !tris;
+        for (size_t i = 0; i < aim_shape_count; i++) {
+            const TexShape& s = aim_shapes[i];
+            if (s.width == t.width && s.height == t.height && s.fmt == t.fmt && s.siz == t.siz) return true;
+        }
+        return false;
+    }
+    // A candidate's hash, once per texture in a list: DK64's first-person
+    // scope draws its 64x64 corner eight times a frame. Not a CI texture's,
+    // whose palette can be loaded again between its draws.
+    struct AimMemo { uint32_t addr, pitch; uint16_t width, height, wrap_rows; uint8_t siz, nibble; uint64_t hash; };
+    static constexpr int kAimMemo = 8;
+    AimMemo aim_memo[kAimMemo];
+    int aim_memo_n = 0;
+    uint64_t aim_texture_hash(const TexDesc& d) {
+        if (d.tlut_mode != 0) return hash_texture(d);
+        for (int i = 0; i < aim_memo_n && i < kAimMemo; i++) {
+            const AimMemo& m = aim_memo[i];
+            if (m.addr == d.addr && m.pitch == d.pitch && m.width == d.width && m.height == d.height && m.wrap_rows == d.wrap_rows &&
+                m.siz == d.siz && m.nibble == d.nibble) return m.hash;
+        }
+        const uint64_t h = hash_texture(d);
+        aim_memo[aim_memo_n++ % kAimMemo] = { d.addr, d.pitch, d.width, d.height, d.wrap_rows, d.siz, d.nibble, h };
+        return h;
+    }
     // Interpreter::set_bottom_hud, and the span being read: the draws in it
     // go to the touch screen (DrawRecord::screen), moved by bottom_dx/dy, at
     // the game's coordinates (no origins, alignments or stretching).
@@ -2071,6 +2105,16 @@ struct Interpreter::Impl {
             snapshot(*r);
             r->tex[0] = tex[0];
             r->tex[1] = tex[1];
+            // RenderDesc::aim_texture_hashes: an orthographic sprite of
+            // textured triangles is a candidate reticle too (DK64's minigame
+            // crosshairs, quads of a 32x16 or 64x64 texture), its texture
+            // 8..64 texels a side and of one of the game's shapes; hashed
+            // here, while RDRAM holds it.
+            if (aim_hash && !bottom_span && !img && !r->perspective && r->tex[0].valid && !r->tex[0].snapshot && !r->tex[0].frame &&
+                r->tex[0].rtt < 0 && r->tex[0].width >= 8 && r->tex[0].height >= 8 && r->tex[0].width <= 64 && r->tex[0].height <= 64 &&
+                aim_shape(r->tex[0], true)) {
+                r->tex_hash = aim_texture_hash(r->tex[0]);
+            }
             if (frame_copy) note_draw(*r);
             if (inst_track) start_instance(*r);
             // Deferred triangles: a record whose texel coordinates are the
@@ -2392,10 +2436,10 @@ struct Interpreter::Impl {
         // RenderDesc::aim_texture_hashes: a candidate reticle's texels are
         // hashed here, while RDRAM still holds them (nothing reads RDRAM
         // after "parsed"): a textured rectangle of 8..64 px, roughly square,
-        // sampling ordinary texture memory.
+        // sampling ordinary texture memory (of one of the game's shapes).
         if (aim_hash && !bottom_span && textured && r.tex[0].valid && !r.tex[0].snapshot && !r.tex[0].frame && r.tex[0].rtt < 0 &&
-            w >= 8.0f && h >= 8.0f && w <= 64.0f && h <= 64.0f && w <= h * 1.6f && h <= w * 1.6f) {
-            r.tex_hash = hash_texture(r.tex[0]);
+            w >= 8.0f && h >= 8.0f && w <= 64.0f && h <= 64.0f && w <= h * 1.6f && h <= w * 1.6f && aim_shape(r.tex[0], false)) {
+            r.tex_hash = aim_texture_hash(r.tex[0]);
         }
         const Tile& tl = tiles[tile & 7];
         float uls = (float)(tl.uls >> 2), ult = (float)(tl.ult >> 2);
@@ -3488,6 +3532,7 @@ struct Interpreter::Impl {
         proj_id = 0;
         update_depth_terms();
         mv_seq = 0;
+        aim_memo_n = 0;
         vp_depth = 0;
         scissor_depth = 0;
         othermode_depth = combine_depth = geometry_depth = proj_depth = 0;
@@ -3972,7 +4017,12 @@ void Interpreter::set_world_proj_ids(const uint32_t* ids, int count) {
     set_world_proj_ranges(ranges, count);
 }
 void Interpreter::set_split_untagged_ortho(bool on) { impl_->split_untagged_ortho = on; }
-void Interpreter::set_aim_hash(bool on) { impl_->aim_hash = on; }
+void Interpreter::set_aim_hash(bool on, const TexShape* shapes, size_t shape_count, bool all) {
+    impl_->aim_hash = on;
+    impl_->aim_shapes = shapes;
+    impl_->aim_shape_count = shapes != nullptr ? shape_count : 0;
+    impl_->aim_all = all;
+}
 void Interpreter::set_bottom_hud(bool on) { impl_->bottom_allowed = on; }
 void Interpreter::set_force_branch_z(bool on) { impl_->force_branch_z = on; }
 void Interpreter::set_cull_dl(bool on) { impl_->cull_dl = on; }

@@ -11,6 +11,10 @@ namespace rt64_3ds {
 // family (Banjo-Kazooie). The RDP commands are the same in both.
 enum class Gbi : uint8_t { F3DEX2, F3DEX };
 
+// A texture's shape as its tile describes it: texels across and down, the
+// G_IM_FMT_ format and G_IM_SIZ_ size (RenderDesc::aim_texture_shapes).
+struct TexShape { uint16_t width, height; uint8_t fmt, siz; };
+
 // The RDRAM model's size (librecomp/addresses.hpp, RECOMP_MEM_SIZE_MB: 16 MB
 // by default on the 3DS; a game with mods baked in above the 16 MB mark sets
 // more, Dinosaur Planet 64): every RDRAM address the renderer takes from a

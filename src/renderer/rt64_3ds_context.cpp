@@ -1416,7 +1416,7 @@ private:
             interp_.set_world_proj_ranges(ranges, n);
             set_cut_min_jump(desc.cut_min_jump);   // RenderDesc::cut_min_jump
             aim_log_ = rt64_3ds::settings().dbg_aim_tex_log != 0 ? 1 : 0;   // every candidate reticle texture's hash logged once
-            interp_.set_aim_hash(desc.aim_texture_count > 0 || aim_log_ == 1);
+            interp_.set_aim_hash(desc.aim_texture_count > 0 || aim_log_ == 1, desc.aim_texture_shapes, desc.aim_texture_shape_count, aim_log_ == 1);
             interp_.set_force_branch_z(desc.force_lod_branch);
             {
                 bool n3ds = false;
@@ -3813,6 +3813,7 @@ public:
         // once and replayed for both eyes, so the zoom (eye-independent) is
         // applied to them here, before they are flushed to the GPU.
         const float cover = rt64_3ds::cover_zoom_factor(sf.sep, geo_);
+        const bool aim_textures = rt64_3ds::aim_textures_on();   // the game's pause (set_aim_textures)
         bool any = false, aim_hit = false;
         float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
         for (size_t i = 0; i < frame_.draws.size(); i++) {
@@ -3842,18 +3843,21 @@ public:
             if (cls == rt64_3ds::StereoClass::World && sf.world_empty) cls = rt64_3ds::StereoClass::Hud;
             uint8_t c = (uint8_t)cls;
             float a, b, e, f;
-            if (d.tex_hash != 0 && d.kind == rt64_3ds::DrawRecord::TexRect && d.rtt < 0) {
+            if (d.tex_hash != 0 && d.rtt < 0 && d.count > 0) {
                 // RenderDesc::aim_texture_hashes: the game's reticle by its
                 // texture (the desktop fork's way; it moves across the
-                // screen), placed at the depth under it.
+                // screen), placed at the depth under it. A rectangle or
+                // orthographic triangles (their vertices in clip space).
                 if (aim_log_ == 1) log_aim_texture(d);
                 bool hit = false;
-                for (size_t k = 0; k < desc.aim_texture_count && !hit; k++) hit = desc.aim_texture_hashes[k] == d.tex_hash;
+                for (size_t k = 0; k < desc.aim_texture_count && !hit && aim_textures; k++) hit = desc.aim_texture_hashes[k] == d.tex_hash;
                 if (hit) {
+                    const bool tris = d.kind == rt64_3ds::DrawRecord::Tris;
                     a = 1e9f; b = -1e9f; e = 1e9f; f = -1e9f;
                     for (uint32_t v = d.first; v < d.first + d.count; v++) {
-                        a = std::min(a, verts[v].x); b = std::max(b, verts[v].x);
-                        e = std::min(e, verts[v].y); f = std::max(f, verts[v].y);
+                        const float x = tris ? verts[v].x / verts[v].w : verts[v].x, y = tris ? verts[v].y / verts[v].w : verts[v].y;
+                        a = std::min(a, x); b = std::max(b, x);
+                        e = std::min(e, y); f = std::max(f, y);
                     }
                     c = kReticle;
                     any = true; aim_hit = true;

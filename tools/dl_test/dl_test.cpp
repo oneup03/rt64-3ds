@@ -85,10 +85,21 @@ int main(int argc, char** argv) {
     if (getenv("DL_RECT_PARITY")) { interp.set_fix_rect_lr(true); interp.set_merge_rect_slices(true); }
     // RenderDesc::scissor_edge_slack (Goemon: 5).
     if (const char* e = getenv("DL_SCISSOR_SLACK")) interp.set_scissor_edge_slack(atoi(e));
-    // DL_AIM_HASH: the candidate reticle rectangles' texture hashes, as the
-    // console's dbg_aim_tex_log prints them (for RenderDesc::aim_texture_hashes).
+    // DL_AIM_HASH: the candidate reticles' texture hashes, as the console's
+    // dbg_aim_tex_log prints them (for RenderDesc::aim_texture_hashes).
+    // DL_AIM_SHAPES=WxH:fmt:siz,...: only those the game's
+    // RenderDesc::aim_texture_shapes let through (DK64: 32x16:0:2,64x64:3:1).
     const bool aim_hash = getenv("DL_AIM_HASH") != nullptr;
-    if (aim_hash) interp.set_aim_hash(true);
+    std::vector<rt64_3ds::TexShape> aim_shapes;
+    if (const char* e = getenv("DL_AIM_SHAPES")) {
+        for (const char* p = e; *p;) {
+            unsigned w = 0, h = 0, fmt = 0, siz = 0;
+            if (sscanf(p, "%ux%u:%u:%u", &w, &h, &fmt, &siz) == 4) aim_shapes.push_back({ (uint16_t)w, (uint16_t)h, (uint8_t)fmt, (uint8_t)siz });
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+    }
+    if (aim_hash) interp.set_aim_hash(true, aim_shapes.data(), aim_shapes.size(), aim_shapes.empty());
     // DL_BOTTOM: the game's touch-screen spans honoured (the HUD row on the
     // touch screen); DL_RENDER then draws the top screen without them and
     // DL_RENDER_BOTTOM the touch screen.
@@ -444,13 +455,16 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < frame.draws.size(); i++) {
             const auto& d = frame.draws[i];
             if (d.tex_hash == 0) continue;
+            // A triangle record's vertices are in clip space.
+            const bool tris = d.kind == rt64_3ds::DrawRecord::Tris;
             float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
             for (uint32_t k = d.first; k < d.first + d.count; k++) {
                 const auto& v = frame.verts[k];
-                x0 = std::min(x0, v.x); x1 = std::max(x1, v.x); y0 = std::min(y0, v.y); y1 = std::max(y1, v.y);
+                const float x = tris ? v.x / v.w : v.x, y = tris ? v.y / v.w : v.y;
+                x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y);
             }
-            printf("aim-tex: %016llx %ux%u fmt %u siz %u tlut %u, draw %zu tex %06x at %.0f,%.0f..%.0f,%.0f\n", (unsigned long long)d.tex_hash,
-                   d.tex[0].width, d.tex[0].height, d.tex[0].fmt, d.tex[0].siz, d.tex[0].tlut_mode, i, d.tex[0].addr, x0, y0, x1, y1);
+            printf("aim-tex: %016llx %ux%u fmt %u siz %u tlut %u, draw %zu %s tex %06x at %.0f,%.0f..%.0f,%.0f\n", (unsigned long long)d.tex_hash,
+                   d.tex[0].width, d.tex[0].height, d.tex[0].fmt, d.tex[0].siz, d.tex[0].tlut_mode, i, tris ? "tris" : "rect", d.tex[0].addr, x0, y0, x1, y1);
         }
     }
 

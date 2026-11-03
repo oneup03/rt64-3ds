@@ -82,8 +82,11 @@ public:
     void set_world_proj_ranges(const ProjIdRange* ranges, int count);
     void set_world_proj_ids(const uint32_t* ids, int count);
     // RenderDesc::aim_texture_hashes (or dbg_aim_tex_log): hash the texels of
-    // every candidate reticle rectangle into DrawRecord::tex_hash.
-    void set_aim_hash(bool on);
+    // every candidate reticle into DrawRecord::tex_hash. With shapes
+    // (RenderDesc::aim_texture_shapes) only textures of those, a rectangle's
+    // or orthographic triangles'; without, rectangles alone. all (the log):
+    // every candidate, triangles too.
+    void set_aim_hash(bool on, const TexShape* shapes = nullptr, size_t shape_count = 0, bool all = false);
     // The game's touch-screen spans (include/rt64_3ds_gbi.h) honoured: their
     // draws get DrawRecord::screen 1, placed in the game's coordinates
     // (RenderDesc::hud_on_bottom_supported with the HUD row on the bottom).

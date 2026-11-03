@@ -330,17 +330,27 @@ struct RenderDesc {
 
     // ---- The aiming reticle, for the depth-aware crosshair.
     //
-    // Textured rectangles whose texels hash to one of these (FNV-1a over the
-    // bytes the tile load reads, and the palette entries of a CI texture:
-    // rt64_3ds_stereo.cpp hash_rect_texture) are the game's aiming reticle:
+    // Textured rectangles (and with aim_texture_shapes, orthographic
+    // triangles) whose texels hash to one of these (FNV-1a over the bytes
+    // the tile load reads, as RDRAM holds them, and the palette entries of
+    // a CI texture: rt64_3ds_dl.cpp hash_texture) are the game's aiming reticle:
     // placed at the depth under it (the aim sampler), as the desktop fork
     // finds its reticle by texture hash (Dinosaur Planet's moving 32x32
     // crosshair). settings.ini's dbg_aim_tex_log logs the hash, size
-    // and format of every candidate (8..64 px, roughly square) to collect
-    // them. None (the default): only DK64's quad heuristic under
-    // first_person_scene().
+    // and format of every candidate (8..64 px, roughly square, and
+    // orthographic triangles with a texture of 8..64 texels a side) to
+    // collect them. None (the default): only DK64's quad heuristic under
+    // first_person_scene(). set_aim_textures pauses the match.
     const uint64_t* aim_texture_hashes = nullptr;
     size_t aim_texture_count = 0;
+    // The shapes of those textures, for a reticle drawn with triangles
+    // (DK64's minigame crosshairs: orthographic quads of a 32x16 RGBA16 or a
+    // 64x64 IA8 texture). Given, only a texture of one of these shapes is
+    // hashed, a rectangle's or orthographic triangles': hashing every HUD
+    // sprite's texels read up to 128 KB a frame in DK64. None: rectangles
+    // alone, every candidate.
+    const TexShape* aim_texture_shapes = nullptr;
+    size_t aim_texture_shape_count = 0;
     // The 3D page's Crosshair row (Settings::crosshair_hud): off for a game
     // with no reticle the renderer places (Goemon), whose row would do
     // nothing.
@@ -426,6 +436,11 @@ Settings& settings();
 // Fed by the game's patches through host functions.
 void set_first_person(bool on);
 bool first_person_scene();
+// RenderDesc::aim_texture_hashes matched (the default), or paused while a
+// texture of the list is drawn as something else (DK64's race arrows are
+// its minigame crosshair's frames).
+void set_aim_textures(bool on);
+bool aim_textures_on();
 
 // Copy a region of the last finished frame (the left eye) into the game's
 // RGBA16 framebuffer in RDRAM, for game code that reads pixels (DK64's fairy
