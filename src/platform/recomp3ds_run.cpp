@@ -324,12 +324,41 @@ void old3ds_quiet_end() {
     }
 }
 
+// Luma3DS's menu combo while the menu is held shut (update_rosalina_throttle),
+// else 0. A combo changed in the menu counts from the next boot, as Luma
+// reports the one it booted with.
+u32 g_rosalina_combo = 0;
+
+// The menu shut or let open: the plugin loader's SetRosalinaMenuBlock, on a
+// port any process may connect to (Luma since v13.0). It takes one session,
+// which a 3GX plugin may want, so none is kept open. Luma clears the block
+// only when a process with a plugin ends: finish_exit clears ours. If it is
+// refused, update_rosalina_throttle goes by the keys alone.
+void set_rosalina_menu_shut(bool shut) {
+    if (g_rosalina_combo == 0) return;
+    Handle port = 0;
+    Result rc = svcConnectToPort(&port, "plg:ldr");
+    if (R_SUCCEEDED(rc)) {
+        u32* cmd = getThreadCommandBuffer();
+        cmd[0] = IPC_MakeHeader(11, 1, 0);
+        cmd[1] = shut ? 1 : 0;
+        rc = svcSendSyncRequest(port);
+        if (R_SUCCEEDED(rc)) rc = (Result)cmd[1];
+        svcCloseHandle(port);
+    }
+    if (R_FAILED(rc)) {
+        fprintf(stderr, "recomp3ds: Rosalina's menu not %s (%08lx)\n", shut ? "held shut" : "let open", (unsigned long)rc);
+        g_rosalina_combo = 0;
+    }
+}
+
 [[noreturn]] void finish_exit() {
     static volatile u32 once = 0;
     if (__atomic_exchange_n(&once, 1u, __ATOMIC_SEQ_CST) != 0) {
         for (;;) svcSleepThread(1000000000ll);    // the other path is already leaving
     }
     park_main_thread();
+    set_rosalina_menu_shut(false);
     fflush(stderr);
     // A frame capture still being written stops between two FS requests
     // (its file stays incomplete): nothing of ours is in flight on the card
@@ -406,31 +435,56 @@ Result set_core1_limit(u32 pct) {
     return rc;
 }
 
-// Luma3DS's Rosalina menu (L+Down+SELECT) runs on core 1, the system core,
-// where the application has up to 80% (more on an Old 3DS: run()). While
-// L+Down is held, before SELECT completes the combo (once the menu is open
-// the application is frozen and can no longer react), the application's
-// share drops to 30%, and goes back a quarter second after they are let
-// go. Called with the keys held each time the main thread scans the pad;
-// returns whether L+Down is held.
+// Luma3DS's Rosalina menu runs on core 1, the system core, where the
+// application has up to 80% (more on an Old 3DS: run()). Entered at that
+// share it has frozen the console; at 30% it has not (why is not known).
+// Once the menu is open the application is frozen and can
+// no longer react, and Rosalina reads the pad every 50 ms, so keys alone lose
+// the race when SELECT is pressed first and L+Down complete the combo. So the
+// menu is held shut (set_rosalina_menu_shut) from before the share goes up:
+// with the whole combo held the share drops to 30% and only then is the menu
+// let open, whatever order the keys came in. A quarter second after they are
+// let go the menu is shut again and only then does the share go back.
+constexpr u32 kRosalinaLimit = 30;
+
+// Before run() raises the application's share of core 1.
+void hold_rosalina_menu_shut() {
+    s64 luma = 0, combo = 0;
+    if (R_FAILED(svcGetSystemInfo(&luma, 0x10000, 0)) || luma == 0) return;   // not Luma3DS
+    svcGetSystemInfo(&combo, 0x10000, 0x101);
+    g_rosalina_combo = combo != 0 ? (u32)combo : (KEY_L | KEY_DDOWN | KEY_SELECT);
+    set_rosalina_menu_shut(true);
+    fprintf(stderr, "recomp3ds: Luma3DS, Rosalina's combo %08lx%s\n", (unsigned long)(combo != 0 ? combo : (KEY_L | KEY_DDOWN | KEY_SELECT)),
+            g_rosalina_combo != 0 ? ", its menu held shut" : "");
+}
+
+// The keys that mean the combo. With the menu not held shut (no Luma3DS, one
+// older than v13.0, a plugin on the port) only L+Down gets the share down
+// before SELECT completes the combo, in that order.
+u32 rosalina_keys() { return g_rosalina_combo != 0 ? g_rosalina_combo : (KEY_L | KEY_DDOWN); }
+
+// Called with the keys held each time the main thread scans the pad; returns
+// whether rosalina_keys() are held.
 bool update_rosalina_throttle(u32 held) {
-    constexpr u32 kRosalinaLimit = 30;
     static bool throttled = false;
     static u64 released = 0;
-    const bool combo = (held & (KEY_L | KEY_DDOWN)) == (KEY_L | KEY_DDOWN);
+    const bool combo = (held & rosalina_keys()) == rosalina_keys();
     if (g_core1_limit <= kRosalinaLimit) return combo;
     if (combo) {
         released = 0;
         if (!throttled) {
             const Result rc = set_core1_limit(kRosalinaLimit);
             throttled = true;
-            fprintf(stderr, "recomp3ds: L+Down (Rosalina): core 1 limit %lu%% (%08lx)\n", (unsigned long)kRosalinaLimit, (unsigned long)rc);
+            fprintf(stderr, "recomp3ds: Rosalina's combo: core 1 limit %lu%% (%08lx)\n", (unsigned long)kRosalinaLimit, (unsigned long)rc);
+            recomp3ds::log_flush();             // on the card should the menu then freeze the console
+            set_rosalina_menu_shut(false);
         }
     }
     else if (throttled) {
         const u64 now = svcGetSystemTick();
         if (released == 0) released = now;
         else if (now - released > SYSCLOCK_ARM11 / 4) {
+            set_rosalina_menu_shut(true);
             const Result rc = set_core1_limit(g_core1_limit);
             throttled = false;
             released = 0;
@@ -581,15 +635,16 @@ void update_gfx_inner() {
         static bool fired = false;
         const u32 held = recomp3ds::input_raw_held() | recomp3ds::autotest_keys();   // settings_menu_update's scan
         if (update_rosalina_throttle(held)) {
-            // L+Down: Rosalina's combo on its way. Its SELECT neither opens
-            // the settings menu nor takes a screenshot.
+            // Rosalina's combo. Its SELECT neither opens the settings menu
+            // nor takes a screenshot, and no screenshot starts while the rest
+            // of the combo may be on its way.
             select_since = 0;
             fired = true;
         }
         else if (held & KEY_SELECT) {
             const u64 now = svcGetSystemTick();
             if (select_since == 0) select_since = now;
-            else if (!fired && now - select_since > SYSCLOCK_ARM11) {
+            else if (!fired && now - select_since > SYSCLOCK_ARM11 && (held & rosalina_keys() & ~KEY_SELECT) == 0) {
                 fired = true;
                 if (recomp3ds::settings_debug_capture()) {
                     rt64_3ds::request_capture();
@@ -1313,6 +1368,7 @@ int recomp3ds::run(const GameDesc& desc) {
             // ignored (a New 3DS, as a CIA and as a .3dsx). The kernel
             // reads 1-89 as a percentage (90 and up as other things); an
             // Old 3DS asks for GameDesc::old3ds_core1_limit first.
+            hold_rosalina_menu_shut();
             u32 limit = 0;
             Result rc = -1;
             const u32 first = is_new_3ds ? 80u : (u32)std::clamp(desc.old3ds_core1_limit, 20, 89);
@@ -1354,6 +1410,11 @@ int recomp3ds::run(const GameDesc& desc) {
                 if (core2) g_sp_core = 1;               // the audio task beside the renderer's core
                 else if (game_on_0) g_gfx_core = g_sp_core = 1;   // two cores: the rest on core 1
                 else g_game_core = 1;                   // two cores: the game on core 1
+            }
+            // No share above the menu's: nothing to hold it shut for.
+            if (g_core1_limit <= kRosalinaLimit) {
+                set_rosalina_menu_shut(false);
+                g_rosalina_combo = 0;
             }
             // Without time on core 1 everything shares core 0.
             g_helper_core = (core2 || game_on_0) && g_core1_granted ? 1 : 0;
