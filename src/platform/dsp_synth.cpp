@@ -206,6 +206,7 @@ volatile uint32_t g_st_decode = 0, g_st_apply = 0;      // ticks decoding sample
 volatile uint32_t g_st_remaps = 0;
 volatile uint32_t g_st_skipped = 0;     // frames built without their commands
 volatile uint32_t g_st_unplayable = 0;  // starts whose wave read_wave refused
+volatile uint32_t g_st_taken = 0;       // channels taken from a voice still playing (find_voice)
 uint32_t g_frames_base = 0;     // g_dsp_frames at the last stats line
 
 // The AI stream's samples a DSP frame plays.
@@ -396,13 +397,27 @@ Voice* find_voice(uint32_t key, bool create) {
     if (!create) return nullptr;
     Voice* pick = nullptr;
     for (Voice& v : g_voices) if (v.ch >= 0 && v.key == 0) { pick = &v; break; }
-    // More voices than channels: the least recently used, a silent one first.
-    for (int pass = 0; pass < 2 && pick == nullptr; pass++) {
+    // More voices than channels (DK64 sounds up to 30 on 23): a silent one,
+    // the least recently used; else the quietest playing, by where its
+    // volume is headed (a release tail goes before a line at full volume).
+    // Not the least recently used playing one: a long sound the game starts
+    // and then leaves alone (King Kut Out's voice) looked oldest within a
+    // second or two while notes and effects kept being updated, and was cut.
+    for (Voice& v : g_voices) {
+        if (v.ch < 0 || v.playing) continue;    // < 0: a channel reserved for the game
+        if (pick == nullptr || v.last_used < pick->last_used) pick = &v;
+    }
+    if (pick == nullptr) {
+        float pick_level = 0.0f;
         for (Voice& v : g_voices) {
-            if (v.ch < 0) continue;             // a channel reserved for the game
-            if (pass == 0 && v.playing) continue;
-            if (pick == nullptr || v.last_used < pick->last_used) pick = &v;
+            if (v.ch < 0) continue;
+            const float level = v.ramp_left > 0.0f ? v.vol_target : v.vol;
+            if (pick == nullptr || level < pick_level || (level == pick_level && v.last_used < pick->last_used)) {
+                pick = &v;
+                pick_level = level;
+            }
         }
+        g_st_taken = g_st_taken + 1;
     }
     if (pick->key != 0) stop_channel(*pick);
     const int ch = pick->ch;
@@ -936,6 +951,8 @@ recomp3ds::DspSynthStats recomp3ds::dsp_synth_take_stats() {
     g_st_skipped = 0;
     s.unplayable = g_st_unplayable;
     g_st_unplayable = 0;
+    s.taken = g_st_taken;
+    g_st_taken = 0;
     uint32_t reverb_ticks = 0;
     recomp3ds::dsp_reverb_take_stats(&reverb_ticks, &s.reverb_gaps);
     s.reverb_us = (uint32_t)((uint64_t)reverb_ticks * 1000000ull / SYSCLOCK_ARM11);

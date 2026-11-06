@@ -92,6 +92,7 @@ struct DspSynthStats {
     uint32_t reverb_gaps;   // times the reverb's output was not ready in time
     uint32_t lists_skipped; // audio frames built without a command list (recomp3ds_synth_skip_build)
     uint32_t unplayable;    // starts whose wave it cannot play (not VADPCM of order 2 or raw PCM16): silent
+    uint32_t taken;         // channels taken from a voice still playing (more voices sounding than channels)
 };
 DspSynthStats dsp_synth_take_stats();
 
