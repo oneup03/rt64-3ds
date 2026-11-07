@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
 #include <ctime>
 #include <unordered_map>
 #include <vector>
@@ -3332,19 +3334,33 @@ public:
         char dir[224];
         rt64_3ds::data_path(dir, sizeof(dir), "screenshots");
         mkdir(dir, 0777);
-        // Named by date and time; a second one within the same second gets
-        // a number.
-        static time_t last_time = 0;
-        static int same_second = 0;
+        // Numbered, then the date and time: 0001_2026-11-07_10-07-10. The
+        // number goes on from the highest already in the folder, over every
+        // run, so a screenshot never overwrites one (the clock alone does not
+        // do: Azahar starts each run at the same time unless told otherwise).
+        static int next_number = 0;
+        if (next_number == 0) {
+            next_number = 1;
+            if (DIR* d = opendir(dir)) {
+                while (const struct dirent* e = readdir(d)) {
+                    int n = 0;
+                    if (sscanf(e->d_name, "%d_", &n) == 1 && n >= next_number) next_number = n + 1;
+                }
+                closedir(d);
+            }
+        }
         const time_t now = time(nullptr);
-        same_second = now == last_time ? same_second + 1 : 0;
-        last_time = now;
         struct tm tm_now;
         localtime_r(&now, &tm_now);
         char stamp[32];
         strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", &tm_now);
-        if (same_second > 0) snprintf(g_shot_name, sizeof(g_shot_name), "%s_%d", stamp, same_second + 1);
-        else snprintf(g_shot_name, sizeof(g_shot_name), "%s", stamp);
+        for (;;) {
+            snprintf(g_shot_name, sizeof(g_shot_name), "%04d_%s", next_number++, stamp);
+            char top[96], path[256];
+            snprintf(top, sizeof(top), "screenshots/%s_top.bmp", g_shot_name);
+            rt64_3ds::data_path(path, sizeof(path), top);
+            if (access(path, F_OK) != 0) break;
+        }
 
         ShotJob* job = new ShotJob{};
         // An eye target: RGBA8 in 8x8 tiles, 30 per tile row, Morton order

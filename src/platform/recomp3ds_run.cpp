@@ -495,7 +495,8 @@ bool update_rosalina_throttle(u32 held) {
 }
 
 // HOME: a quit prompt on the touch screen instead of the HOME Menu (as in
-// the Sonic R port). A quits; B (or HOME again) resumes. The HOME Menu is
+// the Sonic R port). X quits (not A, which the game's own menus confirm
+// with: a press meant for them must not quit); B (or HOME again) resumes. The HOME Menu is
 // not offered: coming back from it froze the GPU queue on the console.
 // While the prompt is up the game is held (the renderer takes no display
 // list, so the game waits on its current one), its input is blocked and its
@@ -514,7 +515,7 @@ void draw_home_prompt(bool show) {
         recomp3ds::screen_printf("\x1b[%d;0H----------------------------------------", kRow);
         recomp3ds::screen_printf("\x1b[%d;0H  Quit %-33s", kRow + 1, g_desc != nullptr ? g_desc->render.game_name : "the game");
         // With no HOME Menu behind the game, quitting restarts the console.
-        recomp3ds::screen_printf("\x1b[%d;0H  %-38s", kRow + 2, g_no_home_menu ? "A: quit and restart   B: resume" : "A: quit   B: resume");
+        recomp3ds::screen_printf("\x1b[%d;0H  %-38s", kRow + 2, g_no_home_menu ? "X: quit and restart   B: resume" : "X: quit   B: resume");
         recomp3ds::screen_printf("\x1b[%d;0H----------------------------------------", kRow + 3);
     }
     else {
@@ -543,7 +544,7 @@ bool home_prompt() {
         const u32 down = keys & ~prev;
         prev = keys;
         if (aptCheckHomePressRejected() || take_power_press() || recomp3ds::autotest_take_home()) break;
-        if (down & KEY_A) { quit = true; break; }
+        if (down & KEY_X) { quit = true; break; }
         if (down & KEY_B) break;
         svcSleepThread(16 * 1000000ll);
     }
@@ -664,13 +665,17 @@ void update_gfx_inner() {
         }
         // The capture writer's news: saving, progress, saved, refused (one
         // is still being written), failed or stalled.
+        // A final line (saved, failed, refused) goes away after 10 s; one
+        // still in progress stays until the next.
         static int shown_seq = 0, shown_shot = 0;
+        static u64 clear_at = 0;
         int seq = 0;
         const char* capture_line = rt64_3ds::capture_message(&seq);
         if (seq != shown_seq) {
             shown_seq = seq;
             recomp3ds::screen_printf("\x1b[28;0H%-39.39s", capture_line);
             gfxFlushBuffers();
+            clear_at = rt64_3ds::capture_state() >= 2 ? svcGetSystemTick() + 10ull * SYSCLOCK_ARM11 : 0;
         }
         const int shot = rt64_3ds::screenshot_state();
         if (shot >= 2 && shown_shot != shot) {
@@ -679,8 +684,14 @@ void update_gfx_inner() {
             else snprintf(line, sizeof(line), "Screenshot failed");
             recomp3ds::screen_printf("\x1b[28;0H%-39.39s", line);
             gfxFlushBuffers();
+            clear_at = svcGetSystemTick() + 10ull * SYSCLOCK_ARM11;
         }
         shown_shot = shot;
+        if (clear_at != 0 && svcGetSystemTick() >= clear_at) {
+            clear_at = 0;
+            recomp3ds::screen_printf("\x1b[28;0H%-39s", "");
+            gfxFlushBuffers();
+        }
     }
     g_main_stage = 6;
     // Once a second: frame rate and CPU load to the log and the touch screen.

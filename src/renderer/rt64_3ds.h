@@ -547,7 +547,8 @@ void request_capture_pair();
 
 // A screenshot of what is on the screens: the top screen's eyes (the right
 // one only when the frame was drawn in 3D) and the touch screen, as BMPs in
-// the game's folder under screenshots/, named by date and time.
+// the game's folder under screenshots/, numbered on from the highest
+// there (never overwriting one) and then the date and time.
 void request_screenshot();
 int screenshot_state(); // 0 none, 1 being written, 2 written, 3 failed
 const char* screenshot_name();      // the last one's name, without _top.bmp etc.
