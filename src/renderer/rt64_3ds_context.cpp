@@ -3637,8 +3637,12 @@ public:
     // convergence and what it measured; the game's frames move them on.
     rt64_3ds::StereoFrame finish_stereo_frame(rt64_3ds::StereoFrame sf, bool hold = false) {
         const rt64_3ds::Settings& st = rt64_3ds::settings();
+        // The setting's convergence, under the game's cap when it sets one
+        // (set_convergence_cap); auto convergence only comes nearer.
+        const float cap = rt64_3ds::convergence_cap();
+        const float manual = cap > 0.0f ? std::min(cap, (float)st.convergence_hundredths * 0.2f) : (float)st.convergence_hundredths * 0.2f;
         if (hold) {
-            sf.conv = held_sf_.conv > 0.0f ? held_sf_.conv : (float)st.convergence_hundredths * 0.2f;
+            sf.conv = held_sf_.conv > 0.0f ? std::min(held_sf_.conv, manual) : manual;
             sf.world_empty = sf.on && held_sf_.world_empty;
             if (sf.on && st.hud_depth != 50) rt64_3ds::set_hud_terms(sf, st.hud_depth, slider_, st.slider_gain);
             if (rt64_3ds::render_desc().snap_hud_shift) sf.px_scale = geo_.scale_x;
@@ -3647,7 +3651,6 @@ public:
             sf.aim_ndc = held_sf_.aim_ndc;
             return sf;
         }
-        const float manual = (float)st.convergence_hundredths * 0.2f;
         sf.conv = manual;
         near_z_ = -1.0f;
         if (sf.on && st.auto_convergence) {

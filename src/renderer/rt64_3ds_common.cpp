@@ -11,6 +11,7 @@ rt64_3ds::RenderDesc g_desc{};
 rt64_3ds::Settings g_settings{};
 rt64_3ds::FrameStats g_stats{};
 volatile bool g_first_person = false;
+volatile float g_convergence_cap = 0.0f;
 volatile bool g_aim_textures = true;
 std::atomic<u64> g_keep_frames_until{0};   // keep_frames' lease: its end, in system ticks
 char g_data_dir[160] = "sdmc:/3ds";
@@ -32,6 +33,8 @@ const rt64_3ds::FrameStats& rt64_3ds::stats() { return g_stats; }
 rt64_3ds::FrameStats& rt64_3ds::mutable_stats() { return g_stats; }
 void rt64_3ds::set_first_person(bool on) { g_first_person = on; }
 bool rt64_3ds::first_person_scene() { return g_first_person; }
+void rt64_3ds::set_convergence_cap(float units) { g_convergence_cap = units > 0.0f ? units : 0.0f; }
+float rt64_3ds::convergence_cap() { return g_convergence_cap; }
 void rt64_3ds::set_aim_textures(bool on) { g_aim_textures = on; }
 bool rt64_3ds::aim_textures_on() { return g_aim_textures; }
 void rt64_3ds::keep_frames(int ms) { g_keep_frames_until = svcGetSystemTick() + (u64)ms * (SYSCLOCK_ARM11 / 1000); }
