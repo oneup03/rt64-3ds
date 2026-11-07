@@ -305,7 +305,7 @@ private:
                 int idx = py * cur_->w + px;
                 if (zcmp) {
                     if (zmode == 3) { if (z > cur_->depth[idx] + 0.002f) continue; }
-                    else if (z > cur_->depth[idx]) continue;
+                    else if (z >= cur_->depth[idx]) continue;          // strictly nearer, as the console's GPU_GREATER
                 }
                 float u = p0 * a.u + p1 * b.u + p2 * c.u, v = p0 * a.v + p1 * b.v + p2 * c.v;
                 C4 sh = { clamp255((int)(p0 * a.r + p1 * b.r + p2 * c.r)), clamp255((int)(p0 * a.g + p1 * b.g + p2 * c.g)),

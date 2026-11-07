@@ -3065,7 +3065,13 @@ private:
         // what copy-mode alpha compares test (the eye's alpha is whatever
         // the combiner put out).
         if (frame_viewport_) wmask = (GPU_WRITEMASK)(wmask & ~GPU_WRITE_ALPHA);
-        C3D_DepthTest(zcmp, zcmp ? GPU_GEQUAL : GPU_ALWAYS, wmask);
+        // Strictly nearer, as RT64 has it (LESS; nearer is larger here): a
+        // surface drawn again exactly over itself loses. DK64's Galleon gold
+        // stacks draw each top twice, textured and then untextured on the
+        // same vertices, and the N64 keeps the first (with full coverage
+        // already there its compare is strict). Decals are moved nearer by
+        // the depth map above, so they still pass.
+        C3D_DepthTest(zcmp, zcmp ? GPU_GREATER : GPU_ALWAYS, wmask);
 
         // Blending: force-blend with memory colour by source alpha.
         const bool blend = draw_blends(d);
