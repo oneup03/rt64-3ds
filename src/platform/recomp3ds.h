@@ -264,6 +264,11 @@ const char* base_path();
 // Whether the C-Stick also presses the C buttons (on by default). A game
 // that reads the C-Stick as an analog camera turns it off.
 void input_set_cstick_buttons(bool on);
+// The D-pad as the stick (off by default): while on, a held D-pad direction
+// pushes the stick fully that way, the Circle Pad's reading ignored, and the
+// D-pad presses no buttons. For a game's digital-control scenes (DK64's
+// arcade games, Donkey Kong and Jetpac). Any thread.
+void input_set_dpad_stick(bool on);
 // GameDesc::cstick_camera_analog_x: whether the Controls page's C-Stick row
 // is on Camera, so the game turns its camera from the C-Stick's left and
 // right itself. Any thread.

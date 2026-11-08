@@ -38,6 +38,7 @@ struct HidLock {
     HidLock() { LightLock_Init(&lock); }
 } g_hid;
 volatile bool g_cstick_buttons = true;
+volatile bool g_dpad_stick = false;       // input_set_dpad_stick
 volatile bool g_cstick_up = true;       // C-Stick up presses C-Up (settings menu)
 volatile bool g_cstick_down = true;     // C-Stick down presses C-Down (settings menu)
 volatile float g_stick_dz = 0.05f, g_cstick_dz = 0.20f;
@@ -231,6 +232,7 @@ void recomp3ds::input_set_user_buttons(const uint16_t* n64_per_key) {
 }
 
 void recomp3ds::input_set_cstick_buttons(bool on) { g_cstick_buttons = on; }
+void recomp3ds::input_set_dpad_stick(bool on) { g_dpad_stick = on; }
 void recomp3ds::input_set_cstick_camera(uint16_t hold, uint16_t lead_ms, uint16_t press_ms, uint16_t period_ms) {
     g_cam_cfg.store(uint64_t(hold) | (uint64_t(lead_ms) << 16) | (uint64_t(press_ms) << 32) | (uint64_t(period_ms) << 48));
 }
@@ -376,7 +378,9 @@ bool recomp3ds::input_get(int controller_num, uint16_t* buttons, float* x, float
         return false;
     }
     uint16_t b = 0;
-    const u32 h = g_held & ~settings_menu_keys();
+    const bool dpad_stick = g_dpad_stick;
+    const u32 dpad = KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT;
+    const u32 h = g_held & ~settings_menu_keys() & (dpad_stick ? ~dpad : ~0u);
     const MapRef m = g_map.load();
     for (uint32_t i = 0; i < m.count; i++) {
         if (h & m.map[i].keys) b |= m.map[i].n64;
@@ -399,6 +403,11 @@ bool recomp3ds::input_get(int controller_num, uint16_t* buttons, float* x, float
     b |= touch_pad_held();
     *buttons = b;
     stick_value(g_cpad, g_stick_dz, x, y);
+    if (dpad_stick && (g_held & ~settings_menu_keys() & dpad) != 0) {
+        const u32 d = g_held & ~settings_menu_keys();
+        *x = (d & KEY_DRIGHT) ? 1.0f : (d & KEY_DLEFT) ? -1.0f : 0.0f;
+        *y = (d & KEY_DUP) ? 1.0f : (d & KEY_DDOWN) ? -1.0f : 0.0f;
+    }
     return true;
 }
 
