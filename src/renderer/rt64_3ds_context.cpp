@@ -3653,12 +3653,12 @@ public:
     // convergence and what it measured; the game's frames move them on.
     rt64_3ds::StereoFrame finish_stereo_frame(rt64_3ds::StereoFrame sf, bool hold = false) {
         const rt64_3ds::Settings& st = rt64_3ds::settings();
-        // The setting's convergence, under the game's cap when it sets one
-        // (set_convergence_cap); auto convergence only comes nearer.
-        const float cap = rt64_3ds::convergence_cap();
-        const float manual = cap > 0.0f ? std::min(cap, (float)st.convergence_hundredths * 0.2f) : (float)st.convergence_hundredths * 0.2f;
+        // The game's own convergence for the scene when it sets one
+        // (set_scene_convergence), in place of the setting's and auto's.
+        const float scene = rt64_3ds::scene_convergence();
+        const float manual = scene > 0.0f ? scene : (float)st.convergence_hundredths * 0.2f;
         if (hold) {
-            sf.conv = held_sf_.conv > 0.0f ? std::min(held_sf_.conv, manual) : manual;
+            sf.conv = scene > 0.0f ? scene : held_sf_.conv > 0.0f ? held_sf_.conv : manual;
             sf.world_empty = sf.on && held_sf_.world_empty;
             if (sf.on && st.hud_depth != 50) rt64_3ds::set_hud_terms(sf, st.hud_depth, slider_, st.slider_gain);
             if (rt64_3ds::render_desc().snap_hud_shift) sf.px_scale = geo_.scale_x;
@@ -3669,7 +3669,7 @@ public:
         }
         sf.conv = manual;
         near_z_ = -1.0f;
-        if (sf.on && st.auto_convergence) {
+        if (sf.on && st.auto_convergence && scene <= 0.0f) {
             if (prev_cam_world_) {
                 const float zp = rt64_3ds::near_depth_statistic(depth_grid_, grid_cols_, grid_rows_, rt64_3ds::render_desc().autoconv.region_bottom);
                 near_z_ = zp > 0.0f ? rt64_3ds::view_depth(zp, prev_m22_, prev_m32_) : -1.0f;

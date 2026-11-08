@@ -436,13 +436,13 @@ Settings& settings();
 // Fed by the game's patches through host functions.
 void set_first_person(bool on);
 bool first_person_scene();
-// A scene held at a low convergence: while set above 0, the convergence (in
-// world units) is at most this, manual or auto, so what is nearer than the
-// auto measure's reach stays near the screen instead of popping out (DK64's
-// bonus barrel games: the player's barrel cannon, in the bottom strip the
-// measure leaves out). 0, the default: off.
-void set_convergence_cap(float units);
-float convergence_cap();
+// A scene held at a set convergence: while set above 0, the convergence is
+// exactly this many world units, manual or auto (auto convergence starts
+// over when it ends), for a scene the measure gets wrong (DK64's bonus
+// barrel games: the player's barrel cannon sits in the bottom strip it
+// leaves out, and popped out of the screen). 0, the default: off.
+void set_scene_convergence(float units);
+float scene_convergence();
 // RenderDesc::aim_texture_hashes matched (the default), or paused while a
 // texture of the list is drawn as something else (DK64's race arrows are
 // its minigame crosshair's frames).
