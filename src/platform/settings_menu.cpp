@@ -393,6 +393,7 @@ bool mod_required(const std::string& id) {
 // GameDesc::mod_choice_*: built-in mods that don't work together, on one row.
 std::string g_mod_choice_label, g_mod_choice_off;
 std::vector<std::string> g_mod_choice_ids, g_mod_choice_names;
+int g_mod_choice_default = -1;      // GameDesc::mod_choice_default
 int in_mod_choice(const std::string& id) {
     for (size_t i = 0; i < g_mod_choice_ids.size(); i++) if (g_mod_choice_ids[i] == id) return (int)i;
     return -1;
@@ -409,13 +410,17 @@ bool choice_dependency(const std::vector<recomp::mods::ModDetails>& mods, const 
     return false;
 }
 #endif
-// The one of them settings.ini has on (the first, should it have several), or -1.
+// The one of them settings.ini has on (the first, should it have several), or
+// -1; the game's default while it has none of their keys.
 int saved_mod_choice() {
+    bool saved = false;
     for (size_t i = 0; i < g_mod_choice_ids.size(); i++) {
         const auto on = g_mod_values.find("mod." + g_mod_choice_ids[i]);
-        if (on != g_mod_values.end() && on->second != 0) return (int)i;
+        if (on == g_mod_values.end()) continue;
+        if (on->second != 0) return (int)i;
+        saved = true;
     }
-    return -1;
+    return saved ? -1 : g_mod_choice_default;
 }
 LightLock g_file_lock;
 
@@ -980,6 +985,7 @@ void recomp3ds::settings_menu_init(const char* base_path, const GameDesc& desc) 
     g_mod_choice_off = desc.mod_choice_off_name != nullptr ? desc.mod_choice_off_name : "Off";
     g_mod_choice_ids.clear();
     g_mod_choice_names.clear();
+    g_mod_choice_default = (desc.mod_choice_default >= 0 && (size_t)desc.mod_choice_default < desc.mod_choice_count) ? desc.mod_choice_default : -1;
     for (size_t i = 0; i < desc.mod_choice_count; i++) {
         g_mod_choice_ids.push_back(desc.mod_choice_ids[i]);
         g_mod_choice_names.push_back(desc.mod_choice_names != nullptr ? desc.mod_choice_names[i] : desc.mod_choice_ids[i]);

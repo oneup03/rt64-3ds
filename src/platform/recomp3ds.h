@@ -123,6 +123,10 @@ struct GameDesc {
     const char* const* mod_choice_ids = nullptr;
     const char* const* mod_choice_names = nullptr;
     size_t mod_choice_count = 0;
+    // The choice (an index into mod_choice_ids; -1 none) while settings.ini
+    // holds none of their keys: a first start, before the row was ever
+    // changed. Off once chosen stays off (Goemon's Redub, on by default).
+    int mod_choice_default = -1;
     // Optional: a mod was switched on or off on the Mods page (it takes
     // effect at once), e.g. to give a mod's key a button.
     void (*on_mod_switched)(const char* mod_id, bool on) = nullptr;
