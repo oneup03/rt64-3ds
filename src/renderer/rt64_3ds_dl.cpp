@@ -2148,7 +2148,7 @@ struct Interpreter::Impl {
                 s.draw = draw;
                 s.first_tri = (uint32_t)ip->tris.size();
                 s.uv_first = (uint32_t)ip->tri_uv.size();
-                s.ss = shift_scale(tl.shifts); s.st = shift_scale(tl.shiftt);
+                s.ss = tri_shift_scale(tl.shifts); s.st = tri_shift_scale(tl.shiftt);
                 s.uls = (float)(tl.uls >> 2); s.ult = (float)(tl.ult >> 2);
                 s.zprim = (othermode_l & G_ZS_PRIM) != 0 ? prim_z_tri() : -1.0f;
                 s.tile = tile_cur;
@@ -2177,7 +2177,7 @@ struct Interpreter::Impl {
         const Tile& tl = tiles[texture.tile & 7];
         // (tile_du/dv: the in-between frame's tile scroll, else 0.)
         const float uls = (float)(tl.uls >> 2) + tile_du[0], ult = (float)(tl.ult >> 2) + tile_dv[0];
-        const float ss = shift_scale(tl.shifts), st = shift_scale(tl.shiftt);
+        const float ss = tri_shift_scale(tl.shifts), st = tri_shift_scale(tl.shiftt);
         const bool snap = r->tex[0].snapshot;
         output_tri(TriSink{ &out->verts, &r->count, &stats->tris, &stats->clipped, &stats->tris_lost_vbo, screen_w, screen_h, no_near_clip },
                    a, b, c, cull_bits(), ss, st, uls, ult,
@@ -2200,7 +2200,7 @@ struct Interpreter::Impl {
             defer_key_draw = draw;
             defer_key_state = state_seq;
             const Tile& tl = tiles[texture.tile & 7];
-            D.runs[D.nruns++] = { draw, D.ntris, shift_scale(tl.shifts), shift_scale(tl.shiftt),
+            D.runs[D.nruns++] = { draw, D.ntris, tri_shift_scale(tl.shifts), tri_shift_scale(tl.shiftt),
                                   (float)(tl.uls >> 2) + tile_du[0], (float)(tl.ult >> 2) + tile_dv[0],
                                   (othermode_l & G_ZS_PRIM) != 0 ? prim_z_tri() : -1.0f, cull_bits(), 0, 0 };
         }
@@ -2216,7 +2216,7 @@ struct Interpreter::Impl {
     bool tri_inside_image(int i0, int i1, int i2) {
         const Tile& tl = tiles[texture.tile & 7];
         const float uls = (float)(tl.uls >> 2), ult = (float)(tl.ult >> 2);
-        const float ss = shift_scale(tl.shifts), st = shift_scale(tl.shiftt);
+        const float ss = tri_shift_scale(tl.shifts), st = tri_shift_scale(tl.shiftt);
         const int idx[3] = { i0, i1, i2 };
         for (int k = 0; k < 3; k++) {
             const LoadedVertex& lv = slot(idx[k]);
@@ -2332,6 +2332,13 @@ struct Interpreter::Impl {
                                                1.0f / 256, 1.0f / 512, 1.0f / 1024, 32.0f, 16.0f, 8.0f, 4.0f, 2.0f };
         return kShiftScale[s & 15];
     }
+    // A triangle's shift scale: with texture perspective off (G_TP_NONE) the
+    // RDP samples a triangle at half its coordinates, which games allow for
+    // (RT64's perspCorrectionMod, as the hardware does; rectangles are not
+    // halved). Goemon's ending draws its space backdrop as quads of 32x64
+    // tiles cut 30x60 apart, coordinates 0..60 x 0..120: taken whole, three
+    // quarters of each quad sampled past the clamped tile, as streaks.
+    float tri_shift_scale(int s) const { return (othermode_h & (1u << 19)) ? shift_scale(s) : 0.5f * shift_scale(s); }
 
     // Rectangles are emitted in N64 pixels with w = 1. An anchored edge moves
     // by its offset and by its origin's place in the frame (RT64's
