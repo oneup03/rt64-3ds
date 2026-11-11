@@ -1477,6 +1477,10 @@ gEX3DSTopScreen(gfx++);                // back to the top screen (a list's end d
   framebuffer; a frame whose touch-screen draws and text are unchanged is
   skipped (redrawn every 30 frames anyway). 300 KB of VRAM, a 256 KB
   texture for the text.
+- `RenderDesc::hud_bottom_background`: a 320x240 RGB565 image (top row
+  first) drawn behind the game's touch-screen draws, in place of black;
+  256 KB of linear memory. Banjo's is a darkened jiggy-puzzle crop
+  (`platform/3ds/hud_background.png`, embedded with `.incbin`).
 - The console (status lines, touch buttons, alerts) writes a copy of its
   framebuffer while the renderer has the screen (`screen_bottom_update`,
   log.cpp). The settings menu, the HOME prompt and a fatal error take the

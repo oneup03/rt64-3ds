@@ -87,6 +87,10 @@ struct RenderDesc {
     // the Game page's HUD row (Settings::hud_on_bottom) puts those draws
     // there or leaves them on the top screen.
     bool hud_on_bottom_supported = false;
+    // Drawn behind that HUD on the touch screen: 320x240 RGB565 pixels, the
+    // top row first, left to right (the console's text still goes over it).
+    // None (the default): black.
+    const uint16_t* hud_bottom_background = nullptr;
     const uint32_t* snapshot_buffers = nullptr;   // RDRAM addresses the game copies frames into
     size_t snapshot_count = 0;
     // Write the rendered depth back into the game's RDRAM depth buffer each

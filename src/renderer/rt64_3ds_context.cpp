@@ -4333,6 +4333,8 @@ public:
     float bottom_scale_ = 1.0f, bottom_ox_ = 0.0f, bottom_oy_ = 0.0f;
     C3D_Tex con_tex_{};             // the console's text, 512x256 RGBA4, black see-through
     bool con_tex_ok_ = false;
+    C3D_Tex bg_tex_{};              // RenderDesc::hud_bottom_background, 512x256 RGB565
+    bool bg_tex_ok_ = false;
     bool bottom_shown_ = false;     // the last game frame drew it
     uint32_t bottom_hash_ = 0;
     int bottom_same_ = 0;           // game frames it was skipped for since
@@ -4344,8 +4346,27 @@ public:
             flush_dcache(con_tex_.data, 512 * 256 * 2);
             C3D_TexSetFilter(&con_tex_, GPU_NEAREST, GPU_NEAREST);
         }
-        fprintf(stderr, "rt64-3ds: touch-screen target %s, console texture %s (VRAM left %u KB)\n", bottom_ != nullptr ? "ready" : "FAILED",
-                con_tex_ok_ ? "ready" : "FAILED", (unsigned)(vramSpaceFree() / 1024));
+        const uint16_t* bg = rt64_3ds::render_desc().hud_bottom_background;
+        if (bg != nullptr && (bg_tex_ok_ = C3D_TexInit(&bg_tex_, 512, 256, GPU_RGB565))) {
+            memset(bg_tex_.data, 0, 512 * 256 * 2);
+            uint16_t* dst = (uint16_t*)bg_tex_.data;
+            for (int y = 0; y < 240; y++) {
+                for (int x = 0; x < 320; x++) tiled_texel(dst, x, y) = bg[y * 320 + x];
+            }
+            flush_dcache(dst, 512 * 256 * 2);
+            C3D_TexSetFilter(&bg_tex_, GPU_NEAREST, GPU_NEAREST);
+        }
+        fprintf(stderr, "rt64-3ds: touch-screen target %s, console texture %s, background %s (VRAM left %u KB)\n", bottom_ != nullptr ? "ready" : "FAILED",
+                con_tex_ok_ ? "ready" : "FAILED", bg == nullptr ? "none" : bg_tex_ok_ ? "ready" : "FAILED", (unsigned)(vramSpaceFree() / 1024));
+    }
+    // A 512x256 texture's texel for the touch screen's (x, y), y down from
+    // the top (rows flipped, as the texture cache's; 8x8 tiles, Morton order
+    // inside).
+    static uint16_t& tiled_texel(uint16_t* tex, int x, int y) {
+        const int yd = 255 - y;
+        const unsigned mx = (x & 1) | ((x & 2) << 1) | ((x & 4) << 2);
+        const unsigned my = ((yd & 1) << 1) | ((yd & 2) << 2) | ((yd & 4) << 3);
+        return tex[(yd >> 3) * (512 / 8) * 64 + (x >> 3) * 64 + (my | mx)];
     }
     void bottom_geometry() {
         const float k = std::min(320.0f / (float)geo_.w, 240.0f / (float)geo_.h);
@@ -4402,7 +4423,9 @@ public:
         }
         flush_dcache(dst, 512 * 256 * 2);
     }
-    void draw_console(GpuVertex* q, uint32_t first) {
+    // A texture over the whole touch screen (the console's text, the
+    // background), its 320x240 in the corner of a 512x256 tex, blended by its alpha.
+    void draw_screen_quad(C3D_Tex* tex, GpuVertex* q, uint32_t first) {
         const float l = -bottom_ox_, r = (float)geo_.w + bottom_ox_, t = -bottom_oy_, b = (float)geo_.h + bottom_oy_;
         const float xs[6] = { l, r, r, l, r, l }, ys[6] = { t, t, b, t, b, b };
         const float us[6] = { 0.0f, 320.0f, 320.0f, 0.0f, 320.0f, 0.0f }, vs[6] = { 0.0f, 0.0f, 240.0f, 0.0f, 240.0f, 240.0f };
@@ -4415,7 +4438,7 @@ public:
             else C3D_TexEnvSrc(env, C3D_Both, GPU_PREVIOUS, GPU_PREVIOUS, GPU_PREVIOUS);
             C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
         }
-        C3D_TexBind(0, &con_tex_);
+        C3D_TexBind(0, tex);
         C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uvscale_, 1.0f / 512.0f, 1.0f / 256.0f, 0.0f, 0.0f);
         C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
         C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
@@ -4432,7 +4455,8 @@ public:
         GX_DisplayTransfer((u32*)src, GX_BUFFER_DIM(240, 320), (u32*)dst, GX_BUFFER_DIM(240, 320), kFlags);
     }
     // After a game frame's eyes (vb: its vertices, n of them; the six after
-    // them the ghost quad's, the six after those the console's).
+    // them the ghost quad's, the six after those the console's, then the
+    // background's).
     void bottom_pass(GpuVertex* vb, size_t n) {
         if (bottom_ == nullptr || !g_bottom_on.load(std::memory_order_relaxed)) {
             bottom_shown_ = false;
@@ -4458,13 +4482,18 @@ public:
         C3D_FVUnifSet(GPU_VERTEX_SHADER, u_eye_, 1.0f, 0.0f, 0.0f, 0.0f);
         last_sa_ = last_sb_ = 0.0f;
         set_cull(GPU_CULL_NONE);
+        // The background first (the six vertices after the console's).
+        if (bg_tex_ok_ && n + 18 <= kVboVerts) {
+            draw_screen_quad(&bg_tex_, vb + n + 12, (uint32_t)(n + 12));
+            forget_draw_state();
+        }
         for (size_t i = 0; i < frame_.draws.size(); i++) {
             const rt64_3ds::DrawRecord& d = frame_.draws[i];
             if (d.screen == 0 || d.count < 3 || d.first + d.count > n) continue;
             apply_state(d, i, nullptr);
             C3D_DrawArrays(GPU_TRIANGLES, d.first, d.count);
         }
-        if (con_tex_ok_ && g_bottom_console != nullptr && n + 12 <= kVboVerts) draw_console(vb + n + 6, (uint32_t)(n + 6));
+        if (con_tex_ok_ && g_bottom_console != nullptr && n + 12 <= kVboVerts) draw_screen_quad(&con_tex_, vb + n + 6, (uint32_t)(n + 6));
         forget_draw_state();
         // To the screen, after the draws on the GX queue (or the deferred frame's).
         close_segment();
