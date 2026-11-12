@@ -1469,30 +1469,90 @@ gEX3DSTopScreen(gfx++);                // back to the top screen (a list's end d
   (1:1 for 320x240, 292x216 with borders), moved by the span's dx, dy:
   one span for a whole HUD, or one per piece to place the pieces apart.
   Spans are many per list if need be.
-- Those draws (`DrawRecord::screen`) leave the eyes and every top-screen
+- Those draws (`DrawRecord::screen`) leave the eyes, the in-betweens
+  (`build_inbetween` builds none of their triangles) and every top-screen
   decision (reticle, auto-convergence, the world camera, depth). The
-  renderer draws them once per game frame (not on the in-betweens) into a
-  320x240 target with a depth buffer of its own, the console's text over
-  them (black see-through), and copies that into the touch screen's
-  framebuffer; a frame whose touch-screen draws and text are unchanged is
-  skipped (redrawn every 30 frames anyway). 300 KB of VRAM, a 256 KB
-  texture for the text.
+  renderer draws them once per game frame into a 320x240 target with a
+  depth buffer of its own, the console's text over them, and copies that
+  into the touch screen's framebuffer (`bottom_pass`). The CPU only says
+  what to draw; the rest is the GPU's:
+  - Only the strip of screen columns that changed is redrawn and copied:
+    in the tilted 240x320 layout a screen column is a row of the buffers,
+    so a strip is one run of 8x8-tile rows. Each draw is compared with the
+    last game frame's (state, textures by address, vertices); the strip
+    covers the changed draws where they were and where they are, to 8
+    columns. The whole screen when the text, the fills, the frame's
+    geometry or the number of draws changed, or the strip is 256 columns
+    or more, and every 30 game frames (a texture rewritten in place shows
+    then); a frame with nothing changed is skipped. Banjo in Spiral
+    Mountain (Azahar): 92% of game frames a strip of about 120 columns
+    (the life icon to the spinning jiggy and Mumbo token), the rest whole
+    (the 30-frame refresh, the performance monitor's line once a second).
+    DK64 in play redraws whole every game frame: its melons bob on the
+    right and its icons spin on the left, so the changed columns span
+    about 12 to 309. A HUD that animates at both edges gets no strip; one
+    whose motion stays on one side does. TEXEL1's coordinates count only
+    for a draw that samples a TEXEL1: otherwise they're whatever the next
+    tile was left with (in DK64 that changed every frame, and made every
+    rectangle look changed).
+  - The console's text reaches its texture through the GX transfer engine
+    when it changed (a display transfer tiles it, a texture copy pads it
+    to the texture's 256 texels), and the combiner makes its black
+    see-through: alpha is 4 x (r + g + b), so every colour of libctru's
+    palette is opaque and black is dropped by the alpha test, nothing
+    blended.
+  - The touch screen takes at most seven GX operations a game frame of
+    citro3d's 32 (two only when the text changed: its transfer and copy;
+    one only when a picture set at run time changed: its transfer; the
+    background's copy, the depth fill when a draw uses depth, the draws,
+    the copy to the screen).
+  300 KB of VRAM; in linear memory a 256 KB texture for the text, 150 KB
+  for its tiled copy and the console's own 150 KB copy (log.cpp).
 - `RenderDesc::hud_bottom_background`: a 320x240 RGB565 image (top row
-  first) drawn behind the game's touch-screen draws, in place of black;
-  256 KB of linear memory. Banjo's is a darkened jiggy-puzzle crop
+  first) behind the game's touch-screen draws, in place of black. It is
+  tiled once at start into the target's own layout (150 KB of linear
+  memory), and the transfer engine copies the strip being redrawn from it.
+  Banjo's is a darkened jiggy-puzzle crop
   (`platform/3ds/hud_background.png`, embedded with `.incbin`).
+- `RenderDesc::hud_bottom_background_at_run_time`: the picture comes from
+  the game while it runs instead (`rt64_3ds::set_bottom_background`, the
+  same 320x240 RGB565 layout, from any thread; only a change counts), for
+  one built from the game's own data. It shows only in the game frames
+  whose list carries `gEX3DSBottomBackground` (once anywhere in it), black
+  in the rest, so a HUD that hides takes its backdrop with it. The renderer
+  turns it into the screen's linear layout in a staging buffer and the
+  transfer engine tiles it, queued with the frame's other GX operations: a
+  frame still on its way reads the old picture whole; a newer picture waits
+  four game frames for the staging buffer. 300 KB of linear memory, set
+  aside at start. DK64's is the main menu's leaves, kept as the menu draws
+  them (`patches/hud_3ds.c`): in place of 48 rectangles and 8 texture loads
+  in every frame's list, one marker (Azahar, in play: the touch screen's
+  CPU time 1.3 to 0.7 ms a game frame as a New 3DS, 1.45 to 0.8 as an Old
+  one; the picture's making about 1.5 ms once). Goemon's is the pause
+  screen's blue diamonds, a 16x16 tile in 8-line bands darkened down the
+  screen (`patches/hud_backdrop.c`): in place of 30 band rectangles a frame
+  (Azahar, New 3DS: a whole redraw 1.3 to 0.8 ms, an unchanged frame's
+  comparison 0.27 to 0.18). `tools/dl_test` doesn't
+  draw it (`DL_RENDER_BOTTOM` shows black behind those frames).
 - The console (status lines, touch buttons, alerts) writes a copy of its
-  framebuffer while the renderer has the screen (`screen_bottom_update`,
-  log.cpp). The settings menu, the HOME prompt and a fatal error take the
-  screen back once the renderer's last copy is done (150 ms); closing the
-  menu hands it over again.
+  framebuffer in linear memory while the renderer has the screen
+  (`screen_bottom_update`, log.cpp; reserved at boot by
+  `screen_reserve_shadow`, before other threads allocate linear memory:
+  libctru's linear allocator has no lock). The GPU reads it, so the core that
+  wrote it flushes it out of its cache first (the ARM11's cache operations
+  act on the calling core's cache only): the main thread in
+  `screen_flush`, which then tells the renderer, or a writer on another
+  core itself. The settings menu, the HOME prompt and a fatal error take
+  the screen back once the renderer's last copy is done (150 ms); closing
+  the menu hands it over again.
 - The touch buttons keep to the game's safe area while the HUD is down
   (`GameDesc::touch_area_hud`, in console cells: Goemon's right of its
   map, which stays on the left), in one column or two, at least two cells tall with whole
   labels. More buttons than that take the usual rows over the HUD, their
-  fills half see-through (the colours sampled from the painted buttons,
-  `rt64_3ds::set_bottom_console_see_through`); a game with no safe area
-  always does.
+  fills half see-through: the renderer draws them blended
+  (`rt64_3ds::set_bottom_fills`, the console's blue and yellow) and the
+  console writes only the labels (blue on a held button's yellow, where
+  black would be see-through); a game with no safe area always does.
 - With the row on the top screen the markers are skipped: the spans draw
   where they always did. `recomp3ds::hud_on_bottom()` tells the game's
   patches (through its recomp API) which it is, for a HUD that hides

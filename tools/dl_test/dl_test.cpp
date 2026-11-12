@@ -224,19 +224,26 @@ int main(int argc, char** argv) {
         auto t4 = std::chrono::steady_clock::now();
         float rworst = 0.0f;
         size_t rdiffer = 0;
-        bool same_layout = rebuilt.draws.size() == between.draws.size() && rebuilt.verts.size() == between.verts.size();
-        for (size_t i = 0; same_layout && i < rebuilt.draws.size(); i++) same_layout = rebuilt.draws[i].first == between.draws[i].first && rebuilt.draws[i].count == between.draws[i].count;
-        if (same_layout) {
-            for (size_t i = 0; i < rebuilt.verts.size(); i++) {
-                const auto& a = rebuilt.verts[i];
-                const auto& b = between.verts[i];
+        // Draw by draw: the touch screen's (DL_BOTTOM) are left out of a
+        // rebuilt in-between, the rest match the second run's.
+        bool same_layout = rebuilt.draws.size() == between.draws.size();
+        size_t screen_left = 0;
+        for (size_t i = 0; same_layout && i < rebuilt.draws.size(); i++) {
+            if (between.draws[i].screen != 0) { same_layout = rebuilt.draws[i].count == 0; screen_left += between.draws[i].count; }
+            else same_layout = rebuilt.draws[i].count == between.draws[i].count;
+        }
+        for (size_t i = 0; same_layout && i < rebuilt.draws.size(); i++) {
+            if (between.draws[i].screen != 0) continue;
+            for (uint32_t k = 0; k < rebuilt.draws[i].count; k++) {
+                const auto& a = rebuilt.verts[rebuilt.draws[i].first + k];
+                const auto& b = between.verts[between.draws[i].first + k];
                 const float d = std::max({ std::fabs(a.x - b.x), std::fabs(a.y - b.y), std::fabs(a.z - b.z), std::fabs(a.w - b.w), std::fabs(a.u - b.u), std::fabs(a.v - b.v) });
                 if (d > rworst) rworst = d;
                 if (d > 1e-3f || a.r != b.r || a.g != b.g || a.b != b.b || a.a != b.a) rdiffer++;
             }
         }
-        printf("rebuilt in-between: ok %d, %.3f ms, %u triangles, %zu draws %zu verts; same layout as the second run %d, worst difference %.6f, %zu vertices differ\n",
-               (int)rok, std::chrono::duration<double, std::milli>(t4 - t3).count(), rtris, rebuilt.draws.size(), rebuilt.verts.size(), (int)same_layout, rworst, rdiffer);
+        printf("rebuilt in-between: ok %d, %.3f ms, %u triangles, %zu draws %zu verts (%zu touch-screen verts left out); same layout as the second run %d, worst difference %.6f, %zu vertices differ\n",
+               (int)rok, std::chrono::duration<double, std::milli>(t4 - t3).count(), rtris, rebuilt.draws.size(), rebuilt.verts.size(), screen_left, (int)same_layout, rworst, rdiffer);
         // DL_DESCRIBE=<draw>[,<draw>...]: what interpolates those records
         // (Interpreter::describe_inbetween_draw, as the console's log does).
         if (const char* e = getenv("DL_DESCRIBE")) {

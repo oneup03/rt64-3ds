@@ -131,6 +131,11 @@ namespace recomp3ds {
     // the log with stderr (log_init), so the runtime's diagnostic printf
     // lines ("Opening mod ...") don't stay on the screen.
     void screen_init(PrintConsole* console);
+    // The copy of the console's framebuffer the renderer's GPU reads while
+    // it has the touch screen (screen_bottom_update), in linear memory:
+    // taken at boot, before other threads allocate there (libctru's linear
+    // allocator has no lock), by a game with RenderDesc::hud_on_bottom_supported.
+    void screen_reserve_shadow();
     void screen_printf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
     // The touch screen to the renderer for the game's HUD (hud: Settings::
     // hud_on_bottom with the settings menu closed), the console's text drawn

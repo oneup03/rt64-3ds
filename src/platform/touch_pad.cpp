@@ -9,7 +9,9 @@
 // A touch holds the button under it (one at a time: the panel reads a
 // single point). With a game's HUD on the touch screen the grid keeps to
 // the game's safe area (GameDesc::touch_area_hud) while the buttons fit
-// there, else it takes the usual rows over the HUD, its fills see-through.
+// there, else it takes the usual rows over the HUD, its fills see-through:
+// the renderer draws them (rt64_3ds::set_bottom_fills) and the console
+// writes only the labels, on its see-through black.
 #include <3ds.h>
 #include <algorithm>
 #include <atomic>
@@ -82,8 +84,11 @@ int g_drawn_active = -2;
 bool g_drawn = false;           // the grid on screen is the live one
 bool g_area_used = false;       // something of ours is on screen (to clear)
 bool g_live_hud = false;        // the grid was laid out for a HUD on the touch screen
-bool g_see_through = false;     // ... over it: its fills see-through (rt64_3ds::set_bottom_console_see_through)
-uint16_t g_fill[2] = { 0, 0 };  // the fills' colours as the console paints them (sampled), idle and held
+bool g_see_through = false;     // ... over it: its fills see-through (rt64_3ds::set_bottom_fills)
+// The see-through fills: the console's blue and yellow (libctru's palette,
+// 0x0010 and 0x8400 in RGB565) at about half.
+constexpr uint8_t kIdleFill[4] = { 0, 0, 131, 136 };
+constexpr uint8_t kHeldFill[4] = { 131, 129, 0, 136 };
 
 // Made on first use, from whichever thread gets there first (C++'s guarded
 // static initialisation).
@@ -92,9 +97,10 @@ LightLock& set_lock() {
     return lock;
 }
 
-void paint(int col, int row, int w, int h, const char* label, bool held) {
-    // Blue, yellow while held.
-    const char* colour = held ? "\x1b[43m\x1b[30m" : "\x1b[44m\x1b[37m";
+void paint(int col, int row, int w, int h, const char* label, bool held, bool see_through) {
+    // Blue, yellow while held; see-through, the label alone on the
+    // console's black (blue on the yellow fill: black would be see-through).
+    const char* colour = see_through ? (held ? "\x1b[40m\x1b[34m" : "\x1b[40m\x1b[37m") : held ? "\x1b[43m\x1b[30m" : "\x1b[44m\x1b[37m";
     const int len = (int)__builtin_strlen(label);
     const int left = (w - len) / 2;
     for (int r = 0; r < h; r++) {
@@ -210,15 +216,18 @@ void make_live(uint16_t offered, uint32_t user) {
 
 void draw_live(int held_index) {
     clear_area();
+    rt64_3ds::BottomFill fills[kLiveMax];
+    int nf = 0;
     for (size_t i = 0; i < g_live_count; i++) {
         const LabelButton& b = g_live[i];
-        paint(b.col, b.row, b.w, b.h, b.label, (int)i == held_index);
-        // The fill as painted (a button's top-left pixel: no label there),
-        // once of each kind, for the see-through grid.
-        uint16_t& fill = g_fill[(int)i == held_index ? 1 : 0];
-        if (fill == 0) fill = recomp3ds::screen_pixel(b.col * 8, b.row * 8);
+        const bool held = (int)i == held_index;
+        paint(b.col, b.row, b.w, b.h, b.label, held, g_see_through);
+        if (g_see_through && nf < rt64_3ds::kBottomFillsMax) {
+            const uint8_t* c = held ? kHeldFill : kIdleFill;
+            fills[nf++] = rt64_3ds::BottomFill{ (int16_t)(b.col * 8), (int16_t)(b.row * 8), (int16_t)(b.w * 8), (int16_t)(b.h * 8), { c[0], c[1], c[2], c[3] } };
+        }
     }
-    rt64_3ds::set_bottom_console_see_through(g_see_through ? g_fill[0] : 0, g_see_through ? g_fill[1] : 0);
+    rt64_3ds::set_bottom_fills(fills, nf);
 }
 
 // The touch: returns the N64 buttons to send now.
@@ -312,7 +321,7 @@ void recomp3ds::touch_pad_update(bool shown, bool over_hud, bool contact, int x,
         // alone (a message the runtime printed there).
         if (g_area_used) clear_area();
         g_area_used = false;
-        if (g_see_through) rt64_3ds::set_bottom_console_see_through(0, 0);
+        if (g_see_through) rt64_3ds::set_bottom_fills(nullptr, 0);
         g_see_through = false;
         g_drawn = true;
         return;

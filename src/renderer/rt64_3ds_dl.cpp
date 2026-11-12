@@ -3027,6 +3027,7 @@ struct Interpreter::Impl {
                             bottom_dx = bottom ? (float)((int32_t)(w1 << 8) >> 20) : 0.0f;
                             bottom_dy = bottom ? (float)((int32_t)(w1 << 20) >> 20) : 0.0f;
                         }
+                        else if (sop == 3) out->bottom_background = true;
                     }
                     break;
                 case G_EXTENDED: {
@@ -3717,6 +3718,7 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
     for (int i = 0; i < kMaxRtt; i++) o.rtts[i] = real.rtts[i];
     o.inst_cams = real.inst_cams;
     o.frame_sample_last = real.frame_sample_last;
+    o.bottom_background = real.bottom_background;
     o.verts.clear();
     // Each load's matrix in the in-between frame: the game frame's where
     // neither its transform nor its projection is interpolated.
@@ -3799,6 +3801,10 @@ bool Interpreter::build_inbetween(const FrameRecord& real, FrameRecord& o, uint3
                 const uint32_t real_first = d.first, real_count = d.count;
                 d.first = out.size();
                 d.count = 0;
+                // The touch screen's draws: drawn once per game frame there,
+                // never in an in-between (the next draw's loop below steps
+                // over their triangles).
+                if (d.screen != 0) continue;
                 if (d.kind != DrawRecord::Tris) {
                     // The list's own copy (Interp::rect_verts), not the game
                     // frame's, which the renderer may have changed already.

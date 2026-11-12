@@ -105,13 +105,32 @@ void apt_post_hook(APT_HookType type, void*) {
 bool gpu_away() { return g_suspended || g_sleeping; }
 volatile bool g_paused = false;
 // The touch screen (rt64_3ds::set_bottom_screen): the renderer draws the
-// game's touch-screen spans there, with the console's text from
-// g_bottom_console over them; the tick of the last copy it queued there.
+// game's touch-screen spans there, with the touch buttons' see-through
+// fills and the console's text from g_bottom_console over them; the tick of
+// the last copy it queued there.
 std::atomic<bool> g_bottom_on{ false };
 const uint16_t* volatile g_bottom_console = nullptr;
 std::atomic<bool> g_bottom_console_changed{ false };
-std::atomic<uint32_t> g_bottom_see_through{ 0 };    // set_bottom_console_see_through: first | second << 16
 std::atomic<uint32_t> g_bottom_last_copy_ms{ 0 };   // 0: none yet
+// set_bottom_fills (any thread), taken by the renderer under the lock when
+// the version moved.
+rt64_3ds::BottomFill g_bottom_fills[rt64_3ds::kBottomFillsMax] = {};
+int g_bottom_fill_count = 0;
+std::atomic<uint32_t> g_bottom_fill_version{ 0 };
+LightLock& bottom_fill_lock() {
+    static LightLock lock = [] { LightLock l; LightLock_Init(&l); return l; }();
+    return lock;
+}
+// set_bottom_background (any thread): the picture, 320x240 RGB565 top row
+// first (heap, allocated on the first call), taken by the renderer under
+// the lock when the version moved.
+uint16_t* g_bottom_bg = nullptr;
+bool g_bottom_bg_set = false;
+std::atomic<uint32_t> g_bottom_bg_version{ 0 };
+LightLock& bottom_bg_lock() {
+    static LightLock lock = [] { LightLock l; LightLock_Init(&l); return l; }();
+    return lock;
+}
 
 uint32_t now_ms() { return (uint32_t)(svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000)); }
 volatile bool g_capture_request = false;
@@ -2127,7 +2146,7 @@ private:
             const DeferredOp& op = dops_[i];
             if (op.fill != nullptr) C3D_RenderTargetClear(op.fill, op.bits, op.color, 0);
             else if (op.copy_dst != nullptr) copy_depth(op.copy_src, op.copy_dst, op.copy_bytes);
-            else if (op.show_dst != nullptr) show_bottom(op.show_src, op.show_dst);
+            else if (op.gx.kind != GxOp::None) run_gx(op.gx);
             else GX_ProcessCommandList(op.list, op.words * 4, 0);
         }
         C3D_FrameEnd(GX_CMDLIST_FLUSH);       // the recording was flushed as it ended (end_deferred)
@@ -3105,7 +3124,8 @@ private:
             int x0 = (int)lroundf(((float)d.scissor[0] + bottom_ox_) * bottom_scale_), y0 = (int)lroundf(((float)d.scissor[1] + bottom_oy_) * bottom_scale_);
             int x1 = (int)lroundf(((float)d.scissor[2] + bottom_ox_) * bottom_scale_), y1 = (int)lroundf(((float)d.scissor[3] + bottom_oy_) * bottom_scale_);
             if (no_scissor) { x0 = 0; y0 = 0; x1 = 320; y1 = 240; }
-            x0 = std::max(x0, 0); y0 = std::max(y0, 0); x1 = std::min(x1, 320); y1 = std::min(y1, 240);
+            // ... and within the strip being redrawn.
+            x0 = std::max(x0, band_x0_); y0 = std::max(y0, 0); x1 = std::min(x1, band_x1_); y1 = std::min(y1, 240);
             if (x1 <= x0 || y1 <= y0) C3D_SetScissor(GPU_SCISSOR_NORMAL, 1023, 1023, 1024, 1024);
             else C3D_SetScissor(GPU_SCISSOR_NORMAL, (u32)(240 - y1), (u32)(320 - x1), (u32)(240 - y0), (u32)(320 - x0));
             prof_[2] += tick() - tp2;
@@ -4165,6 +4185,34 @@ public:
     int linked_set_ = 0;                        // what citro3d transfers to the screen: 0 top_/top_r_, 1 the in-betweens', -1 black_
     bool pair_ = false;                         // send_dl: replaying an interpolated pair
     static constexpr u32 kDeferBytes = C3D_DEFAULT_CMDBUF_SIZE * 2;   // as citro3d's own (C3D_Init above)
+    // A transfer-engine operation of the touch screen's (queue_gx): a
+    // texture copy (size bytes; dims are line widths and gaps), a display
+    // transfer, or a fill with zeros of size bytes from dst (and of size2
+    // from dst2).
+    struct GxOp {
+        enum Kind : uint8_t { None, Copy, Transfer, Fill };
+        Kind kind = None;
+        const void* src = nullptr;
+        void* dst = nullptr;
+        u32 in_dim = 0, out_dim = 0;
+        u32 size = 0;
+        u32 flags = 0;                          // a transfer's
+        void* dst2 = nullptr;
+        u32 size2 = 0;
+    };
+    static void run_gx(const GxOp& g) {
+        constexpr u32 kTextureCopyMode = BIT(3);
+        constexpr u16 kFill16 = BIT(0);         // start, 16-bit values
+        switch (g.kind) {
+        case GxOp::Copy: GX_TextureCopy((u32*)g.src, g.in_dim, (u32*)g.dst, g.out_dim, g.size, kTextureCopyMode); break;
+        case GxOp::Transfer: GX_DisplayTransfer((u32*)g.src, g.in_dim, (u32*)g.dst, g.out_dim, g.flags); break;
+        case GxOp::Fill:
+            GX_MemoryFill((u32*)g.dst, 0, (u32*)((u8*)g.dst + g.size), kFill16, (u32*)g.dst2, 0,
+                          g.dst2 != nullptr ? (u32*)((u8*)g.dst2 + g.size2) : nullptr, g.dst2 != nullptr ? kFill16 : 0);
+            break;
+        default: break;
+        }
+    }
     struct DeferredOp {                         // in GX queue order: a command list, a clear (fill), or a copy
         u32* list;
         u32 words;
@@ -4174,8 +4222,7 @@ public:
         const void* copy_src = nullptr;         // a copy: copy_bytes from copy_src to copy_dst (copy_depth)
         void* copy_dst = nullptr;
         u32 copy_bytes = 0;
-        const void* show_src = nullptr;         // the touch screen's image to its framebuffer (show_bottom)
-        void* show_dst = nullptr;
+        GxOp gx{};                              // the touch screen's (queue_gx)
     };
     static constexpr int kMaxDeferredOps = 30;  // citro3d's GX queue takes 32 a frame
     u32* dbuf_ = nullptr;                       // the game frame's command buffer (linear)
@@ -4324,49 +4371,97 @@ public:
     // platform gives it to the renderer: set_bottom_screen). The game's
     // touch-screen spans (DrawRecord::screen) are drawn there once per game
     // frame, its frame centred at the largest whole scale that fits (1 for
-    // 320x240 and Banjo's 292x216), the console's text (set_bottom_console)
-    // over them, and copied to the screen's framebuffer: the console's own,
-    // single-buffered. Skipped while it would draw what it drew.
+    // 320x240 and Banjo's 292x216), over the background (or black), under
+    // the touch buttons' see-through fills (set_bottom_fills) and the
+    // console's text (set_bottom_console), and copied to the screen's
+    // framebuffer: the console's own, single-buffered.
+    //
+    // The CPU only says what to draw. The GX transfer engine restores the
+    // background from a copy in the target's own layout, and brings the
+    // console's text into its texture when it changed (tiled, then padded to
+    // the texture's width: two transfers); the combiner makes the text's
+    // black see-through (alpha from its colour, black dropped by the alpha
+    // test).
+    //
+    // In the tilted 240x320 layout a screen column is a row of the buffers,
+    // so a strip of screen columns is one run of 8x8-tile rows in each. Only
+    // the strip covering what changed since the last game frame (by each
+    // draw's state, textures' addresses and vertices) is restored, drawn and
+    // copied to the screen; the target keeps the rest. The whole screen when
+    // the text, the fills, the geometry or the number of draws changed, and
+    // every kBottomRefresh game frames (a texture rewritten in place shows
+    // then).
     static constexpr int kBottomTarget = -5;
+    static constexpr int kBottomRefresh = 30;
+    static constexpr int kBottomWholeCols = 256;            // a strip this wide or wider: the whole screen
+    static constexpr u32 kBottomColBytes = 240 * 2;          // a screen column in the RGB565 and D16 buffers
+    static constexpr u32 kBottomBytes = 320 * kBottomColBytes;
+    static constexpr u32 kBottomTransfer = GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_RAW_COPY(0) | GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGB565) |
+                                           GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB565) | GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO);
+    static constexpr u32 kBottomToScreen = kBottomTransfer | GX_TRANSFER_OUT_TILED(0);   // tiled target -> the screen's linear framebuffer
+    static constexpr u32 kBottomToTiled = kBottomTransfer | GX_TRANSFER_OUT_TILED(1);    // the console's linear framebuffer -> tiled
     C3D_RenderTarget* bottom_ = nullptr;
     C3D_Mtx bproj_{};
     float bottom_scale_ = 1.0f, bottom_ox_ = 0.0f, bottom_oy_ = 0.0f;
-    C3D_Tex con_tex_{};             // the console's text, 512x256 RGBA4, black see-through
+    C3D_Tex con_tex_{};             // the console's text, 256x512 RGB565: screen column x in row x, screen y = 239 - column
     bool con_tex_ok_ = false;
-    C3D_Tex bg_tex_{};              // RenderDesc::hud_bottom_background, 512x256 RGB565
-    bool bg_tex_ok_ = false;
-    bool bottom_shown_ = false;     // the last game frame drew it
-    uint32_t bottom_hash_ = 0;
-    int bottom_same_ = 0;           // game frames it was skipped for since
+    bool con_ready_ = false;        // con_tex_ has the text (an upload was queued)
+    u16* con_tiled_ = nullptr;      // the console's framebuffer tiled (linear memory), on its way to con_tex_
+    u16* bg_tiled_ = nullptr;       // the background picture in the target's layout (linear memory)
+    bool bg_ready_ = false;         // bg_tiled_ holds one (RenderDesc::hud_bottom_background, or set_bottom_background's)
+    // RenderDesc::hud_bottom_background_at_run_time: the picture comes from
+    // set_bottom_background, through bg_stage_ (the screen's linear layout,
+    // as the console's), and shows in the frames that ask for it
+    // (FrameRecord::bottom_background).
+    bool bg_runtime_ = false;
+    u16* bg_stage_ = nullptr;
+    uint32_t bg_version_ = 0;       // g_bottom_bg_version, as last taken
+    int bg_wait_ = 0;               // game frames before bg_stage_ may be written again (its transfer done)
+    bool bg_drawn_ = false;         // the target holds the picture behind its draws (else black)
+    bool bottom_shown_ = false;     // the target holds the last game frame's touch screen
+    int bottom_since_whole_ = 0;    // game frames since the whole screen was drawn
+    float bottom_drawn_geo_[3] = {};    // bottom_scale_, bottom_ox_, bottom_oy_ of what the target holds
+    int band_x0_ = 0, band_x1_ = 320;   // the strip being drawn (screen columns): apply_state's scissor keeps to it
+    // A touch-screen draw: what it looks like (hash_draw) and the screen
+    // columns it covers, this game frame and the last one drawn.
+    struct BottomDraw { uint32_t hash; int16_t x0, x1; };
+    std::vector<BottomDraw> bdraws_, bdraws_last_;
+    rt64_3ds::BottomFill fills_[rt64_3ds::kBottomFillsMax] = {};   // set_bottom_fills, as last taken
+    int fill_count_ = 0;
+    uint32_t fills_version_ = 0;
     void init_bottom() {
         bottom_ = C3D_RenderTargetCreate(240, 320, GPU_RB_RGB565, GPU_RB_DEPTH16);
-        con_tex_ok_ = C3D_TexInit(&con_tex_, 512, 256, GPU_RGBA4);
-        if (con_tex_ok_) {
-            memset(con_tex_.data, 0, 512 * 256 * 2);
-            flush_dcache(con_tex_.data, 512 * 256 * 2);
-            C3D_TexSetFilter(&con_tex_, GPU_NEAREST, GPU_NEAREST);
-        }
+        con_tiled_ = (u16*)linearAlloc(kBottomBytes);
+        con_tex_ok_ = con_tiled_ != nullptr && C3D_TexInit(&con_tex_, 256, 512, GPU_RGB565);
+        if (con_tex_ok_) C3D_TexSetFilter(&con_tex_, GPU_NEAREST, GPU_NEAREST);
+        // The background in the target's layout, once: 8x8 tiles, 30 to a
+        // tile row, Morton order inside; row r is screen x, column c screen
+        // y from the bottom (as the eye targets, maybe_capture_framebuffer).
+        // A picture set while the game runs gets its memory now (linear
+        // memory is allocated here, at start, never from another thread
+        // later); it is tiled by the transfer engine on its way in.
         const uint16_t* bg = rt64_3ds::render_desc().hud_bottom_background;
-        if (bg != nullptr && (bg_tex_ok_ = C3D_TexInit(&bg_tex_, 512, 256, GPU_RGB565))) {
-            memset(bg_tex_.data, 0, 512 * 256 * 2);
-            uint16_t* dst = (uint16_t*)bg_tex_.data;
-            for (int y = 0; y < 240; y++) {
-                for (int x = 0; x < 320; x++) tiled_texel(dst, x, y) = bg[y * 320 + x];
-            }
-            flush_dcache(dst, 512 * 256 * 2);
-            C3D_TexSetFilter(&bg_tex_, GPU_NEAREST, GPU_NEAREST);
+        bg_runtime_ = rt64_3ds::render_desc().hud_bottom_background_at_run_time;
+        if (bg != nullptr || bg_runtime_) bg_tiled_ = (u16*)linearAlloc(kBottomBytes);
+        if (bg_runtime_ && bg_tiled_ != nullptr && (bg_stage_ = (u16*)linearAlloc(kBottomBytes)) == nullptr) {
+            linearFree(bg_tiled_);
+            bg_tiled_ = nullptr;
         }
-        fprintf(stderr, "rt64-3ds: touch-screen target %s, console texture %s, background %s (VRAM left %u KB)\n", bottom_ != nullptr ? "ready" : "FAILED",
-                con_tex_ok_ ? "ready" : "FAILED", bg == nullptr ? "none" : bg_tex_ok_ ? "ready" : "FAILED", (unsigned)(vramSpaceFree() / 1024));
-    }
-    // A 512x256 texture's texel for the touch screen's (x, y), y down from
-    // the top (rows flipped, as the texture cache's; 8x8 tiles, Morton order
-    // inside).
-    static uint16_t& tiled_texel(uint16_t* tex, int x, int y) {
-        const int yd = 255 - y;
-        const unsigned mx = (x & 1) | ((x & 2) << 1) | ((x & 4) << 2);
-        const unsigned my = ((yd & 1) << 1) | ((yd & 2) << 2) | ((yd & 4) << 3);
-        return tex[(yd >> 3) * (512 / 8) * 64 + (x >> 3) * 64 + (my | mx)];
+        if (bg != nullptr && bg_tiled_ != nullptr) {
+            for (uint32_t r = 0; r < 320; r++) {
+                for (uint32_t c = 0; c < 240; c++) {
+                    const uint32_t tile = (r >> 3) * 30 + (c >> 3);
+                    const uint32_t m = (c & 1) | ((r & 1) << 1) | ((c & 2) << 1) | ((r & 2) << 2) | ((c & 4) << 2) | ((r & 4) << 3);
+                    bg_tiled_[tile * 64 + m] = bg[(239 - c) * 320 + r];
+                }
+            }
+            flush_dcache(bg_tiled_, kBottomBytes);
+            bg_ready_ = true;
+        }
+        fprintf(stderr, "rt64-3ds: touch-screen target %s, console texture %s, background %s (VRAM left %u KB, linear free %u KB)\n",
+                bottom_ != nullptr ? "ready" : "FAILED", con_tex_ok_ ? "ready" : "FAILED",
+                bg == nullptr && !bg_runtime_ ? "none" : bg_tiled_ == nullptr ? "FAILED" : bg_runtime_ ? "set at run time" : "ready",
+                (unsigned)(vramSpaceFree() / 1024), (unsigned)(linearSpaceFree() / 1024));
     }
     void bottom_geometry() {
         const float k = std::min(320.0f / (float)geo_.w, 240.0f / (float)geo_.h);
@@ -4377,7 +4472,7 @@ public:
     }
     // What a bottom draw looks like, for the skip: its state, textures (by
     // address, not texels: a texture that changes in place is caught by the
-    // redraw every 30 frames) and vertices.
+    // whole redraw every kBottomRefresh game frames) and vertices.
     static uint32_t hash_words(uint32_t h, const void* p, size_t bytes) {
         const uint32_t* w = (const uint32_t*)p;
         for (size_t i = 0; i < bytes / 4; i++) h = (h ^ w[i]) * 16777619u;
@@ -4388,7 +4483,11 @@ public:
         memcpy(&k[6], d.prim, 4); memcpy(&k[7], d.env, 4); memcpy(&k[8], d.blend, 4); memcpy(&k[9], d.fog, 4);
         memcpy(&k[11], d.scissor, 8);
         h = hash_words(h, k, sizeof(k));
-        h = hash_words(h, d.uv1, sizeof(d.uv1));
+        // TEXEL1's coordinates only with a TEXEL1 the backend samples (as
+        // apply_state reads them): otherwise uv1 is whatever the next tile
+        // was left with, which in DK64 changes every frame and made every
+        // rectangle look changed, the whole screen redrawn each game frame.
+        if (d.tex[1].valid && !d.tex[1].snapshot && !d.tex[1].frame) h = hash_words(h, d.uv1, sizeof(d.uv1));
         for (const rt64_3ds::TexDesc& t : d.tex) {
             if (!t.valid) { h = (h ^ 0xFFFFFFFFu) * 16777619u; continue; }
             const uint32_t tk[6] = { t.addr, t.pitch | ((uint32_t)t.fmt << 16) | ((uint32_t)t.siz << 24), (uint32_t)t.width | ((uint32_t)t.height << 16),
@@ -4398,113 +4497,262 @@ public:
         }
         return hash_words(h, frame_.verts.data() + d.first, (size_t)d.count * sizeof(GpuVertex));
     }
-    // The console's framebuffer (240 px columns, bottom row first, RGB565)
-    // into con_tex_ (rows flipped, as the texture cache's), black clear and
-    // the see-through colours half so.
-    void convert_console() {
-        const uint16_t* fb = g_bottom_console;
-        if (fb == nullptr || !con_tex_ok_) return;
-        const uint32_t st = g_bottom_see_through.load(std::memory_order_relaxed);
-        const uint16_t see0 = (uint16_t)st, see1 = (uint16_t)(st >> 16);
-        uint16_t* dst = (uint16_t*)con_tex_.data;
-        constexpr int kTilesX = 512 / 8;
-        for (int x = 0; x < 320; x++) {
-            const uint16_t* col = fb + x * 240;
-            const unsigned mx = (x & 1) | ((x & 2) << 1) | ((x & 4) << 2);
-            uint16_t* tiles = dst + (x >> 3) * 64;
-            for (int y = 0; y < 240; y++) {
-                const uint16_t p = col[239 - y];
-                const int yd = 255 - y;
-                const unsigned my = ((yd & 1) << 1) | ((yd & 2) << 2) | ((yd & 4) << 3);
-                const uint16_t alpha = (p == see0 || p == see1) ? 0x8 : 0xF;
-                tiles[(yd >> 3) * kTilesX * 64 + (my | mx)] =
-                    p == 0 ? 0 : (uint16_t)(((p >> 12) << 12) | (((p >> 7) & 0xF) << 8) | (((p >> 1) & 0xF) << 4) | alpha);
-            }
+    // The screen columns a touch-screen draw covers: its vertices', within
+    // its scissor (the whole scissor with a vertex behind the eye), a column
+    // of slack each side; x0 >= x1 when none.
+    void bottom_columns(const rt64_3ds::DrawRecord& d, int16_t* x0, int16_t* x1) const {
+        float lo = (float)d.scissor[0], hi = (float)d.scissor[2];
+        float mn = 1e30f, mx = -1e30f;
+        bool behind = false;
+        const GpuVertex* v = frame_.verts.data() + d.first;
+        for (uint32_t k = 0; k < d.count; k++) {
+            if (!(v[k].w > 0.0f)) { behind = true; break; }
+            const float x = v[k].x / v[k].w;
+            mn = std::min(mn, x);
+            mx = std::max(mx, x);
         }
-        flush_dcache(dst, 512 * 256 * 2);
+        if (!behind) { lo = std::max(lo, mn); hi = std::min(hi, mx); }
+        const int a = (int)std::floor((lo + bottom_ox_) * bottom_scale_) - 1, b = (int)std::ceil((hi + bottom_ox_) * bottom_scale_) + 1;
+        *x0 = (int16_t)std::max(a, 0);
+        *x1 = (int16_t)std::min(b, 320);
     }
-    // A texture over the whole touch screen (the console's text, the
-    // background), its 320x240 in the corner of a 512x256 tex, blended by its alpha.
-    void draw_screen_quad(C3D_Tex* tex, GpuVertex* q, uint32_t first) {
-        const float l = -bottom_ox_, r = (float)geo_.w + bottom_ox_, t = -bottom_oy_, b = (float)geo_.h + bottom_oy_;
-        const float xs[6] = { l, r, r, l, r, l }, ys[6] = { t, t, b, t, b, b };
-        const float us[6] = { 0.0f, 320.0f, 320.0f, 0.0f, 320.0f, 0.0f }, vs[6] = { 0.0f, 0.0f, 240.0f, 0.0f, 240.0f, 240.0f };
-        for (int i = 0; i < 6; i++) q[i] = GpuVertex{ xs[i], ys[i], 0.0f, 1.0f, us[i], vs[i], 255, 255, 255, 255 };
+    // A GX transfer-engine operation of the touch screen's, in GX queue
+    // order like the rest: on the queue now, ahead of the commands recorded
+    // since the last split (as citro3d queues a clear), or with the
+    // deferred frame's ops.
+    void queue_gx(const GxOp& g) {
+        if (!deferring_) { run_gx(g); return; }
+        DeferredOp op{ nullptr, 0, nullptr, C3D_CLEAR_ALL, 0 };
+        op.gx = g;
+        push_op(op);
+    }
+    // The platform's fills, when they changed (set_bottom_fills).
+    bool take_fills() {
+        if (g_bottom_fill_version.load() == fills_version_) return false;
+        LightLock_Lock(&bottom_fill_lock());
+        fill_count_ = g_bottom_fill_count;
+        memcpy(fills_, g_bottom_fills, sizeof(fills_[0]) * (size_t)fill_count_);
+        fills_version_ = g_bottom_fill_version.load();
+        LightLock_Unlock(&bottom_fill_lock());
+        return true;
+    }
+    // A quad over touch-screen pixels (sx0, sy0)-(sx1, sy1), y down, at the
+    // game's coordinates (bproj_); texel coordinates at its corners
+    // top-left, top-right, bottom-right, bottom-left.
+    void bottom_quad(GpuVertex* q, float sx0, float sy0, float sx1, float sy1, const float (&uv)[4][2], const uint8_t* rgba) const {
+        const float l = sx0 / bottom_scale_ - bottom_ox_, r = sx1 / bottom_scale_ - bottom_ox_;
+        const float t = sy0 / bottom_scale_ - bottom_oy_, b = sy1 / bottom_scale_ - bottom_oy_;
+        const float xs[4] = { l, r, r, l }, ys[4] = { t, t, b, b };
+        static constexpr int kCorner[6] = { 0, 1, 2, 0, 2, 3 };
+        for (int i = 0; i < 6; i++) {
+            const int c = kCorner[i];
+            q[i] = GpuVertex{ xs[c], ys[c], 0.0f, 1.0f, uv[c][0], uv[c][1], rgba[0], rgba[1], rgba[2], rgba[3] };
+        }
+    }
+    // What a quad of the touch screen's own needs besides its combiner:
+    // no depth, the strip's scissor.
+    void bottom_quad_state(int x0, int x1) {
+        C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+        C3D_SetScissor(GPU_SCISSOR_NORMAL, 0, (u32)(320 - x1), 240, (u32)(320 - x0));
+    }
+    // The touch buttons' see-through fills, over the game's draws.
+    void draw_fills(GpuVertex* q, u32 first, int x0, int x1) {
+        static constexpr float kNoUv[4][2] = {};
+        for (int i = 0; i < fill_count_; i++) {
+            const rt64_3ds::BottomFill& f = fills_[i];
+            bottom_quad(q + i * 6, (float)f.x, (float)f.y, (float)(f.x + f.w), (float)(f.y + f.h), kNoUv, f.rgba);
+        }
+        flush_dcache(q, (size_t)fill_count_ * 6 * sizeof(GpuVertex));
+        for (int i = 0; i < 6; i++) {
+            C3D_TexEnv* env = C3D_GetTexEnv(i);
+            C3D_TexEnvInit(env);
+            C3D_TexEnvSrc(env, C3D_Both, i == 0 ? GPU_PRIMARY_COLOR : GPU_PREVIOUS, GPU_PREVIOUS, GPU_PREVIOUS);
+            C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+        }
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
+        C3D_AlphaTest(false, GPU_ALWAYS, 0);
+        bottom_quad_state(x0, x1);
+        C3D_DrawArrays(GPU_TRIANGLES, first, fill_count_ * 6);
+    }
+    // The console's text over everything: its texels' colour, alpha 4 x
+    // (r + g + b) (any of the console's colours opaque, black 0), black
+    // dropped by the alpha test and nothing blended.
+    void draw_text(GpuVertex* q, u32 first, int x0, int x1) {
+        // con_tex_: screen column x is row x (texel t 511 - x, the rows
+        // flipped as every texture's), screen y column 239 - y.
+        static constexpr float kUv[4][2] = { { 240.0f, 512.0f }, { 240.0f, 192.0f }, { 0.0f, 192.0f }, { 0.0f, 512.0f } };
+        static constexpr uint8_t kWhite[4] = { 255, 255, 255, 255 };
+        bottom_quad(q, 0.0f, 0.0f, 320.0f, 240.0f, kUv, kWhite);
         flush_dcache(q, 6 * sizeof(GpuVertex));
         for (int i = 0; i < 6; i++) {
             C3D_TexEnv* env = C3D_GetTexEnv(i);
             C3D_TexEnvInit(env);
-            if (i == 0) C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_TEXTURE0, GPU_TEXTURE0);
-            else C3D_TexEnvSrc(env, C3D_Both, GPU_PREVIOUS, GPU_PREVIOUS, GPU_PREVIOUS);
-            C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+            if (i == 0) {
+                C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_TEXTURE0, GPU_TEXTURE0);
+                C3D_TexEnvOpAlpha(env, GPU_TEVOP_A_SRC_R, GPU_TEVOP_A_SRC_G, GPU_TEVOP_A_SRC_ALPHA);
+                C3D_TexEnvFunc(env, C3D_RGB, GPU_REPLACE);
+                C3D_TexEnvFunc(env, C3D_Alpha, GPU_ADD);
+            }
+            else if (i == 1) {
+                C3D_TexEnvSrc(env, C3D_RGB, GPU_PREVIOUS, GPU_PREVIOUS, GPU_PREVIOUS);
+                C3D_TexEnvSrc(env, C3D_Alpha, GPU_PREVIOUS, GPU_TEXTURE0, GPU_PREVIOUS);
+                C3D_TexEnvOpAlpha(env, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_B, GPU_TEVOP_A_SRC_ALPHA);
+                C3D_TexEnvFunc(env, C3D_RGB, GPU_REPLACE);
+                C3D_TexEnvFunc(env, C3D_Alpha, GPU_ADD);
+                C3D_TexEnvScale(env, C3D_Alpha, GPU_TEVSCALE_4);
+            }
+            else {
+                C3D_TexEnvSrc(env, C3D_Both, GPU_PREVIOUS, GPU_PREVIOUS, GPU_PREVIOUS);
+                C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+            }
         }
-        C3D_TexBind(0, tex);
-        C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uvscale_, 1.0f / 512.0f, 1.0f / 256.0f, 0.0f, 0.0f);
-        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
-        C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
-        C3D_AlphaTest(false, GPU_ALWAYS, 0);
-        C3D_SetScissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
+        C3D_TexBind(0, &con_tex_);
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, u_uvscale_, 1.0f / 256.0f, 1.0f / 512.0f, 0.0f, 0.0f);
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+        C3D_AlphaTest(true, GPU_GREATER, 0);
+        bottom_quad_state(x0, x1);
         C3D_DrawArrays(GPU_TRIANGLES, first, 6);
     }
-    // The touch screen's image into its framebuffer (on the GX queue after
-    // its draws).
-    static void show_bottom(const void* src, void* dst) {
-        constexpr u32 kFlags = GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
-                               GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGB565) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB565) |
-                               GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO);
-        GX_DisplayTransfer((u32*)src, GX_BUFFER_DIM(240, 320), (u32*)dst, GX_BUFFER_DIM(240, 320), kFlags);
+    // set_bottom_background's picture, when it moved and the last one's
+    // transfer is surely done: into the screen's layout in bg_stage_, then
+    // tiled into bg_tiled_ by the transfer engine, in order with the GX
+    // operations of the frames before (a frame still on its way reads the
+    // old picture whole). True when the picture changed.
+    bool take_background() {
+        if (bg_wait_ > 0) bg_wait_--;
+        if (bg_stage_ == nullptr || bg_wait_ > 0 || g_bottom_bg_version.load() == bg_version_) return false;
+        LightLock_Lock(&bottom_bg_lock());
+        bg_version_ = g_bottom_bg_version.load();
+        const bool set = g_bottom_bg_set && g_bottom_bg != nullptr;
+        if (set) {
+            // As libctru's framebuffer: a row of 240 per screen column x,
+            // screen y from the bottom.
+            const uint16_t* src = g_bottom_bg;
+            for (uint32_t x = 0; x < 320; x++) {
+                u16* const col = bg_stage_ + x * 240;
+                for (uint32_t y = 0; y < 240; y++) col[239 - y] = src[y * 320 + x];
+            }
+        }
+        LightLock_Unlock(&bottom_bg_lock());
+        if (set) {
+            flush_dcache(bg_stage_, kBottomBytes);
+            queue_gx(GxOp{ GxOp::Transfer, bg_stage_, bg_tiled_, GX_BUFFER_DIM(240, 320), GX_BUFFER_DIM(240, 320), 0, kBottomToTiled });
+            bg_wait_ = 4;   // the deferred frames' operations run within a frame or two
+        }
+        bg_ready_ = set;
+        return true;
     }
     // After a game frame's eyes (vb: its vertices, n of them; the six after
-    // them the ghost quad's, the six after those the console's, then the
-    // background's).
+    // them the ghost quad's, then the fills' and the text's).
     void bottom_pass(GpuVertex* vb, size_t n) {
         if (bottom_ == nullptr || !g_bottom_on.load(std::memory_order_relaxed)) {
             bottom_shown_ = false;
             return;
         }
-        uint32_t h = 2166136261u;
+        bdraws_.clear();
+        bool depth_used = false;
         for (const rt64_3ds::DrawRecord& d : frame_.draws) {
-            if (d.screen != 0 && d.count >= 3 && d.first + d.count <= n) h = hash_draw(h, d);
+            if (d.screen == 0 || d.count < 3 || d.first + d.count > n) continue;
+            BottomDraw b{ hash_draw(2166136261u, d), 0, 0 };
+            bottom_columns(d, &b.x0, &b.x1);
+            bdraws_.push_back(b);
+            if ((d.othermode_l & 0x30) != 0) depth_used = true;    // the depth compared or written
         }
-        const bool con = g_bottom_console_changed.exchange(false);
-        if (con) convert_console();
-        if (bottom_shown_ && !con && h == bottom_hash_ && ++bottom_same_ < 30) return;
-        bottom_shown_ = true;
-        bottom_hash_ = h;
-        bottom_same_ = 0;
-        clear_target(bottom_, C3D_CLEAR_ALL, 0);
+        const bool con = g_bottom_console_changed.exchange(false) && con_tex_ok_ && g_bottom_console != nullptr;
+        const bool fills = take_fills();
+        const bool geo = bottom_drawn_geo_[0] != bottom_scale_ || bottom_drawn_geo_[1] != bottom_ox_ || bottom_drawn_geo_[2] != bottom_oy_;
+        // The picture behind the draws: always, or (set at run time) in the
+        // frames whose list asks for it.
+        const bool bg_new = take_background();
+        const bool bg_on = bg_ready_ && (!bg_runtime_ || frame_.bottom_background);
+        bool whole = !bottom_shown_ || con || fills || geo || bg_new || bg_on != bg_drawn_ || bdraws_.size() != bdraws_last_.size() ||
+                     ++bottom_since_whole_ >= kBottomRefresh;
+        int x0 = 0, x1 = 320;
+        if (!whole) {
+            // The columns of every draw that changed, where it was and where it is.
+            int lo = 320, hi = 0;
+            for (size_t i = 0; i < bdraws_.size(); i++) {
+                const BottomDraw& a = bdraws_[i];
+                const BottomDraw& b = bdraws_last_[i];
+                if (a.hash == b.hash) continue;
+                if (a.x1 > a.x0) { lo = std::min(lo, (int)a.x0); hi = std::max(hi, (int)a.x1); }
+                if (b.x1 > b.x0) { lo = std::min(lo, (int)b.x0); hi = std::max(hi, (int)b.x1); }
+            }
+            if (hi <= lo) {
+                bdraws_.swap(bdraws_last_);
+                return;
+            }
+            x0 = lo & ~7;
+            x1 = std::min(320, (hi + 7) & ~7);
+            if (x1 - x0 >= kBottomWholeCols) whole = true;
+        }
+        if (whole) {
+            x0 = 0;
+            x1 = 320;
+            bottom_since_whole_ = 0;
+        }
+        // The text, when it changed: tiled, then into the texture a tile row
+        // at a time (240 texels of 256 to a row; TextureCopy sizes in bytes,
+        // its line widths and gaps in 16-byte units).
+        if (con) {
+            constexpr u32 kTileRow = 240 * 8 * 2, kGap = (256 - 240) * 8 * 2;
+            queue_gx(GxOp{ GxOp::Transfer, (const void*)g_bottom_console, con_tiled_, GX_BUFFER_DIM(240, 320), GX_BUFFER_DIM(240, 320), 0, kBottomToTiled });
+            queue_gx(GxOp{ GxOp::Copy, con_tiled_, con_tex_.data, GX_BUFFER_DIM(kTileRow / 16, 0), GX_BUFFER_DIM(kTileRow / 16, kGap / 16), kBottomBytes, 0 });
+            con_ready_ = true;
+        }
+        // The strip's background (or black) and, when a draw uses it, depth.
+        const u32 off = (u32)x0 * kBottomColBytes, bytes = (u32)(x1 - x0) * kBottomColBytes;
+        u8* const color = (u8*)bottom_->frameBuf.colorBuf;
+        u8* const depth = (u8*)bottom_->frameBuf.depthBuf;
+        if (bg_on) {
+            queue_gx(GxOp{ GxOp::Copy, (const u8*)bg_tiled_ + off, color + off, GX_BUFFER_DIM(kBottomColBytes * 8 / 16, 0), GX_BUFFER_DIM(kBottomColBytes * 8 / 16, 0), bytes, 0 });
+            if (depth_used) queue_gx(GxOp{ GxOp::Fill, nullptr, depth + off, 0, 0, bytes, 0 });
+        }
+        else {
+            GxOp fill{ GxOp::Fill, nullptr, color + off, 0, 0, bytes, 0 };
+            if (depth_used) { fill.dst2 = depth + off; fill.size2 = bytes; }
+            queue_gx(fill);
+        }
         draw_on(bottom_);
         cur_target_ = kBottomTarget;
         frame_viewport_ = false;
         forget_draw_state();
+        band_x0_ = x0;
+        band_x1_ = x1;
         C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, u_xform_, &bproj_);
         C3D_FVUnifSet(GPU_VERTEX_SHADER, u_stereo_, 0.0f, 0.0f, 0.0f, 0.0f);
         C3D_FVUnifSet(GPU_VERTEX_SHADER, u_eye_, 1.0f, 0.0f, 0.0f, 0.0f);
         last_sa_ = last_sb_ = 0.0f;
         set_cull(GPU_CULL_NONE);
-        // The background first (the six vertices after the console's).
-        if (bg_tex_ok_ && n + 18 <= kVboVerts) {
-            draw_screen_quad(&bg_tex_, vb + n + 12, (uint32_t)(n + 12));
-            forget_draw_state();
-        }
+        size_t k = 0;
         for (size_t i = 0; i < frame_.draws.size(); i++) {
             const rt64_3ds::DrawRecord& d = frame_.draws[i];
             if (d.screen == 0 || d.count < 3 || d.first + d.count > n) continue;
+            const BottomDraw& b = bdraws_[k++];
+            if (b.x1 <= x0 || b.x0 >= x1) continue;     // outside the strip
             apply_state(d, i, nullptr);
             C3D_DrawArrays(GPU_TRIANGLES, d.first, d.count);
         }
-        if (con_tex_ok_ && g_bottom_console != nullptr && n + 12 <= kVboVerts) draw_screen_quad(&con_tex_, vb + n + 6, (uint32_t)(n + 6));
-        forget_draw_state();
-        // To the screen, after the draws on the GX queue (or the deferred frame's).
-        close_segment();
-        void* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
-        if (deferring_) {
-            DeferredOp op{ nullptr, 0, nullptr, C3D_CLEAR_ALL, 0 };
-            op.show_src = bottom_->frameBuf.colorBuf;
-            op.show_dst = fb;
-            push_op(op);
+        u32 q = (u32)n + 6;
+        if (fill_count_ > 0 && q + 6 * (u32)fill_count_ <= kVboVerts) {
+            draw_fills(vb + q, q, x0, x1);
+            q += 6 * (u32)fill_count_;
         }
-        else show_bottom(bottom_->frameBuf.colorBuf, fb);
+        if (con_ready_ && q + 6 <= kVboVerts) draw_text(vb + q, q, x0, x1);
+        forget_draw_state();
+        band_x0_ = 0;
+        band_x1_ = 320;
+        // To the screen, after the draws on the GX queue (or the deferred
+        // frame's): the strip of the framebuffer's 240-pixel columns.
+        close_segment();
+        u8* const fb = (u8*)gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+        queue_gx(GxOp{ GxOp::Transfer, color + off, fb + off, GX_BUFFER_DIM(240, x1 - x0), GX_BUFFER_DIM(240, x1 - x0), 0, kBottomToScreen });
+        bottom_shown_ = true;
+        bg_drawn_ = bg_on;
+        bottom_drawn_geo_[0] = bottom_scale_;
+        bottom_drawn_geo_[1] = bottom_ox_;
+        bottom_drawn_geo_[2] = bottom_oy_;
+        bdraws_.swap(bdraws_last_);
         const uint32_t ms = now_ms();
         g_bottom_last_copy_ms.store(ms != 0 ? ms : 1);
     }
@@ -4776,9 +5024,37 @@ void rt64_3ds::set_bottom_console(const uint16_t* console) {
     g_bottom_console_changed.store(true);
 }
 void rt64_3ds::note_bottom_console_changed() { g_bottom_console_changed.store(true, std::memory_order_relaxed); }
-void rt64_3ds::set_bottom_console_see_through(uint16_t first, uint16_t second) {
-    const uint32_t v = (uint32_t)first | ((uint32_t)second << 16);
-    if (g_bottom_see_through.exchange(v) != v) g_bottom_console_changed.store(true);
+void rt64_3ds::set_bottom_fills(const BottomFill* fills, int count) {
+    if (count < 0) count = 0;
+    if (count > kBottomFillsMax) count = kBottomFillsMax;
+    LightLock_Lock(&bottom_fill_lock());
+    // Only a change makes the renderer draw the whole screen again.
+    if (count != g_bottom_fill_count || (count > 0 && memcmp(g_bottom_fills, fills, sizeof(BottomFill) * (size_t)count) != 0)) {
+        if (count > 0) memcpy(g_bottom_fills, fills, sizeof(BottomFill) * (size_t)count);
+        g_bottom_fill_count = count;
+        g_bottom_fill_version.fetch_add(1);
+    }
+    LightLock_Unlock(&bottom_fill_lock());
+}
+void rt64_3ds::set_bottom_background(const uint16_t* pixels) {
+    constexpr size_t kBytes = 320 * 240 * sizeof(uint16_t);
+    LightLock_Lock(&bottom_bg_lock());
+    if (pixels == nullptr) {
+        if (g_bottom_bg_set) {
+            g_bottom_bg_set = false;
+            g_bottom_bg_version.fetch_add(1);
+        }
+    }
+    else {
+        if (g_bottom_bg == nullptr) g_bottom_bg = (uint16_t*)malloc(kBytes);
+        // Only a change makes the renderer take it (and draw the whole screen).
+        if (g_bottom_bg != nullptr && (!g_bottom_bg_set || memcmp(g_bottom_bg, pixels, kBytes) != 0)) {
+            memcpy(g_bottom_bg, pixels, kBytes);
+            g_bottom_bg_set = true;
+            g_bottom_bg_version.fetch_add(1);
+        }
+    }
+    LightLock_Unlock(&bottom_bg_lock());
 }
 uint32_t rt64_3ds::bottom_idle_ms() {
     const uint32_t t = g_bottom_last_copy_ms.load();

@@ -215,6 +215,9 @@ struct FrameRecord {
     // drawn so far (TexDesc::frame), -1 = none. The backend keeps a copy of
     // each eye's frame up to there.
     int32_t frame_sample_last = -1;
+    // gEX3DSBottomBackground: this frame's touch screen shows the picture
+    // set at run time (RenderDesc::hud_bottom_background_at_run_time).
+    bool bottom_background = false;
 
     // Exchanges two records whole (frame interpolation keeps the in-between
     // frame beside the game's).
@@ -241,6 +244,7 @@ struct FrameRecord {
         std::swap(rtts, o.rtts);
         inst_cams.swap(o.inst_cams);
         std::swap(frame_sample_last, o.frame_sample_last);
+        std::swap(bottom_background, o.bottom_background);
     }
 
     void clear() {
@@ -257,6 +261,7 @@ struct FrameRecord {
         cam_is_world = false;
         has_hud_cam = false;
         frame_sample_last = -1;
+        bottom_background = false;
         inst_cams.clear();
     }
 };

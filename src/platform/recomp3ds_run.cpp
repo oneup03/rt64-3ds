@@ -1173,6 +1173,7 @@ int recomp3ds::run(const GameDesc& desc) {
     gfxInitDefault();
     // Status text on the touch screen (screen_printf).
     recomp3ds::screen_init(consoleInit(GFX_BOTTOM, nullptr));
+    if (desc.render.hud_on_bottom_supported) recomp3ds::screen_reserve_shadow();
     if (__3dslink_host.s_addr != 0) {
         link3dsStdio();
     }

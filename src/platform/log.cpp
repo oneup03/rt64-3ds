@@ -176,15 +176,23 @@ volatile bool g_screen_dirty = false;   // the console drew since screen_flush
 // Who has the touch screen (screen_bottom_update): the console, writing its
 // framebuffer, or the renderer, drawing the game's HUD there with the
 // console's text over it; the console then writes g_shadow, a copy of its
-// framebuffer the renderer reads (rt64_3ds::set_bottom_console).
+// framebuffer in linear memory that the GPU reads (rt64_3ds::set_bottom_console).
+// What the console wrote there is flushed out of the CPU's cache by the
+// core that wrote it (the ARM11's cache operations act on the calling
+// core's cache only): the main thread's (screen_flush), else the writer's
+// own; the renderer is told once it is.
 PrintConsole* g_console = nullptr;
 uint16_t* g_shadow = nullptr;
+size_t g_shadow_bytes = 0;
 bool g_on_shadow = false;               // the console writes g_shadow
+s32 g_main_core = -1;                   // the main thread's (screen_init)
 bool g_releasing = false;               // the renderer was told to stop; waiting for its last copy
 uint32_t g_release_ms = 0;
 constexpr uint32_t kReleaseMs = 150;    // a copy queued before the stop is on the screen by then
 
 uint32_t tick_ms() { return (uint32_t)(svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000)); }
+
+void flush_shadow() { svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)g_shadow, g_shadow_bytes); }
 
 uint16_t* bottom_fb(size_t* bytes) {
     u16 w = 0, h = 0;
@@ -233,6 +241,16 @@ void recomp3ds::screen_init(PrintConsole* console) {
     LightLock_Init(&g_screen_lock);
     g_screen = devoptab_list[STD_OUT];
     g_console = console;
+    g_main_core = svcGetProcessorID();
+}
+
+void recomp3ds::screen_reserve_shadow() {
+    if (g_shadow != nullptr) return;
+    size_t bytes = 0;
+    if (bottom_fb(&bytes) == nullptr) return;
+    g_shadow = (uint16_t*)linearAlloc(bytes);
+    if (g_shadow != nullptr) g_shadow_bytes = bytes;
+    else fprintf(stderr, "recomp3ds: no linear memory for the touch screen's console copy: the HUD stays on the top screen\n");
 }
 
 void recomp3ds::screen_bottom_update(bool hud) {
@@ -241,12 +259,12 @@ void recomp3ds::screen_bottom_update(bool hud) {
         if (!g_on_shadow) {
             size_t bytes = 0;
             uint16_t* fb = bottom_fb(&bytes);
-            if (g_shadow == nullptr) g_shadow = (uint16_t*)malloc(bytes);
-            if (g_shadow == nullptr) return;
+            if (g_shadow == nullptr || g_shadow_bytes != bytes) return;    // none reserved (screen_reserve_shadow)
             LightLock_Lock(&g_screen_lock);
             memcpy(g_shadow, fb, bytes);
             g_console->frameBuffer = g_shadow;
             LightLock_Unlock(&g_screen_lock);
+            flush_shadow();
             g_on_shadow = true;
             rt64_3ds::set_bottom_console(g_shadow);
         }
@@ -293,9 +311,11 @@ void recomp3ds::screen_printf(const char* fmt, ...) {
     if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
     LightLock_Lock(&g_screen_lock);
     g_screen->write_r(_REENT, nullptr, buf, (size_t)n);
+    // Another core's write is flushed here; the main thread's next
+    // screen_flush tells the renderer either way.
+    if (g_on_shadow && svcGetProcessorID() != g_main_core) flush_shadow();
     g_screen_dirty = true;
     LightLock_Unlock(&g_screen_lock);
-    if (g_on_shadow) rt64_3ds::note_bottom_console_changed();
 }
 
 // A line of its own at the bottom of the touch screen, in red (empty: clear
@@ -307,8 +327,12 @@ void recomp3ds::screen_alert(const char* text, int row) {
     char buf[64];
     const int n = snprintf(buf, sizeof(buf), "\x1b[%d;0H\x1b[31m%-39.39s\x1b[0m", row, text);
     g_screen->write_r(_REENT, nullptr, buf, (size_t)n);
+    if (g_on_shadow) flush_shadow();
     LightLock_Unlock(&g_screen_lock);
-    if (g_on_shadow) rt64_3ds::note_bottom_console_changed();
+    if (g_on_shadow) {
+        rt64_3ds::note_bottom_console_changed();
+        return;
+    }
     u16 w = 0, h = 0;
     u8* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &w, &h);
     if (fb != nullptr) svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)fb, (u32)w * h * gspGetBytesPerPixel(gfxGetScreenFormat(GFX_BOTTOM)));
@@ -325,10 +349,15 @@ uint32_t recomp3ds::log_write_stuck_ms() {
 // the display reads memory: what it drew is written back here, with the
 // kernel's flush on this core (gfxFlushBuffers asks the GSP module on core
 // 1, and the renderer's frame end no longer flushes the whole linear heap).
+// The same for the copy the renderer's GPU reads, then the renderer is told.
 void recomp3ds::screen_flush() {
     if (!g_screen_dirty) return;
     g_screen_dirty = false;
-    if (g_on_shadow) return;            // the renderer reads the copy
+    if (g_on_shadow) {
+        flush_shadow();
+        rt64_3ds::note_bottom_console_changed();
+        return;
+    }
     u16 w = 0, h = 0;
     u8* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &w, &h);
     if (fb == nullptr) return;

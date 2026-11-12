@@ -91,6 +91,12 @@ struct RenderDesc {
     // top row first, left to right (the console's text still goes over it).
     // None (the default): black.
     const uint16_t* hud_bottom_background = nullptr;
+    // The picture is handed over while the game runs instead
+    // (rt64_3ds::set_bottom_background: one the game builds from its own
+    // data), and shows only in the game frames whose list asks for it
+    // (gEX3DSBottomBackground), black in the rest. Its memory (300 KB of
+    // linear memory) is set aside at start.
+    bool hud_bottom_background_at_run_time = false;
     const uint32_t* snapshot_buffers = nullptr;   // RDRAM addresses the game copies frames into
     size_t snapshot_count = 0;
     // Write the rendered depth back into the game's RDRAM depth buffer each
@@ -515,21 +521,35 @@ void set_paused(bool paused);
 
 // The touch screen (RenderDesc::hud_on_bottom_supported). On: the renderer
 // draws the game's touch-screen spans there each game frame (the lists read
-// from then on keep them off the eyes), over black, with the console's text
-// over them, and copies the image into the screen's framebuffer. Off: it
-// stops; the console may write the framebuffer again once bottom_idle_ms()
-// says the last copy is done (a copy queued in a frame reaches the screen
-// within that frame's GPU work).
+// from then on keep them off the eyes), over the background or black, with
+// the fills and the console's text over them, and copies the image into the
+// screen's framebuffer (only the strip of it that changed). Off: it stops;
+// the console may write the framebuffer again once bottom_idle_ms() says
+// the last copy is done (a copy queued in a frame reaches the screen within
+// that frame's GPU work).
 void set_bottom_screen(bool on);
 // The console's framebuffer (240 px per column, RGB565, as libctru's
-// console writes it), drawn with black see-through; changes reach the
-// screen once note_bottom_console_changed says so.
+// console writes it), drawn with black see-through. The GPU reads it, so it
+// is linear memory, and what the console wrote is out of the CPU's cache
+// before note_bottom_console_changed says it changed.
 void set_bottom_console(const uint16_t* console);
 void note_bottom_console_changed();
-// Two of the console's colours drawn half see-through (0: none): the touch
-// buttons' fills, idle and held, when the grid lies over the HUD.
-void set_bottom_console_see_through(uint16_t first, uint16_t second);
-uint32_t bottom_idle_ms();      // since the last copy to the touch screen was queued (UINT32_MAX: none)
+// Rectangles drawn blended between the game's draws and the console's
+// text: the touch buttons' see-through fills when the grid lies over the
+// HUD (the console then writes only their labels). Touch-screen pixels, y
+// down; count 0: none.
+struct BottomFill {
+    int16_t x, y, w, h;
+    uint8_t rgba[4];
+};
+constexpr int kBottomFillsMax = 16;
+void set_bottom_fills(const BottomFill* fills, int count);
+// RenderDesc::hud_bottom_background_at_run_time: the picture behind the
+// touch-screen HUD, 320x240 RGB565 pixels, the top row first, left to right
+// (copied; nullptr: none). Any thread; the renderer takes it at the next
+// game frame drawn there, a later one at most every few frames.
+void set_bottom_background(const uint16_t* pixels);
+uint32_t bottom_idle_ms();     // since the last copy to the touch screen was queued (UINT32_MAX: none)
 
 // Save the next frame for the host tools: its gfx task and RDRAM
 // (gfx_task.bin) and what it rendered (gfx_frame.ppm), in the game's folder.
